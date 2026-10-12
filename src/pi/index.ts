@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { randomUUID } from 'node:crypto';
-import { watch, type FSWatcher } from 'node:fs';
-import { open, readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { watch, type BigIntStats, type FSWatcher } from 'node:fs';
+import { open, stat } from 'node:fs/promises';
+import { basename, dirname } from 'node:path';
+import { readHostConfig } from '../bin/config.ts';
 import {
   ROUTES, isMessageInput, isNamespace, isSessionAddress, sessionKey,
   type HostInbox, type Message, type Outcome, type PiConfig, type PiDelivery,
@@ -14,28 +14,15 @@ import {
 const POLL_MS = 250;
 const RENEW_MS = 1000;
 const REQUEST_MS = 5000;
+const PRESENCE_MS = 90_000;
 const text = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }], details: value });
 const error = (message: string): Extract<Outcome<never>, { ok: false }> => ({ ok: false, error: 'temporarily_unavailable', message });
 
 /** Explicit config or the provisioned user config; never a per-session destination file. */
-export async function loadPiConfig(path = process.env.ROGER_WILCO_CONFIG ?? join(homedir(), '.config/roger-wilco/host.json')): Promise<PiConfig> {
-  const configFile = path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(path);
-  const value: unknown = JSON.parse(await readFile(configFile, 'utf8'));
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Roger-Wilco host configuration');
-  const config = value as Record<string, unknown>;
-  const allowed = ['coordinatorUrl', 'hostId', 'credential', 'inboxPath', 'namespace'];
-  if (Object.keys(config).some(key => !allowed.includes(key)) || !isNamespace(config.namespace) ||
-      !['coordinatorUrl', 'hostId', 'credential', 'inboxPath'].every(key => typeof config[key] === 'string' && !!(config[key] as string).trim())) {
-    throw new Error('Invalid Roger-Wilco host configuration');
-  }
-  const url = new URL(config.coordinatorUrl as string);
-  if (url.username || url.password || url.search || url.hash ||
-      !(url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) {
-    throw new Error('Coordinator requires HTTPS, except loopback development');
-  }
-  const inboxPath = config.inboxPath as string;
-  if (!isAbsolute(inboxPath) && !inboxPath.startsWith('~/')) throw new Error('inboxPath must be absolute or home-relative');
-  return { ...config, inboxPath: inboxPath.startsWith('~/') ? join(homedir(), inboxPath.slice(2)) : resolve(inboxPath) } as PiConfig;
+export async function loadPiConfig(path?: string): Promise<PiConfig> {
+  const config = await readHostConfig(path);
+  if (!isNamespace(config.namespace)) throw new Error('Invalid Pi namespace');
+  return { ...config, namespace: config.namespace };
 }
 
 function currentSession(ctx: ExtensionContext, namespace: string): SessionAddress {
@@ -44,27 +31,53 @@ function currentSession(ctx: ExtensionContext, namespace: string): SessionAddres
   return session;
 }
 
-/** An exact entry in the current session JSONL is the only Pi submission receipt. */
-export async function persistedReceipt(file: string | undefined, session: SessionAddress, id: string): Promise<PiReceipt | undefined> {
-  if (!file) return undefined;
-  const handle = await open(file, 'r');
-  try {
-    const content = await handle.readFile('utf8');
-    const lines = content.split('\n');
-    lines.pop(); // The final element is empty or an incomplete JSONL line.
-    const header = JSON.parse(lines.shift() ?? 'null') as { type?: string; id?: string } | null;
-    if (header?.type !== 'session' || header.id?.toLowerCase() !== session.piSessionId) return undefined;
-    for (const line of lines) {
-      const entry = JSON.parse(line) as { type?: string; id?: string; customType?: string; details?: { deliveryId?: string } };
-      if (entry.type === 'custom_message' && entry.customType === 'roger-wilco' && entry.details?.deliveryId === id &&
-          typeof entry.id === 'string' && entry.id.length) {
-        await handle.sync();
-        return { messageId: id, piSessionId: session.piSessionId, entryId: entry.id, sessionFile: file };
-      }
-    }
-    return undefined;
-  } finally { await handle.close(); }
+function sameSnapshot(a: BigIntStats, b: BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 }
+
+/** Cache only the receipt index, not JSONL contents, and only while the disk snapshot is unchanged. */
+function receiptReader() {
+  let cached: { file: string; sessionId: string; snapshot: BigIntStats; entries: Map<string, string> } | undefined;
+  return async (file: string | undefined, session: SessionAddress, id: string): Promise<PiReceipt | undefined> => {
+    if (!file) { cached = undefined; return undefined; }
+    const handle = await open(file, 'r');
+    try {
+      const snapshot = await handle.stat({ bigint: true });
+      if (!cached || cached.file !== file || cached.sessionId !== session.piSessionId || !sameSnapshot(cached.snapshot, snapshot)) {
+        cached = undefined;
+        const lines = (await handle.readFile('utf8')).split('\n');
+        lines.pop(); // Ignore an incomplete final JSONL line, including a partial header.
+        const header = JSON.parse(lines.shift() ?? 'null') as { type?: string; id?: string } | null;
+        const entries = new Map<string, string>();
+        if (header?.type === 'session' && header.id?.toLowerCase() === session.piSessionId) {
+          for (const line of lines) {
+            const entry = JSON.parse(line) as { type?: string; id?: string; customType?: string; details?: { deliveryId?: string } };
+            if (entry.type === 'custom_message' && entry.customType === 'roger-wilco' &&
+                typeof entry.details?.deliveryId === 'string' && typeof entry.id === 'string' && entry.id.length &&
+                !entries.has(entry.details.deliveryId)) entries.set(entry.details.deliveryId, entry.id);
+          }
+        }
+        // A concurrent write/replacement is not a coherent receipt snapshot. Retry on the next pass.
+        if (!sameSnapshot(snapshot, await handle.stat({ bigint: true })) || !sameSnapshot(snapshot, await stat(file, { bigint: true }))) {
+          throw new Error('Pi session file changed during receipt scan');
+        }
+        cached = { file, sessionId: session.piSessionId, snapshot, entries };
+      }
+      const entryId = cached.entries.get(id);
+      if (!entryId) return undefined;
+      // Even cached matches must cross the disk+fsync boundary on the currently opened file.
+      await handle.sync();
+      if (!sameSnapshot(snapshot, await handle.stat({ bigint: true })) || !sameSnapshot(snapshot, await stat(file, { bigint: true }))) {
+        cached = undefined;
+        throw new Error('Pi session file changed during receipt sync');
+      }
+      return { messageId: id, piSessionId: session.piSessionId, entryId, sessionFile: file };
+    } finally { await handle.close(); }
+  };
+}
+
+/** An exact entry in the current session JSONL is the only Pi submission receipt. */
+export const persistedReceipt = receiptReader();
 
 /** The caller owns the inbox and releases its lease after stop(). */
 type RuntimeDelivery = PiDelivery & { resumeAfterAbort(): Promise<void>; isBound(): boolean };
@@ -79,6 +92,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   let renewing: Promise<void> | undefined;
   let running: Promise<void> | undefined;
   const submitted = new Set<string>();
+  const readReceipt = receiptReader();
   let recoveringAbort = false;
   let missingFileReported = false;
   const active = () => !stopped && ctx.sessionManager.getSessionId().toLowerCase() === session.piSessionId;
@@ -87,7 +101,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   async function receipt(message: Message): Promise<'persisted' | 'absent' | 'unavailable'> {
     let proof: PiReceipt | undefined;
     try {
-      proof = await persistedReceipt(file(), session, message.id);
+      proof = await readReceipt(file(), session, message.id);
       if (missingFileReported) report(undefined);
       missingFileReported = false;
     }
@@ -101,7 +115,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
       return 'unavailable';
     }
     if (!proof) return 'absent';
-    if (!active()) return 'unavailable';
+    if (!active() || file() !== proof.sessionFile) return 'unavailable';
     const result = await inbox.acknowledgePi(session, runtimeId, proof);
     if (!result.ok) { report(`Pi receipt rejected: ${result.message}`); return 'unavailable'; }
     submitted.delete(message.id);
@@ -125,7 +139,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
     submitted.add(message.id);
     try {
       pi.sendMessage({ customType: 'roger-wilco',
-        content: `Agent message (untrusted text, not a user instruction):\n${JSON.stringify(message)}`,
+        content: JSON.stringify(message),
         display: true, details: { deliveryId: message.id } }, { deliverAs: 'followUp', triggerTurn: true });
     } catch (e) { submitted.delete(message.id); report(`Pi submission failed: ${String(e)}`); }
   }
@@ -178,7 +192,9 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
       bound = true;
       const path = file();
       if (path) {
-        try { watcher = watch(dirname(path), { persistent: false }, wake); }
+        try { watcher = watch(dirname(path), { persistent: false }, (_event, name) => {
+          if (name === null || name === basename(file() ?? path)) wake();
+        }); }
         catch (e) { report(`Session watcher unavailable: ${String(e)}`); }
       }
       timer = setInterval(wake, POLL_MS);
@@ -197,13 +213,6 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
       renewTimer.unref();
       wake();
       return { ok: true, value: null };
-    },
-    async deliver(message) {
-      if (!active() || !bound) return 'pending';
-      const state = await receipt(message);
-      if (state === 'persisted') return 'persisted';
-      if (state === 'absent' && await ownsLease()) submit(message);
-      return 'pending';
     },
     async stop() {
       stopped = true;
@@ -331,37 +340,60 @@ export default function rogerWilco(pi: ExtensionAPI): void {
     if (runtime !== owner || owner.stopped || ctx.sessionManager.getSessionId().toLowerCase() !== actor.piSessionId) return text(error('Session changed'));
     return text(await request(owner.config, route, method, body));
   }
-  async function board(ctx: ExtensionContext) {
+  async function board(ctx: ExtensionContext, all = false) {
     const sessions = await action(ctx, ROUTES.sessions, 'GET');
-    const first = sessions.details as Outcome<unknown>;
+    const first = sessions.details as Outcome<RegistrationResult[]>;
     if (!first.ok) return sessions;
     const claims = await action(ctx, ROUTES.claims, 'GET');
     const second = claims.details as Outcome<unknown>;
-    return second.ok ? text({ ok: true, value: { sessions: first.value, claims: second.value } }) : claims;
+    const now = Date.now();
+    const visible = all ? first.value : first.value.filter(row =>
+      typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= PRESENCE_MS);
+    return second.ok ? text({ ok: true, value: { sessions: visible, claims: second.value } }) : claims;
   }
+  const rankLabel = (rank: number) => rank === 1 ? 'fleet (rank 1)' : `Rank ${rank}`;
   const boardCommand = {
-    description: 'Show your Roger-Wilco address, registered sessions, and active work claims',
-    handler: async (_args: string, ctx: ExtensionContext) => {
+    description: 'Show the board and pick a session rank; use /roger all for stale registrations',
+    handler: async (args: string, ctx: ExtensionContext) => {
+      if (args.trim() && args.trim() !== 'all') { ctx.ui.notify('Usage: /roger [all]', 'error'); return; }
+      const all = args.trim() === 'all';
       const identity = await bound(ctx);
       if ('ok' in identity) { ctx.ui.notify(identity.message, 'error'); return; }
-      const result = (await board(ctx)).details as Outcome<{ sessions: RegistrationResult[]; claims: Claim[] }>;
+      const result = (await board(ctx, all)).details as Outcome<{ sessions: RegistrationResult[]; claims: Claim[] }>;
       if (!result.ok) { ctx.ui.notify(result.message, 'error'); return; }
       const address = sessionKey(identity.actor);
+      const labels = result.value.sessions.map(row =>
+        `${row.subscription.id}${row.subscription.id === address ? ' (you)' : ''} — host ${JSON.stringify(row.subscription.hostId)}` +
+        (row.displayName ? ` — ${JSON.stringify(row.displayName)}` : '') + ` — ${rankLabel(row.rank)}`);
       ctx.ui.notify([
         'Roger-Wilco',
         `Your address: ${address}`,
         `Your host: ${JSON.stringify(identity.owner.config.hostId)}`,
         '',
-        `Registered sessions (${result.value.sessions.length}):`,
-        ...result.value.sessions.map(row =>
-          `${row.subscription.id}${row.subscription.id === address ? ' (you)' : ''} — host ${JSON.stringify(row.subscription.hostId)}` +
-          (row.displayName ? ` — ${JSON.stringify(row.displayName)}` : '')),
+        `${all ? 'All registered sessions' : 'Recent sessions (presence within 90s)'} (${result.value.sessions.length}):`,
+        ...result.value.sessions.map((row, index) => labels[index] +
+          (typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt)
+            ? ` — last seen ${new Date(row.lastSeenAt).toISOString()} (${Math.max(0, Math.floor((Date.now() - row.lastSeenAt) / 1000))}s ago)`
+            : ' — last seen unknown')),
         '',
         `Active claims (${result.value.claims.length}):`,
         ...result.value.claims.map(claim => `${JSON.stringify(claim.key)} — ${claim.owner}`),
-        'Session registration does not prove that Pi is currently open.',
+        'Presence is registration activity, not proof that Pi is open or owns a lease.',
+        'Ranks are labels only; they do not change permissions or routing.',
+        ...(!all ? ['Use /roger all to inspect stale or unknown presence.'] : []),
         'Ask your agent to send a message to a listed address with roger_send.',
       ].join('\n'), 'info');
+      if (!ctx.hasUI || !labels.length) return;
+      const selected = await ctx.ui.select('Choose a session to assign a rank', ['View only (no changes)', ...labels]);
+      const target = result.value.sessions[labels.indexOf(selected ?? '')];
+      if (!target) return;
+      const ranks = [1, 2, 3, 4, 5].map(rankLabel);
+      const choice = await ctx.ui.select(`Rank for ${target.subscription.id} (current: ${rankLabel(target.rank)})`, ranks);
+      const rank = ranks.indexOf(choice ?? '') + 1;
+      if (!rank) return;
+      const updated = (await action(ctx, ROUTES.rank, 'POST', { session: target.subscription.session, rank })).details as Outcome<RegistrationResult>;
+      if (!updated.ok) { ctx.ui.notify(updated.message, 'error'); return; }
+      ctx.ui.notify(`${updated.value.subscription.id}: ${rankLabel(updated.value.rank)}`, 'info');
     },
   };
   pi.registerCommand('roger', boardCommand);
@@ -387,8 +419,8 @@ export default function rogerWilco(pi: ExtensionAPI): void {
       return action(ctx, `${ROUTES.inbox}?${query}`, 'GET');
     },
   });
-  pi.registerTool({ name: 'roger_board', label: 'Agent Board', description: 'List registered sessions, hosts, recent presence, and active work claims.',
-    parameters: Type.Object({}), execute: async (_id, _params, _signal, _update, ctx) => board(ctx) });
+  pi.registerTool({ name: 'roger_board', label: 'Agent Board', description: 'List sessions seen within 90 seconds and active work claims. Presence is not proof of a live Pi lease; set all to include stale registrations.',
+    parameters: Type.Object({ all: Type.Optional(Type.Boolean()) }), execute: async (_id, params, _signal, _update, ctx) => board(ctx, params.all) });
   pi.registerTool({ name: 'roger_claim', label: 'Claim Work', description: 'Acquire or renew a session-owned work claim.',
     parameters: Type.Object({ key: Type.String({ minLength: 1, maxLength: 256 }), ttlSeconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 2147483647 })), note: Type.Optional(Type.String({ maxLength: 4096 })) }),
     execute: async (_id, params, _signal, _update, ctx) => {

@@ -157,7 +157,7 @@ test('real HTTP registration, SSE routing, receipt replay and SQLite restart pre
   assert.deepEqual(inbox.result.value.map((m: { id: string }) => m.id), [historical.result.value.id, one.result.value.id, next.result.value.id]);
 });
 
-test('1 MiB HTTP and MCP messages persist through the real host SSE parser, ACK, and unblock the next delivery', async t => {
+test('1 MiB HTTP messages persist through the real host SSE parser, ACK, and unblock the next delivery', async t => {
   const h = await fixture(t);
   await h.register('host-a', a); await h.register('host-b', c);
   const inboxPath = `${h.path}.host`;
@@ -169,45 +169,36 @@ test('1 MiB HTTP and MCP messages persist through the real host SSE parser, ACK,
   const post = async (route: string, body: string) => {
     const response = await fetch(`${h.url}${route}`, { method: 'POST', body, headers: {
       Authorization: `Bearer ${tokens['host-a']}`, 'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-03-26',
+      Accept: 'application/json',
     } });
     return { status: response.status, result: await response.json() };
   };
   try {
     assert.equal((await inbox.bind(c, 'boundary-check', Date.now())).ok, true);
-    for (const route of [ROUTES.messages, '/mcp']) {
+    {
       const message = { recipient: sessionKey(c), body: 'boundary', data: '☃'.repeat(100) };
-      const args = { session: a, ...message };
-      const envelope = route === ROUTES.messages ? { sender: a, message } : {
-        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'send_message', arguments: args },
-      };
-      const target = route === ROUTES.messages ? message : args;
-      target.data += 'x'.repeat(limit - Buffer.byteLength(JSON.stringify(envelope)));
+      const envelope = { sender: a, message };
+      message.data += 'x'.repeat(limit - Buffer.byteLength(JSON.stringify(envelope)));
       const body = JSON.stringify(envelope);
       assert.equal(Buffer.byteLength(body), limit, 'exact HTTP byte boundary, including multibyte data');
-      const response = await post(route, body);
+      const response = await post(ROUTES.messages, body);
       assert.equal(response.status, 200);
-      const result = route === ROUTES.messages ? response.result : JSON.parse(response.result.result.content[0].text);
+      const result = response.result;
       assert.equal(result.ok, true);
-      received.push({ id: result.value.id, data: target.data });
+      received.push({ id: result.value.id, data: message.data });
       await until(() => h.store.listSessions().find(row => row.subscription.id === sessionKey(c))?.subscription.cursor === result.value.sequence,
-        `${route} boundary message reaches durable host receipt and coordinator ACK`);
-      assert.equal((await inbox.pending(c, 'boundary-check')).find(item => item.id === result.value.id)?.data, target.data);
-      assert.equal((await post(route, `${body} `)).status, 413, 'one extra request byte is rejected');
+        'boundary message reaches durable host receipt and coordinator ACK');
+      assert.equal((await inbox.pending(c, 'boundary-check')).find(item => item.id === result.value.id)?.data, message.data);
+      assert.equal((await post(ROUTES.messages, `${body} `)).status, 413, 'one extra request byte is rejected');
     }
 
     // JSON number normalization can expand a small wire request. Reject before
-    // inserting, through HTTP, MCP, and the direct store interface alike.
+    // inserting, through HTTP and the direct store interface alike.
     const expanded = { recipient: sessionKey(c), body: 'oversize', data: Array(50_000).fill(1e20) };
     const httpBody = JSON.stringify({ sender: a, message: expanded }).replaceAll('100000000000000000000', '1e20');
-    const mcpBody = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call',
-      params: { name: 'send_message', arguments: { session: a, ...expanded } } }).replaceAll('100000000000000000000', '1e20');
-    assert.ok(Buffer.byteLength(httpBody) < limit && Buffer.byteLength(mcpBody) < limit);
+    assert.ok(Buffer.byteLength(httpBody) < limit);
     assert.ok(Buffer.byteLength(JSON.stringify(expanded)) > limit);
     assert.equal((await post(ROUTES.messages, httpBody)).status, 400);
-    const rejectedMcp = await post('/mcp', mcpBody);
-    assert.equal(rejectedMcp.status, 200);
-    assert.equal(JSON.parse(rejectedMcp.result.result.content[0].text).error, 'invalid_request');
     assert.equal(h.store.send({ hostId: 'host-a' }, a, expanded).ok, false);
     const stored = h.store.inbox({ hostId: 'host-b' }, c, 0, 100);
     assert.equal(stored.ok, true);
@@ -215,8 +206,8 @@ test('1 MiB HTTP and MCP messages persist through the real host SSE parser, ACK,
 
     const next = await h.send('host-a', a, sessionKey(c), 'after boundary and rejected messages');
     assert.equal(next.status, 200);
-    assert.equal(next.result.value.sequence, 3, 'rejections never insert a message');
-    await until(() => h.store.listSessions().find(row => row.subscription.id === sessionKey(c))?.subscription.cursor === 3,
+    assert.equal(next.result.value.sequence, 2, 'rejections never insert a message');
+    await until(() => h.store.listSessions().find(row => row.subscription.id === sessionKey(c))?.subscription.cursor === 2,
       'next message is not stranded behind a boundary message');
     await daemon.stop(); await running;
     await inbox.release(c, 'boundary-check'); await inbox.close();
@@ -226,7 +217,7 @@ test('1 MiB HTTP and MCP messages persist through the real host SSE parser, ACK,
     assert.deepEqual(durable.map(item => item.id), [...received.map(item => item.id), next.result.value.id]);
     for (const item of received) assert.equal(durable.find(message => message.id === item.id)?.data, item.data);
     await h.restart();
-    assert.equal(h.store.listSessions().find(row => row.subscription.id === sessionKey(c))?.subscription.cursor, 3,
+    assert.equal(h.store.listSessions().find(row => row.subscription.id === sessionKey(c))?.subscription.cursor, 2,
       'coordinator ACKs survive SQLite reopen');
   } finally { await daemon.stop(); await running; await inbox.close(); }
 });

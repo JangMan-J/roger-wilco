@@ -32,7 +32,10 @@ test('~/ host configuration gives Pi and host daemon the same durable inbox', as
   const piConfig = await loadPiConfig();
   const daemonConfig = await readHostConfig();
   assert.equal(piConfig.inboxPath, join(dir, 'shared/host.sqlite'));
-  assert.equal(piConfig.inboxPath, daemonConfig.inboxPath);
+  assert.deepEqual(piConfig, daemonConfig);
+  assert.deepEqual(await loadPiConfig(configFile), piConfig);
+  delete process.env.ROGER_WILCO_CONFIG;
+  assert.deepEqual(await loadPiConfig(), piConfig, 'default config path is resolved from HOME');
 
   const owner = randomUUID();
   const sender = randomUUID();
@@ -50,6 +53,7 @@ test('~/ host configuration gives Pi and host daemon the same durable inbox', as
     for (let i = 0; i < 200 && !sent.length; i++) await delay(10);
     assert.equal(sent.length, 1, 'Pi received the event stored through the daemon inbox path');
     assert.equal(sent[0].message.details.deliveryId, message.id);
+    assert.equal(sent[0].message.content, JSON.stringify(message), 'Roger sends metadata without a repeated warning prefix');
     assert.deepEqual(sent[0].options, { deliverAs: 'followUp', triggerTurn: true });
   } finally {
     await handlers.get('session_shutdown')({ reason: 'quit' }, ctx);
@@ -155,15 +159,22 @@ test('a rebound runtime does not wake an ID acknowledged by the takeover owner',
   }
 });
 
-test('Pi applies the host HTTPS and absolute/home-relative inbox requirements', async t => {
+test('Pi and host share trust validation; Pi additionally requires a namespace', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-config-invalid-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const configFile = join(dir, 'host.json');
   const base = { namespace: 'fleet', hostId: 'host-a', credential: 'offline', inboxPath: join(dir, 'host.sqlite') };
-  for (const coordinatorUrl of ['http://example.com', 'http://user:password@localhost', 'https://example.com/?query=1']) {
-    await writeFile(configFile, JSON.stringify({ ...base, coordinatorUrl }));
-    await assert.rejects(loadPiConfig(configFile), /HTTPS|coordinator/);
+  for (const change of [
+    { coordinatorUrl: 'http://example.com' }, { coordinatorUrl: 'http://user:password@localhost' },
+    { coordinatorUrl: 'https://example.com/?query=1' }, { coordinatorUrl: 'https://example.com/#fragment' },
+    { inboxPath: './host.sqlite' }, { namespace: 'Invalid' }, { namespace: null },
+    { hostId: '' }, { credential: ' ' }, { callbackUrl: 'https://callback.example' },
+  ]) {
+    await writeFile(configFile, JSON.stringify({ ...base, coordinatorUrl: 'https://example.com', ...change }));
+    await assert.rejects(loadPiConfig(configFile));
+    await assert.rejects(readHostConfig(configFile));
   }
-  await writeFile(configFile, JSON.stringify({ ...base, coordinatorUrl: 'https://example.com', inboxPath: './host.sqlite' }));
-  await assert.rejects(loadPiConfig(configFile), /inboxPath/);
+  await writeFile(configFile, JSON.stringify({ ...base, coordinatorUrl: 'https://example.com', namespace: undefined }));
+  assert.equal((await readHostConfig(configFile)).hostId, 'host-a', 'daemon does not require a namespace');
+  await assert.rejects(loadPiConfig(configFile), /namespace/);
 });

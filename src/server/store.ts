@@ -9,11 +9,15 @@ import {
   type RegistrationResult, type SessionAddress, type StreamFrame, type Subscription,
 } from '../protocol/index.ts';
 
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const MAINTENANCE_MS = 60_000;
+const COLLECTION_LIMIT = 5000;
+
 const schema = `
 CREATE TABLE IF NOT EXISTS store_config (namespace TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, host_id TEXT NOT NULL, display_name TEXT,
-  last_seen_at INTEGER NOT NULL DEFAULT 0,
+  last_seen_at INTEGER NOT NULL DEFAULT 0, rank INTEGER NOT NULL DEFAULT 1,
   initial_cursor INTEGER NOT NULL, cursor INTEGER NOT NULL, offered INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -22,12 +26,13 @@ CREATE TABLE IF NOT EXISTS messages (
   data TEXT NOT NULL, visibility TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, id);
+CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp);
 CREATE TABLE IF NOT EXISTS claims (
   key TEXT PRIMARY KEY, owner TEXT NOT NULL, note TEXT,
   claimed_at INTEGER NOT NULL, expires_at INTEGER
 );`;
 
-type SessionRow = { id: string; host_id: string; display_name: string | null; last_seen_at: number; cursor: number; initial_cursor: number; offered: number | null };
+type SessionRow = { id: string; host_id: string; display_name: string | null; last_seen_at: number; rank: number; cursor: number; initial_cursor: number; offered: number | null };
 type MessageRow = { id: number; timestamp: number; sender: string; recipient: string; body: string; data: string; visibility: 'private' | 'public' };
 type ClaimRow = { key: string; owner: string; note: string | null; claimed_at: number; expires_at: number | null };
 const failure = <T>(error: 'invalid_request' | 'not_found' | 'owner_conflict', message: string): Outcome<T> => ({ ok: false, error, message });
@@ -42,7 +47,10 @@ const addressOf = (key: string): SessionAddress => {
 class Store implements CoordinatorStore {
   private readonly db: DatabaseSync;
   private readonly namespace: string;
-  private readonly rotation = new Map<string, number>();
+  private readonly rotation = new Map<string, string>();
+  private nextMaintenance = 0;
+  private readonly pendingRows: StatementSync;
+  private readonly offer: StatementSync;
   private readonly sessionRow: StatementSync;
   private readonly messageRow: StatementSync;
   private readonly claimRow: StatementSync;
@@ -53,18 +61,37 @@ class Store implements CoordinatorStore {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     try {
-      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;');
       this.db.exec(schema);
-      if (!(this.db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[]).some(column => column.name === 'last_seen_at'))
+      const columns = this.db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
+      if (!columns.some(column => column.name === 'last_seen_at'))
         this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0');
+      if (!columns.some(column => column.name === 'rank'))
+        this.db.exec('ALTER TABLE sessions ADD COLUMN rank INTEGER NOT NULL DEFAULT 1');
+      this.db.exec(`CREATE INDEX IF NOT EXISTS sessions_host ON sessions(host_id, id);
+        CREATE INDEX IF NOT EXISTS sessions_last_seen ON sessions(last_seen_at);
+        CREATE INDEX IF NOT EXISTS sessions_cursor ON sessions(cursor)`);
       this.transaction(() => {
         const row = this.db.prepare('SELECT namespace FROM store_config').get() as { namespace: string } | undefined;
         if (row && row.namespace !== namespace) throw new Error('Coordinator database namespace mismatch');
         if (!row) this.db.prepare('INSERT INTO store_config (namespace) VALUES (?)').run(namespace);
+        // Pre-presence databases get one retention window, not immediate data loss.
+        this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE last_seen_at = 0').run(Date.now());
       });
       this.sessionRow = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
       this.messageRow = this.db.prepare('SELECT * FROM messages WHERE id = ?');
       this.claimRow = this.db.prepare('SELECT * FROM claims WHERE key = ?');
+      // Two indexed seeks per retained subscription, one bounded result set; no JS N+1 reads.
+      this.pendingRows = this.db.prepare(`SELECT m.*, s.id AS subscription_id, s.offered
+        FROM sessions s JOIN messages m ON m.id = (
+          SELECT MIN(id) FROM (
+            SELECT MIN(id) AS id FROM messages WHERE recipient = s.id AND id > s.cursor
+            UNION ALL
+            SELECT MIN(id) AS id FROM messages WHERE recipient = '*' AND sender != s.id AND id > s.cursor
+          )
+        ) WHERE s.host_id = ? ORDER BY (s.id <= ?), s.id LIMIT ?`);
+      this.offer = this.db.prepare('UPDATE sessions SET offered = ? WHERE id = ?');
+      this.maintain();
     } catch (error) { this.db.close(); throw error; }
   }
 
@@ -76,13 +103,30 @@ class Store implements CoordinatorStore {
       return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
+  private maintain(): void {
+    const now = Date.now();
+    if (now < this.nextMaintenance) return;
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM sessions WHERE last_seen_at < ?').run(now - RETENTION_MS);
+      // A sender or unrelated low cursor must not pin history. Broadcasts remain
+      // until every retained recipient has acknowledged, or its registration expires.
+      this.db.prepare(`DELETE FROM messages WHERE id IN (
+        SELECT id FROM messages WHERE timestamp < ?
+          AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = messages.recipient AND cursor < messages.id)
+          AND (recipient != '*' OR NOT EXISTS (
+            SELECT 1 FROM sessions WHERE id != messages.sender AND cursor < messages.id
+          )) ORDER BY timestamp LIMIT ?
+      )`).run(now - RETENTION_MS, COLLECTION_LIMIT);
+    });
+    this.nextMaintenance = now + MAINTENANCE_MS;
+  }
   private session(id: string): SessionRow | undefined { return this.sessionRow.get(id) as SessionRow | undefined; }
   private subscription(row: SessionRow): Subscription {
     return { id: row.id, session: addressOf(row.id), hostId: row.host_id, cursor: row.cursor };
   }
   private registration(row: SessionRow): RegistrationResult {
     return { subscription: this.subscription(row), ...(row.display_name === null ? {} : { displayName: row.display_name }),
-      lastSeenAt: row.last_seen_at };
+      lastSeenAt: row.last_seen_at, rank: row.rank };
   }
   private message(row: MessageRow): Message {
     return { version: PROTOCOL_VERSION, id: deliveryId(this.namespace, row.id), sequence: row.id,
@@ -95,6 +139,7 @@ class Store implements CoordinatorStore {
   private assigned(host: HostPrincipal, session: SessionAddress): Outcome<SessionRow> {
     if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace)
       return failure('invalid_request', 'Invalid host or session');
+    this.maintain();
     const row = this.session(sessionKey(session));
     if (!row) return failure('not_found', 'Session is not registered');
     if (row.host_id !== host.hostId) return failure('owner_conflict', 'Session belongs to another host');
@@ -104,13 +149,16 @@ class Store implements CoordinatorStore {
   register(host: HostPrincipal, request: Registration): Outcome<RegistrationResult> {
     if (!validHost(host) || !isRegistration(request) || request.session.namespace !== this.namespace)
       return failure('invalid_request', 'Invalid registration');
+    this.maintain();
     return this.transaction(() => {
       const id = sessionKey(request.session);
       let row = this.session(id);
       if (row && row.host_id !== host.hostId) return failure('owner_conflict', 'Session belongs to another host');
       const now = Date.now();
       if (!row) {
-        const tail = (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS tail FROM messages').get() as { tail: number }).tail;
+        // AUTOINCREMENT's durable watermark survives collection of the entire history.
+        const tail = (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS tail")
+          .get() as { tail: number }).tail;
         this.db.prepare('INSERT INTO sessions (id, host_id, display_name, last_seen_at, initial_cursor, cursor) VALUES (?, ?, ?, ?, ?, ?)')
           .run(id, host.hostId, request.displayName ?? null, now, tail, tail);
       } else {
@@ -120,11 +168,26 @@ class Store implements CoordinatorStore {
       return { ok: true, value: this.registration(this.session(id)!) };
     });
   }
+  setRank(host: HostPrincipal, session: SessionAddress, rank: number): Outcome<RegistrationResult> {
+    if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace ||
+        !Number.isInteger(rank) || rank < 1 || rank > 5)
+      return failure('invalid_request', 'Invalid rank update');
+    this.maintain();
+    return this.transaction(() => {
+      const id = sessionKey(session);
+      if (!this.session(id)) return failure('not_found', 'Session is not registered');
+      // Trusted-user metadata: no owner restriction, presence refresh, or cursor change.
+      this.db.prepare('UPDATE sessions SET rank = ? WHERE id = ?').run(rank, id);
+      return { ok: true, value: this.registration(this.session(id)!) };
+    });
+  }
   listSessions(): RegistrationResult[] {
+    this.maintain();
     return (this.db.prepare('SELECT * FROM sessions ORDER BY id').all() as SessionRow[])
       .map(row => this.registration(row));
   }
   listClaims(): Claim[] {
+    this.maintain();
     return this.transaction(() => {
       const now = Date.now();
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
@@ -161,32 +224,34 @@ class Store implements CoordinatorStore {
   }
   pending(host: HostPrincipal, limit: number): StreamFrame[] {
     if (!validHost(host) || !validLimit(limit)) throw new TypeError('Invalid host or limit');
+    this.maintain();
     return this.transaction(() => {
-      const rows = this.db.prepare('SELECT * FROM sessions WHERE host_id = ? ORDER BY id').all(host.hostId) as SessionRow[];
-      if (!rows.length) return [];
-      const frames: StreamFrame[] = [];
-      const start = (this.rotation.get(host.hostId) ?? 0) % rows.length;
-      this.rotation.set(host.hostId, (start + 1) % rows.length);
-      for (let i = 0; i < rows.length && frames.length < limit; i++) {
-        const row = rows[(start + i) % rows.length]!;
-        const message = this.next(row.id, row.cursor);
-        if (!message) continue;
+      const rows = this.pendingRows.all(host.hostId, this.rotation.get(host.hostId) ?? '', limit) as
+        (MessageRow & { subscription_id: string; offered: number | null })[];
+      if (!rows.length) { this.rotation.delete(host.hostId); return []; }
+      const frames = rows.map(row => {
         // Record the exact item offered before the stream writes it. No later item can bypass it.
-        if (row.offered !== message.id) this.db.prepare('UPDATE sessions SET offered = ? WHERE id = ?').run(message.id, row.id);
-        frames.push({ type: 'message', subscriptionId: row.id, message: this.message(message) });
-      }
+        if (row.offered !== row.id) this.offer.run(row.id, row.subscription_id);
+        return { type: 'message' as const, subscriptionId: row.subscription_id, message: this.message(row) };
+      });
+      this.rotation.set(host.hostId, rows.at(-1)!.subscription_id);
       return frames;
     });
   }
   acknowledge(host: HostPrincipal, receipt: Receipt): Outcome<Subscription> {
     if (!validHost(host) || !isReceipt(receipt) || !receipt.subscriptionId.startsWith(`${this.namespace}:`))
       return failure('invalid_request', 'Invalid receipt');
+    this.maintain();
     return this.transaction(() => {
       const row = this.session(receipt.subscriptionId);
       if (!row) return failure('not_found', 'Subscription does not exist');
       if (row.host_id !== host.hostId) return failure('owner_conflict', 'Subscription belongs to another host');
       const sequence = Number(receipt.messageId.slice(`${this.namespace}:msg:`.length));
       if (sequence <= row.cursor) {
+        // The cursor itself proves the latest ACK even after message collection.
+        // Older retries require retained routing history; an initial tail is not an ACK.
+        if (sequence === row.cursor && sequence > row.initial_cursor)
+          return { ok: true, value: this.subscription(row) };
         const past = this.messageRow.get(sequence) as MessageRow | undefined;
         if (sequence > row.initial_cursor && past &&
             (past.recipient === row.id || (past.recipient === '*' && past.sender !== row.id)))

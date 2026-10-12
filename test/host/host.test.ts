@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createHostDaemon, createHostInbox } from '../../src/host/index.ts';
 import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type HostInbox, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
@@ -85,6 +86,7 @@ test('host commits before receipt, reconnect replay is idempotent, invalid and o
       } else if (connections === 2) {
         res.write(`event: message\ndata: ${JSON.stringify(frame(1))}\n\n`);
         res.write('event: message\ndata: {"invalid":true}\n\n');
+        res.end(); // Reconnect on EOF, not because an individual event was rejected.
       } else if (connections === 3) {
         const oversized = frame(2);
         oversized.message.data = 'x'.repeat(MAX_STREAM_EVENT_BYTES);
@@ -133,6 +135,73 @@ test('host commits before receipt, reconnect replay is idempotent, invalid and o
     assert.equal((await reopened.bind(a, 'owner', Date.now())).ok, true);
     assert.deepEqual((await reopened.pending(a, 'owner')).map(m => m.id), ['fleet:msg:1']);
   } finally { await resumed.stop(); await resumedRun; }
+});
+
+test('unsupported and malformed events do not block another subscription on the same connection', async t => {
+  const { inbox, path } = fixture(t);
+  let connections = 0;
+  const receipts: unknown[] = [];
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.stream) {
+      connections++;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const unsupported = { ...frame(1), message: { ...message(1), version: 2 } };
+      res.write(`event: message\ndata: ${JSON.stringify(unsupported)}\n\n`);
+      res.write('event: message\ndata: {broken json}\n\n');
+      res.write(`event: message\ndata: ${JSON.stringify(frame(2, b))}\n\n`);
+      return;
+    }
+    if (req.url === ROUTES.receipt) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const receipt = JSON.parse(body);
+      receipts.push(receipt);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, value: { id: receipt.subscriptionId, hostId: 'host-a' } }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const daemon = createHostDaemon({ coordinatorUrl: `http://127.0.0.1:${address.port}`,
+    hostId: 'host-a', credential: 'secret', inboxPath: path }, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await waitFor(() => receipts.length > 0);
+    assert.equal(connections, 1);
+    assert.deepEqual(receipts, [{ subscriptionId: sessionKey(b), messageId: 'fleet:msg:2' }]);
+    assert.equal((await inbox.bind(a, 'a', Date.now())).ok, true);
+    assert.equal((await inbox.bind(b, 'b', Date.now())).ok, true);
+    assert.deepEqual(await inbox.pending(a, 'a'), [], 'unsupported event is neither stored nor acknowledged');
+    assert.deepEqual((await inbox.pending(b, 'b')).map(item => item.id), ['fleet:msg:2']);
+  } finally { await daemon.stop(); await run; }
+});
+
+test('acknowledged inbox history expires after seven days, never pending deliveries or recent receipts', async t => {
+  const { inbox, path } = fixture(t);
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await inbox.bind(a, 'owner', now);
+  for (const sequence of [1, 2, 3]) await inbox.receive(frame(sequence));
+  const proof = (sequence: number) => ({ messageId: `fleet:msg:${sequence}` as const,
+    piSessionId: a.piSessionId, entryId: `entry-${sequence}`, sessionFile: 'session.jsonl' });
+  assert.equal((await inbox.acknowledgePi(a, 'owner', proof(1))).ok, true);
+  t.mock.method(Date, 'now', () => now + 7 * 86400_000);
+  await inbox.bind(a, 'owner', Date.now());
+  assert.equal((await inbox.acknowledgePi(a, 'owner', proof(3))).ok, true);
+  await inbox.close();
+  t.mock.method(Date, 'now', () => now + 7 * 86400_000 + 1);
+  const reopened = createHostInbox(path);
+  t.after(() => reopened.close());
+  const db = new DatabaseSync(path);
+  try {
+    assert.deepEqual(db.prepare('SELECT message_id FROM messages ORDER BY sequence').all().map(row => row.message_id),
+      ['fleet:msg:2', 'fleet:msg:3']);
+  } finally { db.close(); }
+  assert.deepEqual((await reopened.pending(a, 'owner')).map(item => item.id), ['fleet:msg:2']);
+  assert.deepEqual(await reopened.receive(frame(3)), { inserted: false }, 'recent dedup survives cleanup');
 });
 
 test('silent open stream reconnects and commits the frame offered only on the next connection', async t => {

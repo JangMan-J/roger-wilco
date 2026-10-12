@@ -74,8 +74,8 @@ curl https://COORDINATOR/health
 ```
 
 `GET /health` does not require credentials.
-The control API, SSE stream, and `/mcp` require a configured bearer credential.
-MCP calls supply an explicit session address.
+The control API and SSE stream require a configured bearer credential.
+The coordinator has no MCP endpoint.
 Pi tools derive their session address from the current session.
 The protocol document lists HTTP routes.
 
@@ -121,3 +121,7 @@ The [research split inventory](research-split.md) lists the source boundaries.
 Run only one wake-up consumer for each selected session.
 Do not reset a new cursor or delete a pending inbox during rollback.
 The coordinator refuses automatic migration of an existing session to another host.
+
+The historical `test/installation/rollback.mjs` rehearsal uses the old bus and its MCP SDK.
+It loads that SDK from `AGENT_BUS_PACKAGE_DIR`, or the sibling `../agent-bus` checkout.
+Those dependencies are not part of Roger-Wilco.

@@ -2,7 +2,7 @@
 
 ## Scope and runtime
 
-This is the frozen contract for lanes A-G.
+This contract describes the current implementation.
 The minimum Node version is `>=26.11.1`.
 The pin in `.node-version` is 26.11.1.
 The runtime uses `node:sqlite` and `DatabaseSync`.
@@ -59,7 +59,7 @@ Those two failures stay distinct.
 
 Pi tools take `sender` and the claim owner from `ctx.sessionManager.getSessionId()` and the configured namespace.
 They do this on each call.
-They do not use host-global MCP headers.
+They do not use host-global sender headers.
 They do not use a user-provided sender ID.
 
 The extension is permitted to use the trusted host credential for outbound HTTP.
@@ -137,6 +137,7 @@ The coordinator HTTP entry handles these fixed paths.
 | Request | Body or query | Success value or rule |
 |---|---|---|
 | `POST /v1/sessions/register` | `Registration` | `RegistrationResult`. The initial cursor is the current message tail, set atomically. A retry from the same host returns the existing subscription and the **unchanged** cursor. Another host receives HTTP 409. Registration is durable before the response. |
+| `POST /v1/sessions/rank` | `{session: SessionAddress, rank: number}` | Updated `RegistrationResult`. Rank must be an integer from 1 through 5. Any authenticated host can change this metadata. |
 | `GET /v1/sessions` | none | Registered sessions and host assignment. No active Pi session is required. |
 | `GET /v1/claims` | none | Active work claims. Expired claims are removed. |
 | `POST /v1/messages` | `{sender: SessionAddress, message: MessageInput}` | `Message`. The server checks the sender host assignment and the same namespace. It checks the envelope. It rejects an invalid envelope. It persists the message before success. Broadcast recipient `*` excludes the sender at delivery. |
@@ -146,22 +147,52 @@ The coordinator HTTP entry handles these fixed paths.
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
 | `POST /v1/hosts/receipts` | `Receipt` | `Subscription`. The coordinator accepts a receipt only for a delivered message on that authenticated host's own subscription. The per-subscription cursor advances monotonically and contiguously. A repeated receipt is idempotent. A forged ID is rejected. An undelivered future ID is rejected. |
 
-Registration results can also contain `displayName` and `lastSeenAt`.
+Registration results contain `rank` and can also contain `displayName` and `lastSeenAt`.
 A registration retry refreshes presence without resetting the subscription cursor.
 Presence timestamps do not prove that a Pi runtime still owns its local lease.
 
-### MCP and Pi tools
+### Rank and Pi tools
 
-`POST /mcp` uses authenticated MCP JSON-RPC.
-It exposes `list_sessions`, `read_board`, `register_session`, `send_message`, `inbox`, `claim_work`, and `release_work`.
-MCP calls supply an explicit session address.
-The coordinator checks that address against the authenticated host.
-It does not use a host-global sender header.
+New and migrated sessions start at rank 1, named `fleet`.
+Ranks 2 through 5 have numeric labels.
+Rank is user-assigned metadata, separate from the routing namespace.
+It grants no authority and changes no delivery or claim permissions.
+Changing rank does not refresh presence or reset a cursor.
+Heartbeats preserve rank.
+
+The coordinator has no MCP endpoint.
+The Pi extension uses HTTP directly.
+The coordinator and host have no third-party runtime dependencies.
 
 Pi exposes `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, and `roger_release`.
 These tools derive their actor from the invoking Pi session.
-The board includes registered sessions and active claims.
-The user commands `/roger` and `/roger_board` display the current address, registered sessions, and active claims without a model turn.
+The board defaults to sessions seen within 90 seconds and includes active claims.
+The model tool accepts `{all:true}` to include stale, retained registrations.
+The user commands `/roger` and `/roger_board` display the board without a model turn.
+They offer a session picker followed by a rank picker.
+Cancellation leaves all ranks unchanged.
+`/roger all` includes stale, retained sessions.
+Session rows show rank, presence age, and `lastSeenAt`.
+
+### Retention
+
+The coordinator removes registrations unseen for more than seven days.
+The 90-second board filter does not stop delivery.
+Until registration expiry, offline sessions retain direct and broadcast delivery through their host.
+After expiry, registration starts at the durable message sequence watermark.
+It does not replay messages from the expired subscription.
+
+Messages older than seven days are eligible for collection.
+The coordinator keeps each message that a retained recipient still needs.
+Unrelated low cursors do not keep old messages.
+A broadcast uses one coordinator row, not one stored copy per session.
+Each receiving host stores a separate local delivery for each recipient.
+
+The latest acknowledged cursor remains retryable while its registration survives.
+Older receipt retries require retained message history.
+The initial registration cursor is not proof of delivery.
+Maintenance runs at startup and at most once per minute during store activity.
+Each sweep collects at most 5,000 messages.
 
 ### Examples
 
@@ -174,7 +205,7 @@ Registration request:
 Successful registration value:
 
 ```json
-{"subscription":{"id":"fleet:550e8400-e29b-41d4-a716-446655440000","session":{"namespace":"fleet","piSessionId":"550e8400-e29b-41d4-a716-446655440000"},"hostId":"host-a","cursor":0}}
+{"subscription":{"id":"fleet:550e8400-e29b-41d4-a716-446655440000","session":{"namespace":"fleet","piSessionId":"550e8400-e29b-41d4-a716-446655440000"},"hostId":"host-a","cursor":0},"rank":1}
 ```
 
 `POST /v1/messages` body:
@@ -208,6 +239,10 @@ It authenticates on each connection.
 `Last-Event-ID` is ignored for durable resume.
 The host calls the receipt POST **only after** the local inbox `receive` transaction commits.
 That transaction deduplicates the message.
+
+The host skips malformed or unsupported message events without a receipt.
+The affected subscription stays pending while other subscriptions continue on that connection.
+Transport failures, invalid UTF-8, and oversized events still close the stream.
 
 A crash after that commit and before the receipt POST replays the same message.
 The replay inserts no duplicate local event.
@@ -244,6 +279,17 @@ Startup binding enqueues registration and returns without a wait for HTTP.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
 
+The host removes local message rows seven days after their Pi ACK.
+It never expires an unacknowledged local message.
+Legacy acknowledged rows receive a full seven-day window after migration.
+Cleanup runs at startup and once per minute during daemon activity.
+An old replay after cleanup checks the retained Pi JSONL receipt before submission.
+Without that original JSONL record, a replay can produce another Pi entry.
+
+SQLite reuses space after collection but does not shrink its database file.
+Journal size limits reduce retained WAL files after resets.
+Active transactions or readers can keep the WAL above those limits.
+
 `pending` is restricted to the active `(session,runtimeId)` lease.
 When Pi is closed, the host daemon continues to receive.
 It never spawns Pi.
@@ -264,7 +310,8 @@ The return value is not a Pi receipt.
 An in-memory `getBranch()` entry is not a Pi receipt.
 Model completion is not a Pi receipt.
 
-For each immutable `DeliveryId`, lane E submits `{customType:'roger-wilco',content:<untrusted-agent-text>,display:true,details:{deliveryId}}` with `{deliverAs:'followUp',triggerTurn:true}`.
+For each immutable `DeliveryId`, lane E submits `{customType:'roger-wilco',content:<agent-message>,display:true,details:{deliveryId}}` with `{deliverAs:'followUp',triggerTurn:true}`.
+The message retains its sender metadata without a repeated warning prefix.
 The accepted boundary is an exact `custom_message` record in the current persistent session JSONL.
 That file is the current `SessionManager.getSessionFile()` result.
 The record matches `details.deliveryId` and `customType`.

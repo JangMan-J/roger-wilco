@@ -78,10 +78,69 @@ test('opening a pre-presence sessions table retains bindings and upgrades metada
   const store = createCoordinatorStore(path, 'fleet');
   try {
     assert.equal(store.listSessions()[0]?.displayName, 'Original');
+    assert.equal(store.listSessions()[0]?.rank, 1);
     const retry = ok(store.register(hostA, { session: a }));
     assert.equal(retry.subscription.cursor, 0);
     assert.equal(retry.displayName, 'Original');
     assert.ok(retry.lastSeenAt! > 0);
+  } finally { store.close(); }
+});
+
+test('rank is persistent cross-host metadata without presence, cursor, or delivery effects; expired registrations reset it', async t => {
+  const path = await fileStore(t);
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    ok(store.register(hostA, { session: a }));
+    assert.equal(ok(store.register(hostA, { session: b, displayName: 'Bee' })).rank, 1);
+    const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'acknowledged' }));
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }));
+    const next = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'offered' }));
+    const offered = store.pending(hostA, 10);
+    const before = store.listSessions().find(row => row.subscription.id === sessionKey(b))!;
+    now += 1000;
+    const ranked = ok(store.setRank(hostB, b, 5));
+    assert.deepEqual(ranked, { ...before, rank: 5 });
+    assert.deepEqual(store.pending(hostA, 10), offered);
+    assert.equal(store.send(hostB, b, { recipient: '*', body: 'rank grants no ownership' }).ok, false);
+    const refreshed = ok(store.register(hostA, { session: b }));
+    assert.deepEqual(refreshed, { ...ranked, lastSeenAt: now });
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.deepEqual(store.listSessions().find(row => row.subscription.id === sessionKey(b)), refreshed);
+    assert.equal(ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: next.id })).cursor, next.sequence);
+    now += 7 * 24 * 60 * 60 * 1000 + 1;
+    const renewed = ok(store.register(hostA, { session: b }));
+    assert.equal(renewed.rank, 1);
+    assert.equal(renewed.subscription.cursor, next.sequence);
+  } finally { store.close(); }
+});
+
+test('rank updates validate principals, addresses, and integer range without mutating on failure', () => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  try {
+    ok(store.register(hostA, { session: a }));
+    for (const rank of [1, 2, 3, 4, 5]) assert.equal(ok(store.setRank(hostB, a, rank)).rank, rank);
+    const before = store.listSessions();
+    for (const rank of [0, 6, -1, 1.5, NaN, Infinity, '2', null, undefined]) {
+      assert.deepEqual(store.setRank(hostA, a, rank as number), {
+        ok: false, error: 'invalid_request', message: 'Invalid rank update',
+      });
+    }
+    for (const [host, address] of [
+      [{ hostId: '' }, a], [null, a], [hostA, null], [hostA, { ...a, namespace: 'other' }],
+      [hostA, { ...a, piSessionId: 'not-a-uuid' }],
+    ] as const) {
+      assert.deepEqual(store.setRank(host as typeof hostA, address as SessionAddress, 2), {
+        ok: false, error: 'invalid_request', message: 'Invalid rank update',
+      });
+    }
+    assert.deepEqual(store.setRank(hostA, b, 2), {
+      ok: false, error: 'not_found', message: 'Session is not registered',
+    });
+    assert.deepEqual(store.listSessions(), before);
   } finally { store.close(); }
 });
 
@@ -182,6 +241,90 @@ test('claim is atomic for competing owners, renewal, zero TTL, expiry takeover, 
     try { expiredDb.prepare('UPDATE claims SET expires_at = 1 WHERE key = ?').run('expired'); }
     finally { expiredDb.close(); }
     assert.deepEqual(store.listClaims().map(claim => claim.key), ['permanent']);
+  } finally { store.close(); }
+});
+
+test('retained offline subscriptions receive and replay until seven days unseen, then expire without future broadcasts', async t => {
+  const path = await fileStore(t);
+  const week = 7 * 24 * 60 * 60 * 1000;
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    register(store);
+    now += 91_000;
+    ok(store.register(hostA, { session: a }));
+    const broadcast = ok(store.send(hostA, a, { recipient: '*', body: 'offline Pi still gets this' }));
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [broadcast.id]);
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [broadcast.id]);
+    now += week - 91_000;
+    ok(store.register(hostA, { session: a }));
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [broadcast.id]);
+    now += 60_001;
+    assert.deepEqual(store.pending(hostA, 10), []);
+    assert.deepEqual(store.pending(hostB, 10), []);
+    assert.deepEqual(store.listSessions().map(row => row.subscription.id), [sessionKey(a)]);
+    assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: broadcast.id }).ok, false);
+    const future = ok(store.send(hostA, a, { recipient: '*', body: 'not retained for dead sessions' }));
+    assert.deepEqual(store.pending(hostA, 10), []);
+    const resumed = ok(store.register(hostA, { session: b }));
+    assert.equal(resumed.subscription.cursor, future.sequence);
+    assert.deepEqual(store.pending(hostA, 10), []);
+    now += 60_001;
+    // Expired recipients no longer pin their unacknowledged broadcast history.
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)).map(message => message.id), [future.id]);
+  } finally { store.close(); }
+});
+
+test('collection protects relevant unacknowledged deliveries, bounds history, and preserves latest receipt proof and sequence', async t => {
+  const path = await fileStore(t);
+  const week = 7 * 24 * 60 * 60 * 1000;
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    register(store);
+    const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'first acknowledged' }));
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }));
+    const last = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'latest acknowledged' }));
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: last.id }));
+    const direct = ok(store.send(hostA, a, { recipient: sessionKey(c), body: 'still needed direct' }));
+    const broadcast = ok(store.send(hostA, a, { recipient: '*', body: 'still needed broadcast' }));
+    // Keep all subscriptions retained; the sender's irrelevant cursor stays at zero.
+    now += week;
+    register(store);
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)).map(message => message.id), [first.id, last.id, broadcast.id]);
+    now += 60_001;
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)).map(message => message.id), [broadcast.id]);
+    assert.deepEqual(store.pending(hostB, 10).map(frame => frame.message.id), [direct.id]);
+    assert.equal(ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: last.id })).cursor, last.sequence);
+    assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }).ok, false);
+    assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(a), messageId: last.id }).ok, false);
+    ok(store.acknowledge(hostB, { subscriptionId: sessionKey(c), messageId: direct.id }));
+    store.pending(hostB, 10);
+    ok(store.acknowledge(hostB, { subscriptionId: sessionKey(c), messageId: broadcast.id }));
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: broadcast.id }));
+    now += 60_001;
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)), []);
+    const db = new DatabaseSync(path);
+    try { assert.equal((db.prepare('SELECT count(*) AS count FROM messages').get() as { count: number }).count, 0); }
+    finally { db.close(); }
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.equal(ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: broadcast.id })).cursor, broadcast.sequence);
+    assert.equal(store.acknowledge(hostB, { subscriptionId: sessionKey(b), messageId: broadcast.id }).ok, false);
+    const newcomer = { ...a, piSessionId: '550e8400-e29b-41d4-a716-446655440004' };
+    assert.equal(ok(store.register(hostA, { session: newcomer })).subscription.cursor, broadcast.sequence);
+    // A tail snapshot is not proof that this new subscription received that ID.
+    assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(newcomer), messageId: broadcast.id }).ok, false);
+    const next = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'new sequence' }));
+    assert.equal(next.sequence, broadcast.sequence + 1);
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [next.id]);
   } finally { store.close(); }
 });
 

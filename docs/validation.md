@@ -1,7 +1,33 @@
 # Extraction verification
 
-Status: complete. Implementation, installation, and cutover checks pass.
-The recovery review and final payload audit closed all reported delivery defects.
+The extraction and cutover checks passed.
+The current source revision also passes all 64 tests, without failures or skips.
+The recorded 52-test runs preceded the slash-command follow-up, which brought the baseline to 53 tests.
+
+## Feedback revision — 2026-10-12
+
+The baseline is commit `5282762`.
+The revised source passes `npm run check`, including type-checking and all four native SIGKILL checkpoints.
+The suite contains 64 tests.
+The packaged coordinator and host start after a production install with no third-party runtime dependencies.
+Deployment verification for this revision is pending.
+
+- Invalid and unsupported SSE events no longer reconnect the entire host.
+  A regression proves that another subscription continues on the same connection.
+- Coordinator retention preserves needed deliveries, latest receipt retries, and the durable sequence watermark.
+  Expired registrations no longer receive future broadcasts.
+- Host retention removes old Pi-acknowledged rows and preserves pending deliveries.
+- Receipt caching preserves file identity, fsync, lease, and session checks.
+  A 6,864,063-byte fixture used one full read for 100 pending lookups.
+  The full-suite run took 33.72 ms for those lookups.
+- Native command tests cover recent presence, stale-session inspection, picker cancellation, and cross-host rank assignment without a model turn.
+  Rank survives SQLite reopen without changing presence, ownership, or cursors.
+- The coordinator has no MCP route.
+  The shared HTTP reader retains byte limits, deadlines, and interruption cleanup.
+- Independent source review found no new receipt-cache or rank-picker defect.
+  Host deduplication after history cleanup requires the original Pi JSONL receipt.
+
+The remaining sections record the original extraction and deployment evidence.
 
 ## Scope
 
@@ -18,7 +44,7 @@ They do not prove model completion or power-loss durability.
 | Versioned envelopes and identity | `test/protocol/contract.test.ts`, shared validators in `src/protocol/index.ts` |
 | Durable registration and initial cursor | `test/store/store.test.ts`, `test/acceptance/coordinator.test.ts` |
 | Lost registration response | Real HTTP response-loss test in `test/acceptance/coordinator.test.ts` |
-| Session-bound authorization and MCP | `test/control/control.test.ts`, `test/pi/tools.test.mjs` |
+| Session-bound authorization | `test/control/control.test.ts`, `test/pi/tools.test.mjs` |
 | Presence and claims | Store and control tests cover presence updates, claim competition, renewal, expiry, and owner-only release |
 | Directed routing and broadcasts | Store and acceptance tests verify host boundaries and broadcast exclusion of the sender |
 | Separate durable acknowledgements | Host replay tests plus native Pi crash tests |
@@ -33,14 +59,14 @@ They do not prove model completion or power-loss durability.
 | Pi closed | The host retains the message, and a resumed persistent session consumes it |
 | Coordinator unavailable | Pi starts, queues registration locally, and the daemon retries |
 | Invalid credentials and envelopes | Control, delivery, and host tests reject them without delivery or acknowledgement |
-| Maximum-size message delivery | Real HTTP/MCP requests at 1 MiB reach durable host storage and ACK, survive reopen, and permit the next delivery |
+| Maximum-size message delivery | Real HTTP requests at 1 MiB reach durable host storage and ACK, survive reopen, and permit the next delivery |
 | Research coexistence | Native Pi loads both extensions and dispatches research through a synthetic HTTP provider |
 | Package startup and shutdown | `test/installation/bin.test.ts`, systemd service checks on both physical hosts |
 | Independent runtime package | The tarball contains the implementation and pinned dependency lock, without either reference project |
 | Migration and rollback | Private snapshots, the directed old-MCP rehearsal, and retained old databases |
 | License provenance | `SOURCE-MANIFEST.md`, `LICENSE`, and `THIRD-PARTY-NOTICES` |
 
-## Recorded checks
+## Recorded extraction checks
 
 - Final `npm run check`: 52 tests passed locally, with no failures or skips.
 - After the portable backpressure fixture change, its local rerun and type-check passed.
@@ -133,7 +159,8 @@ The fix shares the 1 MiB request limit and adds a normalized-input limit before 
 The host parser allows another 1 KiB for bounded envelope metadata and framing.
 The maximum-metadata test covers both directed and broadcast envelopes.
 
-The integrated regression covers HTTP and MCP input, durable host receipt, coordinator ACK, and both SQLite reopens.
+The original integrated regression covered HTTP and MCP input, durable host receipt, coordinator ACK, and both SQLite reopens.
+The current regression retains the HTTP path after removal of the unused MCP endpoint.
 It also rejects raw oversize requests and compact numeric input that expands beyond the normalized limit.
 Rejected requests leave no poison records.
 The next valid message reaches the host and advances its cursor.

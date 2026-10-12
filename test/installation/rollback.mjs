@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+// This historical rehearsal uses the old bus's SDK, not a Roger-Wilco dependency.
+const oldRequire = createRequire(process.env.AGENT_BUS_PACKAGE_DIR
+  ? join(resolve(process.env.AGENT_BUS_PACKAGE_DIR), 'package.json')
+  : new URL('../../../agent-bus/package.json', import.meta.url));
+const { Client } = await import(pathToFileURL(oldRequire.resolve('@modelcontextprotocol/sdk/client/index.js')).href);
+const { StreamableHTTPClientTransport } = await import(pathToFileURL(oldRequire.resolve('@modelcontextprotocol/sdk/client/streamableHttp.js')).href);
 
 const home = homedir();
 const remote = process.env.RW_REMOTE ?? 'agent-jail';

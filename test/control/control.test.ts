@@ -36,12 +36,17 @@ test('real HTTP authentication, strict validation, host-bound sender and claim o
   assert.deepEqual((await request('/v1/claims')).value.value, []);
   assert.equal((await request('/v1/hosts/stream')).status, 404);
   assert.equal((await request('/v1/hosts/receipts', {})).status, 404);
+  assert.equal((await request('/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' }, 'secret-a', {
+    headers: { accept: 'application/json, text/event-stream' },
+  })).status, 404);
   assert.equal((await request('/v1/sessions/register', { session: alice, callbackUrl: 'http://x' })).status, 400);
   const registration = await request('/v1/sessions/register', { session: alice, displayName: 'Alice' });
   assert.equal(registration.status, 200);
   assert.equal(registration.value.value.displayName, 'Alice');
   assert.equal(typeof registration.value.value.lastSeenAt, 'number');
   assert.equal((await request('/v1/sessions/register', { session: bob }, 'secret-b')).status, 200);
+  assert.deepEqual((await request('/v1/sessions')).value.value.map((entry: { subscription: { id: string } }) => entry.subscription.id).sort(),
+    [sessionKey(alice), sessionKey(bob)]);
   assert.equal((await request('/v1/sessions/register', { session: alice }, 'secret-b')).status, 409);
   assert.equal((await request('/v1/messages', { sender: bob, message: { recipient: '*', body: 'spoof' } })).status, 409);
   assert.equal((await request('/v1/messages', { sender: alice, message: { recipient: sessionKey(bob), body: 'hi' } })).status, 200);
@@ -58,6 +63,29 @@ test('real HTTP authentication, strict validation, host-bound sender and claim o
   assert.equal((await request('/v1/claims/release', { key: 'task', owner: bob })).status, 409);
   assert.equal((await request('/v1/claims/release', { key: 'task', owner: alice })).value.value, true);
   assert.deepEqual((await request('/v1/claims')).value.value, []);
+});
+
+test('authenticated hosts can edit another host session rank with strict HTTP validation', async t => {
+  const { request, base } = await fixture(t);
+  assert.equal((await request('/v1/sessions/register', { session: alice })).status, 200);
+  const path = '/v1/sessions/rank';
+  assert.equal((await request(path, { session: alice, rank: 3 }, 'bad')).status, 401);
+  const unauthenticated = await fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ session: alice, rank: 3 }) });
+  assert.equal(unauthenticated.status, 401);
+  await unauthenticated.json();
+  for (const rank of [1, 5]) {
+    const updated = await request(path, { session: alice, rank }, 'secret-b');
+    assert.equal(updated.status, 200);
+    assert.equal(updated.value.value.rank, rank);
+    assert.equal(updated.value.value.subscription.hostId, 'host-a');
+  }
+  for (const body of [
+    ...[0, 6, 1.5, '3'].map(rank => ({ session: alice, rank })),
+    { session: alice }, { session: alice, rank: 3, extra: true },
+  ]) assert.equal((await request(path, body)).status, 400, JSON.stringify(body));
+  assert.equal((await request(path, { session: bob, rank: 3 })).status, 404);
+  assert.equal((await request('/v1/sessions')).value.value[0].rank, 5);
 });
 
 test('recognized credential for a deprovisioned host is distinct from invalid credentials', () => {
@@ -81,39 +109,4 @@ test('bounded JSON parsing rejects oversized, malformed, wrong media type', asyn
   const malformed = await fetch(base + '/v1/sessions/register', { method: 'POST', headers: { authorization: 'Bearer secret-a', 'content-type': 'application/json' }, body: '{' });
   assert.equal(malformed.status, 400);
   assert.equal((await request('/v1/sessions/register', { session: alice }, 'secret-a', { headers: { 'content-type': 'text/plain' } })).status, 415);
-});
-
-test('MCP initialize, list, and calls expose board and host-bound session operations', async t => {
-  const { request } = await fixture(t);
-  const headers = { accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-03-26' };
-  assert.equal((await request('/mcp', { jsonrpc: '2.0', id: 0, method: 'tools/list' }, 'bad', { headers })).status, 401);
-  const initialized = await request('/mcp', { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
-    protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'control-test', version: '1.0' },
-  } }, 'secret-a', { headers });
-  assert.equal(initialized.status, 200);
-  assert.equal(initialized.value.result.serverInfo.name, 'roger-wilco');
-  const listed = await request('/mcp', { jsonrpc: '2.0', id: 2, method: 'tools/list' }, 'secret-a', { headers });
-  assert.equal(listed.status, 200);
-  assert.ok(listed.value.result.tools.some((tool: { name: string }) => tool.name === 'read_board'));
-  const rpc = async (name: string, args: Record<string, unknown>, token = 'secret-a') => {
-    const result = await request('/mcp', { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name, arguments: args } }, token, { headers });
-    assert.equal(result.status, 200, JSON.stringify(result.value));
-    assert.ok(result.value.result, JSON.stringify(result.value));
-    return JSON.parse(result.value.result.content[0].text) as Record<string, any>;
-  };
-  const registered = await rpc('register_session', { session: alice });
-  assert.equal(registered.value.subscription.id, sessionKey(alice));
-  assert.equal((await rpc('register_session', { session: bob }, 'secret-b')).ok, true);
-  assert.equal((await rpc('send_message', { session: bob, recipient: '*', body: 'spoof' })).error, 'owner_conflict');
-  assert.equal((await rpc('send_message', { session: alice, recipient: sessionKey(bob), body: 'hello' })).ok, true);
-  assert.equal((await rpc('inbox', { session: bob }, 'secret-b')).value[0].body, 'hello');
-  const claim = (await rpc('claim_work', { session: alice, key: 'mcp', ttlSeconds: 30 })).value.claim;
-  assert.equal(claim.owner, sessionKey(alice));
-  const board = (await rpc('read_board', {})).value;
-  assert.equal(board.sessions.length, 2);
-  assert.equal(typeof board.sessions[0].lastSeenAt, 'number');
-  assert.deepEqual(board.claims, [claim]);
-  assert.equal((await rpc('release_work', { session: alice, key: 'mcp' })).value, true);
-  assert.deepEqual((await rpc('read_board', {})).value.claims, []);
-  assert.equal((await rpc('list_sessions', {})).value.length, 2);
 });

@@ -12,6 +12,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const STREAM_IDLE_MS = 45_000;
 const RETRY_MIN_MS = 250;
 const RETRY_MAX_MS = 10_000;
+const HISTORY_MS = 7 * 86400_000;
+const SWEEP_MS = 60_000;
 
 type LeaseRow = { runtime_id: string; expires_at: number };
 type RegistrationRow = { session_key: string; registration_json: string };
@@ -20,11 +22,12 @@ type PendingRow = { message_json: string };
 class LocalHostInbox implements HostInbox {
   private readonly db: DatabaseSync;
   private closed = false;
+  private nextSweepAt = 0;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000');
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 1048576');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         session_key TEXT NOT NULL,
@@ -33,6 +36,7 @@ class LocalHostInbox implements HostInbox {
         message_json TEXT NOT NULL,
         receipt_entry_id TEXT,
         receipt_session_file TEXT,
+        acknowledged_at INTEGER,
         PRIMARY KEY (session_key, message_id)
       );
       CREATE INDEX IF NOT EXISTS messages_due ON messages(session_key, receipt_entry_id, sequence);
@@ -46,6 +50,26 @@ class LocalHostInbox implements HostInbox {
         registration_json TEXT NOT NULL
       );
     `);
+    this.tx(() => {
+      const columns = this.db.prepare('PRAGMA table_info(messages)').all();
+      if (!columns.some(column => column.name === 'acknowledged_at'))
+        this.db.exec('ALTER TABLE messages ADD COLUMN acknowledged_at INTEGER');
+      // Give receipts from older versions a full retention window after migration.
+      this.db.prepare('UPDATE messages SET acknowledged_at = ? WHERE receipt_entry_id IS NOT NULL AND acknowledged_at IS NULL')
+        .run(Date.now());
+      this.db.exec('CREATE INDEX IF NOT EXISTS messages_acknowledged ON messages(acknowledged_at)');
+    });
+    this.sweep();
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    if (now < this.nextSweepAt) return;
+    this.tx(() => {
+      this.db.prepare('DELETE FROM messages WHERE acknowledged_at < ? AND receipt_entry_id IS NOT NULL').run(now - HISTORY_MS);
+      this.db.prepare('DELETE FROM leases WHERE expires_at <= ?').run(now);
+    });
+    this.nextSweepAt = now + SWEEP_MS;
   }
 
   private tx<T>(work: () => T): T {
@@ -125,8 +149,8 @@ class LocalHostInbox implements HostInbox {
         return row.receipt_entry_id === proof.entryId && row.receipt_session_file === proof.sessionFile
           ? { ok: true, value: null } : failure('invalid_request', 'Conflicting Pi receipt');
       }
-      this.db.prepare(`UPDATE messages SET receipt_entry_id = ?, receipt_session_file = ?
-        WHERE session_key = ? AND message_id = ?`).run(proof.entryId, proof.sessionFile, sessionKey(session), proof.messageId);
+      this.db.prepare(`UPDATE messages SET receipt_entry_id = ?, receipt_session_file = ?, acknowledged_at = ?
+        WHERE session_key = ? AND message_id = ?`).run(proof.entryId, proof.sessionFile, Date.now(), sessionKey(session), proof.messageId);
       return { ok: true, value: null };
     });
   }
@@ -139,6 +163,7 @@ class LocalHostInbox implements HostInbox {
   }
 
   registrations(): RegistrationRow[] {
+    this.sweep();
     return this.db.prepare('SELECT session_key, registration_json FROM registrations ORDER BY session_key').all() as RegistrationRow[];
   }
 
@@ -180,7 +205,8 @@ async function jsonPost(base: URL, route: string, credential: string, body: unkn
 }
 
 /** SSE parser: byte-limited records, streaming UTF-8, CRLF, multiline data and comments. */
-async function* frames(stream: ReadableStream<Uint8Array>, signal: AbortSignal, onBytes: () => void): AsyncGenerator<StreamFrame> {
+async function* frames(stream: ReadableStream<Uint8Array>, signal: AbortSignal, onBytes: () => void,
+  report: (error: Error) => void): AsyncGenerator<StreamFrame> {
   const reader = stream.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let line = '', data: string[] = [], event = '', bytes = 0;
@@ -192,8 +218,12 @@ async function* frames(stream: ReadableStream<Uint8Array>, signal: AbortSignal, 
       data = []; event = ''; bytes = 0;
       if (!payload || kind !== 'message') return undefined;
       let value: unknown;
-      try { value = JSON.parse(payload); } catch { throw new Error('Invalid SSE JSON'); }
-      if (!isStreamFrame(value)) throw new Error('Invalid SSE frame');
+      try { value = JSON.parse(payload); }
+      catch { report(new Error('Skipping invalid SSE JSON without a receipt')); return undefined; }
+      if (!isStreamFrame(value)) {
+        report(new Error('Skipping unsupported or invalid SSE frame without a receipt'));
+        return undefined;
+      }
       return value;
     }
     if (text.startsWith(':')) return undefined;
@@ -293,7 +323,7 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
         }
         armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out');
         backoff = RETRY_MIN_MS;
-        for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'))) {
+        for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'), report)) {
           await inbox.receive(frame); // transaction commits before receipt is sent
           const receipt = { subscriptionId: frame.subscriptionId, messageId: frame.message.id };
           const ack = await jsonPost(base, ROUTES.receipt, config.credential, receipt, signal) as

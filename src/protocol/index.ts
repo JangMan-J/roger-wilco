@@ -7,6 +7,7 @@ export const MAX_STREAM_EVENT_BYTES = MAX_JSON_BYTES + 1024;
 export const ROUTES = {
   health: '/health',
   register: '/v1/sessions/register',
+  rank: '/v1/sessions/rank',
   sessions: '/v1/sessions', messages: '/v1/messages', inbox: '/v1/inbox',
   claims: '/v1/claims', claimRelease: '/v1/claims/release',
   stream: '/v1/hosts/stream', receipt: '/v1/hosts/receipts',
@@ -32,7 +33,7 @@ export type Message = {
 };
 export type Subscription = { id: SessionKey; session: SessionAddress; hostId: string; cursor: number };
 export type Registration = { session: SessionAddress; displayName?: string };
-export type RegistrationResult = { subscription: Subscription; displayName?: string; lastSeenAt?: number };
+export type RegistrationResult = { subscription: Subscription; rank: number; displayName?: string; lastSeenAt?: number };
 export type Claim = { key: string; owner: SessionKey; note: string | null; claimedAt: number; expiresAt: number | null };
 export type HostPrincipal = { hostId: string }; // resolved from bearer credential, never from request body
 export type HostConfig = { coordinatorUrl: string; hostId: string; credential: string; inboxPath: string };
@@ -44,6 +45,8 @@ export type PiReceipt = { messageId: DeliveryId; piSessionId: string; entryId: s
 /** Lane A. Every operation that changes registration/cursor/claim state is one SQLite transaction. */
 export interface CoordinatorStore {
   register(host: HostPrincipal, request: Registration): Outcome<RegistrationResult>;
+  /** User-assigned metadata (1=fleet, through 5), not an authority or routing permission. */
+  setRank(host: HostPrincipal, session: SessionAddress, rank: number): Outcome<RegistrationResult>;
   listSessions(): RegistrationResult[];
   listClaims(): Claim[];
   send(host: HostPrincipal, sender: SessionAddress, input: MessageInput): Outcome<Message>;
@@ -59,7 +62,7 @@ export interface CoordinatorStore {
 
 /** Lane D owns one shared SQLite inbox per host; never an inbound listener. */
 export interface HostInbox {
-  /** Commit deduplicated message and subscription before returning; replay is idempotent. */
+  /** Commit before returning. Dedup lasts until seven days after Pi ACK; later replay checks Pi's JSONL. */
   receive(frame: StreamFrame): Promise<{ inserted: boolean }>;
   /** One live runtime per session; lease expiration must preserve pending messages. */
   bind(session: SessionAddress, runtimeId: string, now: number): Promise<Outcome<{ leaseExpiresAt: number }>>;
@@ -92,8 +95,6 @@ export interface HostAuthenticator {
 /** Lane E submits a Pi message then observes the persistent session file, never ACKs the void sendMessage call. */
 export interface PiDelivery {
   bind(session: SessionAddress, runtimeId: string): Promise<Outcome<null>>;
-  /** A pending outcome stays queued in SQLite; one runtime must not stack duplicate Pi submissions. */
-  deliver(message: Message): Promise<'persisted' | 'pending'>;
   stop(): Promise<void>;
 }
 

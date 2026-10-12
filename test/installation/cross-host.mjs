@@ -58,6 +58,14 @@ try {
     assert.ok(Date.now() < deadline, 'Automatic cross-host registration timed out');
     await delay(25);
   }
+  const setRank = await fetch(new URL('/v1/sessions/rank', config.coordinatorUrl), {
+    method: 'POST', headers: { authorization: `Bearer ${config.credential}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ session: { namespace: config.namespace, piSessionId: b.sessionId }, rank: 3 }),
+  });
+  assert.equal(setRank.status, 200, 'local authenticated host can rank a remote session');
+  const ranked = await setRank.json();
+  assert.equal(ranked.value.rank, 3);
+  assert.equal(ranked.value.subscription.id, b.address);
   bob.send({ command: 'send', recipient: a.address, body: 'Physical-host directed ping', id: 'ping' });
   const ping = await bob.wait(e => e.type === 'send' && e.id === 'ping');
   assert.equal(ping.result.ok, true);
@@ -82,8 +90,9 @@ try {
   report = { checkedAt: new Date().toISOString(), hosts: [config.hostId, remote],
     package: 'roger-wilco@0.1.0', provider: 'synthetic offline model stream',
     sessions: { local: a.address, remote: b.address, isolated: s.address },
+    rankedSession: { address: b.address, rank: 3 },
     messageIds: [ping.result.value.id, reply.result.value.id, sentBusy.result.value.id],
-    result: 'PASS: auto-registration, cross-host directed round trip, idle wake, busy follow-up, same-host isolation' };
+    result: 'PASS: auto-registration, cross-host rank metadata, directed round trip, idle wake, busy follow-up, same-host isolation' };
 } finally {
   for (const instance of children) if (instance.child.exitCode === null) {
     instance.send({ command: 'stop' });

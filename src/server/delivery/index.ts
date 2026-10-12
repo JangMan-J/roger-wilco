@@ -1,25 +1,16 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import {
-  ROUTES, MAX_JSON_BYTES, isReceipt, type ControlHandler, type CoordinatorStore, type HostAuthenticator,
-  type Outcome, type StreamFrame,
+  ROUTES, isReceipt, type ControlHandler, type CoordinatorStore, type HostAuthenticator,
+  type FailureCode, type Outcome, type StreamFrame,
 } from '../../protocol/index.ts';
+import { json, readBody } from '../http.ts';
 
 const POLL_MS = 250;
 const KEEPALIVE_MS = 15_000;
 const WRITE_DEADLINE_MS = 5_000;
-const BODY_DEADLINE_MS = 10_000;
-const status = { invalid_request: 400, unauthorized: 401, unknown_host: 403, not_found: 404,
-  owner_conflict: 409, temporarily_unavailable: 503 } as const;
 
-function json(response: ServerResponse, result: Outcome<unknown>, code?: number): void {
-  if (response.destroyed || response.writableEnded) return;
-  response.writeHead(code ?? (result.ok ? 200 : status[result.error]), {
-    'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
-  });
-  response.end(JSON.stringify(result));
-}
-function error(code: keyof typeof status, message: string): Outcome<never> {
+function error(code: FailureCode, message: string): Outcome<never> {
   return { ok: false, error: code, message };
 }
 function wait(ms: number, signal: AbortSignal): Promise<void> {
@@ -38,48 +29,6 @@ async function write(response: ServerResponse, frame: string, signal: AbortSigna
     await once(response, 'drain', { signal: AbortSignal.any([signal, AbortSignal.timeout(WRITE_DEADLINE_MS)]) });
     return !signal.aborted && !response.destroyed;
   } catch { return false; }
-}
-async function readReceipt(request: IncomingMessage): Promise<unknown> {
-  const type = request.headers['content-type'];
-  if (typeof type !== 'string' || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(type))
-    throw { code: 415, message: 'Content-Type must be application/json' };
-  const length = request.headers['content-length'];
-  if (length !== undefined && (typeof length !== 'string' || !/^\d+$/.test(length) || Number(length) > MAX_JSON_BYTES))
-    throw { code: 413, message: 'Request body exceeds 1 MiB' };
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let settled = false;
-    const timer = setTimeout(() => finish({ code: 408, message: 'Request body deadline exceeded' }), BODY_DEADLINE_MS);
-    function cleanup() {
-      clearTimeout(timer);
-      request.off('data', data);
-      request.off('end', end);
-      request.off('error', interrupted);
-      request.off('aborted', interrupted);
-    }
-    function finish(problem?: { code: number; message: string }, value?: unknown) {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (problem) { request.pause(); reject(problem); }
-      else resolve(value);
-    }
-    function data(chunk: Buffer) {
-      size += chunk.length;
-      if (size > MAX_JSON_BYTES) finish({ code: 413, message: 'Request body exceeds 1 MiB' });
-      else chunks.push(chunk);
-    }
-    function end() {
-      try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { finish({ code: 400, message: 'Malformed JSON' }); }
-    }
-    function interrupted() { finish({ code: 400, message: 'Request body interrupted' }); }
-    request.on('data', data);
-    request.once('end', end);
-    request.once('error', interrupted);
-    request.once('aborted', interrupted);
-  });
 }
 
 /** SQLite is the sole replay source. Polling after each read avoids a catch-up/live subscription gap. */
@@ -102,7 +51,7 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
       if (url.pathname === ROUTES.receipt) {
         if (request.method !== 'POST') { json(response, error('not_found', 'Unknown route')); return; }
         let body: unknown;
-        try { body = await readReceipt(request); }
+        try { body = await readBody(request); }
         catch (problem) {
           const { code, message } = problem as { code: number; message: string };
           json(response, error('invalid_request', message), code); return;

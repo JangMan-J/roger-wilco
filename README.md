@@ -8,9 +8,13 @@ Research remains in pi-webtasks.
 
 ## In Pi
 
-Run `/reload` after installation, then `/roger` to show your address, registered sessions, and active work claims.
+Run `/reload` after installation, then `/roger` to show your address, recent sessions, and active work claims.
 `/roger_board` is an alias.
 These commands display the board without a model call.
+The session picker lets you assign rank 1 through 5.
+Rank 1 is `fleet`.
+Rank is metadata, not authority or a routing rule.
+`/roger all` includes stale sessions that remain within the retention window.
 The `roger_board` tool remains available to the agent.
 
 ## Requirements
@@ -63,6 +67,12 @@ The host acknowledges receipt only after its inbox transaction commits.
 The extension acknowledges Pi delivery only after the exact message appears in the current persistent session file and a file synchronization succeeds.
 A crash can leave a recognizable duplicate with the same message ID.
 An acknowledgement does not prove model completion.
+
+The board shows sessions seen within 90 seconds.
+Registrations expire after seven days without a heartbeat.
+The coordinator collects old messages only after retained recipients no longer need them.
+The host removes Pi-acknowledged inbox rows after seven days and keeps pending deliveries.
+After cleanup, replay deduplication depends on the original receipt in the persistent Pi session file.
 
 Shared host credentials authorize trusted participants.
 They do not isolate hostile agents from each other.

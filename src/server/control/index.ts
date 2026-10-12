@@ -1,19 +1,9 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { z } from 'zod';
 import {
-  ROUTES, isMessageInput, isRegistration, isSessionAddress, sessionKey, MAX_JSON_BYTES,
-  type ControlHandler, type CoordinatorStore, type HostAuthenticator, type HostPrincipal,
-  type Outcome, type SessionAddress,
+  ROUTES, isMessageInput, isRegistration, isSessionAddress, sessionKey,
+  type ControlHandler, type CoordinatorStore, type HostAuthenticator, type Outcome,
 } from '../../protocol/index.ts';
-
-const REQUEST_DEADLINE_MS = 10_000;
-const status: Record<string, number> = {
-  invalid_request: 400, unauthorized: 401, unknown_host: 403,
-  not_found: 404, owner_conflict: 409, temporarily_unavailable: 503,
-};
+import { json, readBody } from '../http.ts';
 
 /** Configure host IDs as keys and their bearer credentials as values. */
 export function createHostAuthenticator(hostCredentials: Readonly<Record<string, string>>, knownHosts: ReadonlySet<string> = new Set(Object.keys(hostCredentials))): HostAuthenticator {
@@ -40,11 +30,6 @@ export function createHostAuthenticator(hostCredentials: Readonly<Record<string,
 function failure<E extends 'invalid_request' | 'unauthorized' | 'not_found'>(error: E, message: string): Outcome<never> {
   return { ok: false, error, message };
 }
-function json(response: ServerResponse, result: Outcome<unknown>, code?: number): void {
-  if (response.writableEnded || response.destroyed) return;
-  response.writeHead(code ?? (result.ok ? 200 : status[result.error]), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  response.end(JSON.stringify(result));
-}
 function keys(value: unknown, required: string[], optional: string[] = []): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
     required.every(key => Object.hasOwn(value, key)) &&
@@ -58,103 +43,6 @@ function parseInteger(text: string | null, min: number, max: number): number | n
   const value = Number(text);
   return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
 }
-function readBody(request: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const type = request.headers['content-type'];
-    if (typeof type !== 'string' || !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(type)) {
-      reject({ code: 415, message: 'Content-Type must be application/json' }); return;
-    }
-    const length = request.headers['content-length'];
-    if (length !== undefined && (typeof length !== 'string' || !/^\d+$/.test(length) || Number(length) > MAX_JSON_BYTES)) {
-      reject({ code: 413, message: 'Request body exceeds 1 MiB' }); return;
-    }
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let done = false;
-    const timer = setTimeout(() => finish({ code: 408, message: 'Request body deadline exceeded' }), REQUEST_DEADLINE_MS);
-    function cleanup() {
-      clearTimeout(timer);
-      request.off('data', onData);
-      request.off('end', onEnd);
-      request.off('error', onError);
-      request.off('aborted', onAborted);
-    }
-    function finish(error?: { code: number; message: string }, value?: unknown) {
-      if (done) return;
-      done = true;
-      cleanup();
-      if (error) { request.pause(); reject(error); }
-      else resolve(value);
-    }
-    function onData(chunk: Buffer) {
-      size += chunk.length;
-      if (size > MAX_JSON_BYTES) finish({ code: 413, message: 'Request body exceeds 1 MiB' });
-      else chunks.push(chunk);
-    }
-    function onEnd() {
-      try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { finish({ code: 400, message: 'Malformed JSON' }); }
-    }
-    function onError() { finish({ code: 400, message: 'Request body interrupted' }); }
-    function onAborted() { finish({ code: 400, message: 'Request body aborted' }); }
-    request.on('data', onData);
-    request.once('end', onEnd);
-    request.once('error', onError);
-    request.once('aborted', onAborted);
-  });
-}
-function toolResult(result: Outcome<unknown>) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(result) }], ...(!result.ok ? { isError: true } : {}) };
-}
-
-/** Stateless MCP transport; every acting session is an explicit tool argument, checked by the store against the authenticated host. */
-async function mcp(request: IncomingMessage, response: ServerResponse, store: CoordinatorStore, host: HostPrincipal, body: unknown): Promise<void> {
-  const server = new McpServer({ name: 'roger-wilco', version: '1.0.0' });
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-  const address = z.object({ namespace: z.string(), piSessionId: z.string() }).strict();
-  const actor = (session: SessionAddress): boolean => isSessionAddress(session);
-  server.registerTool('list_sessions', { description: 'List registered session addresses and hosts.', inputSchema: {} },
-    async () => toolResult({ ok: true, value: store.listSessions() }));
-  server.registerTool('read_board', { description: 'Read registered sessions and active work claims.', inputSchema: {} },
-    async () => toolResult({ ok: true, value: { sessions: store.listSessions(), claims: store.listClaims() } }));
-  server.registerTool('register_session', { description: 'Register the current Pi session on this host.', inputSchema: { session: address, displayName: z.string().optional() } },
-    async ({ session, displayName }) => toolResult(isRegistration({ session, displayName }) ? store.register(host, { session, displayName }) : failure('invalid_request', 'Invalid registration')));
-  server.registerTool('send_message', { description: 'Send to a session address or broadcast to all other sessions.', inputSchema: {
-    session: address, recipient: z.string(), body: z.string(), data: z.unknown().optional(), visibility: z.enum(['private', 'public']).optional(),
-  } }, async ({ session, recipient, body, data, visibility }) => {
-    const message = { recipient, body, data, visibility };
-    return toolResult(actor(session) && isMessageInput(message) ? store.send(host, session, message) : failure('invalid_request', 'Invalid session or message'));
-  });
-  server.registerTool('inbox', { description: 'Query historical messages for this host-bound session.', inputSchema: {
-    session: address, since: z.number().optional(), limit: z.number().optional(),
-  } }, async ({ session, since = 0, limit = 100 }) => toolResult(actor(session) && Number.isSafeInteger(since) && since >= 0 &&
-    Number.isSafeInteger(limit) && limit >= 1 && limit <= 500 ? store.inbox(host, session, since, limit) : failure('invalid_request', 'Invalid inbox query')));
-  server.registerTool('claim_work', { description: 'Acquire or renew a claim owned by this Pi session.', inputSchema: {
-    session: address, key: z.string(), ttlSeconds: z.number().optional(), note: z.string().optional(),
-  } }, async ({ session, key, ttlSeconds = 900, note }) => toolResult(actor(session) && validClaimKey(key) &&
-    Number.isSafeInteger(ttlSeconds) && ttlSeconds >= 0 &&
-    (note === undefined || typeof note === 'string') ? store.claim(host, key, sessionKey(session), ttlSeconds, note) : failure('invalid_request', 'Invalid claim')));
-  server.registerTool('release_work', { description: 'Release a claim owned by this Pi session.', inputSchema: { session: address, key: z.string() } },
-    async ({ session, key }) => toolResult(actor(session) && validClaimKey(key) ? store.releaseClaim(host, key, sessionKey(session)) : failure('invalid_request', 'Invalid claim')));
-  // The MCP server owns its connected transport; close once on completion, disconnect, or deadline.
-  let closing: Promise<void> | undefined;
-  const close = () => closing ??= server.close();
-  response.once('close', () => { void close().catch(() => {}); });
-  const deadline = setTimeout(() => {
-    json(response, { ok: false, error: 'temporarily_unavailable', message: 'MCP request deadline exceeded' });
-    void close().catch(() => {});
-  }, REQUEST_DEADLINE_MS);
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(request, response, body);
-  } catch {
-    if (!response.headersSent) json(response, { ok: false, error: 'temporarily_unavailable', message: 'MCP request failed' });
-  } finally {
-    clearTimeout(deadline);
-    await close();
-  }
-}
-
 /** HTTP control only; stream and receipt routes belong to lane C and return 404 here. */
 export function createControlHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler {
   return async (request, response) => {
@@ -187,7 +75,7 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         }
         json(response, store.inbox(host, session, since, limit)); return;
       }
-      const post = [ROUTES.register, ROUTES.messages, ROUTES.claims, ROUTES.claimRelease, '/mcp'];
+      const post: string[] = [ROUTES.register, ROUTES.rank, ROUTES.messages, ROUTES.claims, ROUTES.claimRelease];
       if (request.method !== 'POST' || !post.includes(path)) { json(response, failure('not_found', 'Unknown route')); return; }
       let body: unknown;
       try { body = await readBody(request); }
@@ -195,9 +83,15 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         const { code, message } = error as { code: number; message: string };
         json(response, failure('invalid_request', message), code); return;
       }
-      if (path === '/mcp') { await mcp(request, response, store, host, body); return; }
       if (path === ROUTES.register) {
         json(response, isRegistration(body) ? store.register(host, body) : failure('invalid_request', 'Invalid registration')); return;
+      }
+      if (path === ROUTES.rank) {
+        if (!keys(body, ['session', 'rank']) || !isSessionAddress(body.session) ||
+            typeof body.rank !== 'number' || !Number.isInteger(body.rank) || body.rank < 1 || body.rank > 5) {
+          json(response, failure('invalid_request', 'Invalid rank request')); return;
+        }
+        json(response, store.setRank(host, body.session, body.rank)); return;
       }
       if (path === ROUTES.messages) {
         json(response, keys(body, ['sender', 'message']) && isSessionAddress(body.sender) && isMessageInput(body.message) ?

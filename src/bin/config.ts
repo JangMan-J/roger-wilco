@@ -40,9 +40,10 @@ export async function readCoordinatorConfig(path = process.env.ROGER_WILCO_SERVE
     port: port as number, hostCredentials: credentials as Record<string, string>,
   };
 }
-export async function readHostConfig(path = process.env.ROGER_WILCO_CONFIG ?? join(homedir(), '.config/roger-wilco/host.json')): Promise<HostConfig> {
+export async function readHostConfig(path = process.env.ROGER_WILCO_CONFIG ?? join(homedir(), '.config/roger-wilco/host.json')): Promise<HostConfig & { namespace?: string }> {
   const value = await json(path);
   if (Object.keys(value).some(key => !['namespace', 'coordinatorUrl', 'hostId', 'credential', 'inboxPath'].includes(key))) throw new Error('Unknown host configuration field');
+  if (value.namespace !== undefined && !isNamespace(value.namespace)) throw new Error('Invalid host namespace');
   const coordinatorUrl = text(value.coordinatorUrl, 'coordinatorUrl');
   const url = new URL(coordinatorUrl);
   if (url.username || url.password || url.search || url.hash ||
@@ -51,5 +52,6 @@ export async function readHostConfig(path = process.env.ROGER_WILCO_CONFIG ?? jo
   }
   const pathValue = text(value.inboxPath, 'inboxPath');
   if (!isAbsolute(pathValue) && !pathValue.startsWith('~/')) throw new Error('inboxPath must be absolute or home-relative');
-  return { coordinatorUrl, hostId: text(value.hostId, 'hostId'), credential: text(value.credential, 'credential'), inboxPath: homePath(pathValue) };
+  return { coordinatorUrl, hostId: text(value.hostId, 'hostId'), credential: text(value.credential, 'credential'), inboxPath: homePath(pathValue),
+    ...(value.namespace === undefined ? {} : { namespace: value.namespace as string }) };
 }

@@ -86,11 +86,14 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     version: 1, id: `fleet:msg:${sequence}`, sequence, timestamp: Date.now(), sender: `fleet:${b}`,
     recipient: `fleet:${recipient}`, body, data: null, visibility: 'private',
   } });
-  await external.receive(message(1, a, 'Idle update'));
+  const idle = message(1, a, 'Idle update');
+  await external.receive(idle);
   await until(() => requests.length === 1 && !session.isStreaming);
   assert.match(requests[0], /Idle update/);
   const file = manager.getSessionFile();
   await until(async () => (await entries(file)).some(e => e.type === 'custom_message' && e.details?.deliveryId === 'fleet:msg:1'));
+  assert.equal((await entries(file)).find(e => e.details?.deliveryId === 'fleet:msg:1').content, JSON.stringify(idle.message),
+    'native custom messages preserve the envelope without Roger warning boilerplate');
   hold = true;
   const work = session.prompt('Original user work');
   await until(() => requests.length === 2);
