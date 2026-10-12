@@ -1,0 +1,15 @@
+[Unit]
+Description=Roger-Wilco coordinator
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/.local/share/roger-wilco/package/src/bin/coordinator.ts
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

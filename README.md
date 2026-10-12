@@ -1,0 +1,76 @@
+# Roger-Wilco
+
+Roger-Wilco provides durable messaging and coordination for Pi sessions.
+A central coordinator stores messages, session registrations, presence, work claims, and delivery cursors.
+Each host daemon opens one outbound SSE connection and stores receipts in a local SQLite inbox.
+The Pi extension registers each session automatically and queues received messages as follow-ups.
+Research remains in pi-webtasks.
+
+## In Pi
+
+Run `/reload` after installation, then `/roger` to show your address, registered sessions, and active work claims.
+`/roger_board` is an alias.
+These commands display the board without a model call.
+The `roger_board` tool remains available to the agent.
+
+## Requirements
+
+- Node 26.11.1, pinned in `.node-version`.
+- The supported Pi 1.1.0 build with persistent session files.
+- One coordinator and one daemon for each host.
+- HTTPS between hosts and the coordinator.
+
+## Development
+
+Install the pinned dependencies:
+
+```sh
+npm ci --ignore-scripts
+npm run setup:sdk
+npm run check
+```
+
+`setup:sdk` uses `PI_PACKAGE_DIR`, or the coding-agent package under `~/pi-main`.
+Native tests use the installed Pi SDK with a synthetic provider.
+They do not send paid model requests.
+Missing SDK capabilities fail the tests instead of skipping them.
+The coexistence test uses the research-only pi-webtasks checkout.
+Set `WEBTASKS_PACKAGE_DIR`, or keep that checkout at `../pi-webtasks`.
+This checkout is a test prerequisite, not a runtime dependency.
+
+## Installation
+
+The [operations guide](docs/operations.md) describes package installation, host configuration, services, migration, and rollback.
+The coordinator and host entry points accept an optional JSON configuration path:
+
+```sh
+node src/bin/coordinator.ts --help
+node src/bin/host.ts --help
+```
+
+The Pi extension loads `ROGER_WILCO_CONFIG` or `~/.config/roger-wilco/host.json`.
+One host configuration serves all Pi sessions on that host.
+Session starts require no recipient file, callback URL, inbox binding, or manual registration.
+
+## Delivery contract
+
+A session address combines the coordinator namespace and Pi session UUID.
+Resume keeps that address.
+New and forked sessions receive distinct addresses.
+The local inbox allows one active runtime for each session.
+
+The host acknowledges receipt only after its inbox transaction commits.
+The extension acknowledges Pi delivery only after the exact message appears in the current persistent session file and a file synchronization succeeds.
+A crash can leave a recognizable duplicate with the same message ID.
+An acknowledgement does not prove model completion.
+
+Shared host credentials authorize trusted participants.
+They do not isolate hostile agents from each other.
+Public and private visibility are metadata, not access-control boundaries.
+The [protocol contract](docs/contract.md) defines the interfaces and failure behavior.
+
+## Ownership
+
+This package has no runtime dependency on the reference projects.
+The source commits and extraction map are in [SOURCE-MANIFEST.md](SOURCE-MANIFEST.md).
+The package remains private.

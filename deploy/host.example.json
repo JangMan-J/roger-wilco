@@ -1,0 +1,7 @@
+{
+  "namespace": "fleet",
+  "coordinatorUrl": "https://coordinator.example:8445",
+  "hostId": "host-a",
+  "credential": "REPLACE_WITH_HOST_A_TOKEN",
+  "inboxPath": "~/.local/share/roger-wilco/inbox.sqlite"
+}

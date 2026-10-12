@@ -1,0 +1,10 @@
+{
+  "namespace": "fleet",
+  "databasePath": "~/.local/share/roger-wilco/coordinator.sqlite",
+  "listenHost": "127.0.0.1",
+  "port": 7088,
+  "hostCredentials": {
+    "host-a": "REPLACE_WITH_SEPARATE_RANDOM_HOST_A_TOKEN",
+    "host-b": "REPLACE_WITH_SEPARATE_RANDOM_HOST_B_TOKEN"
+  }
+}
