@@ -10,7 +10,21 @@ The baseline is commit `5282762`.
 The revised source passes `npm run check`, including type-checking and all four native SIGKILL checkpoints.
 The suite contains 64 tests.
 The packaged coordinator and host start after a production install with no third-party runtime dependencies.
-Deployment verification for this revision is pending.
+Both hosts run the runtime source from commit `b692d1c`.
+Local and remote `npm run check` each passed all 64 tests without failures or skips.
+Both production installs passed from the packaged lock.
+Online SQLite backups and the previous package remain under `~/.local/share/roger-wilco/before-feedback-b692d1c/` on each host.
+
+The installed cross-host check passed at 21:41 UTC.
+It assigned rank 3 to a remote session and delivered messages `fleet:msg:85` through `fleet:msg:87`.
+Directed round trips, idle wake-up, busy follow-up, and same-host isolation passed.
+The health endpoint returned 200, the retired MCP path returned 404, and all retained registrations had valid ranks.
+Existing Pi sessions need `/reload` to load the picker and revised message format.
+New sessions load them automatically.
+
+The local installation evidence directory contains `feedback-local.log`, `feedback-remote.log`, and `feedback-cross-host.json`.
+The logs retain the remote environment's missing-extra-CA-file warning.
+It did not prevent HTTPS delivery or any test.
 
 - Invalid and unsupported SSE events no longer reconnect the entire host.
   A regression proves that another subscription continues on the same connection.
