@@ -142,6 +142,7 @@ The coordinator HTTP entry handles these fixed paths.
 | `GET /v1/claims` | none | Active work claims. Expired claims are removed. |
 | `POST /v1/messages` | `{sender: SessionAddress, message: MessageInput}` | `Message`. The server checks the sender host assignment and the same namespace. It checks the envelope. It rejects an invalid envelope. It persists the message before success. Broadcast recipient `*` excludes the sender at delivery. |
 | `GET /v1/inbox?namespace=...&piSessionId=...&since=0&limit=100` | explicit historical query | Ordered messages for the session. The host assignment is checked. A caller can query messages from before registration. Those messages do not generate historical automatic wake-ups. |
+| `GET /v1/entities?id=...&since=0&limit=100` | entity ID and message pagination | `{entity:{id,type,label},messages:Message[]}`. Retained mentions in sequence order. Unknown IDs return 404. |
 | `POST /v1/claims` | `{key,owner:SessionAddress,ttlSeconds,note?}` | `{claim,acquired}`. A positive `ttlSeconds` value expires after that many seconds. Zero means no expiry. Acquire, renew, and takeover of an expired claim are atomic. Release is owner-only. |
 | `POST /v1/claims/release` | `{key,owner:SessionAddress}` | A boolean. Release is owner-only. |
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
@@ -164,7 +165,7 @@ The coordinator has no MCP endpoint.
 The Pi extension uses HTTP directly.
 The coordinator and host have no third-party runtime dependencies.
 
-Pi exposes `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, and `roger_release`.
+Pi exposes `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, `roger_release`, and `roger_entity`.
 These tools derive their actor from the invoking Pi session.
 The board defaults to sessions seen within 90 seconds and includes active claims.
 The model tool accepts `{all:true}` to include stale, retained registrations.
@@ -193,6 +194,53 @@ Older receipt retries require retained message history.
 The initial registration cursor is not proof of delivery.
 Maintenance runs at startup and at most once per minute during store activity.
 Each sweep collects at most 5,000 messages.
+
+### Entities
+
+An entity identifies a named subject without defining what that subject represents.
+Entity references do not create claims, tasks, permissions, or rank changes.
+The coordinator indexes references only in the body of each new message.
+It leaves the body, `data`, message envelope, and SSE frame unchanged.
+Existing stored messages are not rescanned during upgrade.
+
+The marker syntax is `[[label]]` or `[[type:label]]`.
+Examples are `[[fix-parser]]` and `[[7:wire format]]`.
+The optional type prefix is a decimal integer from 0 through 255.
+Type 0 is generic and is the default.
+All other byte values remain opaque to Roger-Wilco.
+Consumers assign their meanings without a server-side type catalog.
+
+Labels are single-line phrases of 1–256 UTF-16 code units after normalization.
+Normalization uses Unicode NFC and removes surrounding whitespace.
+Case and internal spacing remain significant.
+Control characters, Unicode line separators, and unpaired surrogates are invalid.
+Brackets cannot occur inside a label.
+A backslash before the opening marker makes it literal.
+Invalid markers remain ordinary message text.
+Repeated references to the same entity create one link per message.
+The `^^example^^` notation has no special meaning.
+
+The ID format is `<namespace>:entity:<type-byte-hex>:<hash>`.
+The type occupies two lowercase hexadecimal digits.
+The hash is the first 32 hexadecimal digits of SHA-256.
+Its input is UTF-8 `JSON.stringify([namespace,type,canonicalLabel])`.
+For example, `[[7:fix-parser]]` in `fleet` resolves to `fleet:entity:07:fae9929240dc225c29962b8cb970472e`.
+Changing the namespace, type, or canonical label changes the identity.
+Message storage and entity links commit in the same transaction.
+A detected hash collision rejects the write rather than merging different entities.
+
+`roger_entity` accepts either `{label,type?}` or `{id}`.
+Both forms accept optional `since` and `limit` values.
+The default cursor is 0 and the default limit is 100.
+The limit range is 1–500.
+Pagination uses the last returned message sequence as the next `since` value.
+Lookup does not create an entity or acknowledge a message.
+
+Entity lookup is namespace-wide for authenticated hosts.
+It includes retained mentions from messages addressed to other sessions, regardless of visibility metadata.
+It is not a session-private inbox view.
+Message collection removes the corresponding links and then unused entity records.
+A later reference recreates the same deterministic ID.
 
 ### Examples
 

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,6 +75,13 @@ test('opening a pre-presence sessions table retains bindings and upgrades metada
     )`);
     db.prepare('INSERT INTO sessions (id, host_id, display_name, initial_cursor, cursor) VALUES (?, ?, ?, ?, ?)')
       .run(sessionKey(a), hostA.hostId, 'Original', 0, 0);
+    db.exec(`CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+      sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL,
+      data TEXT NOT NULL, visibility TEXT NOT NULL
+    )`);
+    db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(Date.now(), sessionKey(a), sessionKey(a), '[[legacy]]', 'null', 'private');
   } finally { db.close(); }
   const store = createCoordinatorStore(path, 'fleet');
   try {
@@ -83,6 +91,11 @@ test('opening a pre-presence sessions table retains bindings and upgrades metada
     assert.equal(retry.subscription.cursor, 0);
     assert.equal(retry.displayName, 'Original');
     assert.ok(retry.lastSeenAt! > 0);
+    const ref = entityRef('legacy');
+    assert.equal((store.entity(ref.id, 0, 10) as { error: string }).error, 'not_found');
+    const current = ok(store.send(hostA, a, { recipient: sessionKey(a), body: 'Now [[legacy]]' }));
+    assert.equal(ok(store.inbox(hostA, a, 0, 10)).length, 2);
+    assert.deepEqual(ok(store.entity(ref.id, 0, 10)), { entity: ref, messages: [current] });
   } finally { store.close(); }
 });
 
@@ -325,6 +338,121 @@ test('collection protects relevant unacknowledged deliveries, bounds history, an
     const next = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'new sequence' }));
     assert.equal(next.sequence, broadcast.sequence + 1);
     assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [next.id]);
+  } finally { store.close(); }
+});
+
+function entityRef(label: string, type = 0, namespace = 'fleet') {
+  const hash = createHash('sha256').update(JSON.stringify([namespace, type, label])).digest('hex').slice(0, 32);
+  return { id: `${namespace}:entity:${type.toString(16).padStart(2, '0')}:${hash}`, type, label };
+}
+
+test('entity mentions deduplicate normalized labels, distinguish opaque types, and reopen without message or routing changes', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  const generic = entityRef('Café');
+  const typed = entityRef('Café', 7);
+  const byte = entityRef('Café', 255);
+  try {
+    register(store);
+    ok(store.setRank(hostA, b, 3));
+    ok(store.claim(hostA, 'work', sessionKey(a), 0));
+    const sessions = store.listSessions();
+    const claims = store.listClaims();
+    const body = 'Discuss [[ Cafe\u0301 ]] and [[Café]] with [[7:Café]] and [[255:Café]].';
+    const data = { untouched: '[[data only]]' };
+    const direct = ok(store.send(hostA, a, { recipient: sessionKey(c), body, data }));
+    const broadcast = ok(store.send(hostA, b, { recipient: '*', body: 'Again [[Café]]', visibility: 'public' }));
+    ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'No marker: Café' }));
+    assert.equal(direct.body, body);
+    assert.deepEqual(direct.data, data);
+    assert.deepEqual(Object.keys(direct).sort(), ['body', 'data', 'id', 'recipient', 'sender', 'sequence', 'timestamp', 'version', 'visibility']);
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: generic, messages: [direct, broadcast] });
+    for (const ref of [typed, byte]) assert.deepEqual(ok(store.entity(ref.id, 0, 10)), { entity: ref, messages: [direct] });
+    assert.deepEqual(ok(store.entity(generic.id, 0, 1)).messages, [direct]);
+    assert.deepEqual(ok(store.entity(generic.id, direct.sequence, 1)).messages, [broadcast]);
+    assert.deepEqual(ok(store.entity(generic.id, broadcast.sequence, 10)), { entity: generic, messages: [] });
+    assert.deepEqual(store.listSessions(), sessions);
+    assert.deepEqual(store.listClaims(), claims);
+    assert.deepEqual(store.pending(hostB, 10), [{ type: 'message', subscriptionId: sessionKey(c), message: direct }]);
+    assert.deepEqual(ok(store.inbox(hostA, a, 0, 10)), [broadcast]);
+    assert.deepEqual(ok(store.inbox(hostB, c, 0, 10)), [direct, broadcast]);
+    assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(c), messageId: direct.id }).ok, false);
+    assert.equal(ok(store.acknowledge(hostB, { subscriptionId: sessionKey(c), messageId: direct.id })).cursor, direct.sequence);
+    for (const ref of [entityRef('data only'), entityRef('café'), entityRef('Café', 1)]) {
+      assert.equal(store.entity(ref.id, 0, 10).ok, false);
+    }
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: generic, messages: [direct, broadcast] });
+  } finally { store.close(); }
+});
+
+test('entity queries validate identity and pagination; failed sends and identity collisions roll back registry and message writes', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  const ref = entityRef('shared');
+  try {
+    register(store);
+    for (const id of ['', null, sessionKey(a), entityRef('shared', 0, 'other').id]) {
+      assert.equal((store.entity(id as string, 0, 10) as { error: string }).error, 'invalid_request');
+    }
+    for (const [since, limit] of [[-1, 10], [0.5, 10], [NaN, 10], [Infinity, 10], [0, 0], [0, 501], [0, 1.5]]) {
+      assert.equal((store.entity(ref.id, since!, limit!) as { error: string }).error, 'invalid_request');
+    }
+    assert.equal((store.entity(ref.id, 0, 10) as { error: string }).error, 'not_found');
+    assert.equal(store.send(hostB, a, { recipient: '*', body: '[[shared]]' }).ok, false);
+    assert.equal(store.send(hostA, a, { recipient: 'invalid', body: '[[shared]]' }).ok, false);
+    assert.equal((store.entity(ref.id, 0, 10) as { error: string }).error, 'not_found');
+    const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[shared]]' }));
+    const db = new DatabaseSync(path);
+    try {
+      // Simulate the otherwise impractical digest collision at the persisted identity boundary.
+      for (const [type, label] of [[7, ref.label], [ref.type, 'different label']] as const) {
+        db.prepare('UPDATE entities SET type = ?, label = ? WHERE id = ?').run(type, label, ref.id);
+        assert.throws(() => store.send(hostA, a, { recipient: sessionKey(b), body: '[[new before collision]] [[shared]]' }), /collision/i);
+        assert.equal((store.entity(entityRef('new before collision').id, 0, 10) as { error: string }).error, 'not_found');
+        assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)), [first]);
+        assert.equal(db.prepare('SELECT count(*) AS count FROM message_entities').get()!.count, 1);
+      }
+      db.prepare('UPDATE entities SET type = ?, label = ? WHERE id = ?').run(ref.type, ref.label, ref.id);
+      assert.deepEqual(ok(store.entity(ref.id, 0, 10)), { entity: ref, messages: [first] });
+    } finally { db.close(); }
+  } finally { store.close(); }
+});
+
+test('entity retention follows message collection, preserves pending mentions, and recreates collected identities', async t => {
+  const path = await fileStore(t);
+  const week = 7 * 24 * 60 * 60 * 1000;
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  const shared = entityRef('shared');
+  const gone = entityRef('gone', 255);
+  try {
+    register(store);
+    const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[shared]] [[255:gone]]' }));
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }));
+    const pending = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[shared]]' }));
+    now += week;
+    register(store);
+    now += 60_001;
+    assert.deepEqual(ok(store.entity(shared.id, 0, 10)), { entity: shared, messages: [pending] });
+    assert.equal((store.entity(gone.id, 0, 10) as { error: string }).error, 'not_found');
+    store.pending(hostA, 10);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: pending.id }));
+    now += 60_001;
+    assert.equal((store.entity(shared.id, 0, 10) as { error: string }).error, 'not_found');
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal(db.prepare('SELECT count(*) AS count FROM message_entities').get()!.count, 0);
+      assert.equal(db.prepare('SELECT count(*) AS count FROM entities').get()!.count, 0);
+    } finally { db.close(); }
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    const again = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[255:gone]]' }));
+    assert.deepEqual(ok(store.entity(gone.id, 0, 10)), { entity: gone, messages: [again] });
+    assert.equal(again.sequence, pending.sequence + 1);
   } finally { store.close(); }
 });
 

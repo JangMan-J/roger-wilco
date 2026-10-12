@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
-import { sessionKey } from '../../src/protocol/index.ts';
+import { entityReference, sessionKey } from '../../src/protocol/index.ts';
 
 const alice = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
 const bob = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
@@ -63,6 +63,47 @@ test('real HTTP authentication, strict validation, host-bound sender and claim o
   assert.equal((await request('/v1/claims/release', { key: 'task', owner: bob })).status, 409);
   assert.equal((await request('/v1/claims/release', { key: 'task', owner: alice })).value.value, true);
   assert.deepEqual((await request('/v1/claims')).value.value, []);
+});
+
+test('entity HTTP lookup returns retained mentions with authentication and strict query bounds', async t => {
+  const { request, base } = await fixture(t);
+  assert.equal((await request('/v1/sessions/register', { session: alice })).status, 200);
+  const first = await request('/v1/messages', { sender: alice, message: { recipient: '*', body: 'Start [[fix-parser]] and [[255:fix-parser]]' } });
+  const second = await request('/v1/messages', { sender: alice, message: { recipient: '*', body: 'Finish [[255:fix-parser]]' } });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  const entity = entityReference('fleet', 'fix-parser', 255);
+  const query = new URLSearchParams({ id: entity.id, since: '0', limit: '1' });
+  const path = '/v1/entities?';
+  assert.equal((await request(path + query, undefined, 'bad')).status, 401);
+  const unauthenticated = await fetch(base + path + query);
+  assert.equal(unauthenticated.status, 401);
+  await unauthenticated.json();
+  assert.deepEqual((await request(path + query, undefined, 'secret-b')).value,
+    { ok: true, value: { entity, messages: [first.value.value] } });
+  query.set('since', String(first.value.value.sequence));
+  assert.deepEqual((await request(path + query)).value.value, { entity, messages: [second.value.value] });
+  query.set('id', entityReference('fleet', 'fix-parser').id);
+  query.set('since', '0');
+  assert.deepEqual((await request(path + query)).value.value,
+    { entity: entityReference('fleet', 'fix-parser'), messages: [first.value.value] });
+  for (const suffix of ['&extra=1', '&id=x', '&since=1', '&limit=2']) {
+    assert.equal((await request(path + query + suffix)).status, 400, suffix);
+  }
+  for (const [key, values] of Object.entries({ id: ['', 'not-an-entity', entityReference('other', 'fix-parser').id],
+    since: ['', '-1', '1.5', '01', '9007199254740992'], limit: ['', '0', '501', '1.5'] })) {
+    for (const value of values) {
+      const invalid = new URLSearchParams(query);
+      invalid.set(key, value);
+      assert.equal((await request(path + invalid)).status, 400, `${key}=${value}`);
+    }
+    const missing = new URLSearchParams(query);
+    missing.delete(key);
+    assert.equal((await request(path + missing)).status, 400, `missing ${key}`);
+  }
+  query.set('id', entityReference('fleet', 'unmentioned').id);
+  assert.equal((await request(path + query)).status, 404);
+  assert.equal((await request('/v1/entities', {})).status, 404);
 });
 
 test('authenticated hosts can edit another host session rank with strict HTTP validation', async t => {

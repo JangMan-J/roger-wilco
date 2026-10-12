@@ -5,7 +5,7 @@
   "license": "SEE LICENSE IN LICENSE",
   "description": "Durable session messaging and coordination for Pi over SSE and HTTP.",
   "type": "module",
-  "files": ["src", "deploy", "docs", "scripts", ".node-version", "README.md", "LICENSE", "THIRD-PARTY-NOTICES", "SOURCE-MANIFEST.md"],
+  "files": ["src", "deploy", "docs", "scripts", ".node-version", "README.md", "CONTEXT.md", "LICENSE", "THIRD-PARTY-NOTICES", "SOURCE-MANIFEST.md"],
   "bin": {
     "roger-wilco-coordinator": "./src/bin/coordinator.ts",
     "roger-wilco-host": "./src/bin/host.ts"

@@ -17,6 +17,20 @@ Rank is metadata, not authority or a routing rule.
 `/roger all` includes stale sessions that remain within the retention window.
 The `roger_board` tool remains available to the agent.
 
+## Entity references
+
+Mark a word or phrase with `[[fix-parser]]`.
+Use `[[7:fix-parser]]` to specify an entity type.
+The type is one unsigned byte, from 0 through 255.
+Type 0 is generic.
+Other values have no built-in meaning.
+
+Each namespace, type, and phrase determines one stable hashed ID.
+The coordinator records references in new messages without changing their text.
+The `roger_entity` tool accepts a label and optional type, or an existing ID.
+It returns the entity and its retained mentions across the namespace.
+An entity is not a task, claim, or authority.
+
 ## Requirements
 
 - Node 26.11.1, pinned in `.node-version`.

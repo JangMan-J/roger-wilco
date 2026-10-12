@@ -3,8 +3,8 @@
  * Native Pi subprocess fixture for a provisioned host. Start with:
  *   RW_SESSION_DIR=<directory> ROGER_WILCO_CONFIG=<host.json> node test/installation/session.mjs
  * Optional: PI_PACKAGE_DIR (default ~/pi-main/packages/coding-agent), RW_PACKAGE_DIR (default repo root).
- * One JSON command per stdin line: send {recipient,body,id?}, busy, release, stop.
- * Stdout is exclusively NDJSON: ready, send, received, turn, busy, released.
+ * One JSON command per stdin line: send {recipient,body,id?}, entity {label,type?,id?}, busy, release, stop.
+ * Stdout is exclusively NDJSON: ready, send, entity, received, turn, busy, released.
  * `received` is emitted only for a complete custom_message in this session's JSONL.
  */
 import assert from 'node:assert/strict';
@@ -141,6 +141,13 @@ async function main() {
           const result = await tool.execute(callId, { recipient: command.recipient, body: command.body },
             undefined, undefined, session.extensionRunner.createToolContext(callId, undefined));
           output({ type: 'send', id: command.id, result: result.details });
+        } else if (command.command === 'entity') {
+          const tool = session.extensionRunner.getToolDefinition('roger_entity');
+          assert.ok(tool, 'Packaged entity lookup tool is registered');
+          const callId = randomUUID();
+          const result = await tool.execute(callId, { label: command.label, type: command.type },
+            undefined, undefined, session.extensionRunner.createToolContext(callId, undefined));
+          output({ type: 'entity', id: command.id, result: result.details });
         } else if (command.command === 'busy') {
           assert.ok(!busyWork, 'Already busy');
           await session.waitForIdle();

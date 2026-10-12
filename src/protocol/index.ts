@@ -1,4 +1,7 @@
 /** Roger-Wilco wire and lane contracts, version 1. No reference-project imports. */
+import { createHash } from 'node:crypto';
+
+const ENTITY_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 export const PROTOCOL_VERSION = 1 as const;
 /** Both raw JSON requests and normalized MessageInput JSON are bounded to 1 MiB. */
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -8,6 +11,7 @@ export const ROUTES = {
   health: '/health',
   register: '/v1/sessions/register',
   rank: '/v1/sessions/rank',
+  entity: '/v1/entities',
   sessions: '/v1/sessions', messages: '/v1/messages', inbox: '/v1/inbox',
   claims: '/v1/claims', claimRelease: '/v1/claims/release',
   stream: '/v1/hosts/stream', receipt: '/v1/hosts/receipts',
@@ -41,6 +45,9 @@ export type PiConfig = HostConfig & { namespace: string }; // same trusted host 
 export type Receipt = { subscriptionId: SessionKey; messageId: DeliveryId };
 export type StreamFrame = { type: 'message'; subscriptionId: SessionKey; message: Message };
 export type PiReceipt = { messageId: DeliveryId; piSessionId: string; entryId: string; sessionFile: string };
+/** Type is one opaque unsigned byte; consumers define meanings beyond generic type 0. */
+export type EntityRef = { id: string; type: number; label: string };
+export type EntityHistory = { entity: EntityRef; messages: Message[] };
 
 /** Lane A. Every operation that changes registration/cursor/claim state is one SQLite transaction. */
 export interface CoordinatorStore {
@@ -51,6 +58,7 @@ export interface CoordinatorStore {
   listClaims(): Claim[];
   send(host: HostPrincipal, sender: SessionAddress, input: MessageInput): Outcome<Message>;
   inbox(host: HostPrincipal, session: SessionAddress, since: number, limit: number): Outcome<Message[]>;
+  entity(id: string, since: number, limit: number): Outcome<EntityHistory>;
   /** Atomic tail snapshot on first registration; retry MUST return unchanged cursor. */
   pending(host: HostPrincipal, limit: number): StreamFrame[];
   /** Only this host's subscription, and only a delivered contiguous item, advances its cursor. */
@@ -105,6 +113,35 @@ export function sessionKey(address: SessionAddress): SessionKey {
 export function deliveryId(namespace: string, sequence: number): DeliveryId {
   if (!isNamespace(namespace) || !Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError('Invalid message identity');
   return `${namespace}:msg:${sequence}`;
+}
+export function entityReference(namespace: string, label: string, type = 0): EntityRef {
+  if (!isNamespace(namespace) || !Number.isInteger(type) || type < 0 || type > 255 ||
+      typeof label !== 'string' || !label.isWellFormed() || ENTITY_CONTROLS.test(label))
+    throw new TypeError('Invalid entity reference');
+  const canonical = label.normalize('NFC').trim();
+  if (!canonical || canonical.length > 256) throw new TypeError('Entity label must contain 1–256 characters');
+  const hash = createHash('sha256').update(JSON.stringify([namespace, type, canonical])).digest('hex').slice(0, 32);
+  return { id: `${namespace}:entity:${type.toString(16).padStart(2, '0')}:${hash}`, type, label: canonical };
+}
+export function isEntityId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z][a-z0-9-]{0,62}:entity:[0-9a-f]{2}:[0-9a-f]{32}$/.test(value);
+}
+/** Flat, single-line [[label]] or [[byte:label]] markers. Malformed and escaped markers stay literal. */
+export function extractEntities(namespace: string, body: string): EntityRef[] {
+  if (!isNamespace(namespace) || typeof body !== 'string') throw new TypeError('Invalid entity text');
+  const entities = new Map<string, EntityRef>();
+  for (const match of body.matchAll(/(?<![\\[])\[\[([^[\]\r\n]*)\]\](?!\])/g)) {
+    if (ENTITY_CONTROLS.test(match[1]!)) continue;
+    const token = match[1]!.trim();
+    const typed = /^(\d+):(.*)$/u.exec(token);
+    try {
+      const entity = entityReference(namespace, typed ? typed[2]! : token, typed ? Number(typed[1]) : 0);
+      entities.set(entity.id, entity);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+    }
+  }
+  return [...entities.values()];
 }
 export function isNamespace(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z][a-z0-9-]{0,62}$/.test(value);

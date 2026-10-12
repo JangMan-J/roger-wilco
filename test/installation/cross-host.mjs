@@ -66,18 +66,28 @@ try {
   const ranked = await setRank.json();
   assert.equal(ranked.value.rank, 3);
   assert.equal(ranked.value.subscription.id, b.address);
-  bob.send({ command: 'send', recipient: a.address, body: 'Physical-host directed ping', id: 'ping' });
+  const entityLabel = `cross-host-${a.sessionId}`;
+  const pingBody = `Physical-host directed ping [[255:${entityLabel}]]`;
+  const replyBody = `Physical-host directed reply [[255:${entityLabel}]]`;
+  bob.send({ command: 'send', recipient: a.address, body: pingBody, id: 'ping' });
   const ping = await bob.wait(e => e.type === 'send' && e.id === 'ping');
   assert.equal(ping.result.ok, true);
   const gotPing = await alice.wait(e => e.type === 'received' && e.id === ping.result.value.id);
-  assert.equal(gotPing.body, 'Physical-host directed ping');
+  assert.equal(gotPing.body, pingBody);
   await alice.wait(e => e.type === 'turn');
-  alice.send({ command: 'send', recipient: b.address, body: 'Physical-host directed reply', id: 'reply' });
+  alice.send({ command: 'send', recipient: b.address, body: replyBody, id: 'reply' });
   const reply = await alice.wait(e => e.type === 'send' && e.id === 'reply');
   assert.equal(reply.result.ok, true);
   const gotReply = await bob.wait(e => e.type === 'received' && e.id === reply.result.value.id);
-  assert.equal(gotReply.body, 'Physical-host directed reply');
+  assert.equal(gotReply.body, replyBody);
   await bob.wait(e => e.type === 'turn');
+  bob.send({ command: 'entity', label: entityLabel, type: 255, id: 'entity-check' });
+  const lookup = await bob.wait(e => e.type === 'entity' && e.id === 'entity-check');
+  assert.equal(lookup.result.ok, true);
+  assert.equal(lookup.result.value.entity.type, 255);
+  assert.equal(lookup.result.value.entity.label, entityLabel);
+  assert.match(lookup.result.value.entity.id, /^fleet:entity:ff:[0-9a-f]{32}$/);
+  assert.deepEqual(lookup.result.value.messages.map(message => message.id), [ping.result.value.id, reply.result.value.id]);
   bob.send({ command: 'busy' });
   await bob.wait(e => e.type === 'busy');
   alice.send({ command: 'send', recipient: b.address, body: 'Physical-host busy follow-up', id: 'busy' });
@@ -91,8 +101,9 @@ try {
     package: 'roger-wilco@0.1.0', provider: 'synthetic offline model stream',
     sessions: { local: a.address, remote: b.address, isolated: s.address },
     rankedSession: { address: b.address, rank: 3 },
+    entity: lookup.result.value.entity,
     messageIds: [ping.result.value.id, reply.result.value.id, sentBusy.result.value.id],
-    result: 'PASS: auto-registration, cross-host rank metadata, directed round trip, idle wake, busy follow-up, same-host isolation' };
+    result: 'PASS: auto-registration, cross-host rank metadata and typed entity lookup, directed round trip, idle wake, busy follow-up, same-host isolation' };
 } finally {
   for (const instance of children) if (instance.child.exitCode === null) {
     instance.send({ command: 'stop' });

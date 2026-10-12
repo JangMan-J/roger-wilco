@@ -6,7 +6,7 @@ import { open, stat } from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
 import { readHostConfig } from '../bin/config.ts';
 import {
-  ROUTES, isMessageInput, isNamespace, isSessionAddress, sessionKey,
+  ROUTES, entityReference, isEntityId, isMessageInput, isNamespace, isSessionAddress, sessionKey,
   type HostInbox, type Message, type Outcome, type PiConfig, type PiDelivery,
   type PiReceipt, type SessionAddress, type RegistrationResult, type Claim,
 } from '../protocol/index.ts';
@@ -398,7 +398,7 @@ export default function rogerWilco(pi: ExtensionAPI): void {
   };
   pi.registerCommand('roger', boardCommand);
   pi.registerCommand('roger_board', boardCommand);
-  pi.registerTool({ name: 'roger_send', label: 'Send Agent Message', description: 'Send an agent message to a session address or broadcast (*).',
+  pi.registerTool({ name: 'roger_send', label: 'Send Agent Message', description: 'Send an agent message to a session address or broadcast (*). Mark entities with [[fix-parser]] (generic type 0) or [[7:fix-parser]] (opaque type byte 0–255); use roger_entity to look up their retained mentions.',
     parameters: Type.Object({ recipient: Type.String(), body: Type.String(), data: Type.Optional(Type.Unknown()),
       visibility: Type.Optional(Type.Union([Type.Literal('private'), Type.Literal('public')])) }),
     execute: async (_id, params, _signal, _update, ctx) => {
@@ -417,6 +417,30 @@ export default function rogerWilco(pi: ExtensionAPI): void {
       const query = new URLSearchParams({ namespace: identity.actor.namespace, piSessionId: identity.actor.piSessionId,
         since: String(params.since ?? 0), limit: String(params.limit ?? 100) });
       return action(ctx, `${ROUTES.inbox}?${query}`, 'GET');
+    },
+  });
+  pi.registerTool({ name: 'roger_entity', label: 'Entity History', description: 'Look up an entity registry record and retained mention messages by label or ID. Type defaults to generic 0; other byte values are opaque, not permissions or work claims.',
+    parameters: Type.Object({ label: Type.Optional(Type.String()), type: Type.Optional(Type.Integer({ minimum: 0, maximum: 255 })),
+      id: Type.Optional(Type.String()), since: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })) }),
+    execute: async (_id, params, _signal, _update, ctx) => {
+      const identity = await bound(ctx);
+      if ('ok' in identity) return text(identity);
+      const since = params.since ?? 0;
+      const limit = params.limit ?? 100;
+      if ((params.label === undefined) === (params.id === undefined) ||
+          (params.id !== undefined && params.type !== undefined) ||
+          !Number.isSafeInteger(since) || since < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        return text({ ok: false, error: 'invalid_request', message: 'Provide exactly one label or ID, type only with label, and valid since/limit bounds' });
+      }
+      let id = params.id;
+      if (params.label !== undefined) {
+        try { id = entityReference(identity.actor.namespace, params.label, params.type).id; }
+        catch { return text({ ok: false, error: 'invalid_request', message: 'Invalid entity label or type' }); }
+      }
+      if (!isEntityId(id)) return text({ ok: false, error: 'invalid_request', message: 'Invalid entity ID' });
+      const query = new URLSearchParams({ id, since: String(since), limit: String(limit) });
+      return action(ctx, `${ROUTES.entity}?${query}`, 'GET');
     },
   });
   pi.registerTool({ name: 'roger_board', label: 'Agent Board', description: 'List sessions seen within 90 seconds and active work claims. Presence is not proof of a live Pi lease; set all to include stale registrations.',

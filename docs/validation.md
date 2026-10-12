@@ -1,8 +1,29 @@
 # Extraction verification
 
 The extraction and cutover checks passed.
-The current source revision also passes all 64 tests, without failures or skips.
+Validation results are recorded by revision below.
 The recorded 52-test runs preceded the slash-command follow-up, which brought the baseline to 53 tests.
+
+## Entity revision — 2026-10-12
+
+The entity feature adds `[[label]]` and `[[byte:label]]` references.
+The byte range is 0–255, with generic type 0.
+Other type values have no built-in meaning.
+The stable ID includes namespace, type, and the normalized label.
+
+Focused protocol, store, HTTP, and Pi checks passed all 27 tests.
+They cover stable identity, normalization, byte limits, atomic tracking, collision rollback, reopen, retention, and lookup.
+Existing message envelopes and SSE size limits remain unchanged.
+The registry indexes new messages only.
+
+Independent review found two parser inconsistencies.
+Unicode line separators could change a typed marker into a generic one.
+Leading control characters could disappear before validation.
+Both regression cases failed before their fixes and now pass.
+The reviewer confirmed both corrections.
+
+The final local `npm run check` passed all 70 tests without failures or skips.
+Remote full-suite and installation verification is pending.
 
 ## Feedback revision — 2026-10-12
 
@@ -10,7 +31,7 @@ The baseline is commit `5282762`.
 The revised source passes `npm run check`, including type-checking and all four native SIGKILL checkpoints.
 The suite contains 64 tests.
 The packaged coordinator and host start after a production install with no third-party runtime dependencies.
-Both hosts run the runtime source from commit `b692d1c`.
+Both hosts received the runtime source from commit `b692d1c`.
 Local and remote `npm run check` each passed all 64 tests without failures or skips.
 Both production installs passed from the packaged lock.
 Online SQLite backups and the previous package remain under `~/.local/share/roger-wilco/before-feedback-b692d1c/` on each host.

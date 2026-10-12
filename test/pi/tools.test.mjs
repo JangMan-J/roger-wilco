@@ -9,6 +9,7 @@ import rogerWilco from '../../src/pi/index.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { nativePi } from '../acceptance/native-pi.ts';
+import { entityReference } from '../../src/protocol/index.ts';
 
 function extension() {
   const handlers = new Map(), tools = new Map();
@@ -35,6 +36,10 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   const recent = { subscription: { id: `fleet:${id}` }, rank: 1, lastSeenAt: now - 90_000 };
   const stale = { subscription: { id: `fleet:${randomUUID()}` }, rank: 3, lastSeenAt: now - 90_001 };
   const unknown = { subscription: { id: `fleet:${randomUUID()}` }, rank: 1 };
+  const generic = entityReference('fleet', 'fix-parser');
+  const typed = entityReference('fleet', 'fix-parser', 255);
+  const mention = { version: 1, id: 'fleet:msg:3', sequence: 3, timestamp: now, sender: `fleet:${id}`,
+    recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
   const requests = [];
   const server = createServer(async (req, res) => {
     let raw = '';
@@ -42,8 +47,10 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     const body = raw ? JSON.parse(raw) : undefined;
     requests.push({ path: req.url, body, authorization: req.headers.authorization });
     res.setHeader('Content-Type', 'application/json');
+    const url = new URL(req.url, 'http://localhost');
     const value = req.url === '/v1/sessions' ? [recent, stale, unknown] :
-      req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] : { accepted: true };
+      req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] :
+      url.pathname === '/v1/entities' ? { entity: url.searchParams.get('id') === typed.id ? typed : generic, messages: [mention] } : { accepted: true };
     res.end(JSON.stringify({ ok: true, value }));
   });
   server.listen(0, '127.0.0.1');
@@ -67,6 +74,23 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   await tool('roger_inbox', { since: 2, limit: 20 });
   await tool('roger_claim', { key: 'work', ttlSeconds: 90 });
   await tool('roger_release', { key: 'work' });
+  for (const [params, entity, since, limit] of [
+    [{ label: ' fix-parser ' }, generic, 0, 100],
+    [{ label: 'fix-parser', type: 255, since: 2, limit: 1 }, typed, 2, 1],
+    [{ id: typed.id }, typed, 0, 100],
+  ]) {
+    assert.deepEqual(await tool('roger_entity', params), { ok: true, value: { entity, messages: [mention] } });
+    assert.equal(requests.at(-1).path, '/v1/entities?' + new URLSearchParams({ id: entity.id, since: String(since), limit: String(limit) }));
+    assert.deepEqual(requests.at(-2).body, { session: { namespace: 'fleet', piSessionId: id } }, 'entity lookup registers the bound session first');
+    assert.equal(requests.at(-2).path, '/v1/sessions/register');
+  }
+  const beforeInvalid = requests.length;
+  for (const params of [{}, { label: 'fix-parser', id: typed.id }, { id: typed.id, type: 0 }, { id: 'invalid' },
+    { label: '' }, { label: 'fix-parser', type: 256 }, { label: 'fix-parser', type: -1 }, { label: 'fix-parser', type: 1.5 },
+    { id: typed.id, since: -1 }, { id: typed.id, since: Number.MAX_SAFE_INTEGER + 1 }, { id: typed.id, limit: 0 }, { id: typed.id, limit: 501 }]) {
+    assert.equal((await tool('roger_entity', params)).error, 'invalid_request', JSON.stringify(params));
+  }
+  assert.equal(requests.length, beforeInvalid, 'invalid entity tool arguments never reach the coordinator');
   assert.deepEqual(requests.find(r => r.path === '/v1/messages').body.sender, { namespace: 'fleet', piSessionId: id });
   assert.deepEqual(requests.find(r => r.path === '/v1/messages').body.message.data, { priority: 2 });
   assert.equal(requests.find(r => r.path === '/v1/inbox?namespace=fleet&piSessionId=' + id + '&since=2&limit=20').path.includes(id), true);
@@ -77,6 +101,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   const newId = randomUUID();
   state.sessionId = newId;
   assert.equal((await tool('roger_send', { recipient: '*', body: 'Stale runtime' })).ok, false);
+  assert.equal((await tool('roger_entity', { label: 'fix-parser' })).ok, false);
   assert.equal(requests.length, before, 'old binding cannot act for a new session');
   await first.handlers.get('session_shutdown')({}, ctx);
   await first.handlers.get('session_start')({ reason: 'fork' }, ctx);

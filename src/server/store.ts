@@ -2,9 +2,9 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
-  deliveryId, isMessageInput, isNamespace, isReceipt, isRegistration,
+  deliveryId, extractEntities, isEntityId, isMessageInput, isNamespace, isReceipt, isRegistration,
   isSessionAddress, isSessionKey, sessionKey, PROTOCOL_VERSION,
-  type Claim, type CoordinatorStore, type HostPrincipal, type Message,
+  type Claim, type CoordinatorStore, type EntityHistory, type EntityRef, type HostPrincipal, type Message,
   type MessageInput, type Outcome, type Receipt, type Registration,
   type RegistrationResult, type SessionAddress, type StreamFrame, type Subscription,
 } from '../protocol/index.ts';
@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, id);
 CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp);
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY, type INTEGER NOT NULL, label TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_entities (
+  entity_id TEXT NOT NULL REFERENCES entities(id),
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  PRIMARY KEY (entity_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS message_entities_message ON message_entities(message_id);
 CREATE TABLE IF NOT EXISTS claims (
   key TEXT PRIMARY KEY, owner TEXT NOT NULL, note TEXT,
   claimed_at INTEGER NOT NULL, expires_at INTEGER
@@ -54,6 +63,9 @@ class Store implements CoordinatorStore {
   private readonly sessionRow: StatementSync;
   private readonly messageRow: StatementSync;
   private readonly claimRow: StatementSync;
+  private readonly entityRow: StatementSync;
+  private readonly insertEntity: StatementSync;
+  private readonly insertMention: StatementSync;
 
   constructor(path: string, namespace: string) {
     if (!isNamespace(namespace)) throw new TypeError('Invalid namespace');
@@ -61,7 +73,7 @@ class Store implements CoordinatorStore {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     try {
-      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;');
+      this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;');
       this.db.exec(schema);
       const columns = this.db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
       if (!columns.some(column => column.name === 'last_seen_at'))
@@ -81,6 +93,9 @@ class Store implements CoordinatorStore {
       this.sessionRow = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
       this.messageRow = this.db.prepare('SELECT * FROM messages WHERE id = ?');
       this.claimRow = this.db.prepare('SELECT * FROM claims WHERE key = ?');
+      this.entityRow = this.db.prepare('SELECT * FROM entities WHERE id = ?');
+      this.insertEntity = this.db.prepare('INSERT INTO entities (id, type, label) VALUES (?, ?, ?)');
+      this.insertMention = this.db.prepare('INSERT INTO message_entities (entity_id, message_id) VALUES (?, ?)');
       // Two indexed seeks per retained subscription, one bounded result set; no JS N+1 reads.
       this.pendingRows = this.db.prepare(`SELECT m.*, s.id AS subscription_id, s.offered
         FROM sessions s JOIN messages m ON m.id = (
@@ -117,6 +132,9 @@ class Store implements CoordinatorStore {
             SELECT 1 FROM sessions WHERE id != messages.sender AND cursor < messages.id
           )) ORDER BY timestamp LIMIT ?
       )`).run(now - RETENTION_MS, COLLECTION_LIMIT);
+      this.db.prepare(`DELETE FROM entities WHERE NOT EXISTS (
+        SELECT 1 FROM message_entities WHERE entity_id = entities.id
+      )`).run();
     });
     this.nextMaintenance = now + MAINTENANCE_MS;
   }
@@ -204,8 +222,27 @@ class Store implements CoordinatorStore {
       const result = this.db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)')
         .run(Date.now(), sessionKey(sender), input.recipient, input.body, JSON.stringify(input.data ?? null), input.visibility ?? 'private');
       if (!Number.isSafeInteger(result.lastInsertRowid)) throw new RangeError('Message sequence exceeds safe integer range');
+      for (const entity of extractEntities(this.namespace, input.body)) {
+        const existing = this.entityRow.get(entity.id) as EntityRef | undefined;
+        if (existing && (existing.type !== entity.type || existing.label !== entity.label))
+          throw new Error('Entity identity collision');
+        if (!existing) this.insertEntity.run(entity.id, entity.type, entity.label);
+        this.insertMention.run(entity.id, result.lastInsertRowid);
+      }
       return { ok: true, value: this.message(this.messageRow.get(result.lastInsertRowid) as MessageRow) };
     });
+  }
+  entity(id: string, since: number, limit: number): Outcome<EntityHistory> {
+    if (!isEntityId(id) || !id.startsWith(`${this.namespace}:entity:`) || !validCursor(since) || !validLimit(limit))
+      return failure('invalid_request', 'Invalid entity query');
+    this.maintain();
+    const entity = this.entityRow.get(id) as EntityRef | undefined;
+    if (!entity) return failure('not_found', 'Entity is not tracked');
+    const rows = this.db.prepare(`SELECT m.* FROM message_entities e JOIN messages m ON m.id = e.message_id
+      WHERE e.entity_id = ? AND e.message_id > ? ORDER BY e.message_id LIMIT ?`)
+      .all(id, since, limit) as MessageRow[];
+    return { ok: true, value: { entity: { id: entity.id, type: entity.type, label: entity.label },
+      messages: rows.map(row => this.message(row)) } };
   }
   private next(id: string, cursor: number): MessageRow | undefined {
     return this.db.prepare(`SELECT * FROM messages WHERE id > ? AND

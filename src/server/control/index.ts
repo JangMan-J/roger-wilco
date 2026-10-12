@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
-  ROUTES, isMessageInput, isRegistration, isSessionAddress, sessionKey,
+  ROUTES, isEntityId, isMessageInput, isRegistration, isSessionAddress, sessionKey,
   type ControlHandler, type CoordinatorStore, type HostAuthenticator, type Outcome,
 } from '../../protocol/index.ts';
 import { json, readBody } from '../http.ts';
@@ -56,7 +56,7 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
       const match = typeof authorization === 'string' && /^Bearer ([^\s]+)$/.exec(authorization);
       const identity = auth.authenticate(match ? match[1]! : null);
       if (!identity.ok) { json(response, identity); return; }
-      if (url.search && path !== ROUTES.inbox) { json(response, failure('invalid_request', 'Unexpected query')); return; }
+      if (url.search && path !== ROUTES.inbox && path !== ROUTES.entity) { json(response, failure('invalid_request', 'Unexpected query')); return; }
       const host = identity.value;
       if (request.method === 'GET' && path === ROUTES.sessions) {
         json(response, { ok: true, value: store.listSessions() }); return;
@@ -74,6 +74,17 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
           json(response, failure('invalid_request', 'Invalid inbox query')); return;
         }
         json(response, store.inbox(host, session, since, limit)); return;
+      }
+      if (request.method === 'GET' && path === ROUTES.entity) {
+        const params = url.searchParams;
+        const id = params.get('id');
+        const since = parseInteger(params.get('since'), 0, Number.MAX_SAFE_INTEGER);
+        const limit = parseInteger(params.get('limit'), 1, 500);
+        if ([...params.keys()].some(key => !['id', 'since', 'limit'].includes(key)) ||
+            [...params.keys()].some(key => params.getAll(key).length !== 1) || !isEntityId(id) || since === null || limit === null) {
+          json(response, failure('invalid_request', 'Invalid entity query')); return;
+        }
+        json(response, store.entity(id, since, limit)); return;
       }
       const post: string[] = [ROUTES.register, ROUTES.rank, ROUTES.messages, ROUTES.claims, ROUTES.claimRelease];
       if (request.method !== 'POST' || !post.includes(path)) { json(response, failure('not_found', 'Unknown route')); return; }
