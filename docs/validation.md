@@ -1,7 +1,7 @@
 # Extraction verification
 
 The extraction and cutover checks passed.
-Validation results are recorded by revision below.
+Validation results are recorded by revision.
 The recorded 52-test runs preceded the slash-command follow-up, which brought the baseline to 53 tests.
 
 ## Entity revision — 2026-10-12
@@ -17,13 +17,22 @@ Existing message envelopes and SSE size limits remain unchanged.
 The registry indexes new messages only.
 
 Independent review found two parser inconsistencies.
-Unicode line separators could change a typed marker into a generic one.
-Leading control characters could disappear before validation.
+Unicode line separators changed typed markers into generic ones.
+Leading control characters disappeared before validation.
 Both regression cases failed before their fixes and now pass.
 The reviewer confirmed both corrections.
 
-The final local `npm run check` passed all 70 tests without failures or skips.
-Remote full-suite and installation verification is pending.
+Local and remote `npm run check` each passed all 70 tests without failures or skips.
+Both hosts run the runtime source from commit `8a13c20`.
+Production installs passed with no new runtime dependencies.
+The previous package and online SQLite backups remain under `~/.local/share/roger-wilco/before-feedback-8a13c20/` on each host.
+
+The installed cross-host check passed at 22:07 UTC.
+The remote Pi tool resolved a type-255 entity shared by messages `fleet:msg:130` and `fleet:msg:131`.
+Rank assignment, message delivery, idle wake-up, busy follow-up, and session isolation also passed.
+Both installed runtime trees match the committed source.
+The local installation evidence directory contains `entities-local.log`, `entities-remote.log`, and `entities-cross-host.json`.
+Existing Pi sessions need `/reload` to load `roger_entity` and the updated send-tool description.
 
 ## Feedback revision — 2026-10-12
 
