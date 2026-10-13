@@ -53,6 +53,8 @@ export type EntityHistory = { entity: EntityRef; messages: Message[] };
 
 /** Lane A. Every operation that changes registration/cursor/claim state is one SQLite transaction. */
 export interface CoordinatorStore {
+  /** Post-commit replay invalidation; undefined means all connected hosts. */
+  subscribe(listener: (hostId: string | undefined) => void): () => void;
   register(host: HostPrincipal, request: Registration): Outcome<RegistrationResult>;
   /** User-assigned metadata (1=fleet, through 5), not an authority or routing permission. */
   setRank(host: HostPrincipal, session: SessionAddress, rank: number): Outcome<RegistrationResult>;
@@ -70,8 +72,12 @@ export interface CoordinatorStore {
   close(): void;
 }
 
-/** Lane D owns one shared SQLite inbox per host; never an inbound listener. */
+/** Lane D owns one SQLite inbox per host. Runtime adapters use its local socket. */
 export interface HostInbox {
+  /** Commit hints. Runtime adapters must retain hints received during reconciliation. */
+  onChange?(listener: () => void): () => void;
+  /** A local transport grant, invalidated on disconnect. */
+  authority?(): string | undefined;
   /** Commit before returning. Dedup lasts until seven days after Pi ACK; later replay checks Pi's JSONL. */
   receive(frame: StreamFrame): Promise<{ inserted: boolean }>;
   /** One live runtime per session; lease expiration must preserve pending messages. */

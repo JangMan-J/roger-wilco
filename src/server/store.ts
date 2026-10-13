@@ -68,6 +68,7 @@ class Store implements CoordinatorStore {
   private readonly db: DatabaseSync;
   private readonly namespace: string;
   private readonly rotation = new Map<string, string>();
+  private readonly listeners = new Set<(hostId: string | undefined) => void>();
   private nextMaintenance = 0;
   private readonly pendingRows: StatementSync;
   private readonly offer: StatementSync;
@@ -244,11 +245,24 @@ class Store implements CoordinatorStore {
     return { ok: true, value: row };
   }
 
+  subscribe(listener: (hostId: string | undefined) => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+  /** All listeners run. A later throw must not hide an earlier wake. */
+  private notify(hostId: string | undefined): void {
+    let fault: unknown;
+    for (const listener of [...this.listeners]) {
+      try { listener(hostId); }
+      catch (error) { fault ??= error; }
+    }
+    if (fault !== undefined) throw fault;
+  }
   register(host: HostPrincipal, request: Registration): Outcome<RegistrationResult> {
     if (!validHost(host) || !isRegistration(request) || request.session.namespace !== this.namespace)
       return failure('invalid_request', 'Invalid registration');
     this.maintain();
-    return this.transaction(() => {
+    const outcome: Outcome<RegistrationResult> = this.transaction(() => {
       const id = sessionKey(request.session);
       let row = this.session(id);
       if (row && row.host_id !== host.hostId) return failure('owner_conflict', 'Session belongs to another host');
@@ -268,6 +282,8 @@ class Store implements CoordinatorStore {
         this.trackEntities([request.displayName], { kind: 'session', key: id });
       return { ok: true, value: this.registration(this.session(id)!) };
     });
+    if (outcome.ok) this.notify(host.hostId);
+    return outcome;
   }
   setRank(host: HostPrincipal, session: SessionAddress, rank: number): Outcome<RegistrationResult> {
     if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace ||
@@ -302,7 +318,7 @@ class Store implements CoordinatorStore {
     if (!assignment.ok) return assignment;
     if (!isMessageInput(input) || (input.recipient !== '*' && !input.recipient.startsWith(`${this.namespace}:`)))
       return failure('invalid_request', 'Invalid message');
-    return this.transaction(() => {
+    const outcome: Outcome<Message> = this.transaction(() => {
       const result = this.db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)')
         .run(Date.now(), sessionKey(sender), input.recipient, input.body, JSON.stringify(input.data ?? null), input.visibility ?? 'private');
       if (!Number.isSafeInteger(result.lastInsertRowid)) throw new RangeError('Message sequence exceeds safe integer range');
@@ -311,6 +327,8 @@ class Store implements CoordinatorStore {
       }
       return { ok: true, value: this.message(this.messageRow.get(result.lastInsertRowid) as MessageRow) };
     });
+    if (outcome.ok) this.notify(undefined);
+    return outcome;
   }
   entity(id: string, since: number, limit: number): Outcome<EntityHistory> {
     if (!isEntityId(id) || !id.startsWith(`${this.namespace}:entity:`) || !validCursor(since) || !validLimit(limit))
@@ -360,7 +378,7 @@ class Store implements CoordinatorStore {
     if (!validHost(host) || !isReceipt(receipt) || !receipt.subscriptionId.startsWith(`${this.namespace}:`))
       return failure('invalid_request', 'Invalid receipt');
     this.maintain();
-    return this.transaction(() => {
+    const outcome: Outcome<Subscription> = this.transaction(() => {
       const row = this.session(receipt.subscriptionId);
       if (!row) return failure('not_found', 'Subscription does not exist');
       if (row.host_id !== host.hostId) return failure('owner_conflict', 'Subscription belongs to another host');
@@ -382,6 +400,8 @@ class Store implements CoordinatorStore {
       this.db.prepare('UPDATE sessions SET cursor = ?, offered = NULL WHERE id = ?').run(sequence, row.id);
       return { ok: true, value: this.subscription(this.session(row.id)!) };
     });
+    if (outcome.ok) this.notify(host.hostId);
+    return outcome;
   }
   claim(host: HostPrincipal, key: string, owner: string, ttlSeconds: number, note?: string): Outcome<{ claim: Claim; acquired: boolean }> {
     if (!validHost(host) || typeof key !== 'string' || key.length < 1 || key.length > 256 || !isSessionKey(owner) ||

@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createHostInbox } from '../../src/host/index.ts';
+import { listenLocal } from '../../src/host/ipc.ts';
 import rogerWilco, { persistedReceipt } from '../../src/pi/index.ts';
 
 const childFile = fileURLToPath(new URL('./crash-child.mjs', import.meta.url));
@@ -16,17 +17,21 @@ const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
 const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
 const stages = ['before-write', 'after-write-before-fsync', 'after-fsync-before-ack', 'after-ack'];
 
-function receiptEntry(inboxPath, address, id) {
+function receiptState(inboxPath, address, id) {
   const db = new DatabaseSync(inboxPath, { readOnly: true });
   try {
-    return db.prepare('SELECT receipt_entry_id FROM messages WHERE session_key = ? AND message_id = ?')
-      .get(`${address.namespace}:${address.piSessionId}`, id)?.receipt_entry_id;
+    return db.prepare(`SELECT receipt_entry_id, receipt_session_file, acknowledged_at
+      FROM inbox_messages WHERE session_key = ? AND message_id = ?`)
+      .get(`${address.namespace}:${address.piSessionId}`, id);
   } finally { db.close(); }
+}
+function receiptEntry(inboxPath, address, id) {
+  return receiptState(inboxPath, address, id)?.receipt_entry_id;
 }
 function leaseOwner(inboxPath, address) {
   const db = new DatabaseSync(inboxPath, { readOnly: true });
   try {
-    return db.prepare('SELECT runtime_id FROM leases WHERE session_key = ?')
+    return db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?')
       .get(`${address.namespace}:${address.piSessionId}`)?.runtime_id;
   } finally { db.close(); }
 }
@@ -38,46 +43,121 @@ async function until(check, attempts = 300) {
   assert.fail('Expected native Pi delivery/ACK before deadline');
 }
 
-for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes its persistent inbox`, { timeout: 45_000 }, async t => {
+for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes its persistent inbox`, { timeout: 20_000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-crash-'));
   const sessionId = randomUUID();
   const address = { namespace: 'fleet', piSessionId: sessionId };
   const id = 'fleet:msg:1';
   const inboxPath = join(dir, 'inbox.sqlite');
-  const child = fork(childFile, [dir, sessionId, stage], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  const config = { namespace: 'fleet', hostId: 'host-a', credential: 'offline',
+    coordinatorUrl: 'http://127.0.0.1:1', inboxPath };
+  await writeFile(join(dir, 'host.json'), JSON.stringify(config));
+  const inbox = createHostInbox(inboxPath);
+  let local;
+  let child;
+  let exited;
+  let resumeAck;
+  t.after(async () => {
+    child?.kill('SIGKILL');
+    await exited;
+    resumeAck?.();
+    await local?.close();
+    await inbox.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  local = await listenLocal(config, inbox);
+  let checkpoint;
+  let failCheckpoint;
+  const reached = new Promise((resolve, reject) => {
+    checkpoint = resolve;
+    failCheckpoint = reject;
+  });
+  const originalAck = inbox.acknowledgePi;
+  let readyFile;
+  if (stage === 'after-ack') {
+    const gate = new Promise(resolve => { resumeAck = resolve; });
+    inbox.acknowledgePi = async function(session, owner, proof) {
+      try {
+        assert.deepEqual(session, address);
+        assert.equal(proof.messageId, id);
+        assert.equal(proof.piSessionId, sessionId);
+        assert.equal(proof.sessionFile, readyFile);
+        const result = await originalAck.call(this, session, owner, proof);
+        assert.deepEqual(result, { ok: true, value: null });
+        assert.equal(receiptEntry(inboxPath, address, id), proof.entryId);
+        checkpoint({ stage, file: readyFile, proof });
+        // The transaction committed, but no ACK response reaches Pi before death.
+        await gate;
+        return result;
+      } catch (error) {
+        failCheckpoint(error);
+        throw error;
+      }
+    };
+  }
+  child = fork(childFile, [dir, sessionId, stage], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   let stderr = '';
   child.stderr.on('data', data => { stderr += data; });
-  t.after(async () => { child.kill('SIGKILL'); await rm(dir, { recursive: true, force: true }); });
+  child.once('error', failCheckpoint);
+  child.once('exit', (code, signal) => {
+    failCheckpoint(new Error(`Child exited ${code}/${signal}: ${stderr}`));
+  });
+  child.on('message', state => {
+    if (state.stage !== 'ready') {
+      checkpoint(state);
+      return;
+    }
+    void (async () => {
+      assert.equal(readyFile, undefined, 'one ready barrier');
+      readyFile = state.file;
+      assert.ok(leaseOwner(inboxPath, address), 'Pi bound through the daemon before receive');
+      assert.deepEqual(await inbox.receive({
+        type: 'message', subscriptionId: `fleet:${sessionId}`,
+        message: { version: 1, id, sequence: 1, timestamp: Date.now(),
+          sender: 'fleet:550e8400-e29b-41d4-a716-446655440001',
+          recipient: `fleet:${sessionId}`, body: 'offline message',
+          data: null, visibility: 'private' },
+      }), { inserted: true });
+    })().catch(failCheckpoint);
+  });
   let deadline;
   const state = await Promise.race([
-    new Promise((resolve, reject) => {
-      child.once('message', resolve);
-      child.once('exit', (code, signal) => reject(new Error(`Child exited ${code}/${signal}: ${stderr}`)));
-    }),
+    reached,
     new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(`Timed out waiting for ${stage}: ${stderr}`)), 10_000); }),
   ]).finally(() => clearTimeout(deadline));
   assert.equal(state.stage, stage);
-  child.kill('SIGKILL');
-  await new Promise(resolve => child.once('exit', resolve));
-
-  const file = state.file;
+  assert.equal(state.file, readyFile);
   const killedOwner = leaseOwner(inboxPath, address);
   assert.ok(killedOwner);
+  child.kill('SIGKILL');
+  assert.equal((await exited).signal, 'SIGKILL');
+  resumeAck?.();
+  inbox.acknowledgePi = originalAck;
+  await until(() => leaseOwner(inboxPath, address) === undefined);
+
+  const file = state.file;
   const initial = pi.SessionManager.open(file);
   assert.equal(initial.getSessionId(), sessionId);
   const priorEntries = initial.getBranch().filter(e => e.type === 'custom_message' && e.customType === 'roger-wilco' && e.details?.deliveryId === id);
   assert.equal(priorEntries.length, stage === 'before-write' ? 0 : 1);
   assert.equal(receiptEntry(inboxPath, address, id), stage === 'after-ack' ? priorEntries[0].id : null,
     'SIGKILL checkpoint is on the real host ACK boundary');
+  const committed = receiptState(inboxPath, address, id);
+  assert.equal(committed.receipt_session_file, stage === 'after-ack' ? file : null);
+  if (stage === 'after-ack') assert.equal(typeof committed.acknowledged_at, 'number');
+  else assert.equal(committed.acknowledged_at, null);
   if (state.proof) {
     assert.equal(state.proof.messageId, id);
     assert.equal(state.proof.entryId, priorEntries[0].id);
     assert.equal(state.proof.sessionFile, file);
   }
 
-  // Resume immediately, inside the dead owner's real lease window. The extension
-  // must stay alive and reclaim it when the original 30-second expiry arrives.
+  // The same daemon survives Pi's death. Disconnect retires the old grant;
+  // recovery must not wait for its former 30-second expiry.
   const savedConfig = process.env.ROGER_WILCO_CONFIG;
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('Network disabled in crash fixture'); };
   process.env.ROGER_WILCO_CONFIG = join(dir, 'host.json');
   try {
     const modelRuntime = await pi.ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: join(dir, 'models.json') });
@@ -104,23 +184,29 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
     };
     try {
       await session.bindExtensions({});
-      assert.equal(receiptEntry(inboxPath, address, id), stage === 'after-ack' ? priorEntries[0].id : null,
-        'immediate resume must not steal the unexpired lease');
-      await until(() => leaseOwner(inboxPath, address) !== killedOwner, 3500);
+      await until(() => {
+        const owner = leaseOwner(inboxPath, address);
+        return owner !== undefined && owner !== killedOwner;
+      });
       await until(() => typeof receiptEntry(inboxPath, address, id) === 'string');
-      // Even a message already ACKed before SIGKILL must not cause a late retry on the next poll.
-      await new Promise(resolve => setTimeout(resolve, 550));
+      // Exercise another lifecycle reconciliation, not an assumed idle poll.
+      await session.extensionRunner.emit({ type: 'turn_end' });
+      await session.extensionRunner.emit({ type: 'agent_settled', aborted: false });
       assert.equal(turns, stage === 'before-write' ? 1 : 0,
         'only an ID absent from native Pi JSONL is submitted on recovery');
       const recovered = pi.SessionManager.open(file).getBranch()
         .filter(e => e.type === 'custom_message' && e.customType === 'roger-wilco' && e.details?.deliveryId === id);
       assert.equal(recovered.length, 1, 'recovery does not create duplicate Pi entries');
       assert.equal(receiptEntry(inboxPath, address, id), recovered[0].id);
+      assert.equal(receiptState(inboxPath, address, id).receipt_session_file, file);
       if (priorEntries.length) assert.equal(recovered[0].id, priorEntries[0].id);
     } finally {
       await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
       session.dispose();
     }
+    await until(() => leaseOwner(inboxPath, address) === undefined);
+    await local.close();
+    await inbox.close();
     const reopened = createHostInbox(inboxPath);
     try {
       assert.equal((await reopened.bind(address, 'verified-reopen', Date.now())).ok, true);
@@ -128,6 +214,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
       await reopened.release(address, 'verified-reopen');
     } finally { await reopened.close(); }
   } finally {
+    globalThis.fetch = savedFetch;
     if (savedConfig === undefined) delete process.env.ROGER_WILCO_CONFIG;
     else process.env.ROGER_WILCO_CONFIG = savedConfig;
   }

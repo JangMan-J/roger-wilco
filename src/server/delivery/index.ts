@@ -6,20 +6,11 @@ import {
 } from '../../protocol/index.ts';
 import { json, readBody } from '../http.ts';
 
-const POLL_MS = 250;
 const KEEPALIVE_MS = 15_000;
 const WRITE_DEADLINE_MS = 5_000;
 
 function error(code: FailureCode, message: string): Outcome<never> {
   return { ok: false, error: code, message };
-}
-function wait(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise(resolve => {
-    const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
-    const timer = setTimeout(done, ms);
-    signal.addEventListener('abort', done, { once: true });
-  });
 }
 async function write(response: ServerResponse, frame: string, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted || response.destroyed || response.writableEnded) return false;
@@ -31,12 +22,21 @@ async function write(response: ServerResponse, frame: string, signal: AbortSigna
   } catch { return false; }
 }
 
-/** SQLite is the sole replay source. Polling after each read avoids a catch-up/live subscription gap. */
+type Live = {
+  abort: AbortController; response: ServerResponse; inFlight: Map<string, string>;
+  dirty: boolean; waiting?: () => void; wake(): void; done: Promise<void>; resolveDone(): void;
+};
+/** SQLite is the sole replay source. Subscribe before the first pending read. */
 export type StreamHandler = ControlHandler & { close(): Promise<void> };
 export function createStreamHandler(store: CoordinatorStore, auth: HostAuthenticator): StreamHandler {
-  const active = new Map<string, { abort: AbortController; response: ServerResponse; inFlight: Map<string, string>;
-    done: Promise<void>; resolveDone(): void }>();
+  const active = new Map<string, Live>();
   let closed = false;
+  const fail = () => { for (const connection of active.values()) { connection.abort.abort(); connection.response.destroy(); } };
+  const unsubscribe = store.subscribe(hostId => {
+    const targets = hostId === undefined ? [...active.values()] : active.has(hostId) ? [active.get(hostId)!] : [];
+    try { for (const connection of targets) connection.wake(); }
+    catch (problem) { fail(); throw problem; }
+  });
   const handler: ControlHandler = async (request, response) => {
     try {
       if (closed) { json(response, error('temporarily_unavailable', 'Stream handler is closed')); return; }
@@ -57,10 +57,14 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
           json(response, error('invalid_request', message), code); return;
         }
         if (!isReceipt(body)) { json(response, error('invalid_request', 'Invalid receipt')); return; }
-        const result = store.acknowledge(identity.value, body);
+        let result: ReturnType<CoordinatorStore['acknowledge']>;
+        try { result = store.acknowledge(identity.value, body); }
+        catch (problem) { fail(); throw problem; }
         if (result.ok) {
-          const flight = active.get(identity.value.hostId)?.inFlight;
-          if (flight?.get(body.subscriptionId) === body.messageId) flight.delete(body.subscriptionId);
+          const connection = active.get(identity.value.hostId);
+          // Store notify runs before acknowledge returns, so clear flight and wake again.
+          if (connection?.inFlight.get(body.subscriptionId) === body.messageId) connection.inFlight.delete(body.subscriptionId);
+          connection?.wake();
         }
         json(response, result);
         return;
@@ -74,7 +78,10 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
       previous?.response.destroy();
       let resolveDone!: () => void;
       const done = new Promise<void>(resolve => { resolveDone = resolve; });
-      const connection = { abort: new AbortController(), response, inFlight: new Map<string, string>(), done, resolveDone };
+      const connection: Live = {
+        abort: new AbortController(), response, inFlight: new Map(), dirty: true, done, resolveDone,
+        wake() { this.dirty = true; const resume = this.waiting; this.waiting = undefined; resume?.(); },
+      };
       active.set(hostId, connection);
       const { signal } = connection.abort;
       const disconnect = () => connection.abort.abort();
@@ -86,22 +93,41 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
         response.flushHeaders();
         let lastWrite = Date.now();
         while (!signal.aborted) {
-          // Re-read from SQLite on every pass, including after idle and after receipts.
-          const frames: StreamFrame[] = store.pending(identity.value, 500);
-          for (const frame of frames) {
+          if (connection.dirty) {
+            connection.dirty = false;
+            const frames: StreamFrame[] = store.pending(identity.value, 500);
+            let wrote = false;
+            for (const frame of frames) {
+              if (signal.aborted) break;
+              if (connection.inFlight.has(frame.subscriptionId)) continue;
+              connection.inFlight.set(frame.subscriptionId, frame.message.id);
+              const payload = `id: ${frame.message.id}\nevent: message\ndata: ${JSON.stringify(frame)}\n\n`;
+              if (!await write(response, payload, signal)) { connection.abort.abort(); break; }
+              lastWrite = Date.now();
+              wrote = true;
+            }
             if (signal.aborted) break;
-            if (connection.inFlight.has(frame.subscriptionId)) continue;
-            const payload = `id: ${frame.message.id}\nevent: message\ndata: ${JSON.stringify(frame)}\n\n`;
-            connection.inFlight.set(frame.subscriptionId, frame.message.id);
-            if (!await write(response, payload, signal)) { connection.abort.abort(); break; }
-            lastWrite = Date.now();
+            if (wrote && frames.length === 500) connection.dirty = true;
+            if (connection.dirty) continue;
           }
+          await new Promise<void>(resolve => {
+            if (signal.aborted || connection.dirty) { resolve(); return; }
+            const finish = () => {
+              clearTimeout(timer);
+              signal.removeEventListener('abort', finish);
+              if (connection.waiting === finish) connection.waiting = undefined;
+              resolve();
+            };
+            connection.waiting = finish;
+            const timer = setTimeout(finish, Math.max(0, KEEPALIVE_MS - (Date.now() - lastWrite)));
+            signal.addEventListener('abort', finish, { once: true });
+          });
           if (signal.aborted) break;
+          if (connection.dirty) continue;
           if (Date.now() - lastWrite >= KEEPALIVE_MS) {
             if (!await write(response, ': keepalive\n\n', signal)) { connection.abort.abort(); break; }
             lastWrite = Date.now();
           }
-          await wait(POLL_MS, signal);
         }
       } finally {
         response.off('close', disconnect);
@@ -118,6 +144,7 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
   return Object.assign(handler, {
     async close(): Promise<void> {
       closed = true;
+      unsubscribe();
       const connections = [...active.values()];
       for (const connection of connections) {
         connection.abort.abort();

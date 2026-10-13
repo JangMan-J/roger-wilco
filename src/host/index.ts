@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { listenLocal } from './ipc.ts';
 import {
   isRegistration, isSessionAddress, isStreamFrame, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
   type HostConfig, type HostInbox, type Message, type Outcome, type PiReceipt,
@@ -19,16 +20,33 @@ type LeaseRow = { runtime_id: string; expires_at: number };
 type RegistrationRow = { session_key: string; registration_json: string };
 type PendingRow = { message_json: string };
 
-class LocalHostInbox implements HostInbox {
+export class LocalHostInbox implements HostInbox {
   private readonly db: DatabaseSync;
+  private readonly lock: DatabaseSync;
   private closed = false;
   private nextSweepAt = 0;
+  private readonly changes = new Set<(key: string) => void>();
+  private readonly registrationChanges = new Set<() => void>();
+  private readonly faults = new Set<() => void>();
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    // A separate inode provides a crash-released, process-wide singleton lock.
+    // Never unlink it: doing so would allow two independent owners.
+    this.lock = new DatabaseSync(`${path}.lock`);
+    try {
+      this.lock.exec('PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE');
+    } catch (error) { this.lock.close(); throw error; }
     this.db = new DatabaseSync(path);
+    try {
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 1048576');
-    this.db.exec(`
+    this.tx(() => {
+      const version = this.db.prepare('PRAGMA user_version').get()!.user_version;
+      if (version !== 0 && version !== 2) throw new Error(`Unsupported inbox schema version: ${version}`);
+      if (version === 0) {
+        // Old writers remain attached to this inode. Empty read-only views stop
+        // both existing handles and constructors from recreating writer tables.
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         session_key TEXT NOT NULL,
         message_id TEXT NOT NULL,
@@ -49,25 +67,67 @@ class LocalHostInbox implements HostInbox {
         session_key TEXT PRIMARY KEY,
         registration_json TEXT NOT NULL
       );
-    `);
-    this.tx(() => {
+        `);
       const columns = this.db.prepare('PRAGMA table_info(messages)').all();
       if (!columns.some(column => column.name === 'acknowledged_at'))
         this.db.exec('ALTER TABLE messages ADD COLUMN acknowledged_at INTEGER');
       // Give receipts from older versions a full retention window after migration.
       this.db.prepare('UPDATE messages SET acknowledged_at = ? WHERE receipt_entry_id IS NOT NULL AND acknowledged_at IS NULL')
         .run(Date.now());
-      this.db.exec('CREATE INDEX IF NOT EXISTS messages_acknowledged ON messages(acknowledged_at)');
+        this.db.exec(`
+          DROP INDEX IF EXISTS messages_due;
+          DROP INDEX IF EXISTS messages_acknowledged;
+          ALTER TABLE messages RENAME TO inbox_messages;
+          ALTER TABLE leases RENAME TO inbox_leases;
+          ALTER TABLE registrations RENAME TO inbox_registrations;
+          CREATE VIEW messages AS SELECT * FROM inbox_messages WHERE 0;
+          CREATE VIEW leases AS SELECT * FROM inbox_leases WHERE 0;
+          CREATE VIEW registrations AS SELECT * FROM inbox_registrations WHERE 0;
+          CREATE INDEX inbox_messages_due ON inbox_messages(session_key, receipt_entry_id, sequence);
+          CREATE INDEX inbox_messages_acknowledged ON inbox_messages(acknowledged_at);
+          PRAGMA user_version = 2;
+        `);
+      }
+      // Connection grants never survive a daemon restart.
+      this.db.exec('DELETE FROM inbox_leases');
     });
     this.sweep();
+    } catch (error) { this.db.close(); this.lock.close(); throw error; }
   }
 
-  private sweep(): void {
+  onChange(listener: () => void): () => void { return this.subscribe(listener); }
+  subscribe(listener: (key: string) => void): () => void {
+    this.changes.add(listener);
+    return () => this.changes.delete(listener);
+  }
+  onRegistration(listener: () => void): () => void {
+    this.registrationChanges.add(listener);
+    return () => this.registrationChanges.delete(listener);
+  }
+  onFault(listener: () => void): () => void {
+    this.faults.add(listener);
+    return () => this.faults.delete(listener);
+  }
+  private notify<T>(listeners: Set<(value: T) => void>, value: T): void {
+    let fault: unknown;
+    for (const listener of listeners) {
+      try { listener(value); } catch (error) { fault = error; }
+    }
+    if (fault !== undefined) {
+      for (const listener of this.faults) { try { listener(); } catch {} }
+      throw fault;
+    }
+  }
+  private changed(key: string): void {
+    this.notify(this.changes, key);
+  }
+
+  sweep(): void {
     const now = Date.now();
     if (now < this.nextSweepAt) return;
     this.tx(() => {
-      this.db.prepare('DELETE FROM messages WHERE acknowledged_at < ? AND receipt_entry_id IS NOT NULL').run(now - HISTORY_MS);
-      this.db.prepare('DELETE FROM leases WHERE expires_at <= ?').run(now);
+      this.db.prepare('DELETE FROM inbox_messages WHERE acknowledged_at < ? AND receipt_entry_id IS NOT NULL').run(now - HISTORY_MS);
+      this.db.prepare('DELETE FROM inbox_leases WHERE expires_at <= ?').run(now);
     });
     this.nextSweepAt = now + SWEEP_MS;
   }
@@ -86,9 +146,10 @@ class LocalHostInbox implements HostInbox {
 
   async receive(frame: StreamFrame): Promise<{ inserted: boolean }> {
     if (!isStreamFrame(frame)) throw new TypeError('Invalid stream frame');
-    const result = this.db.prepare(`INSERT OR IGNORE INTO messages
+    const result = this.db.prepare(`INSERT OR IGNORE INTO inbox_messages
       (session_key, message_id, sequence, message_json) VALUES (?, ?, ?, ?)`).run(
       frame.subscriptionId, frame.message.id, frame.message.sequence, JSON.stringify(frame.message));
+    if (result.changes === 1) this.changed(frame.subscriptionId);
     return { inserted: result.changes === 1 };
   }
 
@@ -104,12 +165,12 @@ class LocalHostInbox implements HostInbox {
     if (!isSessionAddress(session) || !runtimeId || !Number.isSafeInteger(now) || now < 0) return failure('invalid_request', 'Invalid lease input');
     return this.tx(() => {
       const key = sessionKey(session);
-      const row = this.db.prepare('SELECT runtime_id, expires_at FROM leases WHERE session_key = ?').get(key) as LeaseRow | undefined;
+      const row = this.db.prepare('SELECT runtime_id, expires_at FROM inbox_leases WHERE session_key = ?').get(key) as LeaseRow | undefined;
       if (renew && (!row || row.runtime_id !== runtimeId || row.expires_at <= now)) return failure('owner_conflict', 'Lease no longer owned');
       if (!renew && row && row.expires_at > now && row.runtime_id !== runtimeId) return failure('owner_conflict', 'Session already active');
       // A lease is always bounded by the current clock, even on a repeated bind.
       const expires = now + LEASE_MS;
-      this.db.prepare(`INSERT INTO leases (session_key, runtime_id, expires_at) VALUES (?, ?, ?)
+      this.db.prepare(`INSERT INTO inbox_leases (session_key, runtime_id, expires_at) VALUES (?, ?, ?)
         ON CONFLICT(session_key) DO UPDATE SET runtime_id = excluded.runtime_id, expires_at = excluded.expires_at`)
         .run(key, runtimeId, expires);
       return { ok: true, value: { leaseExpiresAt: expires } };
@@ -118,20 +179,28 @@ class LocalHostInbox implements HostInbox {
 
   async release(session: SessionAddress, runtimeId: string): Promise<void> {
     if (!isSessionAddress(session) || !runtimeId) return;
-    this.db.prepare('DELETE FROM leases WHERE session_key = ? AND runtime_id = ?').run(sessionKey(session), runtimeId);
+    this.db.prepare('DELETE FROM inbox_leases WHERE session_key = ? AND runtime_id = ?').run(sessionKey(session), runtimeId);
   }
 
   private owns(session: SessionAddress, runtimeId: string): boolean {
-    const row = this.db.prepare('SELECT runtime_id, expires_at FROM leases WHERE session_key = ?')
+    const row = this.db.prepare('SELECT runtime_id, expires_at FROM inbox_leases WHERE session_key = ?')
       .get(sessionKey(session)) as LeaseRow | undefined;
     return !!row && row.runtime_id === runtimeId && row.expires_at > Date.now();
   }
 
   async pending(session: SessionAddress, runtimeId: string): Promise<Message[]> {
     if (!isSessionAddress(session) || !runtimeId || !this.owns(session, runtimeId)) return [];
-    const rows = this.db.prepare(`SELECT message_json FROM messages WHERE session_key = ? AND receipt_entry_id IS NULL
+    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages WHERE session_key = ? AND receipt_entry_id IS NULL
       ORDER BY sequence ASC`).all(sessionKey(session)) as PendingRow[];
     return rows.map(row => JSON.parse(row.message_json) as Message);
+  }
+
+  pendingPage(session: SessionAddress, owner: string, afterSequence = 0): Outcome<{ messages: Message[]; more: boolean }> {
+    if (!this.owns(session, owner)) return failure('owner_conflict', 'Session lease is not owned');
+    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages
+      WHERE session_key = ? AND receipt_entry_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 2`)
+      .all(sessionKey(session), afterSequence) as PendingRow[];
+    return { ok: true, value: { messages: rows.slice(0, 1).map(row => JSON.parse(row.message_json)), more: rows.length > 1 } };
   }
 
   async acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>> {
@@ -139,9 +208,10 @@ class LocalHostInbox implements HostInbox {
       typeof proof.messageId !== 'string' || !proof.messageId.startsWith(`${session.namespace}:msg:`) ||
       typeof proof.entryId !== 'string' || !proof.entryId ||
       typeof proof.sessionFile !== 'string' || !proof.sessionFile) return failure('invalid_request', 'Invalid Pi receipt');
-    return this.tx(() => {
+    let changed = false;
+    const result: Outcome<null> = this.tx(() => {
       if (!this.owns(session, runtimeId)) return failure('owner_conflict', 'Session lease is not owned');
-      const row = this.db.prepare(`SELECT message_json, receipt_entry_id, receipt_session_file FROM messages
+      const row = this.db.prepare(`SELECT message_json, receipt_entry_id, receipt_session_file FROM inbox_messages
         WHERE session_key = ? AND message_id = ?`).get(sessionKey(session), proof.messageId) as
         (PendingRow & { receipt_entry_id: string | null; receipt_session_file: string | null }) | undefined;
       if (!row) return failure('not_found', 'Message not in session inbox');
@@ -149,32 +219,37 @@ class LocalHostInbox implements HostInbox {
         return row.receipt_entry_id === proof.entryId && row.receipt_session_file === proof.sessionFile
           ? { ok: true, value: null } : failure('invalid_request', 'Conflicting Pi receipt');
       }
-      this.db.prepare(`UPDATE messages SET receipt_entry_id = ?, receipt_session_file = ?, acknowledged_at = ?
+      this.db.prepare(`UPDATE inbox_messages SET receipt_entry_id = ?, receipt_session_file = ?, acknowledged_at = ?
         WHERE session_key = ? AND message_id = ?`).run(proof.entryId, proof.sessionFile, Date.now(), sessionKey(session), proof.messageId);
+      changed = true;
       return { ok: true, value: null };
     });
+    if (changed) this.changed(sessionKey(session));
+    return result;
   }
 
   async enqueueRegistration(registration: Registration): Promise<void> {
     if (!isRegistration(registration)) throw new TypeError('Invalid registration');
-    this.db.prepare(`INSERT INTO registrations (session_key, registration_json) VALUES (?, ?)
-      ON CONFLICT(session_key) DO UPDATE SET registration_json = excluded.registration_json`)
+    const result = this.db.prepare(`INSERT INTO inbox_registrations (session_key, registration_json) VALUES (?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET registration_json = excluded.registration_json
+      WHERE registration_json <> excluded.registration_json`)
       .run(sessionKey(registration.session), JSON.stringify(registration));
+    if (result.changes) this.notify(this.registrationChanges, undefined);
   }
 
   registrations(): RegistrationRow[] {
     this.sweep();
-    return this.db.prepare('SELECT session_key, registration_json FROM registrations ORDER BY session_key').all() as RegistrationRow[];
+    return this.db.prepare('SELECT session_key, registration_json FROM inbox_registrations ORDER BY session_key').all() as RegistrationRow[];
   }
 
   completeRegistration(row: RegistrationRow): void {
     // A concurrent re-enqueue is not consumed by a response to the earlier request.
-    this.db.prepare('DELETE FROM registrations WHERE session_key = ? AND registration_json = ?')
+    this.db.prepare('DELETE FROM inbox_registrations WHERE session_key = ? AND registration_json = ?')
       .run(row.session_key, row.registration_json);
   }
 
   async close(): Promise<void> {
-    if (!this.closed) { this.closed = true; this.db.close(); }
+    if (!this.closed) { this.closed = true; this.changes.clear(); this.registrationChanges.clear(); this.faults.clear(); this.db.close(); this.lock.close(); }
   }
 }
 
@@ -268,6 +343,13 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
   let controller: AbortController | undefined;
   let loops: Promise<void>[] = [];
   let external: AbortSignal | undefined;
+  let ipc: Awaited<ReturnType<typeof listenLocal>> | undefined;
+  let opening: Promise<Awaited<ReturnType<typeof listenLocal>>> | undefined;
+  let sweepTimer: NodeJS.Timeout | undefined;
+  let unsubscribeRegistration: (() => void) | undefined;
+  let registrationDirty = true;
+  let registrationWake: (() => void) | undefined;
+  const kickRegistrations = () => { registrationDirty = true; registrationWake?.(); };
   const onAbort = () => controller?.abort();
   let lastError = '';
   let lastReport = 0;
@@ -283,6 +365,16 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
   const registrationLoop = async (signal: AbortSignal) => {
     let backoff = RETRY_MIN_MS;
     while (!signal.aborted) {
+      if (!registrationDirty) {
+        await new Promise<void>(resolve => {
+          const done = () => { registrationWake = undefined; signal.removeEventListener('abort', done); resolve(); };
+          registrationWake = done;
+          signal.addEventListener('abort', done, { once: true });
+          if (registrationDirty || signal.aborted) done();
+        });
+      }
+      if (signal.aborted) break;
+      registrationDirty = false;
       try {
         for (const row of inbox.registrations()) {
           if (signal.aborted) break;
@@ -294,11 +386,12 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
           inbox.completeRegistration(row);
         }
         backoff = RETRY_MIN_MS;
-        await delay(500, signal);
       } catch (error) {
         if (!signal.aborted) report(error);
         await delay(backoff, signal);
         backoff = Math.min(backoff * 2, RETRY_MAX_MS);
+        // Retry known failed work, not an empty-queue discovery scan.
+        registrationDirty = true;
       }
     }
   };
@@ -322,6 +415,7 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
           throw new Error(`Stream unavailable: HTTP ${response.status}`);
         }
         armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out');
+        kickRegistrations();
         backoff = RETRY_MIN_MS;
         for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'), report)) {
           await inbox.receive(frame); // transaction commits before receipt is sent
@@ -347,15 +441,27 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
     async start(signal: AbortSignal) {
       if (controller) throw new Error('Host daemon already started');
       controller = new AbortController();
+      const current = controller;
       external = signal;
       signal.addEventListener('abort', onAbort, { once: true });
       if (signal.aborted) controller.abort();
-      loops = [registrationLoop(controller.signal), streamLoop(controller.signal)];
+      unsubscribeRegistration = inbox.onRegistration(kickRegistrations);
+      opening = listenLocal(config, inbox);
+      ipc = await opening;
+      if (current.signal.aborted) { await ipc.close(); return; }
+      sweepTimer = setInterval(() => inbox.sweep(), SWEEP_MS);
+      sweepTimer.unref();
+      registrationDirty = true;
+      loops = [registrationLoop(current.signal), streamLoop(current.signal)];
       await Promise.all(loops);
     },
     async stop() {
       controller?.abort();
+      clearInterval(sweepTimer);
+      await opening?.catch(() => {});
       await Promise.all(loops);
+      await ipc?.close();
+      unsubscribeRegistration?.();
       external?.removeEventListener('abort', onAbort);
       controller = undefined;
       loops = [];

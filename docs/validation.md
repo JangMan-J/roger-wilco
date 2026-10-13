@@ -96,7 +96,7 @@ They do not prove model completion or power-loss durability.
 | Slow and disconnected hosts | Real TCP backpressure and independent-host tests in `test/acceptance/coordinator.test.ts` |
 | Silent stream recovery | Real HTTP tests exercise the 10-second header deadline and 45-second idle deadline |
 | One active Pi owner | Native duplicate-open, stale-read, and lease-expiry tests |
-| Resume after SIGKILL | Four subprocess checkpoints restart immediately and wait for the real lease to expire |
+| Resume after SIGKILL | Four subprocess checkpoints restart through IPC after disconnect retires the old connection grant |
 | Idle wake and busy follow-up | Native Pi tests and physical-host package tests |
 | Aborted busy turn | Signal-aware native regression and four distinguishing mutation probes verify the recovery guards |
 | Fork and switch | Actual Pi runtime `fork()` and `switchSession()` calls in acceptance tests |

@@ -35,7 +35,10 @@ Keep the old messaging path active until isolated acceptance passes.
 Use an absolute path or a `~/` path for each SQLite database.
 Use distinct databases and credentials for the old and new services.
 Keep the coordinator on loopback behind an HTTPS reverse proxy.
-Expose no inbound listener on a host daemon.
+Expose no inbound network listener on a host daemon.
+The daemon provides a local Unix socket at the inbox path plus `.sock`.
+Set the inbox directory mode to `0700`.
+The daemon sets the socket mode to `0600`.
 
 ## Start the services
 
@@ -62,6 +65,54 @@ The host file contains the coordinator URL, host ID, credential, namespace, and 
 The coordinator file maps each host ID to its credential.
 The namespace must match on both sides.
 The daemon and Pi extension must use the same local inbox.
+Only the daemon opens the inbox database.
+Pi connects to its local socket and reconciles committed delivery hints.
+The daemon holds an exclusive SQLite transaction on the adjacent `.lock` file.
+Never unlink that lock file while a daemon runs.
+
+## Upgrade from polling to local push
+
+This upgrade uses the existing Roger-Wilco databases and credentials.
+It does not restore the retired agent-bus service.
+
+1. Run the complete tests, including the legacy-writer fence test.
+2. Run `node deploy/snapshot-current.mjs SNAPSHOT-NAME` on each host.
+3. Keep the snapshot directory private.
+4. Record the source revision of the new package.
+5. Install the tested package on both hosts.
+6. Set each inbox directory mode to `0700`.
+7. Restart the coordinator.
+8. Restart each host daemon.
+9. Reload Pi sessions to load the socket client.
+10. Run the installed two-host acceptance script.
+
+The host migration renames durable tables on the existing database inode.
+Empty read-only views occupy the legacy names.
+Old Pi processes cannot mutate the migrated inbox.
+They require a reload before local delivery resumes.
+Pending messages and queued registrations remain in the database.
+
+### Transport rollback
+
+Rollback requires a package from metadata baseline `edfe56e`.
+That revision preserves the metadata correction but uses the legacy inbox schema.
+Do not restore an earlier coordinator package that keys entity identity by metadata.
+
+1. Stop all Pi runtimes that can open the affected inbox.
+2. Stop the host daemon.
+3. Save another snapshot of the current state.
+4. Run `node deploy/rollback-inbox.ts --legacy-clients-stopped INBOX-PATH`.
+5. Restore the metadata-baseline package.
+6. Start the host daemon.
+7. Start the Pi runtimes.
+8. Verify delivery and retained receipts.
+
+The rollback command preserves current messages, receipts, and registrations in place.
+It clears runtime leases because stopped processes no longer own them.
+The command cannot prove that legacy clients stopped.
+Removing the writer fence before those clients stop permits their old writes again.
+Do not replace the current database with a pre-cutover backup.
+Such replacement discards later messages, receipts, or claims.
 
 ## Inspect
 

@@ -173,3 +173,67 @@ test('message arriving after initial empty poll reaches the stream without recon
   const message = ok(f.store.send(hostA, a, { recipient: sessionKey(b), body: 'live' }));
   assert.equal((await s.next()).message.id, message.id);
 });
+
+test('quiet idle does not reread pending; send and receipt wake the stream', async t => {
+  const f = await fixture(t);
+  ok(f.store.register(hostA, { session: a }));
+  ok(f.store.register(hostA, { session: b }));
+  let reads = 0;
+  const store = new Proxy(f.store, {
+    get(target, property, receiver) {
+      if (property === 'pending') return (host: typeof hostA, limit: number) => { reads += 1; return target.pending(host, limit); };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as CoordinatorStore;
+  const handler = createStreamHandler(store, auth);
+  const server = createServer((req, res) => { void handler(req, res); });
+  t.after(async () => { await handler.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `http://127.0.0.1:${address.port}`;
+  const s = await stream(base);
+  t.after(() => s.cancel());
+  const until = async (ready: () => boolean, label: string) => {
+    const deadline = Date.now() + 200;
+    while (!ready()) {
+      assert.ok(Date.now() < deadline, label);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const idle = async () => {
+    const mark = reads;
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(reads, mark);
+  };
+  await until(() => reads >= 1, 'expected initial replay read');
+  await idle();
+  const first = ok(f.store.send(hostA, a, { recipient: sessionKey(b), body: 'wake' }));
+  assert.equal((await s.next()).message.id, first.id);
+  await idle();
+  const beforeQueued = reads;
+  const second = ok(f.store.send(hostA, a, { recipient: sessionKey(b), body: 'queued' }));
+  await until(() => reads > beforeQueued, 'send did not wake replay');
+  let early: string | undefined;
+  const queued = s.next().then(frame => { early = frame.message.id; return frame; });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(early, undefined);
+  const beforeAck = reads;
+  assert.equal((await receipt(base, 'a', { subscriptionId: sessionKey(b), messageId: first.id })).body.value?.cursor, first.sequence);
+  await until(() => reads > beforeAck, 'receipt did not wake replay');
+  assert.equal((await queued).message.id, second.id);
+});
+
+test('a throwing listener cannot hide a committed wake', async t => {
+  const f = await fixture(t);
+  ok(f.store.register(hostA, { session: a }));
+  ok(f.store.register(hostA, { session: b }));
+  const base = await f.listen();
+  const s = await stream(base);
+  t.after(() => s.cancel());
+  f.store.subscribe(() => { throw new Error('notifier fault'); });
+  const waiting = s.next();
+  assert.throws(() => f.store.send(hostA, a, { recipient: sessionKey(b), body: 'fault' }), /notifier fault/);
+  assert.equal((await waiting).message.body, 'fault');
+});

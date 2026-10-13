@@ -101,11 +101,9 @@ test('host commits before receipt, reconnect replay is idempotent, invalid and o
       assert.deepEqual(JSON.parse(body), { subscriptionId: sessionKey(a), messageId: 'fleet:msg:1' });
       receipts++;
       if (receipts === 1) {
-        const opened = createHostInbox(path);
-        assert.equal((await opened.bind(a, 'inspect', Date.now())).ok, true);
-        firstCommitted = (await opened.pending(a, 'inspect')).length === 1;
-        await opened.release(a, 'inspect');
-        await opened.close();
+        const opened = new DatabaseSync(path, { readOnly: true });
+        firstCommitted = opened.prepare('SELECT count(*) AS n FROM inbox_messages WHERE message_id = ?').get('fleet:msg:1')!.n === 1;
+        opened.close();
         res.writeHead(503).end();
       } else {
         res.setHeader('content-type', 'application/json');
@@ -197,9 +195,10 @@ test('acknowledged inbox history expires after seven days, never pending deliver
   t.after(() => reopened.close());
   const db = new DatabaseSync(path);
   try {
-    assert.deepEqual(db.prepare('SELECT message_id FROM messages ORDER BY sequence').all().map(row => row.message_id),
+    assert.deepEqual(db.prepare('SELECT message_id FROM inbox_messages ORDER BY sequence').all().map(row => row.message_id),
       ['fleet:msg:2', 'fleet:msg:3']);
   } finally { db.close(); }
+  assert.equal((await reopened.bind(a, 'owner', Date.now())).ok, true);
   assert.deepEqual((await reopened.pending(a, 'owner')).map(item => item.id), ['fleet:msg:2']);
   assert.deepEqual(await reopened.receive(frame(3)), { inserted: false }, 'recent dedup survives cleanup');
 });

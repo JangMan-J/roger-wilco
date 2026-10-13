@@ -11,7 +11,6 @@ import {
   type PiReceipt, type SessionAddress, type RegistrationResult, type Claim,
 } from '../protocol/index.ts';
 
-const POLL_MS = 250;
 const RENEW_MS = 1000;
 const REQUEST_MS = 5000;
 const PRESENCE_MS = 90_000;
@@ -80,7 +79,7 @@ function receiptReader() {
 export const persistedReceipt = receiptReader();
 
 /** The caller owns the inbox and releases its lease after stop(). */
-type RuntimeDelivery = PiDelivery & { resumeAfterAbort(): Promise<void>; isBound(): boolean };
+type RuntimeDelivery = PiDelivery & { wake(): void; resumeAfterAbort(): Promise<void>; isBound(): boolean };
 
 export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox: HostInbox,
   session: SessionAddress, runtimeId: string, report: (message: string | undefined) => void = () => {}): RuntimeDelivery {
@@ -91,17 +90,38 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   let renewTimer: NodeJS.Timeout | undefined;
   let renewing: Promise<void> | undefined;
   let running: Promise<void> | undefined;
+  let dirty = false;
+  let retryDelay = 250;
+  let retryAbort = false;
   const submitted = new Set<string>();
   const readReceipt = receiptReader();
   let recoveringAbort = false;
   let missingFileReported = false;
   const active = () => !stopped && ctx.sessionManager.getSessionId().toLowerCase() === session.piSessionId;
   const file = () => ctx.sessionManager.getSessionFile();
+  const authority = () => inbox.authority ? inbox.authority() : runtimeId;
+  const valid = (token: string | undefined) =>
+    active() && bound && token !== undefined && token === authority();
+  const unsubscribe = inbox.onChange?.(() => {
+    if (inbox.authority && authority() === undefined) bound = false;
+    wake();
+  });
 
-  async function receipt(message: Message): Promise<'persisted' | 'absent' | 'unavailable'> {
+  function retry() {
+    if (timer || !active()) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      wake();
+      if (retryAbort) void resumeAfterAbort();
+    }, retryDelay);
+    timer.unref();
+    retryDelay = Math.min(retryDelay * 2, 5000);
+  }
+
+  async function receipt(message: Message, token: string | undefined, path: string | undefined): Promise<'persisted' | 'absent' | 'unavailable'> {
     let proof: PiReceipt | undefined;
     try {
-      proof = await readReceipt(file(), session, message.id);
+      proof = await readReceipt(path, session, message.id);
       if (missingFileReported) report(undefined);
       missingFileReported = false;
     }
@@ -114,64 +134,92 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
       report(`Pi session receipt unavailable: ${String(e)}`);
       return 'unavailable';
     }
+    if (!valid(token) || file() !== path) return 'unavailable';
     if (!proof) return 'absent';
-    if (!active() || file() !== proof.sessionFile) return 'unavailable';
+    if (path !== proof.sessionFile) return 'unavailable';
     const result = await inbox.acknowledgePi(session, runtimeId, proof);
+    if (!valid(token) || file() !== path) return 'unavailable';
     if (!result.ok) { report(`Pi receipt rejected: ${result.message}`); return 'unavailable'; }
     submitted.delete(message.id);
     if (!submitted.size) recoveringAbort = false;
     return 'persisted';
   }
 
-  async function ownsLease(): Promise<boolean> {
-    if (!active() || !bound) return false;
+  async function ownsLease(token = authority()): Promise<boolean> {
+    if (!valid(token)) return false;
     const result = await inbox.renew(session, runtimeId, Date.now());
+    if (!valid(token)) return false;
     if (!result.ok) {
       bound = false;
       report(`Roger-Wilco session owner conflict: ${result.message}`);
       return false;
     }
-    return active() && bound;
+    return valid(token);
   }
 
-  function submit(message: Message) {
-    if (!active() || !file() || submitted.has(message.id)) return;
+  function submit(message: Message, token: string | undefined, path: string | undefined) {
+    if (!valid(token) || !path || file() !== path || submitted.has(message.id)) return;
     submitted.add(message.id);
     try {
       pi.sendMessage({ customType: 'roger-wilco',
         content: JSON.stringify(message),
         display: true, details: { deliveryId: message.id } }, { deliverAs: 'followUp', triggerTurn: true });
-    } catch (e) { submitted.delete(message.id); report(`Pi submission failed: ${String(e)}`); }
+    } catch (e) { submitted.delete(message.id); report(`Pi submission failed: ${String(e)}`); retry(); }
   }
 
   async function pass() {
-    if (!active() || !bound) return;
+    const token = authority();
+    const path = file();
+    if (!valid(token)) return;
     const pending = await inbox.pending(session, runtimeId);
+    if (!valid(token)) return;
+    if (file() !== path) { retry(); return; }
     for (const message of pending) {
-      if (!active()) return;
-      const state = await receipt(message);
-      if (state !== 'absent') continue;
-      if (!file()) { report('Pi session has no persistent file; delivery remains pending'); continue; }
+      if (!valid(token) || file() !== path) return;
+      const state = await receipt(message, token, path);
+      if (state === 'persisted') { dirty = true; continue; }
+      if (state === 'unavailable') { retry(); continue; }
+      if (!path) { report('Pi session has no persistent file; delivery remains pending'); retry(); continue; }
+      if (submitted.has(message.id)) continue;
       // The receipt read is async: a different runtime may have taken this lease meanwhile.
-      if (!(await ownsLease())) return;
-      submit(message);
+      if (!(await ownsLease(token))) return;
+      submit(message, token, path);
     }
   }
   function wake() {
-    if (running || !active()) return;
-    running = pass().catch(e => report(`Roger-Wilco delivery failed: ${String(e)}`)).finally(() => { running = undefined; });
+    if (!active()) return;
+    dirty = true;
+    if (running) return;
+    running = (async () => {
+      while (dirty && active() && bound) {
+        dirty = false;
+        await pass();
+      }
+    })().catch(e => {
+      bound = false;
+      report(`Roger-Wilco delivery failed: ${String(e)}`);
+      retry();
+    }).finally(() => {
+      running = undefined;
+      if (!timer) retryDelay = 250;
+      if (dirty && active() && bound) wake();
+    });
   }
-  return {
-    isBound: () => bound,
-    async resumeAfterAbort() {
+  async function resumeAfterAbort() {
       if (!active() || !bound || !submitted.size || recoveringAbort) return;
+      const token = authority();
+      const path = file();
+      if (!valid(token)) return;
+      retryAbort = false;
       recoveringAbort = true;
       try {
         // The user-input pending count excludes custom follow-ups. A submitted
         // ID may also have been acknowledged by a takeover owner while this
         // runtime was unbound; only wake IDs still pending in this inbox.
         const pending = await inbox.pending(session, runtimeId);
-        if (!pending.some(message => submitted.has(message.id)) || !(await ownsLease()) || !submitted.size) {
+        if (!valid(token) || file() !== path ||
+            !pending.some(message => submitted.has(message.id)) || !(await ownsLease(token)) ||
+            !valid(token) || file() !== path || !submitted.size) {
           recoveringAbort = false;
           return;
         }
@@ -181,34 +229,49 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
           { deliverAs: 'followUp', triggerTurn: true });
       } catch (e) {
         recoveringAbort = false;
+        retryAbort = true;
+        if (inbox.authority && authority() === undefined) bound = false;
         report(`Roger-Wilco abort recovery failed: ${String(e)}`);
+        retry();
       }
-    },
+  }
+  return {
+    wake,
+    isBound: () => valid(authority()),
+    resumeAfterAbort,
     async bind(address, owner) {
       if (sessionKey(address) !== sessionKey(session) || owner !== runtimeId || !active()) return error('Session changed during binding');
-      const lease = await inbox.bind(session, runtimeId, Date.now());
+      if (valid(authority())) return { ok: true, value: null };
+      let lease;
+      try { lease = await inbox.bind(session, runtimeId, Date.now()); }
+      catch (e) { bound = false; return error(`Host unavailable: ${String(e)}`); }
       if (!lease.ok) return lease;
-      if (bound) return { ok: true, value: null };
+      if (!active() || authority() === undefined) return error('Session or connection changed during binding');
       bound = true;
       const path = file();
-      if (path) {
+      if (path && !watcher) {
         try { watcher = watch(dirname(path), { persistent: false }, (_event, name) => {
           if (name === null || name === basename(file() ?? path)) wake();
         }); }
         catch (e) { report(`Session watcher unavailable: ${String(e)}`); }
       }
-      timer = setInterval(wake, POLL_MS);
-      timer.unref();
-      renewTimer = setInterval(() => {
+      renewTimer ??= setInterval(() => {
         if (!active() || renewing) return;
         renewing = (async () => {
           if (bound) await ownsLease();
           else {
             const result = await inbox.bind(session, runtimeId, Date.now());
-            if (result.ok) { bound = true; report(undefined); wake(); }
-            else if (result.error !== 'owner_conflict') report(`Roger-Wilco lease recovery: ${result.message}`);
+            if (result.ok && active() && authority() !== undefined) {
+              bound = true; report(undefined); wake();
+              if (retryAbort) void resumeAfterAbort();
+              await inbox.enqueueRegistration({ session });
+            }
+            else if (!result.ok && result.error !== 'owner_conflict') report(`Roger-Wilco lease recovery: ${result.message}`);
           }
-        })().catch(e => report(`Roger-Wilco lease renewal failed: ${String(e)}`)).finally(() => { renewing = undefined; });
+        })().catch(e => {
+          bound = false;
+          report(`Roger-Wilco lease renewal failed: ${String(e)}`);
+        }).finally(() => { renewing = undefined; });
       }, RENEW_MS);
       renewTimer.unref();
       wake();
@@ -216,8 +279,9 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
     },
     async stop() {
       stopped = true;
+      unsubscribe?.();
       watcher?.close();
-      if (timer) clearInterval(timer);
+      if (timer) clearTimeout(timer);
       if (renewTimer) clearInterval(renewTimer);
       await running;
       await renewing;
@@ -270,21 +334,20 @@ export default function rogerWilco(pi: ExtensionAPI): void {
       const config = await loadPiConfig();
       const session = currentSession(ctx, config.namespace);
       if (!ctx.sessionManager.getSessionFile()) throw new Error('Roger-Wilco requires a persistent Pi session manager');
-      const { createHostInbox } = await import('../host/index.ts');
-      const inbox = createHostInbox(config.inboxPath);
+      const { createHostClient } = await import('../host/client.ts');
+      const inbox = createHostClient(config.inboxPath);
       const runtimeId = randomUUID();
       const delivery = createPiDelivery(pi, ctx, inbox, session, runtimeId, message => status(ctx, message));
       const next: Runtime = { session, runtimeId, inbox, delivery, config, stopped: false };
       try {
         const result = await delivery.bind(session, runtimeId);
-        if (!result.ok && result.error !== 'owner_conflict') {
-          status(ctx, `Roger-Wilco: ${result.error}: ${result.message}`); await inbox.close(); return;
-        }
         runtime = next;
         if (!result.ok) {
           status(ctx, `Roger-Wilco: ${result.error}: ${result.message}; waiting for lease`);
+          let retrying = false;
           next.bindRetry = setInterval(() => {
-            if (runtime !== next || next.stopped) return;
+            if (runtime !== next || next.stopped || retrying) return;
+            retrying = true;
             void serial(async () => {
               if (runtime !== next || next.stopped) return;
               const retry = await delivery.bind(session, runtimeId);
@@ -293,11 +356,14 @@ export default function rogerWilco(pi: ExtensionAPI): void {
                 next.bindRetry = undefined;
                 status(ctx, undefined);
               } else if (retry.error !== 'owner_conflict') status(ctx, `Roger-Wilco: ${retry.error}: ${retry.message}`);
-            }).catch(e => status(ctx, `Roger-Wilco lease recovery: ${String(e)}`));
+              await inbox.enqueueRegistration({ session });
+            }).catch(e => status(ctx, `Roger-Wilco lease recovery: ${String(e)}`))
+              .finally(() => { retrying = false; });
           }, RENEW_MS);
           next.bindRetry.unref();
         }
-        await inbox.enqueueRegistration({ session });
+        await inbox.enqueueRegistration({ session })
+          .catch(e => status(ctx, `Roger-Wilco presence: ${String(e)}`));
         next.heartbeat = setInterval(() => {
           if (runtime !== next || next.stopped) return;
           void inbox.enqueueRegistration({ session }).catch(e => status(ctx, `Roger-Wilco presence: ${String(e)}`));
@@ -318,7 +384,9 @@ export default function rogerWilco(pi: ExtensionAPI): void {
     } catch (e) { status(ctx, `Roger-Wilco unavailable: ${String(e)}`); }
   }));
   pi.on('session_shutdown', (_event, ctx) => serial(async () => { await stop(); status(ctx, undefined); }));
+  pi.on('turn_end', () => { runtime?.delivery.wake(); });
   pi.on('agent_settled', (event) => {
+    runtime?.delivery.wake();
     if (event.aborted) return runtime?.delivery.resumeAfterAbort();
   });
 

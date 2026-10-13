@@ -11,10 +11,10 @@ Shared declarations and validators live in `src/protocol/index.ts`.
 
 The coordinator owns messages, registrations, claims, and cursors.
 The host daemon owns one local SQLite inbox and one outbound SSE stream for all of its sessions.
-The Pi extension uses that inbox.
+The Pi extension accesses that inbox through a private Unix socket.
 It also uses authenticated outbound HTTP.
 
-There is no inbound host server.
+There is no inbound host network server.
 There is no callback URL.
 There is no webhook signing.
 There is no research type.
@@ -45,7 +45,9 @@ Host ID is routing metadata, not an address.
 Provision each host once with `{coordinatorUrl, hostId, credential, inboxPath}`.
 The Pi extension also receives `namespace`.
 Configuration must have no callback URL.
-Configuration must have no inbound listener.
+Configuration must have no inbound network listener.
+The local socket path is `inboxPath` plus `.sock`.
+Its containing directory is private, and its mode is `0600`.
 Runtime paths come from configuration or the home directory.
 Those paths must not hard-code a user's absolute path.
 
@@ -83,6 +85,9 @@ The implemented lease lasts 30 seconds.
 The extension retries a conflicting binding every second.
 
 A stop or a switch releases the old runtime.
+The daemon supplies lease time and binds a fresh random grant to each socket connection.
+Disconnect and daemon restart invalidate the grant.
+Another connection cannot reuse a live grant, even with the same runtime ID.
 Only the addressed session is permitted to consume its own inbox.
 
 ### Errors and limits
@@ -355,7 +360,9 @@ It then reconnects with the capped exponential backoff.
 
 ### Local inbox
 
-`HostInbox` methods in `src/protocol/index.ts` use one durable local SQLite database per host.
+The daemon uses one durable local SQLite database per host.
+`src/host/client.ts` implements the runtime-facing inbox methods through local IPC.
+Only the daemon opens the database and performs schema work.
 The `receive(frame)` transaction deduplicates by the immutable namespaced message ID.
 It records the addressed session.
 
@@ -363,6 +370,10 @@ The local registration queue survives a coordinator outage.
 Startup binding enqueues registration and returns without a wait for HTTP.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
+Committed enqueue, startup, and stream reconnect trigger the worker.
+Identical queued registrations do not generate another write or wake.
+A known failed request receives a bounded retry delay.
+An empty queue has no scan timer.
 
 The host removes local message rows seven days after their Pi ACK.
 It never expires an unacknowledged local message.
@@ -375,7 +386,12 @@ SQLite reuses space after collection but does not shrink its database file.
 Journal size limits reduce retained WAL files after resets.
 Active transactions or readers can keep the WAL above those limits.
 
-`pending` is restricted to the active `(session,runtimeId)` lease.
+`pending` is restricted to the active connection grant and session.
+Bind installs the subscriber before its response.
+The runtime catches up after bind and after committed change notifications.
+Pending pages contain at most one message, with at most 32 messages per client batch.
+Each reconciliation starts from the oldest unacknowledged row.
+The [local contract](migration/local-contract.md) defines framing, bounds, and grant checks.
 When Pi is closed, the host daemon continues to receive.
 It never spawns Pi.
 Lane E is permitted to call coordinator HTTP directly for session-bound tools.
@@ -404,6 +420,7 @@ Lane E fsyncs that file after the record is present.
 
 Lane E must check the current session ID again before the ACK commit.
 Lane E must check the runtime lease again before the ACK commit.
+It also compares the connection grant captured before asynchronous receipt work.
 `HostInbox.acknowledgePi` then commits `PiReceipt`.
 `PiReceipt` contains the entry ID and the session file.
 
@@ -422,6 +439,10 @@ Lane E does not ACK on an I/O failure.
 It reports a status or an error.
 It keeps the message pending.
 It retries on resume or recovery.
+Turn-end and settled events request reconciliation for Roger's trigger-turn follow-ups.
+Filesystem notifications remain advisory.
+The runtime retains notifications received during an active reconciliation.
+There is no periodic idle inbox scan.
 Production sessions require a persistent `SessionManager`.
 In-memory SDK fixtures must switch to a persistent manager.
 A missing file never blocks Pi startup.
@@ -441,16 +462,16 @@ One stage is a kill after the file write and before `fsync`.
 One stage is a kill after `fsync` and before the inbox ACK.
 One stage is a kill after the ACK.
 
-The test reopens the session and the inbox.
+The test reopens the Pi session while the host daemon remains alive.
 The result must be the correct retry or dedup.
 No message moves across session IDs.
 The same lanes must also run tests for idle wake-up, busy follow-up, resume, fork, duplicate owner, and absence of a file.
 
 Native crash tests in `test/pi/crash.test.mjs` kill the actual extension with `SIGKILL`.
 They resume that extension immediately.
-Resume starts while the dead owner's lease is still live.
-The new runtime waits and retries the lease.
-It does not take the unexpired lease.
+Disconnect retires the dead runtime's connection grant.
+The replacement acquires a fresh grant without waiting for the former lease deadline.
+An unrelated live connection still prevents takeover.
 
 `SIGKILL` is not a power-loss test.
 These tests do not prove that unsynced pages survive power loss.
@@ -502,6 +523,8 @@ It serves the fixed HTTP control routes.
 Tests live in `test/delivery/`.
 It serves the stream route and the receipt route.
 One host stream covers all subscribed sessions.
+Store commits and receipts trigger durable replay reads.
+Keepalive writes do not query pending messages.
 This lane does not edit the schema.
 
 ### Lane D
@@ -516,11 +539,11 @@ Lane D is the sole owner of the host schema and the durable local registration q
 `src/pi/index.ts` exports the default `(pi: ExtensionAPI): void` Pi extension.
 The bound runtime implements `PiDelivery`.
 It loads `PiConfig`.
-It opens the lane D inbox.
-On session shutdown it closes that inbox and relinquishes the lease.
+It connects to the lane D socket.
+On session shutdown it closes that connection and relinquishes the lease.
 
 Tests live in `test/pi/`.
-There is no second inbox implementation.
+There is no second local database writer.
 The sender and the claim owner come from the current session context.
 
 ### Lane F

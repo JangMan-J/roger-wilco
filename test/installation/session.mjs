@@ -3,7 +3,7 @@
  * Native Pi subprocess fixture for a provisioned host. Start with:
  *   RW_SESSION_DIR=<directory> ROGER_WILCO_CONFIG=<host.json> node test/installation/session.mjs
  * Optional: PI_PACKAGE_DIR (default ~/pi-main/packages/coding-agent), RW_PACKAGE_DIR (default repo root).
- * One JSON command per stdin line: send {recipient,body,id?}, entity {label,type?,id?}, busy, release, stop.
+ * Commands: send {recipient,body,id?}, entity {label,type?,id?}, busy, wait-queued {deliveryId}, release, stop.
  * Stdout is exclusively NDJSON: ready, send, entity, received, turn, busy, released.
  * `received` is emitted only for a complete custom_message in this session's JSONL.
  */
@@ -156,6 +156,15 @@ async function main() {
           busyWork = session.prompt('Offline busy turn');
           await withTimeout(began, 5000);
           output({ type: 'busy', turns });
+        } else if (command.command === 'wait-queued') {
+          assert.equal(typeof command.deliveryId, 'string');
+          assert.ok(busyWork && release, 'A held busy turn is required');
+          const deadline = Date.now() + 5000;
+          while (!session.agent.peekQueuedMessages().some(message => message.details?.deliveryId === command.deliveryId)) {
+            assert.ok(Date.now() < deadline, 'Busy follow-up did not enter the Pi queue');
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          output({ type: 'queued', deliveryId: command.deliveryId, turns });
         } else if (command.command === 'release') {
           assert.ok(busyWork && release, 'No busy model turn');
           release();

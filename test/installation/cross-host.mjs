@@ -90,20 +90,33 @@ try {
   assert.deepEqual(lookup.result.value.messages.map(message => message.id), [ping.result.value.id, reply.result.value.id]);
   bob.send({ command: 'busy' });
   await bob.wait(e => e.type === 'busy');
-  alice.send({ command: 'send', recipient: b.address, body: 'Physical-host busy follow-up', id: 'busy' });
+  const busyBody = `Physical-host busy follow-up [[153:${entityLabel}]]`;
+  alice.send({ command: 'send', recipient: b.address, body: busyBody, id: 'busy' });
   const sentBusy = await alice.wait(e => e.type === 'send' && e.id === 'busy');
   assert.equal(sentBusy.result.ok, true);
+  bob.send({ command: 'wait-queued', deliveryId: sentBusy.result.value.id });
+  await bob.wait(e => e.type === 'queued' && e.deliveryId === sentBusy.result.value.id);
   bob.send({ command: 'release' });
-  await bob.wait(e => e.type === 'received' && e.id === sentBusy.result.value.id);
+  const gotBusy = await bob.wait(e => e.type === 'received' && e.id === sentBusy.result.value.id);
+  assert.equal(gotBusy.body, busyBody);
   await bob.wait(e => e.type === 'turn' && e.count >= 3);
+  // A lookup with the old integer must neither select a different identity nor
+  // replay that old metadata over the last accepted write.
+  bob.send({ command: 'entity', label: entityLabel, type: 255, id: 'entity-updated' });
+  const updated = await bob.wait(e => e.type === 'entity' && e.id === 'entity-updated');
+  assert.equal(updated.result.ok, true);
+  assert.equal(updated.result.value.entity.id, lookup.result.value.entity.id);
+  assert.equal(updated.result.value.entity.type, 153);
+  assert.deepEqual(updated.result.value.messages.map(message => message.id),
+    [ping.result.value.id, reply.result.value.id, sentBusy.result.value.id]);
   assert.equal(spare.events.some(e => e.type === 'received' || e.type === 'turn'), false, 'Other local session must remain idle');
   report = { checkedAt: new Date().toISOString(), hosts: [config.hostId, remote],
     package: 'roger-wilco@0.1.0', provider: 'synthetic offline model stream',
     sessions: { local: a.address, remote: b.address, isolated: s.address },
     rankedSession: { address: b.address, rank: 3 },
-    entity: lookup.result.value.entity,
+    entityBefore: lookup.result.value.entity, entity: updated.result.value.entity,
     messageIds: [ping.result.value.id, reply.result.value.id, sentBusy.result.value.id],
-    result: 'PASS: auto-registration, cross-host rank metadata and typed entity lookup, directed round trip, idle wake, busy follow-up, same-host isolation' };
+    result: 'PASS: auto-registration, cross-host rank metadata, stable entity identity across metadata changes, directed round trip, idle wake, queued busy follow-up, same-host isolation' };
 } finally {
   for (const instance of children) if (instance.child.exitCode === null) {
     instance.send({ command: 'stop' });

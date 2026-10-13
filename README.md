@@ -88,11 +88,16 @@ A session address combines the coordinator namespace and Pi session UUID.
 Resume keeps that address.
 New and forked sessions receive distinct addresses.
 The local inbox allows one active runtime for each session.
+Only the host daemon opens SQLite.
+The Pi adapter uses a private Unix socket and commit-triggered notifications.
+The coordinator also wakes replay from committed changes, without an idle scan.
 
 The host acknowledges receipt only after its inbox transaction commits.
 The extension acknowledges Pi delivery only after the exact message appears in the current persistent session file and a file synchronization succeeds.
 A crash can leave a recognizable duplicate with the same message ID.
 An acknowledgement does not prove model completion.
+Pi lifecycle events and filesystem hints trigger receipt checks.
+They do not replace the exact file evidence.
 
 The board shows sessions seen within 90 seconds.
 Registrations expire after seven days without a heartbeat.

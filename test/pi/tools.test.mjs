@@ -6,6 +6,8 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import rogerWilco from '../../src/pi/index.ts';
+import { createHostInbox } from '../../src/host/index.ts';
+import { listenLocal } from '../../src/host/ipc.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { nativePi } from '../acceptance/native-pi.ts';
@@ -22,6 +24,11 @@ function context(sessionId, dir) {
   const state = { sessionId, status: undefined };
   return { state, ctx: { sessionManager: { getSessionId: () => state.sessionId, getSessionFile: () => join(dir, `${state.sessionId}.jsonl`) },
     hasUI: true, ui: { setStatus: (_key, value) => { state.status = value; } } } };
+}
+async function hostSocket(t, config) {
+  const inbox = createHostInbox(config.inboxPath);
+  const ipc = await listenLocal(config, inbox);
+  t.after(async () => { await ipc.close(); await inbox.close(); });
 }
 
 test('session-bound tools use the invoking UUID; board includes sessions and claims; duplicate runtime conflicts', async t => {
@@ -55,8 +62,10 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   server.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify({ namespace: 'fleet', hostId: 'host-a',
-    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') }));
+  const hostConfig = { namespace: 'fleet', hostId: 'host-a',
+    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') };
+  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify(hostConfig));
+  await hostSocket(t, hostConfig);
   const first = extension();
   const { state, ctx } = context(id, dir);
   await first.handlers.get('session_start')({}, ctx);
@@ -173,8 +182,10 @@ test('native slash commands show the board without a model turn and report unava
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify({ namespace: 'fleet', hostId: 'host-a',
-    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') }));
+  const hostConfig = { namespace: 'fleet', hostId: 'host-a',
+    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') };
+  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify(hostConfig));
+  await hostSocket(t, hostConfig);
   const native = await nativePi(t, dir, {
     extensions: [resolve(process.env.RW_PACKAGE_DIR ?? '.', 'src/pi/index.ts')],
   });
@@ -252,8 +263,10 @@ test('native rank picker persists another host’s session metadata through the 
   const server = createServer((req, res) => { void handler(req, res); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify({ namespace: 'fleet', hostId: 'host-a',
-    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') }));
+  const hostConfig = { namespace: 'fleet', hostId: 'host-a',
+    credential: 'offline-secret', coordinatorUrl: `http://127.0.0.1:${server.address().port}`, inboxPath: join(dir, 'host.sqlite') };
+  await writeFile(process.env.ROGER_WILCO_CONFIG, JSON.stringify(hostConfig));
+  await hostSocket(t, hostConfig);
   const native = await nativePi(t, dir, { extensions: [resolve(process.env.RW_PACKAGE_DIR ?? '.', 'src/pi/index.ts')] });
   const notices = [];
   native.session.extensionRunner.setUIContext({
