@@ -58,6 +58,50 @@ function receiptReader() {
 /** An exact entry in the current session JSONL is the only Pi submission receipt. */
 export const persistedReceipt = receiptReader();
 
+/** Result of asking whether one message is persisted in a session's current store. */
+export type EvidenceLookup<Evidence> =
+  | { state: 'persisted'; evidence: Evidence }
+  | { state: 'absent' }
+  /** The store does not exist yet; nothing in it can be persisted, so delivery may proceed. */
+  | { state: 'store_missing' };
+
+/**
+ * The delivery-evidence seam: "the message is persisted; here is the evidence."
+ * Only exact, durable evidence read from the current store may be returned as
+ * 'persisted'. Anything indeterminate (concurrent change, unreadable store)
+ * must throw so the caller retries instead of acknowledging.
+ */
+export interface DeliveryEvidence<Evidence> {
+  /** The session's current store identity; undefined while the session has none. */
+  location(): string | undefined;
+  /** Look up exact durable evidence that `messageId` is persisted at `location`. */
+  lookup(location: string | undefined, messageId: string): Promise<EvidenceLookup<Evidence>>;
+  /** True only when `evidence` was taken from `location`. */
+  locatedAt(evidence: Evidence, location: string): boolean;
+  /** Present the evidence to the host as the delivery acknowledgement. */
+  acknowledge(evidence: Evidence): Promise<Outcome<null>>;
+}
+
+/** Pi's evidence: an exact roger-wilco entry in the current session JSONL, verified across fsync. */
+function piSessionFileEvidence(ctx: ExtensionContext, inbox: HostInbox,
+  session: SessionAddress, runtimeId: string): DeliveryEvidence<PiReceipt> {
+  const readReceipt = receiptReader();
+  return {
+    location: () => ctx.sessionManager.getSessionFile(),
+    async lookup(location, messageId) {
+      try {
+        const receipt = await readReceipt(location, session, messageId);
+        return receipt ? { state: 'persisted', evidence: receipt } : { state: 'absent' };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'store_missing' };
+        throw e;
+      }
+    },
+    locatedAt: (receipt, location) => receipt.sessionFile === location,
+    acknowledge: receipt => inbox.acknowledgePi(session, runtimeId, receipt),
+  };
+}
+
 /** The caller owns the inbox and releases its lease after stop(). */
 export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox: HostInbox,
   session: SessionAddress, runtimeId: string, report: (message: string | undefined) => void = () => {}): PiDelivery {
@@ -72,11 +116,11 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   let retryDelay = 250;
   let retryAbort = false;
   const submitted = new Set<string>();
-  const readReceipt = receiptReader();
+  const evidence = piSessionFileEvidence(ctx, inbox, session, runtimeId);
   let recoveringAbort = false;
   let missingFileReported = false;
   const active = () => !stopped && ctx.sessionManager.getSessionId().toLowerCase() === session.piSessionId;
-  const file = () => ctx.sessionManager.getSessionFile();
+  const file = () => evidence.location();
   const authority = () => inbox.authority();
   const valid = (token: string | undefined) =>
     active() && bound && token !== undefined && token === authority();
@@ -97,25 +141,24 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   }
 
   async function receipt(message: Message, token: string | undefined, path: string | undefined): Promise<'persisted' | 'absent' | 'unavailable'> {
-    let proof: PiReceipt | undefined;
-    try {
-      proof = await readReceipt(path, session, message.id);
-      if (missingFileReported) report(undefined);
-      missingFileReported = false;
-    }
+    let found;
+    try { found = await evidence.lookup(path, message.id); }
     catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-        if (!missingFileReported) report('Pi session file is not yet persistent; delivery remains pending');
-        missingFileReported = true;
-        return 'absent'; // Pi may create the file when the first message triggers a turn.
-      }
       report(`Pi session receipt unavailable: ${String(e)}`);
       return 'unavailable';
     }
+    if (found.state === 'store_missing') {
+      if (!missingFileReported) report('Pi session file is not yet persistent; delivery remains pending');
+      missingFileReported = true;
+      return 'absent'; // Pi may create the file when the first message triggers a turn.
+    }
+    if (missingFileReported) report(undefined);
+    missingFileReported = false;
     if (!valid(token) || file() !== path) return 'unavailable';
-    if (!proof) return 'absent';
-    if (path !== proof.sessionFile) return 'unavailable';
-    const result = await inbox.acknowledgePi(session, runtimeId, proof);
+    if (found.state === 'absent') return 'absent';
+    const proof = found.evidence;
+    if (!path || !evidence.locatedAt(proof, path)) return 'unavailable';
+    const result = await evidence.acknowledge(proof);
     if (!valid(token) || file() !== path) return 'unavailable';
     if (!result.ok) { report(`Pi receipt rejected: ${result.message}`); return 'unavailable'; }
     submitted.delete(message.id);

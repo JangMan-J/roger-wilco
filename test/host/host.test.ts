@@ -369,3 +369,27 @@ test('registration queue survives reopen, retries lost response and stops prompt
   await offline.stop(); await offlineRun;
   assert.ok(Date.now() - before < 1000);
 });
+
+test('a non-UUID session has its own lease and inbox; a Pi UUID lease stays on the folded key', async t => {
+  const { inbox } = fixture(t);
+  const agent: SessionAddress = { namespace: 'fleet', piSessionId: 'V1StGXR8_Z5jdHi6B-myT' };
+  const lower: SessionAddress = { namespace: 'fleet', piSessionId: agent.piSessionId.toLowerCase() };
+  const upper = { ...a, piSessionId: a.piSessionId.toUpperCase() };
+  const now = Date.now();
+  assert.equal(sessionKey(upper), sessionKey(a));
+  assert.notEqual(sessionKey(agent), sessionKey(lower));
+  assert.equal((await inbox.bind(agent, 'agent-runtime', now)).ok, true);
+  assert.equal((await inbox.bind(lower, 'lower-runtime', now)).ok, true);
+  assert.equal((await inbox.bind(upper, 'pi-runtime', now)).ok, true);
+  assert.equal((await inbox.bind(a, 'other-pi', now)).ok, false);
+  assert.equal((await inbox.bind(agent, 'other-agent', now)).ok, false);
+  assert.deepEqual(await inbox.receive(frame(1, agent)), { inserted: true });
+  assert.deepEqual(await inbox.receive(frame(2, a)), { inserted: true });
+  assert.deepEqual(await inbox.receive(frame(3, lower)), { inserted: true });
+  assert.deepEqual((await inbox.pending(agent, 'agent-runtime')).map(message => message.id), ['fleet:msg:1']);
+  assert.deepEqual((await inbox.pending(a, 'pi-runtime')).map(message => message.id), ['fleet:msg:2']);
+  assert.deepEqual((await inbox.pending(lower, 'lower-runtime')).map(message => message.id), ['fleet:msg:3']);
+  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'other:tracer-1' }, 'x', now)).ok, false);
+  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'a'.repeat(129) }, 'x', now)).ok, false);
+  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'bad\nid' }, 'x', now)).ok, false);
+});

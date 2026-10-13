@@ -144,7 +144,7 @@ test('rank updates validate principals, addresses, and integer range without mut
     }
     for (const [host, address] of [
       [{ hostId: '' }, a], [null, a], [hostA, null], [hostA, { ...a, namespace: 'other' }],
-      [hostA, { ...a, piSessionId: 'not-a-uuid' }],
+      [hostA, { ...a, piSessionId: 'has:colon' }],
     ] as const) {
       assert.deepEqual(store.setRank(host as typeof hostA, address as SessionAddress, 2), {
         ok: false, error: 'invalid_request', message: 'Invalid rank update',
@@ -599,5 +599,64 @@ test('store validates direct public calls without relying on HTTP', () => {
     assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(a), messageId: 'fleet:msg:1', extra: true } as unknown as Receipt).ok, false);
     assert.throws(() => store.pending(hostA, 0), TypeError);
     assert.throws(() => store.pending(null as unknown as { hostId: string }, 1), TypeError);
+  } finally { store.close(); }
+});
+
+test('a non-UUID session registers beside Pi UUIDs; namespace and host checks stay closed', () => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  try {
+    const agent: SessionAddress = { namespace: 'fleet', piSessionId: 'V1StGXR8_Z5jdHi6B-myT' };
+    const lower: SessionAddress = { namespace: 'fleet', piSessionId: agent.piSessionId.toLowerCase() };
+    const upper = { ...a, piSessionId: a.piSessionId.toUpperCase() };
+    assert.equal(sessionKey(upper), `fleet:${a.piSessionId}`);
+    assert.notEqual(sessionKey(agent), sessionKey(lower));
+    const registered = ok(store.register(hostA, { session: agent, displayName: 'Tracer' }));
+    assert.equal(registered.subscription.id, `fleet:${agent.piSessionId}`);
+    assert.deepEqual(registered.subscription.session, agent);
+    assert.equal(registered.rank, 1);
+    assert.equal(registered.subscription.hostId, hostA.hostId);
+    assert.equal(typeof registered.lastSeenAt, 'number');
+    ok(store.register(hostA, { session: upper }));
+    const pi = store.listSessions().find(row => row.subscription.id === sessionKey(a));
+    assert.equal(pi?.subscription.session.piSessionId, a.piSessionId);
+    assert.equal(store.listSessions().filter(row => row.subscription.id === sessionKey(a)).length, 1);
+    const ranked = ok(store.setRank(hostB, agent, 4));
+    assert.equal(ranked.rank, 4);
+    assert.equal(ranked.lastSeenAt, registered.lastSeenAt);
+    const claimed = ok(store.claim(hostA, 'job', sessionKey(agent), 30, 'watch'));
+    assert.equal(claimed.acquired, true);
+    assert.equal(claimed.claim.owner, sessionKey(agent));
+    const sent = ok(store.send(hostA, a, { recipient: sessionKey(agent), body: 'hello tracer' }));
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.subscriptionId), [sessionKey(agent)]);
+    assert.deepEqual(store.pending(hostB, 10), []);
+    assert.deepEqual(ok(store.inbox(hostA, agent, 0, 10)).map(message => message.body), ['hello tracer']);
+    assert.deepEqual(ok(store.inbox(hostA, a, 0, 10)), []);
+    ok(store.register(hostA, { session: lower }));
+    assert.deepEqual(ok(store.inbox(hostA, lower, 0, 10)), []);
+    const back = ok(store.send(hostA, agent, { recipient: sessionKey(a), body: 'reply' }));
+    const routed = store.pending(hostA, 10);
+    assert.equal(routed.find(frame => frame.subscriptionId === sessionKey(agent))?.message.id, sent.id);
+    assert.equal(routed.find(frame => frame.subscriptionId === sessionKey(a))?.message.id, back.id);
+    const conflict = store.register(hostB, { session: agent });
+    assert.equal(conflict.ok, false);
+    if (!conflict.ok) assert.equal(conflict.error, 'owner_conflict');
+    const foreign = { namespace: 'other', piSessionId: 'tracer-1' };
+    for (const result of [
+      store.register(hostA, { session: foreign }),
+      store.send(hostA, a, { recipient: sessionKey(foreign), body: 'cross' }),
+      store.send(hostA, foreign, { recipient: sessionKey(agent), body: 'cross' }),
+      store.inbox(hostA, foreign, 0, 10),
+      store.setRank(hostA, foreign, 2),
+      store.claim(hostA, 'job', sessionKey(foreign), 30),
+      store.releaseClaim(hostA, 'job', sessionKey(foreign)),
+      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'other:tracer-1' } }),
+      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'a'.repeat(129) } }),
+      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'bad\nid' } }),
+    ]) {
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.error, 'invalid_request');
+    }
+    assert.deepEqual(store.listSessions().map(row => row.subscription.id).sort(), [sessionKey(a), sessionKey(agent), sessionKey(lower)].sort());
+    assert.equal(store.listClaims()[0]?.owner, sessionKey(agent));
   } finally { store.close(); }
 });

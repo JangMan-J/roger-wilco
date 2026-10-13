@@ -5,8 +5,10 @@ const ENTITY_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 export const PROTOCOL_VERSION = 1 as const;
 /** Both raw JSON requests and normalized MessageInput JSON are bounded to 1 MiB. */
 export const MAX_JSON_BYTES = 1024 * 1024;
-/** Reserve space for v1's bounded namespace/UUID, safe-integer metadata, defaults and SSE framing. */
+/** Reserve space for v1's bounded namespace and session id, safe-integer metadata, defaults and SSE framing. */
 export const MAX_STREAM_EVENT_BYTES = MAX_JSON_BYTES + 1024;
+/** Three ids of this length still fit in MAX_STREAM_EVENT_BYTES. */
+export const MAX_SESSION_ID_LENGTH = 128;
 export const ROUTES = {
   health: '/health',
   register: '/v1/sessions/register',
@@ -17,8 +19,9 @@ export const ROUTES = {
   stream: '/v1/hosts/stream', receipt: '/v1/hosts/receipts',
 } as const;
 export type Visibility = 'private' | 'public';
+/** `piSessionId` keeps its name until the contract rename. It is one opaque session id. */
 export type SessionAddress = { namespace: string; piSessionId: string };
-export type SessionKey = string; // `${namespace}:${piSessionId}`, never a display name or host ID
+export type SessionKey = string; // `${namespace}:${canonical session id}`; one colon; never a display name or host ID
 export type DeliveryId = string; // `${namespace}:msg:${positive SQLite message id}`
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type FailureCode = 'invalid_request' | 'unauthorized' | 'unknown_host' | 'not_found' | 'owner_conflict' | 'temporarily_unavailable';
@@ -112,7 +115,9 @@ export interface PiDelivery {
 
 export function sessionKey(address: SessionAddress): SessionKey {
   if (!isSessionAddress(address)) throw new TypeError('Invalid session address');
-  return `${address.namespace}:${address.piSessionId.toLowerCase()}`;
+  // Canonicalize only a Pi UUID shape. Other ids keep the supplied case.
+  const id = PI_SESSION_ID.test(address.piSessionId) ? address.piSessionId.toLowerCase() : address.piSessionId;
+  return `${address.namespace}:${id}`;
 }
 export function deliveryId(namespace: string, sequence: number): DeliveryId {
   if (!isNamespace(namespace) || !Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError('Invalid message identity');
@@ -162,11 +167,22 @@ export function extractEntities(namespace: string, ...values: JsonValue[]): Enti
 export function isNamespace(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z][a-z0-9-]{0,62}$/.test(value);
 }
+/**
+ * One opaque session id: RFC 3986 unreserved characters, 1–128, case preserved.
+ * No colon: keys split on the first colon. Unreserved URL characters, so a query
+ * value cannot smuggle another parameter. ASCII only: Unicode case folding can change length.
+ */
+const SESSION_ID = new RegExp(`^[A-Za-z0-9._~-]{1,${MAX_SESSION_ID_LENGTH}}$`);
+/** Legacy Pi shape. sessionKey folds a match to lowercase. Not a second accepted grammar. Do not tighten this expression. */
+const PI_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isSessionId(value: unknown): value is string {
+  return typeof value === 'string' && SESSION_ID.test(value);
+}
 export function isSessionAddress(value: unknown): value is SessionAddress {
   if (!record(value)) return false;
-  return hasKeys(value, ['namespace', 'piSessionId']) && isNamespace(value.namespace) && typeof value.piSessionId === 'string' &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.piSessionId);
+  return hasKeys(value, ['namespace', 'piSessionId']) && isNamespace(value.namespace) && isSessionId(value.piSessionId);
 }
+/** Canonical key only: a UUID segment is lowercase; any other segment is the supplied spelling. */
 export function isSessionKey(value: unknown): value is SessionKey {
   if (typeof value !== 'string') return false;
   const colon = value.indexOf(':');

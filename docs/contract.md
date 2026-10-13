@@ -27,11 +27,28 @@ Research remains in pi-webtasks.
 
 A session is `{namespace, piSessionId}`.
 The namespace is lowercase.
-The Pi session id is a UUID.
-The address is `namespace:uuid`.
+The field name `piSessionId` stays the same.
+A session id is one opaque token.
+There is not a second grammar for agent ids.
+The token has 1 to 128 characters.
+Each character is an RFC 3986 unreserved character: `A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, or `-`.
+Case is preserved.
+`Tracer-1` and `tracer-1` are different sessions.
+An id can begin with `_` or `-`.
+The id has no colon, space, or control character.
+A colon would make the address split ambiguous.
+These characters are URL-safe, so the inbox query cannot hide another parameter.
+The 128-character limit keeps three session keys inside the stream event limit.
+The address is `namespace:` plus the canonical session id.
 Display names are not routing keys.
 
-A fork or a new session gets a new UUID and a new address.
+One legacy rule remains.
+An id shaped like a Pi UUID is canonicalized to lowercase in `sessionKey`.
+That lowercase address stays byte-identical for an existing Pi session.
+This is canonicalization, not a second accepted grammar.
+A non-UUID id is not case-folded.
+
+A fork or a new Pi session gets a new UUID and a new address.
 Resume retains both the UUID and the address.
 Message IDs are `namespace:msg:<SQLite sequence>`.
 They are safe positive decimal IDs.
@@ -123,7 +140,7 @@ Only finite JSON values are accepted.
 
 A message body must contain 1 to 65536 characters.
 A message sequence must be a safe positive integer.
-A UUID must be valid.
+A session id must be valid.
 A namespace must be valid.
 
 `visibility` is metadata.
