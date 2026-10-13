@@ -108,11 +108,47 @@ Do not restore an earlier coordinator package that keys entity identity by metad
 8. Verify delivery and retained receipts.
 
 The rollback command preserves current messages, receipts, and registrations in place.
+It accepts an inbox at schema 2 or schema 3.
 It clears runtime leases because stopped processes no longer own them.
 The command cannot prove that legacy clients stopped.
 Removing the writer fence before those clients stop permits their old writes again.
 Do not replace the current database with a pre-cutover backup.
 Such replacement discards later messages, receipts, or claims.
+
+## Upgrade to the agent-neutral contract
+
+This upgrade renames the session address field from `piSessionId` to `sessionId`.
+The rename applies to HTTP bodies, the inbox query, and the local socket.
+It also changes the socket `ack` argument to `{token, evidence}`.
+There is no second wire version and no translation of the old field.
+The coordinator database does not change.
+The host daemon migrates its inbox to schema 3 on first open.
+
+Upgrade every component together, in the order of the push upgrade:
+
+1. Run the complete tests.
+2. Run `node deploy/snapshot-current.mjs SNAPSHOT-NAME` on each host.
+3. Install the tested package on every host.
+4. Restart the coordinator.
+5. Restart each host daemon.
+6. Reload Pi sessions and restart other agents.
+7. Run `node deploy/verify-upgrade.mjs SNAPSHOT-NAME` on each host.
+
+Mixed versions fail closed and loudly. They do not lose or acknowledge messages.
+
+- A coordinator rejects the other field name with HTTP 400 `invalid_request`.
+- A host daemon rejects the other shape on `bind`, registration, and `ack`.
+- A Pi session shows the failure in its status line and keeps retrying.
+- A host daemon rejects a coordinator receipt response of the other shape and reconnects.
+- Pending messages and queued registrations stay in the inbox until versions match.
+
+The Pi extension can load from a different checkout than the installed daemon.
+In that case it must be the same revision as the daemon.
+
+To roll back this upgrade, stop the host daemon and its agents.
+Then run `node deploy/rollback-inbox.ts --contract-clients-stopped INBOX-PATH`.
+That returns the inbox to schema 2 and preserves messages, receipts, and queued registrations.
+Restore the previous package on the coordinator and every host.
 
 ## Inspect
 

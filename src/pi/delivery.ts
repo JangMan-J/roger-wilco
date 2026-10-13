@@ -1,106 +1,27 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { watch, type BigIntStats, type FSWatcher } from 'node:fs';
-import { open, stat } from 'node:fs/promises';
+import { watch, type FSWatcher } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import {
   sessionKey,
-  type HostInbox, type Message, type Outcome, type PiDelivery, type PiReceipt, type SessionAddress,
+  type HostInbox, type Message, type Outcome, type SessionAddress,
 } from '../protocol/index.ts';
+import { isPiSession } from './identity.ts';
+import { deliveryEntry, sessionFileEvidence } from './session-file.ts';
+
+export type { EvidenceSource, EvidenceLookup } from './evidence.ts';
+export { persistedReceipt, receiptEvidence, type PiReceipt } from './session-file.ts';
+
+/** Submits a Pi message, then observes the persistent session file. It never acknowledges the void sendMessage call. */
+export interface PiDelivery {
+  bind(session: SessionAddress, runtimeId: string): Promise<Outcome<null>>;
+  stop(): Promise<void>;
+  wake(): void;
+  resumeAfterAbort(): Promise<void>;
+  isBound(): boolean;
+}
 
 const RENEW_MS = 1000;
 const error = (message: string): Extract<Outcome<never>, { ok: false }> => ({ ok: false, error: 'temporarily_unavailable', message });
-
-function sameSnapshot(a: BigIntStats, b: BigIntStats): boolean {
-  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
-}
-
-/** Cache only the receipt index, not JSONL contents, and only while the disk snapshot is unchanged. */
-function receiptReader() {
-  let cached: { file: string; sessionId: string; snapshot: BigIntStats; entries: Map<string, string> } | undefined;
-  return async (file: string | undefined, session: SessionAddress, id: string): Promise<PiReceipt | undefined> => {
-    if (!file) { cached = undefined; return undefined; }
-    const handle = await open(file, 'r');
-    try {
-      const snapshot = await handle.stat({ bigint: true });
-      if (!cached || cached.file !== file || cached.sessionId !== session.piSessionId || !sameSnapshot(cached.snapshot, snapshot)) {
-        cached = undefined;
-        const lines = (await handle.readFile('utf8')).split('\n');
-        lines.pop(); // Ignore an incomplete final JSONL line, including a partial header.
-        const header = JSON.parse(lines.shift() ?? 'null') as { type?: string; id?: string } | null;
-        const entries = new Map<string, string>();
-        if (header?.type === 'session' && header.id?.toLowerCase() === session.piSessionId) {
-          for (const line of lines) {
-            const entry = JSON.parse(line) as { type?: string; id?: string; customType?: string; details?: { deliveryId?: string } };
-            if (entry.type === 'custom_message' && entry.customType === 'roger-wilco' &&
-                typeof entry.details?.deliveryId === 'string' && typeof entry.id === 'string' && entry.id.length &&
-                !entries.has(entry.details.deliveryId)) entries.set(entry.details.deliveryId, entry.id);
-          }
-        }
-        // A concurrent write/replacement is not a coherent receipt snapshot. Retry on the next pass.
-        if (!sameSnapshot(snapshot, await handle.stat({ bigint: true })) || !sameSnapshot(snapshot, await stat(file, { bigint: true }))) {
-          throw new Error('Pi session file changed during receipt scan');
-        }
-        cached = { file, sessionId: session.piSessionId, snapshot, entries };
-      }
-      const entryId = cached.entries.get(id);
-      if (!entryId) return undefined;
-      // Even cached matches must cross the disk+fsync boundary on the currently opened file.
-      await handle.sync();
-      if (!sameSnapshot(snapshot, await handle.stat({ bigint: true })) || !sameSnapshot(snapshot, await stat(file, { bigint: true }))) {
-        cached = undefined;
-        throw new Error('Pi session file changed during receipt sync');
-      }
-      return { messageId: id, piSessionId: session.piSessionId, entryId, sessionFile: file };
-    } finally { await handle.close(); }
-  };
-}
-
-/** An exact entry in the current session JSONL is the only Pi submission receipt. */
-export const persistedReceipt = receiptReader();
-
-/** Result of asking whether one message is persisted in a session's current store. */
-export type EvidenceLookup<Evidence> =
-  | { state: 'persisted'; evidence: Evidence }
-  | { state: 'absent' }
-  /** The store does not exist yet; nothing in it can be persisted, so delivery may proceed. */
-  | { state: 'store_missing' };
-
-/**
- * The delivery-evidence seam: "the message is persisted; here is the evidence."
- * Only exact, durable evidence read from the current store may be returned as
- * 'persisted'. Anything indeterminate (concurrent change, unreadable store)
- * must throw so the caller retries instead of acknowledging.
- */
-export interface DeliveryEvidence<Evidence> {
-  /** The session's current store identity; undefined while the session has none. */
-  location(): string | undefined;
-  /** Look up exact durable evidence that `messageId` is persisted at `location`. */
-  lookup(location: string | undefined, messageId: string): Promise<EvidenceLookup<Evidence>>;
-  /** True only when `evidence` was taken from `location`. */
-  locatedAt(evidence: Evidence, location: string): boolean;
-  /** Present the evidence to the host as the delivery acknowledgement. */
-  acknowledge(evidence: Evidence): Promise<Outcome<null>>;
-}
-
-/** Pi's evidence: an exact roger-wilco entry in the current session JSONL, verified across fsync. */
-function piSessionFileEvidence(ctx: ExtensionContext, inbox: HostInbox,
-  session: SessionAddress, runtimeId: string): DeliveryEvidence<PiReceipt> {
-  const readReceipt = receiptReader();
-  return {
-    location: () => ctx.sessionManager.getSessionFile(),
-    async lookup(location, messageId) {
-      try {
-        const receipt = await readReceipt(location, session, messageId);
-        return receipt ? { state: 'persisted', evidence: receipt } : { state: 'absent' };
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'store_missing' };
-        throw e;
-      }
-    },
-    locatedAt: (receipt, location) => receipt.sessionFile === location,
-    acknowledge: receipt => inbox.acknowledgePi(session, runtimeId, receipt),
-  };
-}
 
 /** The caller owns the inbox and releases its lease after stop(). */
 export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox: HostInbox,
@@ -116,10 +37,10 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   let retryDelay = 250;
   let retryAbort = false;
   const submitted = new Set<string>();
-  const evidence = piSessionFileEvidence(ctx, inbox, session, runtimeId);
+  const evidence = sessionFileEvidence(ctx, inbox, session, runtimeId);
   let recoveringAbort = false;
   let missingFileReported = false;
-  const active = () => !stopped && ctx.sessionManager.getSessionId().toLowerCase() === session.piSessionId;
+  const active = () => !stopped && isPiSession(ctx, session);
   const file = () => evidence.location();
   const authority = () => inbox.authority();
   const valid = (token: string | undefined) =>
@@ -182,9 +103,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
     if (!valid(token) || !path || file() !== path || submitted.has(message.id)) return;
     submitted.add(message.id);
     try {
-      pi.sendMessage({ customType: 'roger-wilco',
-        content: JSON.stringify(message),
-        display: true, details: { deliveryId: message.id } }, { deliverAs: 'followUp', triggerTurn: true });
+      pi.sendMessage(deliveryEntry(message), { deliverAs: 'followUp', triggerTurn: true });
     } catch (e) { submitted.delete(message.id); report(`Pi submission failed: ${String(e)}`); retry(); }
   }
 

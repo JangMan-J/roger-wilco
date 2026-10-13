@@ -61,7 +61,7 @@ const validLimit = (limit: number): boolean => Number.isSafeInteger(limit) && li
 const validCursor = (cursor: number): boolean => Number.isSafeInteger(cursor) && cursor >= 0;
 const addressOf = (key: string): SessionAddress => {
   const index = key.indexOf(':');
-  return { namespace: key.slice(0, index), piSessionId: key.slice(index + 1) };
+  return { namespace: key.slice(0, index), sessionId: key.slice(index + 1) };
 };
 
 class Store implements CoordinatorStore {

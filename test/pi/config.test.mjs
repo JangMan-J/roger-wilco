@@ -13,7 +13,7 @@ import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 import { createHostClient } from '../../src/host/client.ts';
 import rogerWilco, { loadPiConfig } from '../../src/pi/index.ts';
-import { createPiDelivery, persistedReceipt } from '../../src/pi/delivery.ts';
+import { createPiDelivery, persistedReceipt, receiptEvidence } from '../../src/pi/delivery.ts';
 
 async function serve(inboxPath) {
   const inbox = createHostInbox(inboxPath);
@@ -30,7 +30,7 @@ test('a stalled startup bind has at most one scheduled retry', { timeout: 8000 }
   process.env.ROGER_WILCO_CONFIG = configPath;
   await writeFile(configPath, JSON.stringify({ namespace: 'fleet', hostId: 'host-a',
     coordinatorUrl: 'http://127.0.0.1:1', credential: 'offline', inboxPath }));
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
   await inbox.bind(session, 'existing-owner', Date.now());
   let enqueues = 0;
   const enqueue = inbox.enqueueRegistration.bind(inbox);
@@ -38,7 +38,7 @@ test('a stalled startup bind has at most one scheduled retry', { timeout: 8000 }
   const handlers = new Map();
   rogerWilco({ on: (name, handler) => handlers.set(name, handler),
     registerTool() {}, registerCommand() {}, sendMessage() {} });
-  const ctx = { sessionManager: { getSessionId: () => session.piSessionId,
+  const ctx = { sessionManager: { getSessionId: () => session.sessionId,
     getSessionFile: () => join(dir, 'session.jsonl') }, hasUI: false };
   let resume;
   const gate = new Promise(resolve => { resume = resolve; });
@@ -129,15 +129,15 @@ test('~/ host configuration gives Pi and host daemon the same durable inbox', as
 test('a delayed JSONL read cannot submit after another runtime takes the lease', { timeout: 5000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-takeover-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
   const file = join(dir, 'session.jsonl');
-  await writeFile(file, `${JSON.stringify({ type: 'session', id: session.piSessionId })}\n`);
+  await writeFile(file, `${JSON.stringify({ type: 'session', id: session.sessionId })}\n`);
   const inboxPath = join(dir, 'inbox.sqlite');
   const { inbox, server } = await serve(inboxPath);
   const old = createHostClient(inboxPath);
   const fresh = createHostClient(inboxPath);
   const sent = [];
-  const ctx = { sessionManager: { getSessionId: () => session.piSessionId, getSessionFile: () => file }, hasPendingMessages: () => false };
+  const ctx = { sessionManager: { getSessionId: () => session.sessionId, getSessionFile: () => file }, hasPendingMessages: () => false };
   const originalOpen = fsPromises.open;
   let enteredRead;
   const reading = new Promise(resolve => { enteredRead = resolve; });
@@ -160,13 +160,13 @@ test('a delayed JSONL read cannot submit after another runtime takes the lease',
     assert.equal((await delivery.bind(session, 'old-runtime')).ok, true);
     const grant = old.authority();
     assert.equal(typeof grant, 'string');
-    await inbox.receive({ type: 'message', subscriptionId: `fleet:${session.piSessionId}`, message: {
+    await inbox.receive({ type: 'message', subscriptionId: `fleet:${session.sessionId}`, message: {
       version: 1, id: 'fleet:msg:1', sequence: 1, timestamp: Date.now(),
-      sender: `fleet:${randomUUID()}`, recipient: `fleet:${session.piSessionId}`,
+      sender: `fleet:${randomUUID()}`, recipient: `fleet:${session.sessionId}`,
       body: 'takeover', data: null, visibility: 'private',
     } });
     await reading;
-    expireLease(inboxPath, `fleet:${session.piSessionId}`);
+    expireLease(inboxPath, `fleet:${session.sessionId}`);
     assert.equal(old.authority(), grant);
     assert.equal((await fresh.bind(session, 'new-runtime', Date.now())).ok, true);
     assert.equal(old.authority(), grant);
@@ -190,26 +190,26 @@ test('a delayed JSONL read cannot submit after another runtime takes the lease',
 test('a rebound runtime does not wake an ID acknowledged by the takeover owner', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-stale-wake-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
   const file = join(dir, 'old.jsonl');
   const newFile = join(dir, 'new.jsonl');
-  await writeFile(file, `${JSON.stringify({ type: 'session', id: session.piSessionId })}\n`);
+  await writeFile(file, `${JSON.stringify({ type: 'session', id: session.sessionId })}\n`);
   const inboxPath = join(dir, 'inbox.sqlite');
   const { inbox, server } = await serve(inboxPath);
   const old = createHostClient(inboxPath);
   const fresh = createHostClient(inboxPath);
   const sent = [];
-  const ctx = { sessionManager: { getSessionId: () => session.piSessionId, getSessionFile: () => file } };
+  const ctx = { sessionManager: { getSessionId: () => session.sessionId, getSessionFile: () => file } };
   const delivery = createPiDelivery({ sendMessage: message => sent.push(message) }, ctx, old, session, 'old-runtime');
-  const key = `fleet:${session.piSessionId}`;
+  const key = `fleet:${session.sessionId}`;
   try {
     assert.equal((await delivery.bind(session, 'old-runtime')).ok, true);
     const grant = old.authority();
     assert.equal(typeof grant, 'string');
     const message = { version: 1, id: 'fleet:msg:1', sequence: 1, timestamp: Date.now(),
-      sender: `fleet:${randomUUID()}`, recipient: `fleet:${session.piSessionId}`,
+      sender: `fleet:${randomUUID()}`, recipient: `fleet:${session.sessionId}`,
       body: 'acknowledged during takeover', data: null, visibility: 'private' };
-    await inbox.receive({ type: 'message', subscriptionId: `fleet:${session.piSessionId}`, message });
+    await inbox.receive({ type: 'message', subscriptionId: `fleet:${session.sessionId}`, message });
     for (let i = 0; i < 100 && !sent.length; i++) await delay(10);
     assert.equal(sent.filter(m => m.details?.deliveryId === message.id).length, 1);
     expireLease(inboxPath, key);
@@ -222,10 +222,10 @@ test('a rebound runtime does not wake an ID acknowledged by the takeover owner',
     assert.equal(old.authority(), undefined);
     await delivery.resumeAfterAbort();
     const entry = { type: 'custom_message', customType: 'roger-wilco', id: randomUUID(), details: { deliveryId: message.id } };
-    await writeFile(newFile, `${JSON.stringify({ type: 'session', id: session.piSessionId })}\n${JSON.stringify(entry)}\n`);
+    await writeFile(newFile, `${JSON.stringify({ type: 'session', id: session.sessionId })}\n${JSON.stringify(entry)}\n`);
     const proof = await persistedReceipt(newFile, session, message.id);
     assert.ok(proof);
-    assert.equal((await fresh.acknowledgePi(session, 'new-runtime', proof)).ok, true);
+    assert.equal((await fresh.acknowledgeDelivery(session, 'new-runtime', receiptEvidence(session, proof))).ok, true);
     await fresh.release(session, 'new-runtime');
     assert.equal((await delivery.bind(session, 'old-runtime')).ok, true);
     const rebound = old.authority();

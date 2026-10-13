@@ -14,9 +14,9 @@ import { createHostDaemon, createDaemonInbox as createHostInbox } from '../../sr
 import { ROUTES, sessionKey, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const namespace = 'fleet';
-const a = { namespace, piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
-const b = { namespace, piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const c = { namespace, piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const a = { namespace, sessionId: '550e8400-e29b-41d4-a716-446655440000' };
+const b = { namespace, sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const c = { namespace, sessionId: '550e8400-e29b-41d4-a716-446655440002' };
 const tokens: Record<string, string> = { 'host-a': 'token-a', 'host-b': 'token-b' };
 
 async function fixture(t: test.TestContext) {
@@ -153,7 +153,7 @@ test('real HTTP registration, SSE routing, receipt replay and SQLite restart pre
   assert.equal(next.status, 200);
   await until(() => quiet.frames.length > 0, 'live message after catch-up');
   assert.deepEqual(quiet.frames.map(f => f.message.id), [next.result.value.id]);
-  const inbox = await h.request('host-a', `${ROUTES.inbox}?namespace=fleet&piSessionId=${a.piSessionId}&since=0&limit=100`);
+  const inbox = await h.request('host-a', `${ROUTES.inbox}?namespace=fleet&sessionId=${a.sessionId}&since=0&limit=100`);
   assert.deepEqual(inbox.result.value.map((m: { id: string }) => m.id), [historical.result.value.id, one.result.value.id, next.result.value.id]);
 });
 
@@ -266,7 +266,7 @@ test('backpressured real TCP host stream cannot stall another host; close is bou
   await h.register('host-a', a);
   const recipients: SessionAddress[] = [];
   for (let i = 0; i < 96; i++) {
-    const session = { namespace, piSessionId: `550e8400-e29b-41d4-a716-${String(i + 100).padStart(12, '0')}` };
+    const session = { namespace, sessionId: `550e8400-e29b-41d4-a716-${String(i + 100).padStart(12, '0')}` };
     assert.equal((await h.register('host-b', session)).status, 200);
     recipients.push(session);
   }
@@ -326,7 +326,7 @@ test('HTTP auth/invalid envelopes, cross-host ownership, broadcast and competing
   assert.equal((await h.request('host-b', ROUTES.messages, { sender: a, message: { recipient: sessionKey(b), body: 'forged host' } })).status, 409);
   const broadcast = await h.send('host-a', a, '*', 'all other sessions');
   assert.equal(broadcast.status, 200);
-  const inbox = (session: SessionAddress, host: string) => h.request(host, `${ROUTES.inbox}?namespace=fleet&piSessionId=${session.piSessionId}&since=0&limit=100`);
+  const inbox = (session: SessionAddress, host: string) => h.request(host, `${ROUTES.inbox}?namespace=fleet&sessionId=${session.sessionId}&since=0&limit=100`);
   assert.deepEqual((await inbox(a, 'host-a')).result.value, []);
   assert.deepEqual((await inbox(b, 'host-a')).result.value.map((m: { id: string }) => m.id), [broadcast.result.value.id]);
   assert.deepEqual((await inbox(c, 'host-b')).result.value.map((m: { id: string }) => m.id), [broadcast.result.value.id]);

@@ -15,30 +15,33 @@ const backup = new DatabaseSync(join(root, name, 'host.sqlite'), { readOnly: tru
 let report;
 try {
   assert.equal(current.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
-  assert.equal(current.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(current.prepare('PRAGMA user_version').get().user_version, 3);
   for (const table of ['messages', 'leases', 'registrations']) {
     assert.equal(current.prepare('SELECT type FROM sqlite_schema WHERE name = ?').get(table).type, 'view');
     assert.equal(current.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0);
   }
-  const oldTable = backup.prepare('PRAGMA user_version').get().user_version === 2 ? 'inbox_messages' : 'messages';
-  const before = backup.prepare(`SELECT * FROM ${oldTable}`).all();
+  const backupVersion = backup.prepare('PRAGMA user_version').get().user_version;
+  const oldTable = backupVersion >= 2 ? 'inbox_messages' : 'messages';
+  // Schema 3 renamed the evidence columns; values are unchanged.
+  const [oldRecord, oldLocation] = backupVersion >= 3 ? ['evidence_record_id', 'evidence_location'] : ['receipt_entry_id', 'receipt_session_file'];
+  const before = backup.prepare(`SELECT *, ${oldRecord} AS old_record, ${oldLocation} AS old_location FROM ${oldTable}`).all();
   let preserved = 0, expired = 0, pendingBefore = 0;
   for (const row of before) {
-    if (row.receipt_entry_id === null) pendingBefore++;
+    if (row.old_record === null) pendingBefore++;
     const after = current.prepare('SELECT * FROM inbox_messages WHERE session_key = ? AND message_id = ?')
       .get(row.session_key, row.message_id);
-    if (!after && row.receipt_entry_id !== null && typeof row.acknowledged_at === 'number' &&
+    if (!after && row.old_record !== null && typeof row.acknowledged_at === 'number' &&
         row.acknowledged_at < Date.now() - 7 * 86400_000) { expired++; continue; }
     assert.ok(after, `Missing retained delivery ${row.message_id}`);
     for (const key of ['sequence', 'message_json']) assert.equal(after[key], row[key], `Changed ${key} for ${row.message_id}`);
-    if (row.receipt_entry_id !== null) {
-      assert.equal(after.receipt_entry_id, row.receipt_entry_id);
-      assert.equal(after.receipt_session_file, row.receipt_session_file);
+    if (row.old_record !== null) {
+      assert.equal(after.evidence_record_id, row.old_record);
+      assert.equal(after.evidence_location, row.old_location);
     }
     preserved++;
   }
   report = { checkedAt: new Date().toISOString(), hostId: config.hostId, snapshot: name,
-    schema: 2, integrity: 'ok', legacyNames: 'empty read-only views',
+    schema: 3, integrity: 'ok', legacyNames: 'empty read-only views',
     baselineMessages: before.length, pendingBefore, preservedMessages: preserved, expiredAcknowledgedMessages: expired };
 } finally { current.close(); backup.close(); }
 const output = join(root, 'installation-check');

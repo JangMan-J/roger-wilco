@@ -15,12 +15,12 @@ import { createHostDaemon, createDaemonInbox as createHostInbox, LocalHostInbox 
 import { listenLocal } from '../../src/host/ipc.ts';
 import {
   MAX_JSON_BYTES, ROUTES, sessionKey,
-  type HostConfig, type HostInbox, type Message, type Outcome, type PiReceipt, type SessionAddress, type StreamFrame,
+  type HostConfig, type HostInbox, type Message, type Outcome, type DeliveryEvidence, type SessionAddress, type StreamFrame,
 } from '../../src/protocol/index.ts';
 
-const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
-const b: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const c: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
+const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const c: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const registrationSql = 'SELECT count(*) AS n FROM inbox_registrations';
 const leaseSql = 'SELECT count(*) AS n FROM inbox_leases';
@@ -31,8 +31,8 @@ function message(sequence: number, recipient: string, body = `m${sequence}`): Me
 function frame(sequence: number, session: SessionAddress, body?: string): StreamFrame {
   return { type: 'message', subscriptionId: sessionKey(session), message: message(sequence, sessionKey(session), body) };
 }
-function proof(sequence: number, session: SessionAddress): PiReceipt {
-  return { messageId: `fleet:msg:${sequence}`, piSessionId: session.piSessionId, entryId: `e${sequence}`, sessionFile: 's.jsonl' };
+function proof(sequence: number, session: SessionAddress): DeliveryEvidence {
+  return { messageId: `fleet:msg:${sequence}`, sessionId: session.sessionId, recordId: `e${sequence}`, location: 's.jsonl' };
 }
 async function waitFor(check: () => boolean | Promise<boolean>, timeout = 4000): Promise<void> {
   const end = Date.now() + timeout;
@@ -146,8 +146,8 @@ test('catch-up finds a pre-bind commit and a hint during reconciliation, isolate
   assert.deepEqual([...ids].sort(), ['fleet:msg:1', 'fleet:msg:9']);
   assert.equal(rightWakes, 0);
   assert.deepEqual((await right.pending(b, 'rt-b')).map(item => item.id), ['fleet:msg:2']);
-  assert.equal((await left.acknowledgePi(b, 'rt-a', proof(2, b))).ok, false);
-  assert.equal((await right.acknowledgePi(b, 'rt-b', proof(2, b))).ok, true);
+  assert.equal((await left.acknowledgeDelivery(b, 'rt-a', proof(2, b))).ok, false);
+  assert.equal((await right.acknowledgeDelivery(b, 'rt-b', proof(2, b))).ok, true);
   assert.deepEqual(await right.pending(b, 'rt-b'), []);
   assert.ok((await left.pending(a, 'rt-a')).every(item => item.id !== 'fleet:msg:2'));
 });
@@ -170,7 +170,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   await waitFor(async () => await count(path, leaseSql) === 0);
   const raw = await sock(path);
   const calls: Array<[number, string, object]> = [
-    [1, 'renew', { token }], [2, 'pending', { token }], [3, 'ack', { token, proof: proof(1, a) }],
+    [1, 'renew', { token }], [2, 'pending', { token }], [3, 'ack', { token, evidence: proof(1, a) }],
   ];
   for (const [id, method, args] of calls) {
     const waiting = readResult(raw, id);
@@ -190,7 +190,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   ipc = await listenLocal(config, reopened);
   const again = await sock(path);
   const waiting = readResult(again, 1);
-  writeFrame(again, 1, 'ack', { token: retired, proof: proof(1, a) });
+  writeFrame(again, 1, 'ack', { token: retired, evidence: proof(1, a) });
   conflict(await waiting);
   again.destroy();
   const rebound = await clientFor(t, path).bind(a, 'rt-a');
@@ -239,8 +239,8 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
   // 10s through the real daemon; each blocker responds within the POST
   // deadline, so no production timeout changes are needed.
   const blockers: SessionAddress[] = [
-    { namespace: 'fleet', piSessionId: '00000000-0000-4000-8000-000000000000' },
-    { namespace: 'fleet', piSessionId: '11111111-1111-4111-8111-111111111111' },
+    { namespace: 'fleet', sessionId: '00000000-0000-4000-8000-000000000000' },
+    { namespace: 'fleet', sessionId: '11111111-1111-4111-8111-111111111111' },
   ];
   await inbox.enqueueRegistration({ session: blockers[0]! });
   await inbox.enqueueRegistration({ session: blockers[1]! });
@@ -249,7 +249,7 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
       let body = '';
       for await (const chunk of req) body += chunk;
       const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
-      if (blockers.some(item => item.piSessionId === registration.session.piSessionId)) await delay(6_000);
+      if (blockers.some(item => item.sessionId === registration.session.sessionId)) await delay(6_000);
       res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
       return;
     }
@@ -277,7 +277,7 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
     await waitFor(async () => await count(path, registrationSql) === 3);
     assert.equal((await client.renew(b, 'rt-b')).ok, true);
     assert.deepEqual((await client.pending(b, 'rt-b')).map(item => item.id), ['fleet:msg:1']);
-    assert.equal((await client.acknowledgePi(b, 'rt-b', proof(1, b))).ok, true);
+    assert.equal((await client.acknowledgeDelivery(b, 'rt-b', proof(1, b))).ok, true);
     assert.equal(client.authority!(), token, 'same-socket work completes without retiring the lease');
     await delay(Math.max(0, 10_500 - (Date.now() - started)));
     assert.equal(settled, false, 'registration still waits for its own attempt');
@@ -308,7 +308,7 @@ test('a stale snapshotted attempt cannot complete a newer identity request', { t
       let body = '';
       for await (const chunk of req) body += chunk;
       const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
-      if (registration.session.piSessionId === a.piSessionId) { aStarted(); await gateA; }
+      if (registration.session.sessionId === a.sessionId) { aStarted(); await gateA; }
       if (registration.displayName === 'New name') { freshStarted(); await gateFresh; }
       applied.set(sessionKey(registration.session), registration.displayName);
       res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
@@ -477,7 +477,7 @@ test('invalid frames close only their socket, and a slow reader stays bounded', 
   for (const id of [2, 3, 4]) writeFrame(slow, id, 'pending', { token: (grant.value as { token: string }).token });
   await inbox.receive(frame(4, b));
   assert.deepEqual((await healthy.pending(b, 'rt-b')).map(item => item.id), ['fleet:msg:4']);
-  assert.equal((await healthy.acknowledgePi(b, 'rt-b', proof(4, b))).ok, true);
+  assert.equal((await healthy.acknowledgeDelivery(b, 'rt-b', proof(4, b))).ok, true);
   await waitFor(async () => await count(path, `SELECT count(*) AS n FROM inbox_leases WHERE session_key = '${sessionKey(a)}'`) === 0, 8_000);
   slow.destroy();
   const elapsed = Date.now() - started;

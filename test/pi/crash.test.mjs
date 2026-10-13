@@ -21,19 +21,19 @@ const stages = ['before-write', 'after-write-before-fsync', 'after-fsync-before-
 function receiptState(inboxPath, address, id) {
   const db = new DatabaseSync(inboxPath, { readOnly: true });
   try {
-    return db.prepare(`SELECT receipt_entry_id, receipt_session_file, acknowledged_at
+    return db.prepare(`SELECT evidence_record_id, evidence_location, acknowledged_at
       FROM inbox_messages WHERE session_key = ? AND message_id = ?`)
-      .get(`${address.namespace}:${address.piSessionId}`, id);
+      .get(`${address.namespace}:${address.sessionId}`, id);
   } finally { db.close(); }
 }
 function receiptEntry(inboxPath, address, id) {
-  return receiptState(inboxPath, address, id)?.receipt_entry_id;
+  return receiptState(inboxPath, address, id)?.evidence_record_id;
 }
 function leaseOwner(inboxPath, address) {
   const db = new DatabaseSync(inboxPath, { readOnly: true });
   try {
     return db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?')
-      .get(`${address.namespace}:${address.piSessionId}`)?.runtime_id;
+      .get(`${address.namespace}:${address.sessionId}`)?.runtime_id;
   } finally { db.close(); }
 }
 async function until(check, attempts = 300) {
@@ -47,7 +47,7 @@ async function until(check, attempts = 300) {
 for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes its persistent inbox`, { timeout: 20_000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-crash-'));
   const sessionId = randomUUID();
-  const address = { namespace: 'fleet', piSessionId: sessionId };
+  const address = { namespace: 'fleet', sessionId: sessionId };
   const id = 'fleet:msg:1';
   const inboxPath = join(dir, 'inbox.sqlite');
   const config = { namespace: 'fleet', hostId: 'host-a', credential: 'offline',
@@ -73,19 +73,19 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
     checkpoint = resolve;
     failCheckpoint = reject;
   });
-  const originalAck = inbox.acknowledgePi;
+  const originalAck = inbox.acknowledgeDelivery;
   let readyFile;
   if (stage === 'after-ack') {
     const gate = new Promise(resolve => { resumeAck = resolve; });
-    inbox.acknowledgePi = async function(session, owner, proof) {
+    inbox.acknowledgeDelivery = async function(session, owner, proof) {
       try {
         assert.deepEqual(session, address);
         assert.equal(proof.messageId, id);
-        assert.equal(proof.piSessionId, sessionId);
-        assert.equal(proof.sessionFile, readyFile);
+        assert.equal(proof.sessionId, sessionId);
+        assert.equal(proof.location, readyFile);
         const result = await originalAck.call(this, session, owner, proof);
         assert.deepEqual(result, { ok: true, value: null });
-        assert.equal(receiptEntry(inboxPath, address, id), proof.entryId);
+        assert.equal(receiptEntry(inboxPath, address, id), proof.recordId);
         checkpoint({ stage, file: readyFile, proof });
         // The transaction committed, but no ACK response reaches Pi before death.
         await gate;
@@ -134,7 +134,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
   child.kill('SIGKILL');
   assert.equal((await exited).signal, 'SIGKILL');
   resumeAck?.();
-  inbox.acknowledgePi = originalAck;
+  inbox.acknowledgeDelivery = originalAck;
   await until(() => leaseOwner(inboxPath, address) === undefined);
 
   const file = state.file;
@@ -145,13 +145,13 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
   assert.equal(receiptEntry(inboxPath, address, id), stage === 'after-ack' ? priorEntries[0].id : null,
     'SIGKILL checkpoint is on the real host ACK boundary');
   const committed = receiptState(inboxPath, address, id);
-  assert.equal(committed.receipt_session_file, stage === 'after-ack' ? file : null);
+  assert.equal(committed.evidence_location, stage === 'after-ack' ? file : null);
   if (stage === 'after-ack') assert.equal(typeof committed.acknowledged_at, 'number');
   else assert.equal(committed.acknowledged_at, null);
   if (state.proof) {
     assert.equal(state.proof.messageId, id);
-    assert.equal(state.proof.entryId, priorEntries[0].id);
-    assert.equal(state.proof.sessionFile, file);
+    assert.equal(state.proof.recordId, priorEntries[0].id);
+    assert.equal(state.proof.location, file);
   }
 
   // The same daemon survives Pi's death. Disconnect retires the old grant;
@@ -199,7 +199,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
         .filter(e => e.type === 'custom_message' && e.customType === 'roger-wilco' && e.details?.deliveryId === id);
       assert.equal(recovered.length, 1, 'recovery does not create duplicate Pi entries');
       assert.equal(receiptEntry(inboxPath, address, id), recovered[0].id);
-      assert.equal(receiptState(inboxPath, address, id).receipt_session_file, file);
+      assert.equal(receiptState(inboxPath, address, id).evidence_location, file);
       if (priorEntries.length) assert.equal(recovered[0].id, priorEntries[0].id);
     } finally {
       await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
@@ -224,9 +224,9 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
 test('only complete JSONL entries count; a malformed committed line never ACKs', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-jsonl-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
   const file = join(dir, 'session.jsonl');
-  const header = JSON.stringify({ type: 'session', version: 3, id: session.piSessionId, timestamp: new Date().toISOString(), cwd: dir });
+  const header = JSON.stringify({ type: 'session', version: 3, id: session.sessionId, timestamp: new Date().toISOString(), cwd: dir });
   const entry = JSON.stringify({ type: 'custom_message', id: 'a0b1c2d3', details: { deliveryId: 'fleet:msg:1' }, customType: 'roger-wilco' });
   await writeFile(file, `${header}\n${entry}\n{"type":"custom_message"`);
   assert.equal((await persistedReceipt(file, session, 'fleet:msg:1')).entryId, 'a0b1c2d3');
@@ -237,9 +237,9 @@ test('only complete JSONL entries count; a malformed committed line never ACKs',
 test('a receipt from another persistent Pi session is not accepted for this session', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'rw-isolation-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const own = { namespace: 'fleet', piSessionId: randomUUID() };
-  const other = { namespace: 'fleet', piSessionId: randomUUID() };
+  const own = { namespace: 'fleet', sessionId: randomUUID() };
+  const other = { namespace: 'fleet', sessionId: randomUUID() };
   const file = join(dir, 'other.jsonl');
-  await writeFile(file, `${JSON.stringify({ type: 'session', version: 3, id: other.piSessionId, timestamp: new Date().toISOString(), cwd: dir })}\n${JSON.stringify({ type: 'custom_message', id: 'a0b1c2d3', parentId: null, timestamp: new Date().toISOString(), customType: 'roger-wilco', content: 'wrong session', display: true, details: { deliveryId: 'fleet:msg:1' } })}\n`);
+  await writeFile(file, `${JSON.stringify({ type: 'session', version: 3, id: other.sessionId, timestamp: new Date().toISOString(), cwd: dir })}\n${JSON.stringify({ type: 'custom_message', id: 'a0b1c2d3', parentId: null, timestamp: new Date().toISOString(), customType: 'roger-wilco', content: 'wrong session', display: true, details: { deliveryId: 'fleet:msg:1' } })}\n`);
   assert.equal(await persistedReceipt(file, own, 'fleet:msg:1'), undefined);
 });

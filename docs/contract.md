@@ -9,6 +9,10 @@ The full check passes on both Node 24.21.0 and Node 26.11.1.
 The runtime uses `node:sqlite` and `DatabaseSync`.
 Runtime code does not import a reference project.
 Shared declarations and validators live in `src/protocol/index.ts`.
+The core is `src/protocol/`, `src/server/`, and `src/host/`.
+It names no agent adapter.
+Adapters are in-repo and attach through `HostInbox` and the HTTP routes.
+The Pi adapter is in `src/pi/`, and the tracer agent is in `src/agent/`.
 
 The coordinator owns messages, registrations, claims, and cursors.
 The host daemon owns one local SQLite inbox and one outbound SSE stream for all of its sessions.
@@ -25,9 +29,11 @@ Research remains in pi-webtasks.
 
 ### Sessions and addresses
 
-A session is `{namespace, piSessionId}`.
+A session is `{namespace, sessionId}`.
 The namespace is lowercase.
-The field name `piSessionId` stays the same.
+The field was named `piSessionId` before the agent-neutral contract.
+That name is rejected, not translated, on every wire and socket surface.
+Agent adapters translate their own session identity at their edge.
 A session id is one opaque token.
 There is not a second grammar for agent ids.
 The token has 1 to 128 characters.
@@ -43,7 +49,8 @@ The address is `namespace:` plus the canonical session id.
 Display names are not routing keys.
 
 One legacy rule remains.
-An id shaped like a Pi UUID is canonicalized to lowercase in `sessionKey`.
+An id shaped like a UUID is canonicalized to lowercase in `sessionKey`.
+Pi session IDs have this shape.
 That lowercase address stays byte-identical for an existing Pi session.
 This is canonicalization, not a second accepted grammar.
 A non-UUID id is not case-folded.
@@ -164,7 +171,7 @@ The coordinator HTTP entry handles these fixed paths.
 | `GET /v1/sessions` | none | Registered sessions and host assignment. No active Pi session is required. |
 | `GET /v1/claims` | none | Active work claims. Expired claims are removed. |
 | `POST /v1/messages` | `{sender: SessionAddress, message: MessageInput}` | `Message`. The server checks the sender host assignment and the same namespace. It checks the envelope. It rejects an invalid envelope. It persists the message before success. Broadcast recipient `*` excludes the sender at delivery. |
-| `GET /v1/inbox?namespace=...&piSessionId=...&since=0&limit=100` | explicit historical query | Ordered messages for the session. The host assignment is checked. A caller can query messages from before registration. Those messages do not generate historical automatic wake-ups. |
+| `GET /v1/inbox?namespace=...&sessionId=...&since=0&limit=100` | explicit historical query | Ordered messages for the session. The host assignment is checked. A caller can query messages from before registration. Those messages do not generate historical automatic wake-ups. |
 | `GET /v1/entities?id=...&since=0&limit=100` | entity ID and message pagination | `{entity:{id,type,label},messages:Message[]}`. Retained mentions in sequence order. Unknown IDs return 404. |
 | `POST /v1/claims` | `{key,owner:SessionAddress,ttlSeconds,note?}` | `{claim,acquired}`. A positive `ttlSeconds` value expires after that many seconds. Zero means no expiry. Acquire, renew, and takeover of an expired claim are atomic. Release is owner-only. |
 | `POST /v1/claims/release` | `{key,owner:SessionAddress}` | A boolean. Release is owner-only. |
@@ -307,19 +314,19 @@ Rollback requires the pre-upgrade database backup, not an older binary on the mi
 Registration request:
 
 ```json
-{"session":{"namespace":"fleet","piSessionId":"550e8400-e29b-41d4-a716-446655440000"},"displayName":"Alice"}
+{"session":{"namespace":"fleet","sessionId":"550e8400-e29b-41d4-a716-446655440000"},"displayName":"Alice"}
 ```
 
 Successful registration value:
 
 ```json
-{"subscription":{"id":"fleet:550e8400-e29b-41d4-a716-446655440000","session":{"namespace":"fleet","piSessionId":"550e8400-e29b-41d4-a716-446655440000"},"hostId":"host-a","cursor":0},"rank":1}
+{"subscription":{"id":"fleet:550e8400-e29b-41d4-a716-446655440000","session":{"namespace":"fleet","sessionId":"550e8400-e29b-41d4-a716-446655440000"},"hostId":"host-a","cursor":0},"rank":1}
 ```
 
 `POST /v1/messages` body:
 
 ```json
-{"sender":{"namespace":"fleet","piSessionId":"550e8400-e29b-41d4-a716-446655440001"},"message":{"recipient":"fleet:550e8400-e29b-41d4-a716-446655440000","body":"Please read the update.","visibility":"private"}}
+{"sender":{"namespace":"fleet","sessionId":"550e8400-e29b-41d4-a716-446655440001"},"message":{"recipient":"fleet:550e8400-e29b-41d4-a716-446655440000","body":"Please read the update.","visibility":"private"}}
 ```
 
 SSE frame:
@@ -381,6 +388,28 @@ It then reconnects with the capped exponential backoff.
 The daemon uses one durable local SQLite database per host.
 `src/host/client.ts` implements the runtime-facing inbox methods through local IPC.
 Only the daemon opens the database and performs schema work.
+The current inbox schema is version 3.
+Version 3 renames the evidence columns to `evidence_record_id` and `evidence_location`.
+It also rewrites queued registration JSON from `piSessionId` to `sessionId`.
+Session keys, messages, cursors, and stored evidence values do not change.
+The legacy `messages` view keeps its old column names.
+The migration runs in one transaction when a daemon first opens a version 0 or version 2 file.
+An older daemon fails closed on a version 3 file with `Unsupported inbox schema version: 3`.
+`node deploy/rollback-inbox.ts --contract-clients-stopped INBOX-PATH` returns a stopped inbox to version 2.
+
+### Delivery evidence
+
+An adapter acknowledges a local delivery with `DeliveryEvidence`.
+Its fields are `{messageId, sessionId, recordId, location}`.
+The `location` names the session's own durable store.
+The `recordId` names the record for that message inside the store.
+The adapter observes that record durably before it acknowledges.
+The socket method is `ack` with `{token, evidence}`.
+The host checks the lease, the session id, and the message namespace.
+A repeated acknowledgement must present the same record and location.
+Other evidence is rejected as `Conflicting delivery evidence`.
+The Pi adapter uses a session JSONL entry and its file.
+The tracer agent uses a record ID in its own append-only evidence file.
 The `receive(frame)` transaction deduplicates by the immutable namespaced message ID.
 It records the addressed session.
 
@@ -442,8 +471,12 @@ Lane E fsyncs that file after the record is present.
 Lane E must check the current session ID again before the ACK commit.
 Lane E must check the runtime lease again before the ACK commit.
 It also compares the connection grant captured before asynchronous receipt work.
-`HostInbox.acknowledgePi` then commits `PiReceipt`.
-`PiReceipt` contains the entry ID and the session file.
+`HostInbox.acknowledgeDelivery` then commits the core `DeliveryEvidence`.
+The Pi adapter keeps its own `PiReceipt`, the entry ID and the session file.
+At its edge it presents that receipt as `{messageId, sessionId, recordId, location}`.
+The entry ID is the `recordId`, and the session file is the `location`.
+The host stores both values and compares them on a repeated acknowledgement.
+It never interprets them.
 
 After a restart, replay first scans the reopened current session file for exact IDs.
 It ACKs IDs that are already in that file.

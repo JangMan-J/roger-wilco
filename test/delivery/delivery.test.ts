@@ -8,9 +8,9 @@ import { createStreamHandler } from '../../src/server/delivery/index.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { sessionKey, type CoordinatorStore, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
-const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const b: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
-const c: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440003' };
+const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const c: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440003' };
 const hostA = { hostId: 'host-a' };
 const hostB = { hostId: 'host-b' };
 const auth = { authenticate(token: string | null) {

@@ -19,8 +19,8 @@ export const ROUTES = {
   stream: '/v1/hosts/stream', receipt: '/v1/hosts/receipts',
 } as const;
 export type Visibility = 'private' | 'public';
-/** `piSessionId` keeps its name until the contract rename. It is one opaque session id. */
-export type SessionAddress = { namespace: string; piSessionId: string };
+/** `sessionId` is one opaque session id. */
+export type SessionAddress = { namespace: string; sessionId: string };
 export type SessionKey = string; // `${namespace}:${canonical session id}`; one colon; never a display name or host ID
 export type DeliveryId = string; // `${namespace}:msg:${positive SQLite message id}`
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -44,10 +44,14 @@ export type RegistrationResult = { subscription: Subscription; rank: number; dis
 export type Claim = { key: string; owner: SessionKey; note: string | null; claimedAt: number; expiresAt: number | null; entities?: EntityRef[] };
 export type HostPrincipal = { hostId: string }; // resolved from bearer credential, never from request body
 export type HostConfig = { coordinatorUrl: string; hostId: string; credential: string; inboxPath: string };
-export type PiConfig = HostConfig & { namespace: string }; // same trusted host credential; sender always bound Pi session
 export type Receipt = { subscriptionId: SessionKey; messageId: DeliveryId };
 export type StreamFrame = { type: 'message'; subscriptionId: SessionKey; message: Message };
-export type PiReceipt = { messageId: DeliveryId; piSessionId: string; entryId: string; sessionFile: string };
+/**
+ * Adapter-supplied evidence that one message is durably persisted in the session's own store.
+ * `recordId` names the record inside that store; `location` names the store. The host compares
+ * both on a repeated acknowledgement and never interprets them.
+ */
+export type DeliveryEvidence = { messageId: DeliveryId; sessionId: string; recordId: string; location: string };
 /** `type` is the legacy field name for opaque integer metadata, never identity or authority. */
 export type EntityRef = { id: string; type: number; label: string };
 /** An absent integer references the entity without changing its metadata. */
@@ -75,7 +79,7 @@ export interface CoordinatorStore {
   close(): void;
 }
 
-/** Pi-facing socket adapter. The daemon's SQLite inbox is a separate module and does not implement this. */
+/** Adapter-facing socket client. The daemon's SQLite inbox is a separate module and does not implement this. */
 export interface HostInbox {
   /** Commit hints. The adapter retains hints that arrive during reconciliation. */
   onChange(listener: () => void): () => void;
@@ -87,9 +91,9 @@ export interface HostInbox {
   release(session: SessionAddress, runtimeId: string): Promise<void>;
   /** At most one bounded page batch. The daemon stores the full pending set. */
   pending(session: SessionAddress, runtimeId: string): Promise<Message[]>;
-  /** Only after exact JSONL entry observed and file fsynced by lane E; identity is retained. */
-  acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>>;
-  /** Durable local registration queue: unavailable coordinator must not block Pi startup. */
+  /** Only after the adapter observed the exact durable record in the session's current store; evidence is retained. */
+  acknowledgeDelivery(session: SessionAddress, runtimeId: string, evidence: DeliveryEvidence): Promise<Outcome<null>>;
+  /** Durable local registration queue: an unavailable coordinator must not block agent startup. */
   enqueueRegistration(registration: Registration): Promise<void>;
   /** Wait until the daemon finishes this registration attempt. Startup does not use this. */
   awaitRegistration(registration: Registration): Promise<Outcome<RegistrationResult>>;
@@ -104,19 +108,11 @@ export type ControlHandler = (request: import('node:http').IncomingMessage, resp
 export interface HostAuthenticator {
   authenticate(bearer: string | null): Outcome<HostPrincipal>;
 }
-/** Lane E submits a Pi message, then observes the persistent session file. It never acknowledges the void sendMessage call. */
-export interface PiDelivery {
-  bind(session: SessionAddress, runtimeId: string): Promise<Outcome<null>>;
-  stop(): Promise<void>;
-  wake(): void;
-  resumeAfterAbort(): Promise<void>;
-  isBound(): boolean;
-}
 
 export function sessionKey(address: SessionAddress): SessionKey {
   if (!isSessionAddress(address)) throw new TypeError('Invalid session address');
-  // Canonicalize only a Pi UUID shape. Other ids keep the supplied case.
-  const id = PI_SESSION_ID.test(address.piSessionId) ? address.piSessionId.toLowerCase() : address.piSessionId;
+  // Canonicalize only a UUID shape. Other ids keep the supplied case.
+  const id = UUID_SESSION_ID.test(address.sessionId) ? address.sessionId.toLowerCase() : address.sessionId;
   return `${address.namespace}:${id}`;
 }
 export function deliveryId(namespace: string, sequence: number): DeliveryId {
@@ -173,20 +169,20 @@ export function isNamespace(value: unknown): value is string {
  * value cannot smuggle another parameter. ASCII only: Unicode case folding can change length.
  */
 const SESSION_ID = new RegExp(`^[A-Za-z0-9._~-]{1,${MAX_SESSION_ID_LENGTH}}$`);
-/** Legacy Pi shape. sessionKey folds a match to lowercase. Not a second accepted grammar. Do not tighten this expression. */
-const PI_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Legacy UUID shape. sessionKey folds a match to lowercase. Not a second accepted grammar. Do not tighten this expression. */
+const UUID_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isSessionId(value: unknown): value is string {
   return typeof value === 'string' && SESSION_ID.test(value);
 }
 export function isSessionAddress(value: unknown): value is SessionAddress {
   if (!record(value)) return false;
-  return hasKeys(value, ['namespace', 'piSessionId']) && isNamespace(value.namespace) && isSessionId(value.piSessionId);
+  return hasKeys(value, ['namespace', 'sessionId']) && isNamespace(value.namespace) && isSessionId(value.sessionId);
 }
 /** Canonical key only: a UUID segment is lowercase; any other segment is the supplied spelling. */
 export function isSessionKey(value: unknown): value is SessionKey {
   if (typeof value !== 'string') return false;
   const colon = value.indexOf(':');
-  const address = { namespace: value.slice(0, colon), piSessionId: value.slice(colon + 1) };
+  const address = { namespace: value.slice(0, colon), sessionId: value.slice(colon + 1) };
   return colon > 0 && isSessionAddress(address) && value === sessionKey(address);
 }
 export function isRegistration(value: unknown): value is Registration {
@@ -202,6 +198,13 @@ export function isMessageInput(value: unknown): value is MessageInput {
     // Normalization can expand numeric literals; check before any store insertion,
     // including direct store calls that have no HTTP request-size guard.
     Buffer.byteLength(JSON.stringify(value)) <= MAX_JSON_BYTES;
+}
+/** Shape only. The host also binds `sessionId` and the message namespace to the acknowledging session. */
+export function isDeliveryEvidence(value: unknown): value is DeliveryEvidence {
+  return record(value) && hasKeys(value, ['messageId', 'sessionId', 'recordId', 'location']) &&
+    typeof value.messageId === 'string' && isSessionId(value.sessionId) &&
+    typeof value.recordId === 'string' && value.recordId.length > 0 &&
+    typeof value.location === 'string' && value.location.length > 0;
 }
 export function isReceipt(value: unknown): value is Receipt {
   if (!record(value) || !hasKeys(value, ['subscriptionId', 'messageId']) ||

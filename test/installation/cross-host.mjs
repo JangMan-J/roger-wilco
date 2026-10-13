@@ -60,7 +60,7 @@ try {
   }
   const setRank = await fetch(new URL('/v1/sessions/rank', config.coordinatorUrl), {
     method: 'POST', headers: { authorization: `Bearer ${config.credential}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ session: { namespace: config.namespace, piSessionId: b.sessionId }, rank: 3 }),
+    body: JSON.stringify({ session: { namespace: config.namespace, sessionId: b.sessionId }, rank: 3 }),
   });
   assert.equal(setRank.status, 200, 'local authenticated host can rank a remote session');
   const ranked = await setRank.json();

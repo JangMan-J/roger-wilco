@@ -45,7 +45,7 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     }
     calls.push({ path: req.url, body, authorization: req.headers.authorization });
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok: true, value: { subscription: { id: `fleet:${body?.session?.piSessionId}`, session: body?.session, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
+    res.end(JSON.stringify({ ok: true, value: { subscription: { id: `fleet:${body?.session?.sessionId}`, session: body?.session, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
   });
   server.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
@@ -99,7 +99,7 @@ test('native Pi extension binds automatically, routes only its session, wakes id
       db.exec('PRAGMA busy_timeout = 5000');
       const token = db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?').get(`fleet:${a}`)?.runtime_id;
       assert.equal(typeof token, 'string');
-      await external.release({ namespace: 'fleet', piSessionId: a }, token);
+      await external.release({ namespace: 'fleet', sessionId: a }, token);
     } finally { db.close(); }
   }
   await session.bindExtensions({});
@@ -146,7 +146,7 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   await until(async () => (await entries(file)).some(e => e.type === 'custom_message' && e.details?.deliveryId === 'fleet:msg:4'));
   await until(async () => {
     const db = new DatabaseSync(inboxPath, { readOnly: true });
-    try { return !!db.prepare('SELECT receipt_entry_id FROM inbox_messages WHERE message_id = ?').get('fleet:msg:4')?.receipt_entry_id; }
+    try { return !!db.prepare('SELECT evidence_record_id FROM inbox_messages WHERE message_id = ?').get('fleet:msg:4')?.evidence_record_id; }
     finally { db.close(); }
   });
   await delay(600);
@@ -193,23 +193,23 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   assert.equal((await entries(file)).filter(e => e.details?.deliveryId === 'fleet:msg:6').length, 1);
   await until(async () => {
     const db = new DatabaseSync(inboxPath, { readOnly: true });
-    try { return !!db.prepare('SELECT receipt_entry_id FROM inbox_messages WHERE message_id = ?').get('fleet:msg:6')?.receipt_entry_id; }
+    try { return !!db.prepare('SELECT evidence_record_id FROM inbox_messages WHERE message_id = ?').get('fleet:msg:6')?.evidence_record_id; }
     finally { db.close(); }
   });
 
   let probe = await openClient();
   await until(async () => {
-    const attempt = await probe.bind({ namespace: 'fleet', piSessionId: a }, 'competing-runtime', Date.now());
+    const attempt = await probe.bind({ namespace: 'fleet', sessionId: a }, 'competing-runtime', Date.now());
     return !attempt.ok && attempt.error === 'owner_conflict';
   });
   await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
   session.dispose();
   probe = await openClient();
-  assert.deepEqual((await probe.bind({ namespace: 'fleet', piSessionId: a }, 'probe-runtime', Date.now())).ok, true);
-  const pendingAtStop = await probe.pending({ namespace: 'fleet', piSessionId: a }, 'probe-runtime');
+  assert.deepEqual((await probe.bind({ namespace: 'fleet', sessionId: a }, 'probe-runtime', Date.now())).ok, true);
+  const pendingAtStop = await probe.pending({ namespace: 'fleet', sessionId: a }, 'probe-runtime');
   assert.ok(pendingAtStop.every(message => ['fleet:msg:2', 'fleet:msg:5'].includes(message.id)),
     'only a just-persisted message may still need its ACK');
-  await probe.release({ namespace: 'fleet', piSessionId: a }, 'probe-runtime');
+  await probe.release({ namespace: 'fleet', sessionId: a }, 'probe-runtime');
   const resumedLoader = new pi.DefaultResourceLoader({ cwd: dir, agentDir: join(dir, 'agent'), settingsManager,
     additionalExtensionPaths: [extension], noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await resumedLoader.reload();
@@ -226,9 +226,9 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   assert.equal(resumedCalls, 0);
   await resumed.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
   probe = await openClient();
-  assert.equal((await probe.bind({ namespace: 'fleet', piSessionId: a }, 'probe-runtime', Date.now())).ok, true);
-  assert.deepEqual(await probe.pending({ namespace: 'fleet', piSessionId: a }, 'probe-runtime'), []);
-  await probe.release({ namespace: 'fleet', piSessionId: a }, 'probe-runtime');
+  assert.equal((await probe.bind({ namespace: 'fleet', sessionId: a }, 'probe-runtime', Date.now())).ok, true);
+  assert.deepEqual(await probe.pending({ namespace: 'fleet', sessionId: a }, 'probe-runtime'), []);
+  await probe.release({ namespace: 'fleet', sessionId: a }, 'probe-runtime');
   assert.equal((await entries(file)).filter(e => e.type === 'custom_message' && e.details?.deliveryId === 'fleet:msg:1').length, 1);
 
   // The old runtime can still have a cached bound flag between takeover and
@@ -248,7 +248,7 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   await loser.followUp('User work already queued');
   assert.equal((await entries(file)).filter(e => e.details?.deliveryId === 'fleet:msg:7').length, 0);
   await retireLiveLease();
-  const owner = { namespace: 'fleet', piSessionId: a };
+  const owner = { namespace: 'fleet', sessionId: a };
   probe = await openClient();
   assert.equal((await probe.bind(owner, 'takeover-owner', Date.now())).ok, true);
   const wakeCount = (await entries(file)).filter(e => e.customType === 'roger-wilco-wake').length;

@@ -9,9 +9,9 @@ import test from 'node:test';
 import { createHostDaemon, createDaemonInbox as createHostInbox, type LocalHostInbox } from '../../src/host/index.ts';
 import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
-const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
-const b: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const c: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
+const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const c: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
 function message(sequence: number, recipient: string = sessionKey(a)): Message {
   return { version: 1, id: `fleet:msg:${sequence}`, sequence, timestamp: 123, sender: sessionKey(c), recipient,
     body: `message ${sequence}`, data: null, visibility: 'private' };
@@ -35,7 +35,7 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeout = 4000):
   assert.fail('Timed out waiting for observable state');
 }
 
-test('durable per-recipient dedup, ownership, expiration and Pi receipt guards across reopen', async t => {
+test('durable per-recipient dedup, ownership, expiration and delivery evidence guards across reopen', async t => {
   const { inbox, path } = fixture(t);
   assert.deepEqual(await inbox.receive(frame(1, a, '*')), { inserted: true });
   assert.deepEqual(await inbox.receive(frame(1, b, '*')), { inserted: true });
@@ -46,12 +46,16 @@ test('durable per-recipient dedup, ownership, expiration and Pi receipt guards a
   assert.equal((await inbox.bind(a, 'second', now)).ok, false);
   assert.deepEqual(await inbox.pending(b, 'first'), []);
   assert.deepEqual((await inbox.pending(a, 'first')).map(m => m.id), ['fleet:msg:1']);
-  assert.equal((await inbox.acknowledgePi(a, 'first', {
-    messageId: 'fleet:msg:1', piSessionId: b.piSessionId, entryId: 'entry-1', sessionFile: 'session.jsonl',
+  assert.equal((await inbox.acknowledgeDelivery(a, 'first', {
+    messageId: 'fleet:msg:1', sessionId: b.sessionId, recordId: 'entry-1', location: 'session.jsonl',
   })).ok, false);
   assert.deepEqual((await inbox.pending(a, 'first')).map(m => m.id), ['fleet:msg:1']);
-  assert.equal((await inbox.acknowledgePi(a, 'first', {
-    messageId: 'fleet:msg:1', piSessionId: a.piSessionId, entryId: 'entry-1', sessionFile: 'session.jsonl',
+  // A pre-contract Pi receipt shape is not delivery evidence.
+  assert.deepEqual(await inbox.acknowledgeDelivery(a, 'first', {
+    messageId: 'fleet:msg:1', piSessionId: a.sessionId, entryId: 'entry-1', sessionFile: 'session.jsonl',
+  } as never), { ok: false, error: 'invalid_request', message: 'Invalid delivery evidence' });
+  assert.equal((await inbox.acknowledgeDelivery(a, 'first', {
+    messageId: 'fleet:msg:1', sessionId: a.sessionId, recordId: 'entry-1', location: 'session.jsonl',
   })).ok, true);
   assert.deepEqual(await inbox.pending(a, 'first'), []);
   assert.equal((await inbox.renew(a, 'second', now + 1)).ok, false);
@@ -64,8 +68,8 @@ test('durable per-recipient dedup, ownership, expiration and Pi receipt guards a
   assert.equal((await reopened.bind(b, 'other', Date.now())).ok, true);
   assert.deepEqual((await reopened.pending(b, 'other')).map(m => m.id), ['fleet:msg:1']);
   assert.deepEqual(await reopened.pending(a, 'second'), []);
-  assert.equal((await reopened.acknowledgePi(a, 'second', {
-    messageId: 'fleet:msg:1', piSessionId: a.piSessionId, entryId: 'different', sessionFile: 'session.jsonl',
+  assert.equal((await reopened.acknowledgeDelivery(a, 'second', {
+    messageId: 'fleet:msg:1', sessionId: a.sessionId, recordId: 'different', location: 'session.jsonl',
   })).ok, false);
 });
 
@@ -184,11 +188,11 @@ test('acknowledged inbox history expires after seven days, never pending deliver
   await inbox.bind(a, 'owner', now);
   for (const sequence of [1, 2, 3]) await inbox.receive(frame(sequence));
   const proof = (sequence: number) => ({ messageId: `fleet:msg:${sequence}` as const,
-    piSessionId: a.piSessionId, entryId: `entry-${sequence}`, sessionFile: 'session.jsonl' });
-  assert.equal((await inbox.acknowledgePi(a, 'owner', proof(1))).ok, true);
+    sessionId: a.sessionId, recordId: `entry-${sequence}`, location: 'session.jsonl' });
+  assert.equal((await inbox.acknowledgeDelivery(a, 'owner', proof(1))).ok, true);
   t.mock.method(Date, 'now', () => now + 7 * 86400_000);
   await inbox.bind(a, 'owner', Date.now());
-  assert.equal((await inbox.acknowledgePi(a, 'owner', proof(3))).ok, true);
+  assert.equal((await inbox.acknowledgeDelivery(a, 'owner', proof(3))).ok, true);
   await inbox.close();
   t.mock.method(Date, 'now', () => now + 7 * 86400_000 + 1);
   const reopened = createHostInbox(path);
@@ -292,9 +296,9 @@ test('a failing first registration does not starve a later session in the same p
       let payload = '';
       for await (const chunk of req) payload += chunk;
       const session = (JSON.parse(payload) as { session: SessionAddress }).session;
-      posts.push(session.piSessionId);
+      posts.push(session.sessionId);
       res.setHeader('content-type', 'application/json');
-      if (session.piSessionId === a.piSessionId) {
+      if (session.sessionId === a.sessionId) {
         res.writeHead(409);
         res.end(JSON.stringify({ ok: false, error: 'owner_conflict', message: 'Session belongs to another host' }));
       } else {
@@ -312,7 +316,7 @@ test('a failing first registration does not starve a later session in the same p
   const run = daemon.start(new AbortController().signal);
   try {
     await waitFor(() => posts.length >= 2);
-    assert.deepEqual(posts.slice(0, 2), [a.piSessionId, b.piSessionId], 'second session posts in the same pass, before any retry of the first');
+    assert.deepEqual(posts.slice(0, 2), [a.sessionId, b.sessionId], 'second session posts in the same pass, before any retry of the first');
     assert.deepEqual(inbox.registrations().map(row => row.session_key), [sessionKey(a)], 'failed row remains queued, completed row is gone');
     assert.deepEqual(results.find(row => row.key === sessionKey(b)), { key: sessionKey(b), ok: true });
     assert.deepEqual(results.find(row => row.key === sessionKey(a)), { key: sessionKey(a), ok: false, error: 'owner_conflict' }, 'coordinator code is preserved');
@@ -372,9 +376,9 @@ test('registration queue survives reopen, retries lost response and stops prompt
 
 test('a non-UUID session has its own lease and inbox; a Pi UUID lease stays on the folded key', async t => {
   const { inbox } = fixture(t);
-  const agent: SessionAddress = { namespace: 'fleet', piSessionId: 'V1StGXR8_Z5jdHi6B-myT' };
-  const lower: SessionAddress = { namespace: 'fleet', piSessionId: agent.piSessionId.toLowerCase() };
-  const upper = { ...a, piSessionId: a.piSessionId.toUpperCase() };
+  const agent: SessionAddress = { namespace: 'fleet', sessionId: 'V1StGXR8_Z5jdHi6B-myT' };
+  const lower: SessionAddress = { namespace: 'fleet', sessionId: agent.sessionId.toLowerCase() };
+  const upper = { ...a, sessionId: a.sessionId.toUpperCase() };
   const now = Date.now();
   assert.equal(sessionKey(upper), sessionKey(a));
   assert.notEqual(sessionKey(agent), sessionKey(lower));
@@ -389,7 +393,7 @@ test('a non-UUID session has its own lease and inbox; a Pi UUID lease stays on t
   assert.deepEqual((await inbox.pending(agent, 'agent-runtime')).map(message => message.id), ['fleet:msg:1']);
   assert.deepEqual((await inbox.pending(a, 'pi-runtime')).map(message => message.id), ['fleet:msg:2']);
   assert.deepEqual((await inbox.pending(lower, 'lower-runtime')).map(message => message.id), ['fleet:msg:3']);
-  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'other:tracer-1' }, 'x', now)).ok, false);
-  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'a'.repeat(129) }, 'x', now)).ok, false);
-  assert.equal((await inbox.bind({ namespace: 'fleet', piSessionId: 'bad\nid' }, 'x', now)).ok, false);
+  assert.equal((await inbox.bind({ namespace: 'fleet', sessionId: 'other:tracer-1' }, 'x', now)).ok, false);
+  assert.equal((await inbox.bind({ namespace: 'fleet', sessionId: 'a'.repeat(129) }, 'x', now)).ok, false);
+  assert.equal((await inbox.bind({ namespace: 'fleet', sessionId: 'bad\nid' }, 'x', now)).ok, false);
 });

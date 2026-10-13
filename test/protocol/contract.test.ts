@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deliveryId, isJson, isMessage, isMessageInput, isRegistration, isRegistrationResult, isSessionAddress, isSessionId, isSessionKey, isStreamFrame, sessionKey, ROUTES,
+import { deliveryId, isDeliveryEvidence, isJson, isMessage, isMessageInput, isRegistration, isRegistrationResult, isSessionAddress, isSessionId, isSessionKey, isStreamFrame, sessionKey, ROUTES,
   MAX_JSON_BYTES, MAX_SESSION_ID_LENGTH, MAX_STREAM_EVENT_BYTES, entityReference, extractEntities, isEntityId } from '../../src/protocol/index.ts';
 
-const alice = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
-const bob = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const alice = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
+const bob = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
 const message = { version: 1, id: deliveryId('fleet', 1), sequence: 1, timestamp: 123, sender: sessionKey(alice), recipient: sessionKey(bob), body: 'Hello', data: null, visibility: 'private' };
 
 test('entity identity includes namespace and canonical phrase but not integer metadata', () => {
@@ -89,24 +89,24 @@ test('versioned namespace+Pi UUID identity and strict envelope validation', () =
   assert.equal(ROUTES.stream, '/v1/hosts/stream');
 });
 
-test('one opaque session id preserves case; only a Pi UUID key is folded', () => {
+test('one opaque session id preserves case; only a UUID-shaped key is folded', () => {
   const raw = '550E8400-E29B-41D4-A716-446655440000';
   const folded = '550e8400-e29b-41d4-a716-446655440000';
   const nano = 'V1StGXR8_Z5jdHi6B-myT';
-  assert.equal(isSessionAddress({ namespace: 'fleet', piSessionId: raw }), true);
-  assert.equal(sessionKey({ namespace: 'fleet', piSessionId: raw }), `fleet:${folded}`);
-  assert.equal(sessionKey({ namespace: 'fleet', piSessionId: folded }), `fleet:${folded}`);
+  assert.equal(isSessionAddress({ namespace: 'fleet', sessionId: raw }), true);
+  assert.equal(sessionKey({ namespace: 'fleet', sessionId: raw }), `fleet:${folded}`);
+  assert.equal(sessionKey({ namespace: 'fleet', sessionId: folded }), `fleet:${folded}`);
   assert.equal(isSessionKey(`fleet:${raw}`), false, 'a UUID session key is the lowercase form');
   assert.equal(isSessionKey(`fleet:${folded}`), true);
   assert.equal(isSessionId(nano), true);
-  assert.equal(sessionKey({ namespace: 'fleet', piSessionId: nano }), `fleet:${nano}`);
-  assert.notEqual(sessionKey({ namespace: 'fleet', piSessionId: nano }), sessionKey({ namespace: 'fleet', piSessionId: nano.toLowerCase() }));
+  assert.equal(sessionKey({ namespace: 'fleet', sessionId: nano }), `fleet:${nano}`);
+  assert.notEqual(sessionKey({ namespace: 'fleet', sessionId: nano }), sessionKey({ namespace: 'fleet', sessionId: nano.toLowerCase() }));
   assert.equal(isSessionKey(`fleet:${nano}`), true);
   assert.equal(isSessionKey(`fleet:${nano.toLowerCase()}`), true);
   assert.equal(isSessionId('Tracer-1'), true);
   assert.notEqual(
-    sessionKey({ namespace: 'fleet', piSessionId: 'Tracer-1' }),
-    sessionKey({ namespace: 'fleet', piSessionId: 'tracer-1' }),
+    sessionKey({ namespace: 'fleet', sessionId: 'Tracer-1' }),
+    sessionKey({ namespace: 'fleet', sessionId: 'tracer-1' }),
   );
   assert.equal(isSessionKey('fleet:Tracer-1'), true);
   assert.equal(isSessionId('not-a-uuid'), true);
@@ -115,10 +115,10 @@ test('one opaque session id preserves case; only a Pi UUID key is folded', () =>
   assert.equal(isSessionId('a~b_c.d-1'), true);
   for (const id of ['_V1StGXR8_Z5jdHi6B-myT', '-tracer', '.tracer', '~tracer', 'A']) {
     assert.equal(isSessionId(id), true, id);
-    assert.equal(sessionKey({ namespace: 'fleet', piSessionId: id }), `fleet:${id}`);
+    assert.equal(sessionKey({ namespace: 'fleet', sessionId: id }), `fleet:${id}`);
     assert.equal(isSessionKey(`fleet:${id}`), true);
   }
-  assert.equal(sessionKey({ namespace: 'fleet', piSessionId: 'not-a-uuid' }), 'fleet:not-a-uuid');
+  assert.equal(sessionKey({ namespace: 'fleet', sessionId: 'not-a-uuid' }), 'fleet:not-a-uuid');
   for (const id of [
     'not-a-uuid ', ' not-a-uuid', 'has:colon', 'other:tracer-1',
     '', 'a'.repeat(MAX_SESSION_ID_LENGTH + 1),
@@ -126,17 +126,17 @@ test('one opaque session id preserves case; only a Pi UUID key is folded', () =>
     'tracer\n1', 'a\u2028b', 'a\u007fb', '{550e8400-e29b-41d4-a716-446655440000}', 'tracer\u0130',
   ]) {
     assert.equal(isSessionId(id), false, id);
-    assert.throws(() => sessionKey({ namespace: 'fleet', piSessionId: id }), TypeError);
+    assert.throws(() => sessionKey({ namespace: 'fleet', sessionId: id }), TypeError);
   }
   assert.notEqual(
-    sessionKey({ namespace: 'fleet', piSessionId: '550e8400e29b41d4a716446655440000' }),
-    sessionKey({ namespace: 'fleet', piSessionId: folded }),
+    sessionKey({ namespace: 'fleet', sessionId: '550e8400e29b41d4a716446655440000' }),
+    sessionKey({ namespace: 'fleet', sessionId: folded }),
   );
   assert.equal(isSessionKey('fleet:not-a-uuid:extra'), false);
   assert.equal(isSessionKey('fleet:Not-A-UUID'), true);
   const namespace = 'n'.repeat(63);
-  const sender = sessionKey({ namespace, piSessionId: 'a'.repeat(MAX_SESSION_ID_LENGTH) });
-  const recipient = sessionKey({ namespace, piSessionId: 'b'.repeat(MAX_SESSION_ID_LENGTH) });
+  const sender = sessionKey({ namespace, sessionId: 'a'.repeat(MAX_SESSION_ID_LENGTH) });
+  const recipient = sessionKey({ namespace, sessionId: 'b'.repeat(MAX_SESSION_ID_LENGTH) });
   const input = { recipient, body: '\n'.repeat(65536), data: '\u2603'.repeat(100) };
   input.data += 'x'.repeat(MAX_JSON_BYTES - Buffer.byteLength(JSON.stringify(input)));
   const sequence = Number.MAX_SAFE_INTEGER;
@@ -147,4 +147,23 @@ test('one opaque session id preserves case; only a Pi UUID key is folded', () =>
   assert.equal(isStreamFrame(frame), true);
   const event = `id: ${frame.message.id}\nevent: message\ndata: ${JSON.stringify(frame)}\n\n`;
   assert.ok(Buffer.byteLength(event) <= MAX_STREAM_EVENT_BYTES);
+});
+
+test('session addresses use sessionId; the pre-contract piSessionId field is rejected, not translated', () => {
+  const legacy = { namespace: 'fleet', piSessionId: alice.sessionId };
+  assert.equal(isSessionAddress(legacy), false);
+  assert.equal(isSessionAddress({ ...alice, piSessionId: alice.sessionId }), false);
+  assert.equal(isRegistration({ session: legacy }), false);
+  assert.equal(isRegistration({ session: alice }), true);
+});
+
+test('delivery evidence is agent-neutral: a record inside a location, for one session id', () => {
+  const evidence = { messageId: 'fleet:msg:1', sessionId: 'Tracer-1', recordId: 'rec-1', location: '/var/lib/agent/evidence.jsonl' };
+  assert.equal(isDeliveryEvidence(evidence), true);
+  assert.equal(isDeliveryEvidence({ ...evidence, sessionId: alice.sessionId, recordId: 'entry', location: 'session.jsonl' }), true);
+  for (const bad of [
+    { messageId: 'fleet:msg:1', piSessionId: alice.sessionId, entryId: 'entry', sessionFile: 'session.jsonl' },
+    { ...evidence, extra: true }, { ...evidence, recordId: '' }, { ...evidence, location: '' },
+    { ...evidence, sessionId: 'has:colon' }, { ...evidence, messageId: 1 }, null, [],
+  ]) assert.equal(isDeliveryEvidence(bad), false, JSON.stringify(bad));
 });

@@ -66,8 +66,8 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         const params = url.searchParams;
         const since = parseInteger(params.get('since'), 0, Number.MAX_SAFE_INTEGER);
         const limit = parseInteger(params.get('limit'), 1, 500);
-        const session = { namespace: params.get('namespace'), piSessionId: params.get('piSessionId') };
-        if (!openQuery(url, ['namespace', 'piSessionId', 'since', 'limit']) || !isSessionAddress(session) || since === null || limit === null) {
+        const session = { namespace: params.get('namespace'), sessionId: params.get('sessionId') };
+        if (!openQuery(url, ['namespace', 'sessionId', 'since', 'limit']) || !isSessionAddress(session) || since === null || limit === null) {
           json(response, failure('invalid_request', 'Invalid inbox query')); return;
         }
         json(response, store.inbox(host, session, since, limit)); return;

@@ -5,8 +5,8 @@ import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { entityReference, sessionKey } from '../../src/protocol/index.ts';
 
-const alice = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const bob = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const alice = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const bob = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
 
 async function fixture(t: { after(fn: () => void | Promise<void>): void }, knownHosts?: ReadonlySet<string>) {
   const store = createCoordinatorStore(':memory:', 'fleet');
@@ -51,10 +51,13 @@ test('real HTTP authentication, strict validation, host-bound sender and claim o
   assert.equal((await request('/v1/messages', { sender: bob, message: { recipient: '*', body: 'spoof' } })).status, 409);
   assert.equal((await request('/v1/messages', { sender: alice, message: { recipient: sessionKey(bob), body: 'hi' } })).status, 200);
   assert.equal((await request('/v1/messages', { sender: alice, message: { recipient: '*', body: 'extra', extra: true } })).status, 400);
-  const query = `?namespace=fleet&piSessionId=${bob.piSessionId}&since=0&limit=10`;
+  const query = `?namespace=fleet&sessionId=${bob.sessionId}&since=0&limit=10`;
   assert.equal((await request('/v1/inbox' + query)).status, 409);
   assert.equal((await request('/v1/inbox' + query, undefined, 'secret-b')).value.value[0].body, 'hi');
   assert.equal((await request('/v1/inbox' + query + '&limit=2', undefined, 'secret-b')).status, 400);
+  // A pre-contract client is refused loudly, never reinterpreted.
+  assert.equal((await request(`/v1/inbox?namespace=fleet&piSessionId=${bob.sessionId}&since=0&limit=10`, undefined, 'secret-b')).status, 400);
+  assert.equal((await request('/v1/sessions/register', { session: { namespace: 'fleet', piSessionId: bob.sessionId } }, 'secret-b')).status, 400);
   assert.equal((await request('/v1/claims', { key: 'task', owner: bob, ttlSeconds: 30 })).status, 409);
   const claimed = await request('/v1/claims', { key: 'task', owner: alice, ttlSeconds: 30 });
   assert.equal(claimed.value.value.claim.owner, sessionKey(alice));
@@ -210,7 +213,7 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.deepEqual((await request('/v1/claims')).value.value, []);
   assert.equal((await lookup(fleet.id)).value.value.entity.type, 0);
 
-  const inboxQuery = `?namespace=fleet&piSessionId=${bob.piSessionId}&since=0&limit=10`;
+  const inboxQuery = `?namespace=fleet&sessionId=${bob.sessionId}&since=0&limit=10`;
   const foreignInbox = await request('/v1/inbox' + inboxQuery);
   assert.equal(foreignInbox.status, 409);
   assert.equal(foreignInbox.value.error, 'owner_conflict');

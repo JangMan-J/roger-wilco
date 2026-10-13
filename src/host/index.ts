@@ -3,8 +3,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { listenLocal } from './ipc.ts';
 import {
-  isFailureCode, isMessage, isOutcome, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, isSubscription, outcomeValue, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
-  type FailureCode, type HostConfig, type Message, type Outcome, type PiReceipt, type RegistrationResult,
+  isDeliveryEvidence, isFailureCode, isMessage, isOutcome, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, isSubscription, outcomeValue, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
+  type FailureCode, type HostConfig, type Message, type Outcome, type DeliveryEvidence, type RegistrationResult,
   type Registration, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
 
@@ -15,6 +15,10 @@ const RETRY_MIN_MS = 250;
 const RETRY_MAX_MS = 10_000;
 const HISTORY_MS = 7 * 86400_000;
 const SWEEP_MS = 60_000;
+/** Current inbox schema. 2 fenced legacy writers; 3 made delivery evidence and queued addresses agent-neutral. */
+const SCHEMA_VERSION = 3;
+/** Session-address field name that schema 2 and older stored in queued registration JSON. Migration input only. */
+const LEGACY_SESSION_FIELD = 'piSessionId';
 
 type LeaseRow = { runtime_id: string; expires_at: number };
 type RegistrationRow = { session_key: string; registration_json: string; generation: number };
@@ -46,8 +50,8 @@ export class LocalHostInbox {
     try {
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 1048576');
     this.tx(() => {
-      const version = this.db.prepare('PRAGMA user_version').get()!.user_version;
-      if (version !== 0 && version !== 2) throw new Error(`Unsupported inbox schema version: ${version}`);
+      let version = this.db.prepare('PRAGMA user_version').get()!.user_version;
+      if (version !== 0 && version !== 2 && version !== SCHEMA_VERSION) throw new Error(`Unsupported inbox schema version: ${version}`);
       if (version === 0) {
         // Old writers remain attached to this inode. Empty read-only views stop
         // both existing handles and constructors from recreating writer tables.
@@ -92,7 +96,9 @@ export class LocalHostInbox {
           CREATE INDEX inbox_messages_acknowledged ON inbox_messages(acknowledged_at);
           PRAGMA user_version = 2;
         `);
+        version = 2;
       }
+      if (version === 2) migrateNeutralEvidence(this.db);
       // Connection grants never survive a daemon restart.
       this.db.exec('DELETE FROM inbox_leases');
     });
@@ -182,7 +188,7 @@ export class LocalHostInbox {
     const now = Date.now();
     if (now < this.nextSweepAt) return;
     this.tx(() => {
-      this.db.prepare('DELETE FROM inbox_messages WHERE acknowledged_at < ? AND receipt_entry_id IS NOT NULL').run(now - HISTORY_MS);
+      this.db.prepare('DELETE FROM inbox_messages WHERE acknowledged_at < ? AND evidence_record_id IS NOT NULL').run(now - HISTORY_MS);
       this.db.prepare('DELETE FROM inbox_leases WHERE expires_at <= ?').run(now);
     });
     this.nextSweepAt = now + SWEEP_MS;
@@ -246,7 +252,7 @@ export class LocalHostInbox {
 
   async pending(session: SessionAddress, runtimeId: string): Promise<Message[]> {
     if (!isSessionAddress(session) || !runtimeId || !this.owns(session, runtimeId)) return [];
-    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages WHERE session_key = ? AND receipt_entry_id IS NULL
+    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages WHERE session_key = ? AND evidence_record_id IS NULL
       ORDER BY sequence ASC`).all(sessionKey(session)) as PendingRow[];
     return rows.map(row => storedMessage(row.message_json));
   }
@@ -254,30 +260,28 @@ export class LocalHostInbox {
   pendingPage(session: SessionAddress, owner: string, afterSequence = 0): Outcome<{ messages: Message[]; more: boolean }> {
     if (!this.owns(session, owner)) return failure('owner_conflict', 'Session lease is not owned');
     const rows = this.db.prepare(`SELECT message_json FROM inbox_messages
-      WHERE session_key = ? AND receipt_entry_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 2`)
+      WHERE session_key = ? AND evidence_record_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 2`)
       .all(sessionKey(session), afterSequence) as PendingRow[];
     const message = rows[0] ? storedMessage(rows[0].message_json) : undefined;
     return { ok: true, value: { messages: message ? [message] : [], more: rows.length > 1 } };
   }
 
-  async acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>> {
-    if (!isSessionAddress(session) || !runtimeId || !proof || proof.piSessionId !== session.piSessionId ||
-      typeof proof.messageId !== 'string' || !proof.messageId.startsWith(`${session.namespace}:msg:`) ||
-      typeof proof.entryId !== 'string' || !proof.entryId ||
-      typeof proof.sessionFile !== 'string' || !proof.sessionFile) return failure('invalid_request', 'Invalid Pi receipt');
+  async acknowledgeDelivery(session: SessionAddress, runtimeId: string, evidence: DeliveryEvidence): Promise<Outcome<null>> {
+    if (!isSessionAddress(session) || !runtimeId || !isDeliveryEvidence(evidence) || evidence.sessionId !== session.sessionId ||
+      !evidence.messageId.startsWith(`${session.namespace}:msg:`)) return failure('invalid_request', 'Invalid delivery evidence');
     let changed = false;
     const result: Outcome<null> = this.tx(() => {
       if (!this.owns(session, runtimeId)) return failure('owner_conflict', 'Session lease is not owned');
-      const row = this.db.prepare(`SELECT message_json, receipt_entry_id, receipt_session_file FROM inbox_messages
-        WHERE session_key = ? AND message_id = ?`).get(sessionKey(session), proof.messageId) as
-        (PendingRow & { receipt_entry_id: string | null; receipt_session_file: string | null }) | undefined;
+      const row = this.db.prepare(`SELECT message_json, evidence_record_id, evidence_location FROM inbox_messages
+        WHERE session_key = ? AND message_id = ?`).get(sessionKey(session), evidence.messageId) as
+        (PendingRow & { evidence_record_id: string | null; evidence_location: string | null }) | undefined;
       if (!row) return failure('not_found', 'Message not in session inbox');
-      if (row.receipt_entry_id !== null) {
-        return row.receipt_entry_id === proof.entryId && row.receipt_session_file === proof.sessionFile
-          ? { ok: true, value: null } : failure('invalid_request', 'Conflicting Pi receipt');
+      if (row.evidence_record_id !== null) {
+        return row.evidence_record_id === evidence.recordId && row.evidence_location === evidence.location
+          ? { ok: true, value: null } : failure('invalid_request', 'Conflicting delivery evidence');
       }
-      this.db.prepare(`UPDATE inbox_messages SET receipt_entry_id = ?, receipt_session_file = ?, acknowledged_at = ?
-        WHERE session_key = ? AND message_id = ?`).run(proof.entryId, proof.sessionFile, Date.now(), sessionKey(session), proof.messageId);
+      this.db.prepare(`UPDATE inbox_messages SET evidence_record_id = ?, evidence_location = ?, acknowledged_at = ?
+        WHERE session_key = ? AND message_id = ?`).run(evidence.recordId, evidence.location, Date.now(), sessionKey(session), evidence.messageId);
       changed = true;
       return { ok: true, value: null };
     });
@@ -356,7 +360,41 @@ function storedRegistration(json: string): Registration {
   return value;
 }
 
-// Do not restore the old createHostInbox export. A cached legacy Pi adapter
+/**
+ * Schema 2 -> 3, inside the constructor transaction. Evidence columns take
+ * agent-neutral names, and queued registrations take the current session
+ * address field, so the daemon can still post them. Keys, messages, cursors
+ * and evidence values are unchanged. The legacy `messages` view keeps its
+ * old column names, so it stays an empty, column-compatible fence. An
+ * unparseable registration row stays as it was; the next enqueue for its
+ * session replaces it, as before.
+ */
+function migrateNeutralEvidence(db: DatabaseSync): void {
+  db.exec(`
+    DROP VIEW messages;
+    ALTER TABLE inbox_messages RENAME COLUMN receipt_entry_id TO evidence_record_id;
+    ALTER TABLE inbox_messages RENAME COLUMN receipt_session_file TO evidence_location;
+    CREATE VIEW messages AS SELECT session_key, message_id, sequence, message_json,
+      evidence_record_id AS receipt_entry_id, evidence_location AS receipt_session_file, acknowledged_at
+      FROM inbox_messages WHERE 0;
+  `);
+  const update = db.prepare('UPDATE inbox_registrations SET registration_json = ? WHERE session_key = ?');
+  for (const row of db.prepare('SELECT session_key, registration_json FROM inbox_registrations').all() as Array<{ session_key: string; registration_json: string }>) {
+    let value: unknown;
+    try { value = JSON.parse(row.registration_json); } catch { continue; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const session = (value as { session?: unknown }).session;
+    if (!session || typeof session !== 'object' || Array.isArray(session)) continue;
+    const { namespace, [LEGACY_SESSION_FIELD]: sessionId, ...rest } = session as Record<string, unknown>;
+    if (sessionId === undefined || Object.keys(rest).length) continue;
+    // Spread keeps key order, so the bytes match what a current client enqueues.
+    const next = { ...(value as Record<string, unknown>), session: { namespace, sessionId } };
+    if (isRegistration(next)) update.run(JSON.stringify(next), row.session_key);
+  }
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
+
+// Do not restore the old createHostInbox export. A cached pre-daemon adapter
 // imports that name lazily; it must not acquire the new daemon-only writer.
 export function createDaemonInbox(path: string): LocalHostInbox {
   return new LocalHostInbox(path);

@@ -199,7 +199,7 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
               (!Number.isSafeInteger(args.afterSequence) || (args.afterSequence as number) < 0)) return invalid('Invalid cursor');
           return inbox.pendingPage(address, owner, args.afterSequence as number | undefined);
         case 'ack':
-          return inbox.acknowledgePi(address, owner, args.proof as Parameters<LocalHostInbox['acknowledgePi']>[2]);
+          return inbox.acknowledgeDelivery(address, owner, args.evidence as Parameters<LocalHostInbox['acknowledgeDelivery']>[2]);
         default: return invalid('Unknown command');
       }
     }

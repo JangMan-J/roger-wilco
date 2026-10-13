@@ -10,7 +10,8 @@ import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
 import { createDaemonInbox as createHostInbox, createHostDaemon, type LocalHostInbox } from '../../src/host/index.ts';
-import { ROUTES, sessionKey, type PiConfig, type SessionAddress } from '../../src/protocol/index.ts';
+import { ROUTES, sessionKey, type SessionAddress } from '../../src/protocol/index.ts';
+import type { PiConfig } from '../../src/pi/config.ts';
 import { nativePi, nativePiRuntime, persistedMessages } from './native-pi.ts';
 
 async function until(check: () => boolean | Promise<boolean>, reason: string) {
@@ -79,9 +80,9 @@ test('native Pi idle and busy delivery isolates two sessions on one host, host B
   const h = await rig(t);
   const alice = await nativePi(t, h.dir);
   const bob = await nativePi(t, h.dir);
-  const remote = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  const remote = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[1]!.inbox.enqueueRegistration({ session: remote });
-  const address = (id: string) => ({ namespace: 'fleet', piSessionId: id });
+  const address = (id: string) => ({ namespace: 'fleet', sessionId: id });
   await until(() => h.store.listSessions().length === 3, 'automatic startup and second-host registration');
   assert.notEqual(alice.id, bob.id);
   const first = await h.send(remote, sessionKey(address(alice.id)), 'Alice only');
@@ -119,15 +120,15 @@ test('Pi starts despite unavailable coordinator URL; queued registration is retr
   }));
   const session = await nativePi(t, h.dir);
   assert.match(session.id, /^[0-9a-f-]{36}$/);
-  await until(() => h.store.listSessions().some(row => row.subscription.id === sessionKey({ namespace: 'fleet', piSessionId: session.id })),
+  await until(() => h.store.listSessions().some(row => row.subscription.id === sessionKey({ namespace: 'fleet', sessionId: session.id })),
     'durable registration queued by Pi is retried by connected host daemon');
 });
 
 test('host restart after local commit but lost receipt replays one durable inbox event', async t => {
   const fault = { dropHostAReceipts: true };
   const h = await rig(t, fault);
-  const recipient = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440088' };
-  const sender = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  const recipient = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440088' };
+  const sender = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[0]!.inbox.enqueueRegistration({ session: recipient });
   await h.hosts[1]!.inbox.enqueueRegistration({ session: sender });
   await until(() => h.store.listSessions().length === 2, 'both hosts registered');
@@ -206,10 +207,10 @@ test('native Pi loads research-only pi-webtasks beside Roger-Wilco: research dis
   assert.deepEqual(providerCalls.map(call => [call.path, call.body.search_queries]), [['/v1/search', ['synthetic evidence']]],
     'research submission reached the synthetic HTTP provider exactly once');
   assert.match(await readFile(searched.details.artifact, 'utf8'), /Offline synthetic research answer/);
-  const remote = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  const remote = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[1]!.inbox.enqueueRegistration({ session: remote });
   await until(() => h.store.listSessions().length === 2, 'both hosts registered');
-  const message = await h.send(remote, sessionKey({ namespace: 'fleet', piSessionId: current.id }), 'New path only');
+  const message = await h.send(remote, sessionKey({ namespace: 'fleet', sessionId: current.id }), 'New path only');
   await until(async () => (await persistedMessages(current.file)).some(m => m.details?.deliveryId === message.id), 'Roger-Wilco persistent delivery');
   assert.equal((await persistedMessages(current.file, 'agent-bus')).length, 0, 'legacy bus does not duplicate Roger-Wilco message');
 });
@@ -222,7 +223,7 @@ test('real Pi fork and switch release the old binding and deliver only each sess
   await runtime.session.prompt('Establish an entry to fork from');
   const forkPoint = runtime.session.sessionManager.getEntries().find((entry: any) => entry.type === 'message' && entry.message.role === 'user');
   assert.ok(forkPoint?.id, 'fork uses an actual persisted user entry');
-  const remote = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  const remote = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[1]!.inbox.enqueueRegistration({ session: remote });
   await until(() => h.store.listSessions().length === 2, 'source and remote registered');
   assert.deepEqual(await runtime.fork(forkPoint.id, { position: 'at' }), { cancelled: false, selectedText: undefined });
@@ -231,8 +232,8 @@ test('real Pi fork and switch release the old binding and deliver only each sess
   assert.notEqual(forkId, originalId);
   assert.notEqual(forkFile, originalFile);
   await until(() => h.store.listSessions().length === 3, 'fork registered automatically');
-  const oldAddress = { namespace: 'fleet', piSessionId: originalId };
-  const forkAddress = { namespace: 'fleet', piSessionId: forkId };
+  const oldAddress = { namespace: 'fleet', sessionId: originalId };
+  const forkAddress = { namespace: 'fleet', sessionId: forkId };
   const forOld = await h.send(remote, sessionKey(oldAddress), 'pending for switched-out original');
   const forFork = await h.send(remote, sessionKey(forkAddress), 'fork only');
   await until(async () => (await persistedMessages(forkFile)).some(m => m.details?.deliveryId === forFork.id), 'fork wakes with its own message');
@@ -267,11 +268,11 @@ test('native Pi duplicate live opening conflicts; distinct new session never con
   await until(async () => (await persistedMessages(original.file)).length >= 0 && h.store.listSessions().length === 1, 'persistent original session registered');
   const duplicate = await nativePi(t, h.dir, { sessionFile: original.file });
   assert.equal(duplicate.id, original.id);
-  const address = { namespace: 'fleet', piSessionId: original.id };
+  const address = { namespace: 'fleet', sessionId: original.id };
   await until(() => h.store.listSessions().length === 1, 'original registered');
   const pending = await h.hosts[0]!.inbox.bind(address, 'intruder', Date.now());
   assert.deepEqual(pending.ok ? pending : { error: pending.error }, { error: 'owner_conflict' });
-  const remote = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  const remote = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[1]!.inbox.enqueueRegistration({ session: remote });
   await until(() => h.store.listSessions().length === 2, 'remote registered');
   const owned = await h.send(remote, sessionKey(address), 'one active owner');

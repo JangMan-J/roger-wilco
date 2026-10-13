@@ -31,7 +31,7 @@ Refuse to unlink a socket that accepts a connection.
 | renew | `{token}` | `{leaseExpiresAt}` |
 | release | `{token}` | `null` |
 | pending | `{token,afterSequence?}` | `{messages,more}` |
-| ack | `{token,proof}` | `null` |
+| ack | `{token,evidence}` | `null` |
 | enqueueRegistration | `{registration}` | `null` |
 | awaitRegistration | `{registration}` | `RegistrationResult` |
 

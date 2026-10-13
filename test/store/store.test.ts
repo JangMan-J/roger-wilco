@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { sessionKey, type CoordinatorStore, type Receipt, type SessionAddress } from '../../src/protocol/index.ts';
 
-const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
-const b: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440002' };
-const c: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440003' };
+const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
+const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
+const c: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440003' };
 const hostA = { hostId: 'host-a' };
 const hostB = { hostId: 'host-b' };
 
@@ -144,7 +144,7 @@ test('rank updates validate principals, addresses, and integer range without mut
     }
     for (const [host, address] of [
       [{ hostId: '' }, a], [null, a], [hostA, null], [hostA, { ...a, namespace: 'other' }],
-      [hostA, { ...a, piSessionId: 'has:colon' }],
+      [hostA, { ...a, sessionId: 'has:colon' }],
     ] as const) {
       assert.deepEqual(store.setRank(host as typeof hostA, address as SessionAddress, 2), {
         ok: false, error: 'invalid_request', message: 'Invalid rank update',
@@ -214,7 +214,7 @@ test('pending visits independent subscriptions fairly even when one remains unac
     const offered = [store.pending(hostA, 1)[0]?.message.id, store.pending(hostA, 1)[0]?.message.id,
       store.pending(hostA, 1)[0]?.message.id];
     // Polling another host must not reset this host's round-robin position.
-    ok(store.register(hostB, { session: { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440004' } }));
+    ok(store.register(hostB, { session: { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440004' } }));
     const interleaved = Array.from({ length: 3 }, () => {
       const frame = store.pending(hostA, 1)[0];
       store.pending(hostB, 1);
@@ -331,7 +331,7 @@ test('collection protects relevant unacknowledged deliveries, bounds history, an
     store = createCoordinatorStore(path, 'fleet');
     assert.equal(ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: broadcast.id })).cursor, broadcast.sequence);
     assert.equal(store.acknowledge(hostB, { subscriptionId: sessionKey(b), messageId: broadcast.id }).ok, false);
-    const newcomer = { ...a, piSessionId: '550e8400-e29b-41d4-a716-446655440004' };
+    const newcomer = { ...a, sessionId: '550e8400-e29b-41d4-a716-446655440004' };
     assert.equal(ok(store.register(hostA, { session: newcomer })).subscription.cursor, broadcast.sequence);
     // A tail snapshot is not proof that this new subscription received that ID.
     assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(newcomer), messageId: broadcast.id }).ok, false);
@@ -605,20 +605,20 @@ test('store validates direct public calls without relying on HTTP', () => {
 test('a non-UUID session registers beside Pi UUIDs; namespace and host checks stay closed', () => {
   const store = createCoordinatorStore(':memory:', 'fleet');
   try {
-    const agent: SessionAddress = { namespace: 'fleet', piSessionId: 'V1StGXR8_Z5jdHi6B-myT' };
-    const lower: SessionAddress = { namespace: 'fleet', piSessionId: agent.piSessionId.toLowerCase() };
-    const upper = { ...a, piSessionId: a.piSessionId.toUpperCase() };
-    assert.equal(sessionKey(upper), `fleet:${a.piSessionId}`);
+    const agent: SessionAddress = { namespace: 'fleet', sessionId: 'V1StGXR8_Z5jdHi6B-myT' };
+    const lower: SessionAddress = { namespace: 'fleet', sessionId: agent.sessionId.toLowerCase() };
+    const upper = { ...a, sessionId: a.sessionId.toUpperCase() };
+    assert.equal(sessionKey(upper), `fleet:${a.sessionId}`);
     assert.notEqual(sessionKey(agent), sessionKey(lower));
     const registered = ok(store.register(hostA, { session: agent, displayName: 'Tracer' }));
-    assert.equal(registered.subscription.id, `fleet:${agent.piSessionId}`);
+    assert.equal(registered.subscription.id, `fleet:${agent.sessionId}`);
     assert.deepEqual(registered.subscription.session, agent);
     assert.equal(registered.rank, 1);
     assert.equal(registered.subscription.hostId, hostA.hostId);
     assert.equal(typeof registered.lastSeenAt, 'number');
     ok(store.register(hostA, { session: upper }));
     const pi = store.listSessions().find(row => row.subscription.id === sessionKey(a));
-    assert.equal(pi?.subscription.session.piSessionId, a.piSessionId);
+    assert.equal(pi?.subscription.session.sessionId, a.sessionId);
     assert.equal(store.listSessions().filter(row => row.subscription.id === sessionKey(a)).length, 1);
     const ranked = ok(store.setRank(hostB, agent, 4));
     assert.equal(ranked.rank, 4);
@@ -640,7 +640,7 @@ test('a non-UUID session registers beside Pi UUIDs; namespace and host checks st
     const conflict = store.register(hostB, { session: agent });
     assert.equal(conflict.ok, false);
     if (!conflict.ok) assert.equal(conflict.error, 'owner_conflict');
-    const foreign = { namespace: 'other', piSessionId: 'tracer-1' };
+    const foreign = { namespace: 'other', sessionId: 'tracer-1' };
     for (const result of [
       store.register(hostA, { session: foreign }),
       store.send(hostA, a, { recipient: sessionKey(foreign), body: 'cross' }),
@@ -649,9 +649,9 @@ test('a non-UUID session registers beside Pi UUIDs; namespace and host checks st
       store.setRank(hostA, foreign, 2),
       store.claim(hostA, 'job', sessionKey(foreign), 30),
       store.releaseClaim(hostA, 'job', sessionKey(foreign)),
-      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'other:tracer-1' } }),
-      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'a'.repeat(129) } }),
-      store.register(hostA, { session: { namespace: 'fleet', piSessionId: 'bad\nid' } }),
+      store.register(hostA, { session: { namespace: 'fleet', sessionId: 'other:tracer-1' } }),
+      store.register(hostA, { session: { namespace: 'fleet', sessionId: 'a'.repeat(129) } }),
+      store.register(hostA, { session: { namespace: 'fleet', sessionId: 'bad\nid' } }),
     ]) {
       assert.equal(result.ok, false);
       if (!result.ok) assert.equal(result.error, 'invalid_request');

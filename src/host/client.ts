@@ -3,8 +3,8 @@ import { lstat } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import {
-  isFailureCode, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, MAX_JSON_BYTES, sessionKey,
-  type FailureCode, type HostInbox, type Message, type Outcome, type PiReceipt,
+  isDeliveryEvidence, isFailureCode, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, MAX_JSON_BYTES, sessionKey,
+  type FailureCode, type HostInbox, type Message, type Outcome, type DeliveryEvidence,
   type Registration, type RegistrationResult, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
 
@@ -160,14 +160,13 @@ class HostClient implements HostInbox {
     }
     return messages;
   }
-  async acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>> {
-    if (!isSessionAddress(session) || typeof runtimeId !== 'string' || !runtimeId || !proof || proof.piSessionId !== session.piSessionId ||
-      typeof proof.messageId !== 'string' || !proof.messageId.startsWith(`${session.namespace}:msg:`) ||
-      typeof proof.entryId !== 'string' || !proof.entryId || typeof proof.sessionFile !== 'string' || !proof.sessionFile)
-      return failure('invalid_request', 'Invalid Pi receipt');
+  async acknowledgeDelivery(session: SessionAddress, runtimeId: string, evidence: DeliveryEvidence): Promise<Outcome<null>> {
+    if (!isSessionAddress(session) || typeof runtimeId !== 'string' || !runtimeId || !isDeliveryEvidence(evidence) ||
+      evidence.sessionId !== session.sessionId || !evidence.messageId.startsWith(`${session.namespace}:msg:`))
+      return failure('invalid_request', 'Invalid delivery evidence');
     const token = this.token;
     if (!token || this.boundKey !== sessionKey(session)) return failure('owner_conflict', 'Lease no longer owned');
-    const result = await this.invoke('ack', { token, proof });
+    const result = await this.invoke('ack', { token, evidence });
     if (this.token !== token) return failure('owner_conflict', 'Lease no longer owned');
     if (!result.ok && result.error === 'owner_conflict') this.disconnect(new Error('Lease no longer owned'));
     return result as Outcome<null>;

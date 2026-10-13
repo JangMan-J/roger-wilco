@@ -61,7 +61,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     if (req.url === '/v1/sessions/register') {
       const session = body.session;
       res.end(JSON.stringify({ ok: true, value: {
-        subscription: { id: `${session.namespace}:${session.piSessionId}`, session, hostId: 'host-a', cursor: 0 },
+        subscription: { id: `${session.namespace}:${session.sessionId}`, session, hostId: 'host-a', cursor: 0 },
         rank: 1, lastSeenAt: now,
       } }));
       return;
@@ -92,10 +92,10 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     { ok: true, value: { sessions: [recent, stale, unknown], claims: [{ key: 'work', owner: `fleet:${id}` }] } });
   const tool = async (name, params) => (await first.tools.get(name).execute('', params, undefined, undefined, ctx)).details;
   await tool('roger_identity', { displayName: '[[0:FLEET]]' });
-  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', piSessionId: id }, displayName: '[[0:FLEET]]' });
+  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', sessionId: id }, displayName: '[[0:FLEET]]' });
   assert.equal(requests.at(-1).path, '/v1/sessions/register');
   await tool('roger_identity', {});
-  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', piSessionId: id } });
+  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', sessionId: id } });
   await tool('roger_send', { recipient: '*', body: 'Hello', data: { priority: 2 }, visibility: 'public' });
   await tool('roger_inbox', { since: 2, limit: 20 });
   await tool('roger_claim', { key: 'work', ttlSeconds: 90 });
@@ -107,7 +107,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   ]) {
     assert.deepEqual(await tool('roger_entity', params), { ok: true, value: { entity, messages: [mention] } });
     assert.equal(requests.at(-1).path, '/v1/entities?' + new URLSearchParams({ id: entity.id, since: String(since), limit: String(limit) }));
-    assert.deepEqual(requests.at(-2).body, { session: { namespace: 'fleet', piSessionId: id } }, 'entity lookup registers the bound session first');
+    assert.deepEqual(requests.at(-2).body, { session: { namespace: 'fleet', sessionId: id } }, 'entity lookup registers the bound session first');
     assert.equal(requests.at(-2).path, '/v1/sessions/register');
   }
   const beforeInvalid = requests.length;
@@ -117,11 +117,11 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     assert.equal((await tool('roger_entity', params)).error, 'invalid_request', JSON.stringify(params));
   }
   assert.equal(requests.length, beforeInvalid, 'invalid entity tool arguments never reach the coordinator');
-  assert.deepEqual(requests.find(r => r.path === '/v1/messages').body.sender, { namespace: 'fleet', piSessionId: id });
+  assert.deepEqual(requests.find(r => r.path === '/v1/messages').body.sender, { namespace: 'fleet', sessionId: id });
   assert.deepEqual(requests.find(r => r.path === '/v1/messages').body.message.data, { priority: 2 });
-  assert.equal(requests.find(r => r.path === '/v1/inbox?namespace=fleet&piSessionId=' + id + '&since=2&limit=20').path.includes(id), true);
-  assert.deepEqual(requests.find(r => r.path === '/v1/claims' && r.body).body.owner, { namespace: 'fleet', piSessionId: id });
-  assert.deepEqual(requests.find(r => r.path === '/v1/claims/release').body.owner, { namespace: 'fleet', piSessionId: id });
+  assert.equal(requests.find(r => r.path === '/v1/inbox?namespace=fleet&sessionId=' + id + '&since=2&limit=20').path.includes(id), true);
+  assert.deepEqual(requests.find(r => r.path === '/v1/claims' && r.body).body.owner, { namespace: 'fleet', sessionId: id });
+  assert.deepEqual(requests.find(r => r.path === '/v1/claims/release').body.owner, { namespace: 'fleet', sessionId: id });
   assert.ok(requests.every(r => r.authorization === 'Bearer offline-secret'));
   const before = requests.length;
   const newId = randomUUID();
@@ -134,7 +134,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   await first.handlers.get('session_start')({ reason: 'fork' }, ctx);
   assert.equal((await tool('roger_send', { recipient: '*', body: 'New session' })).ok, true);
   assert.deepEqual(requests.find(r => r.path === '/v1/messages' && r.body.message.body === 'New session').body.sender,
-    { namespace: 'fleet', piSessionId: newId });
+    { namespace: 'fleet', sessionId: newId });
   await second.handlers.get('session_start')({ reason: 'resume' }, other.ctx);
   assert.equal(other.state.status, undefined, 'switch released the old lease; its original session may resume');
   await first.handlers.get('session_shutdown')({}, ctx);
@@ -156,8 +156,8 @@ test('native slash commands show the board without a model turn and report unava
   let unavailable = false;
   let actor;
   const now = Date.now();
-  const staleSession = { namespace: 'fleet', piSessionId: randomUUID() };
-  const staleId = `fleet:${staleSession.piSessionId}`;
+  const staleSession = { namespace: 'fleet', sessionId: randomUUID() };
+  const staleId = `fleet:${staleSession.sessionId}`;
   const unknownId = `fleet:${randomUUID()}`;
   const rankRequests = [];
   let savedRank = 1;
@@ -175,7 +175,7 @@ test('native slash commands show the board without a model turn and report unava
     if (req.url === '/v1/sessions/register') {
       actor = body.session;
       res.end(JSON.stringify({ ok: true, value: {
-        subscription: { id: `${body.session.namespace}:${body.session.piSessionId}`, session: body.session, hostId: 'host-a', cursor: 0 },
+        subscription: { id: `${body.session.namespace}:${body.session.sessionId}`, session: body.session, hostId: 'host-a', cursor: 0 },
         rank: 1, lastSeenAt: now,
       } }));
       return;
@@ -196,7 +196,7 @@ test('native slash commands show the board without a model turn and report unava
       res.end(JSON.stringify({ ok: false, error: 'temporarily_unavailable', message: 'Coordinator is offline' }));
       return;
     }
-    const address = actor ? `${actor.namespace}:${actor.piSessionId}` : '';
+    const address = actor ? `${actor.namespace}:${actor.sessionId}` : '';
     const value = req.url === '/v1/sessions' ? [
       { subscription: { id: address, session: actor, hostId: 'host-a' }, rank: 1, displayName: 'Alice', lastSeenAt: now },
       { subscription: { id: staleId, session: staleSession, hostId: 'host-b' }, rank: savedRank, lastSeenAt: now - 120_000 },
@@ -280,7 +280,7 @@ test('native rank picker persists another host’s session metadata through the 
   const database = join(dir, 'coordinator.sqlite');
   let store = createCoordinatorStore(database, 'fleet');
   t.after(() => store.close());
-  const target = { namespace: 'fleet', piSessionId: randomUUID() };
+  const target = { namespace: 'fleet', sessionId: randomUUID() };
   const registration = store.register({ hostId: 'host-b' }, { session: target, displayName: 'Other host' });
   assert.equal(registration.ok, true);
   assert.equal(registration.value.rank, 1);
@@ -296,16 +296,16 @@ test('native rank picker persists another host’s session metadata through the 
   const notices = [];
   native.session.extensionRunner.setUIContext({
     setStatus() {}, notify: (message, type) => notices.push({ message, type }),
-    select: async (_title, options) => options.find(option => option.includes(target.piSessionId)) ?? 'Rank 5',
+    select: async (_title, options) => options.find(option => option.includes(target.sessionId)) ?? 'Rank 5',
   });
   await native.session.prompt('/roger');
-  assert.deepEqual(notices.at(-1), { message: `fleet:${target.piSessionId}: Rank 5`, type: 'info' });
+  assert.deepEqual(notices.at(-1), { message: `fleet:${target.sessionId}: Rank 5`, type: 'info' });
   assert.equal(native.calls.length, 0);
   await native.stop();
   store.close();
   store = createCoordinatorStore(database, 'fleet');
   const sessions = store.listSessions();
-  const updated = sessions.find(row => row.subscription.id === `fleet:${target.piSessionId}`);
+  const updated = sessions.find(row => row.subscription.id === `fleet:${target.sessionId}`);
   assert.equal(updated.rank, 5);
   assert.equal(updated.subscription.hostId, 'host-b', 'rank does not migrate ownership');
   assert.equal(updated.subscription.cursor, registration.value.subscription.cursor, 'rank does not alter delivery routing/cursor');

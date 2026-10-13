@@ -11,8 +11,8 @@ test('repeated pending IDs reuse an unchanged disk snapshot; mutations invalidat
   const dir = await fs.mkdtemp(join(tmpdir(), 'rw-receipt-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.jsonl');
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
-  const header = `${JSON.stringify({ type: 'session', id: session.piSessionId })}\n`;
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
+  const header = `${JSON.stringify({ type: 'session', id: session.sessionId })}\n`;
   const entry = `${JSON.stringify({ type: 'custom_message', customType: 'roger-wilco', id: 'entry-one', details: { deliveryId: 'fleet:msg:1' } })}\n`;
   const filler = `${JSON.stringify({ type: 'message', content: 'x'.repeat(1024) })}\n`.repeat(6500);
   await fs.writeFile(file, header + filler);
@@ -53,7 +53,7 @@ test('repeated pending IDs reuse an unchanged disk snapshot; mutations invalidat
   assert.ok(await persistedReceipt(file, session, 'fleet:msg:1'));
   await fs.writeFile(file, header + entry.replace('roger-wilco', 'other-type!'));
   assert.equal(await persistedReceipt(file, session, 'fleet:msg:1'), undefined, 'same-inode, same-size rewrite discards the index');
-  await fs.writeFile(file, header.replace(session.piSessionId, randomUUID()) + entry);
+  await fs.writeFile(file, header.replace(session.sessionId, randomUUID()) + entry);
   assert.equal(await persistedReceipt(file, session, 'fleet:msg:1'), undefined, 'another session cannot supply a receipt');
   await fs.writeFile(file, header + '{bad json}\n' + entry);
   await assert.rejects(persistedReceipt(file, session, 'fleet:msg:1'), SyntaxError);
@@ -69,8 +69,8 @@ test('mutation during scan or fsync cannot return a stale receipt', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'rw-receipt-race-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.jsonl');
-  const session = { namespace: 'fleet', piSessionId: randomUUID() };
-  const header = `${JSON.stringify({ type: 'session', id: session.piSessionId })}\n`;
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
+  const header = `${JSON.stringify({ type: 'session', id: session.sessionId })}\n`;
   const entry = `${JSON.stringify({ type: 'custom_message', customType: 'roger-wilco', id: 'entry-one', details: { deliveryId: 'fleet:msg:1' } })}\n`;
   const originalOpen = fs.open;
   t.after(() => { fs.open = originalOpen; syncBuiltinESMExports(); });
