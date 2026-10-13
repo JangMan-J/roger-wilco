@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { persistedReceipt } from '../../src/pi/index.ts';
+import { persistedReceipt } from '../../src/pi/delivery.ts';
 
 test('repeated pending IDs reuse an unchanged disk snapshot; mutations invalidate receipts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'rw-receipt-'));

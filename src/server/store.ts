@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  deliveryId, entityReference, extractEntities, isEntityId, isMessageInput, isNamespace, isReceipt, isRegistration,
+  deliveryId, entityReference, extractEntities, isEntityId, isMessage, isMessageInput, isNamespace, isReceipt, isRegistration,
   isSessionAddress, isSessionKey, sessionKey, PROTOCOL_VERSION,
   type Claim, type CoordinatorStore, type EntityHistory, type EntityRef, type HostPrincipal, type Message,
   type JsonValue, type MessageInput, type Outcome, type Receipt, type Registration,
@@ -227,9 +227,12 @@ class Store implements CoordinatorStore {
       lastSeenAt: row.last_seen_at, rank: row.rank, ...this.sourceEntities('session', row.id) };
   }
   private message(row: MessageRow): Message {
-    return { version: PROTOCOL_VERSION, id: deliveryId(this.namespace, row.id), sequence: row.id,
+    const data: unknown = JSON.parse(row.data);
+    const message = { version: PROTOCOL_VERSION, id: deliveryId(this.namespace, row.id), sequence: row.id,
       timestamp: row.timestamp, sender: row.sender, recipient: row.recipient, body: row.body,
-      data: JSON.parse(row.data), visibility: row.visibility };
+      data, visibility: row.visibility };
+    if (!isMessage(message)) throw new TypeError('Invalid stored message');
+    return message;
   }
   private claimValue(row: ClaimRow): Claim {
     return { key: row.key, owner: row.owner, note: row.note, claimedAt: row.claimed_at, expiresAt: row.expires_at,

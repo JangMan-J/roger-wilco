@@ -4,13 +4,16 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   MAX_JSON_BYTES, isRegistration, isSessionAddress, sessionKey,
-  type HostConfig, type Outcome, type SessionAddress,
+  type HostConfig, type Outcome, type RegistrationResult, type SessionAddress,
 } from '../protocol/index.ts';
 import type { LocalHostInbox } from './index.ts';
 
 const MAX_FRAME = MAX_JSON_BYTES + 8192;
 const DEADLINE = 5000;
-const LEASE_MS = 30_000;
+/** Waiter deadline starts when the daemon begins an attempt for its session. */
+const AWAIT_ATTEMPT_MS = 15_000;
+/** Leak guard for a waiter whose session is never attempted. */
+const AWAIT_QUEUE_MS = 45_000;
 const ok = <T>(value: T): Outcome<T> => ({ ok: true, value });
 const invalid = (message: string): Outcome<never> => ({ ok: false, error: 'invalid_request', message });
 const conflict = (): Outcome<never> => ({ ok: false, error: 'owner_conflict', message: 'Connection lease is not owned' });
@@ -46,9 +49,13 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
     let session: SessionAddress | undefined;
     let token: string | undefined;
     let retired = false, dirty = false;
-    let expires = 0;
+    let leaseExpiresAt = 0;
     let expiry: NodeJS.Timeout | undefined, pressure: NodeJS.Timeout | undefined;
     let unsubscribe: (() => void) | undefined;
+    let unsubscribeRegistration: (() => void) | undefined;
+    type RegWaiter = { id: number; key: string; generation?: number; bare: boolean; timer?: NodeJS.Timeout; attempted: boolean;
+      offResult: () => void; offAttempt: () => void; offQueued: () => void };
+    const regWaiters = new Map<number, RegWaiter>();
     socket.setTimeout(10_000, () => socket.destroy());
     const close = () => { socket.destroy(); };
     const send = (value: unknown) => {
@@ -67,18 +74,92 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
       clearTimeout(pressure); pressure = undefined;
       if (dirty) hint();
     });
-    const arm = () => {
-      expires = performance.now() + LEASE_MS;
+    const arm = (expiresAt: number) => {
+      leaseExpiresAt = expiresAt;
       clearTimeout(expiry);
-      expiry = setTimeout(close, LEASE_MS);
+      const remaining = expiresAt - Date.now();
+      if (remaining <= 0) { close(); return; }
+      expiry = setTimeout(() => {
+        if (Date.now() >= leaseExpiresAt) close();
+        else arm(leaseExpiresAt);
+      }, Math.min(remaining, 30_000));
     };
     const owns = (args: Record<string, unknown>) =>
-      !!token && args.token === token && !!session && performance.now() < expires && !socket.destroyed;
-    async function command(method: string, args: Record<string, unknown>): Promise<Outcome<unknown>> {
-      if (method === 'enqueueRegistration') {
+      !!token && args.token === token && !!session && !socket.destroyed;
+    const watchRegistration = () => {
+      if (unsubscribeRegistration || !session) return;
+      unsubscribeRegistration = inbox.onRegistrationResult((key, _json, _generation, result) => {
+        if (!session || sessionKey(session) !== key || socket.destroyed) return;
+        send(result.ok ? { v: 1, event: 'registered' } : { v: 1, event: 'registered', error: result.error, message: result.message });
+      });
+    };
+    // Settle exactly once. A result replies and frees the outstanding slot;
+    // cancellation (close/release/shutdown) frees it without a reply.
+    const settleWaiter = (waiter: RegWaiter, result?: Outcome<RegistrationResult>) => {
+      if (!regWaiters.delete(waiter.id)) return;
+      clearTimeout(waiter.timer);
+      waiter.offResult(); waiter.offAttempt(); waiter.offQueued();
+      if (result !== undefined) send({ v: 1, id: waiter.id, result });
+      queued--;
+      if (!regWaiters.size && !token && !socket.destroyed) socket.setTimeout(10_000, () => socket.destroy());
+    };
+    const cancelWaiters = () => { for (const waiter of [...regWaiters.values()]) settleWaiter(waiter); };
+    // Returns undefined when the reply is deferred to a registration waiter.
+    async function command(id: number, method: string, args: Record<string, unknown>): Promise<Outcome<unknown> | undefined> {
+      if (method === 'enqueueRegistration' || method === 'awaitRegistration') {
         if (!isRegistration(args.registration)) return invalid('Invalid registration');
-        await inbox.enqueueRegistration(args.registration);
-        return ok(null);
+        const registration = args.registration;
+        const key = sessionKey(registration.session);
+        if (session && sessionKey(session) !== key) return invalid('A connection serves one session');
+        session = registration.session;
+        watchRegistration();
+        // Only validation and enqueue stay on the serialized chain. The wait
+        // moves to a waiter keyed by request ID so renew/pending/ack proceed.
+        if (method === 'enqueueRegistration') {
+          await inbox.enqueueRegistration(registration);
+          return ok(null);
+        }
+        const timedOut: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration timed out' };
+        const superseded: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' };
+        // The inbox owns correlation: enqueue returns the effective queued
+        // generation, and attempts/results carry it. Install the waiter
+        // before enqueueing so a fast attempt cannot report unheard.
+        const waiter: RegWaiter = { id, key, bare: registration.displayName === undefined, attempted: false, offResult: () => {}, offAttempt: () => {}, offQueued: () => {} };
+        waiter.offResult = inbox.onRegistrationResult((got, _json, generation, result) => {
+          if (got === key && waiter.generation !== undefined && generation === waiter.generation) settleWaiter(waiter, result);
+        });
+        waiter.offAttempt = inbox.onRegistrationAttempt((got, _json, generation) => {
+          if (got !== key || waiter.attempted || waiter.generation === undefined || generation !== waiter.generation) return;
+          waiter.attempted = true;
+          clearTimeout(waiter.timer);
+          waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_ATTEMPT_MS);
+        });
+        waiter.offQueued = inbox.onRegistrationQueued((got, _json, generation) => {
+          if (got !== key || waiter.generation === undefined || generation === waiter.generation) return;
+          // A bare waiter only needs the session registered, so it follows
+          // the newer generation; an explicit waiter is superseded.
+          if (waiter.bare) waiter.generation = generation;
+          else settleWaiter(waiter, superseded);
+        });
+        waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_QUEUE_MS);
+        regWaiters.set(id, waiter);
+        socket.setTimeout(0); // a held waiter is activity, not idleness
+        try {
+          waiter.generation = (await inbox.enqueueRegistration(registration)).generation;
+        } catch (error) { settleWaiter(waiter); throw error; }
+        // A newer enqueue may have landed while this one was in flight.
+        const current = inbox.registrations().find(row => row.session_key === key);
+        if (current && current.generation !== waiter.generation) {
+          if (waiter.bare) waiter.generation = current.generation;
+          else settleWaiter(waiter, superseded);
+        }
+        // An attempt for this generation may already be in flight.
+        if (!socket.destroyed && regWaiters.has(id) && inbox.registrationAttemptGeneration(key) === waiter.generation && !waiter.attempted) {
+          waiter.attempted = true;
+          clearTimeout(waiter.timer);
+          waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_ATTEMPT_MS);
+        }
+        return undefined;
       }
       if (method === 'bind') {
         if (token || retired) return invalid('A connection binds only once');
@@ -93,7 +174,8 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
         // the ready reply, so there is no snapshot/subscription gap.
         unsubscribe = inbox.subscribe(key => { if (session && key === sessionKey(session)) hint(); });
         socket.setTimeout(0);
-        arm();
+        watchRegistration();
+        arm(result.value.leaseExpiresAt);
         return ok({ token, leaseExpiresAt: result.value.leaseExpiresAt });
       }
       if (!owns(args)) return conflict();
@@ -101,13 +183,14 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
       switch (method) {
         case 'renew': {
           const result = await inbox.renew(address, owner, Date.now());
-          if (result.ok && !socket.destroyed) arm();
+          if (result.ok && !socket.destroyed) arm(result.value.leaseExpiresAt);
           else close();
           return result;
         }
         case 'release':
           token = undefined; retired = true;
-          unsubscribe?.(); clearTimeout(expiry);
+          cancelWaiters();
+          unsubscribe?.(); unsubscribeRegistration?.(); unsubscribeRegistration = undefined; clearTimeout(expiry);
           await inbox.release(address, owner);
           socket.setTimeout(10_000, close);
           return ok(null);
@@ -135,23 +218,29 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
         catch { close(); return; }
         input = Buffer.alloc(0);
         if (!request || request.v !== 1 || !Number.isSafeInteger(request.id) || (request.id as number) <= lastId ||
-            typeof request.method !== 'string' || !['bind', 'renew', 'release', 'pending', 'ack', 'enqueueRegistration'].includes(request.method) ||
+            typeof request.method !== 'string' || !['bind', 'renew', 'release', 'pending', 'ack', 'enqueueRegistration', 'awaitRegistration'].includes(request.method) ||
             !request.args || typeof request.args !== 'object' || Array.isArray(request.args) || ++queued > 4) { close(); return; }
         lastId = request.id as number;
         const { id, method, args } = request;
         chain = chain.then(async () => {
-          if (!socket.destroyed) send({ v: 1, id, result: await command(method as string, args as Record<string, unknown>) });
+          if (socket.destroyed) { queued--; return; }
+          const result = await command(id as number, method as string, args as Record<string, unknown>);
+          // A deferred awaitRegistration reply owns its outstanding slot
+          // until settleWaiter replies or cancels it.
+          if (result !== undefined) { send({ v: 1, id, result }); queued--; }
         }).catch(() => {
           // A storage/notifier exception is never a successful reply. Disconnect
           // all readers so their next connection must reconcile durable state.
           for (const peer of sockets) peer.destroy();
-        }).finally(() => { queued--; });
+        });
       }
     });
     socket.on('error', () => close());
     socket.once('close', () => {
       sockets.delete(socket);
+      cancelWaiters(); // daemon shutdown reaches here by destroying sockets
       unsubscribe?.();
+      unsubscribeRegistration?.();
       clearTimeout(expiry); clearTimeout(pressure);
       const owner = token;
       token = undefined; retired = true;

@@ -9,7 +9,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
-import rogerWilco, { persistedReceipt } from '../../src/pi/index.ts';
+import rogerWilco from '../../src/pi/index.ts';
+import { persistedReceipt } from '../../src/pi/delivery.ts';
 
 const childFile = fileURLToPath(new URL('./crash-child.mjs', import.meta.url));
 const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));

@@ -12,7 +12,8 @@ import { readHostConfig } from '../../src/bin/config.ts';
 import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 import { createHostClient } from '../../src/host/client.ts';
-import rogerWilco, { createPiDelivery, loadPiConfig, persistedReceipt } from '../../src/pi/index.ts';
+import rogerWilco, { loadPiConfig } from '../../src/pi/index.ts';
+import { createPiDelivery, persistedReceipt } from '../../src/pi/delivery.ts';
 
 async function serve(inboxPath) {
   const inbox = createHostInbox(inboxPath);

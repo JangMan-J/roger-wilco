@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deliveryId, isJson, isMessage, isMessageInput, isRegistration, isStreamFrame, sessionKey, ROUTES,
+import { deliveryId, isJson, isMessage, isMessageInput, isRegistration, isRegistrationResult, isStreamFrame, sessionKey, ROUTES,
   MAX_JSON_BYTES, MAX_STREAM_EVENT_BYTES, entityReference, extractEntities, isEntityId } from '../../src/protocol/index.ts';
 
 const alice = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
@@ -75,6 +75,12 @@ test('versioned namespace+Pi UUID identity and strict envelope validation', () =
   assert.equal(isMessage({ ...message, body: '', extra: 1 }), false);
   assert.equal(isMessageInput({ recipient: '*', body: 'Broadcast' }), true);
   assert.equal(isMessageInput({ recipient: '*', body: 'Broadcast', unexpected: true }), false);
+  // Documented registration example (docs/contract.md) omits optional lastSeenAt.
+  assert.equal(isRegistrationResult({ subscription: { id: sessionKey(alice), session: alice, hostId: 'host-a', cursor: 0 }, rank: 1 }), true);
+  assert.equal(isRegistrationResult({ subscription: { id: sessionKey(alice), session: alice, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 }), true);
+  assert.equal(isRegistrationResult({ subscription: { id: sessionKey(alice), session: alice, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: -1 }), false);
+  for (const lastSeenAt of [null, '1', 1.5, NaN, Number.MAX_SAFE_INTEGER + 1])
+    assert.equal(isRegistrationResult({ subscription: { id: sessionKey(alice), session: alice, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt }), false);
   assert.equal(isRegistration({ session: alice }), true);
   assert.equal(isRegistration({ session: alice, callbackUrl: 'http://localhost' }), false);
   assert.equal(isRegistration({ session: { ...alice, callbackUrl: 'http://localhost' } }), false);

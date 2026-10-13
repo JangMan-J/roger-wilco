@@ -3,6 +3,60 @@
 The extraction and cutover checks passed.
 Validation results are recorded by revision.
 The recorded 52-test runs preceded the slash-command follow-up, which brought the baseline to 53 tests.
+Earlier revisions are historical evidence only; they do not validate later working trees.
+
+## Registration-wait revision — 2026-10-13
+
+Scope: TODO items 1–8 on top of the uncommitted daemon-only registration diff
+(base commit `03d042c`). `awaitRegistration` now validates and enqueues on the
+serialized socket chain, then waits off-chain in a waiter keyed by request ID
+that counts toward the four-outstanding limit and is cancelled on socket
+close, release, and daemon shutdown. The waiter's 15-second deadline starts
+when the daemon reports an attempt for its session (45-second queue guard;
+client request timeout 65 seconds). Registration failures are isolated per
+queued row with one backoff per failed pass, coordinator failure codes
+(`unauthorized`, `unknown_host`, `owner_conflict`) survive `jsonPost`, the
+`registered` socket event, and the client listener, bare heartbeats no longer
+discard a queued explicit `displayName`, waiters correlate by the inbox-owned
+queue generation (a review follow-up replaced attempt-based matching after a
+probe showed a stale snapshotted attempt could complete a newer identity
+request; superseded explicit waiters settle with a defined
+`temporarily_unavailable` result, bare waiters follow the newer generation,
+stale snapshots are skipped instead of posted, and completion only deletes
+the current generation so an X→Y→X re-registration is not consumed by the
+old attempt), and
+`isRegistrationResult` accepts the documented example that omits `lastSeenAt`.
+
+Evidence (this working tree, local host only):
+
+- `test/host/local-ipc.test.ts` — through the real daemon, two gated
+  blockers delay the target registration attempt past 10 s while `renew`,
+  `pending`, and `ack` complete on the same socket; the lease token is
+  unchanged and a later renew succeeds. A second test reproduces the review
+  race: the stale snapshotted `Old name` row is skipped and never posted,
+  the `New name` waiter stays unsettled through a socket round trip, then
+  succeeds with `New name` once its own attempt is released. A third proves
+  a superseded waiter settles with the defined result, a fourth proves a
+  bare waiter follows a newer explicit registration, and the `registered` event test
+  proves `owner_conflict` reaches the client listener unflattened.
+- `test/host/host.test.ts` — first queued session returns 409, second returns
+  200 in the same pass before any retry; the failed row remains queued and
+  its `owner_conflict` code is reported. The same test proves a bare
+  heartbeat enqueue preserves the queued explicit display name.
+- `test/protocol/contract.test.ts` — the documented registration example
+  (no `lastSeenAt`) validates; `null`, string, fractional, and unsafe
+  timestamps are rejected.
+- `npm run check` (typecheck plus full suite): 95 tests, 95 pass, 0 fail,
+  0 skipped, on 2026-10-13. The review's `registration-race.mjs` probe no
+  longer returns the false success; its waiter now remains pending on the
+  probe's held fresh response (the probe releases that response only in its
+  cleanup, so as written it ends on its own 10-second timer — the in-repo
+  regression above adds the fresh-release step).
+
+Limits: no cross-host or installed-package rerun for this revision. The
+attempt-start deadline plumbing is exercised through the daemon loop, but
+its 15-second duration is not separately timed; the queue guard and attempt
+notice are covered by code path, not by a dedicated clock test.
 
 ## Entity revision — 2026-10-12
 

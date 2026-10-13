@@ -3,24 +3,25 @@ import { lstat } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import {
-  isRegistration, isSessionAddress, isStreamFrame, MAX_JSON_BYTES, sessionKey,
+  isFailureCode, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, MAX_JSON_BYTES, sessionKey,
   type FailureCode, type HostInbox, type Message, type Outcome, type PiReceipt,
-  type Registration, type SessionAddress, type StreamFrame,
+  type Registration, type RegistrationResult, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
 
 const MAX_FRAME = MAX_JSON_BYTES + 8192;
 const MAX_OUTSTANDING = 4;
 const MAX_PAGE = 32;
 const REQUEST_MS = 10_000;
+/** Exceeds the daemon waiter's queue guard plus its per-attempt deadline. */
+const AWAIT_REQUEST_MS = 65_000;
 const CONNECT_MS = 5_000;
 const DRAIN_MS = 5_000;
-const FAILURES = ['invalid_request', 'unauthorized', 'unknown_host', 'not_found', 'owner_conflict', 'temporarily_unavailable'];
 type Waiter = { method: string; resolve: (value: Outcome<unknown>) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 const failure = (error: FailureCode, message: string): Outcome<never> => ({ ok: false, error, message });
 const rec = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const exact = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
-const isFailure = (value: unknown): value is FailureCode => typeof value === 'string' && FAILURES.includes(value);
+const isFailure = isFailureCode;
 const safeTime = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const validToken = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 512 &&
   value.isWellFormed() && !/[\u0000-\u001f\u007f-\u009f\s]/u.test(value);
@@ -32,6 +33,7 @@ function parseOutcome(method: string, value: unknown): Outcome<unknown> | undefi
   if (value.ok === true && exact(value, ['ok', 'value'])) {
     const body = value.value;
     const ok = method === 'release' || method === 'ack' || method === 'enqueueRegistration' ? body === null
+      : method === 'awaitRegistration' ? isRegistrationResult(body)
       : rec(body) && (method === 'bind' ? exact(body, ['token', 'leaseExpiresAt']) && validToken(body.token) && safeTime(body.leaseExpiresAt)
         : method === 'renew' ? exact(body, ['leaseExpiresAt']) && safeTime(body.leaseExpiresAt)
           : method === 'pending' && exact(body, ['messages', 'more']) && Array.isArray(body.messages) && body.messages.length <= 1 && typeof body.more === 'boolean');
@@ -55,6 +57,7 @@ class HostClient implements HostInbox {
   private nextId = 1;
   private readonly waiters = new Map<number, Waiter>();
   private readonly listeners = new Set<() => void>();
+  private readonly registrationListeners = new Set<(result: Outcome<null>) => void>();
   private token: string | undefined;
   private leaseExpiresAt: number | undefined;
   private boundKey: string | undefined;
@@ -73,10 +76,13 @@ class HostClient implements HostInbox {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   }
+  onRegistrationResult(listener: (result: Outcome<null>) => void): () => void {
+    this.registrationListeners.add(listener);
+    return () => { this.registrationListeners.delete(listener); };
+  }
   authority(): string | undefined { return this.token; }
-  async receive(_frame: StreamFrame): Promise<{ inserted: boolean }> { throw new Error('Host client cannot receive'); }
 
-  async bind(session: SessionAddress, runtimeId: string, _now: number): Promise<Outcome<{ leaseExpiresAt: number }>> {
+  async bind(session: SessionAddress, runtimeId: string): Promise<Outcome<{ leaseExpiresAt: number }>> {
     if (this.closed) return failure('temporarily_unavailable', 'Host client is closed');
     if (!isSessionAddress(session) || typeof runtimeId !== 'string' || !runtimeId || runtimeId.length > 200)
       return failure('invalid_request', 'Invalid lease input');
@@ -111,7 +117,7 @@ class HostClient implements HostInbox {
     this.emit();
     return { ok: true, value: { leaseExpiresAt: value.leaseExpiresAt } };
   }
-  async renew(session: SessionAddress, runtimeId: string, _now: number): Promise<Outcome<{ leaseExpiresAt: number }>> {
+  async renew(session: SessionAddress, runtimeId: string): Promise<Outcome<{ leaseExpiresAt: number }>> {
     if (!isSessionAddress(session) || typeof runtimeId !== 'string' || !runtimeId) return failure('invalid_request', 'Invalid lease input');
     const token = this.token;
     if (!token || this.boundKey !== sessionKey(session)) return failure('owner_conflict', 'Lease no longer owned');
@@ -173,9 +179,20 @@ class HostClient implements HostInbox {
     const result = await this.send('enqueueRegistration', { registration });
     if (!result.ok) throw new Error(`${result.error}: ${result.message}`);
   }
+  async awaitRegistration(registration: Registration): Promise<Outcome<RegistrationResult>> {
+    if (this.closed) return failure('temporarily_unavailable', 'Host client is closed');
+    if (!isRegistration(registration)) return failure('invalid_request', 'Invalid registration');
+    try {
+      if (!this.socket?.writable) await this.open();
+      return await this.send('awaitRegistration', { registration }, AWAIT_REQUEST_MS) as Outcome<RegistrationResult>;
+    } catch (error) {
+      return failure('temporarily_unavailable', error instanceof Error ? error.message : String(error));
+    }
+  }
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.registrationListeners.clear();
     const token = this.token;
     this.token = undefined; this.leaseExpiresAt = undefined; this.boundKey = undefined;
     if (token && this.socket?.writable && this.waiters.size < MAX_OUTSTANDING) {
@@ -249,6 +266,9 @@ class HostClient implements HostInbox {
     if (!rec(value) || value.v !== 1) { this.disconnect(new Error('Malformed envelope'), socket); return; }
     if ('event' in value) {
       if (exact(value, ['v', 'event']) && value.event === 'changed') this.emit();
+      else if (exact(value, ['v', 'event']) && value.event === 'registered') this.emitRegistration();
+      else if (exact(value, ['v', 'event', 'error', 'message']) && value.event === 'registered' && isFailure(value.error) && typeof value.message === 'string')
+        this.emitRegistration(value.error, value.message);
       else this.disconnect(new Error('Malformed event'), socket);
       return;
     }
@@ -267,7 +287,7 @@ class HostClient implements HostInbox {
     const key = this.boundKey;
     return !!key && !(page.messages.length === 0 && page.more) && page.messages.every(item => acceptMessage(item, key));
   }
-  private send(method: string, args: unknown): Promise<Outcome<unknown>> {
+  private send(method: string, args: unknown, timeout = REQUEST_MS): Promise<Outcome<unknown>> {
     const socket = this.socket;
     if (!socket?.writable) return Promise.reject(new Error('Inbox socket unavailable'));
     if (this.waiters.size >= MAX_OUTSTANDING) return Promise.reject(new Error('temporarily_unavailable: Too many outstanding inbox requests'));
@@ -276,7 +296,7 @@ class HostClient implements HostInbox {
     const body = JSON.stringify({ v: 1, id, method, args });
     if (Buffer.byteLength(body) + 1 > MAX_FRAME) return Promise.reject(new Error('Inbox request exceeds frame limit'));
     return new Promise((resolvePromise, reject) => {
-      const timer = setTimeout(() => this.disconnect(new Error('Inbox request timed out'), socket), REQUEST_MS);
+      const timer = setTimeout(() => this.disconnect(new Error('Inbox request timed out'), socket), timeout);
       timer.unref();
       this.waiters.set(id, { method, resolve: resolvePromise, reject, timer });
       const frame = `${body}\n`;
@@ -313,6 +333,17 @@ class HostClient implements HostInbox {
       try { listener(); }
       catch {
         this.listeners.delete(listener);
+        this.disconnect(new Error('Inbox observer failed'));
+      }
+    });
+  }
+  private emitRegistration(error?: FailureCode, message?: string): void {
+    const result: Outcome<null> = error === undefined ? { ok: true, value: null } : { ok: false, error, message: message! };
+    for (const listener of this.registrationListeners) queueMicrotask(() => {
+      if (!this.registrationListeners.has(listener)) return;
+      try { listener(result); }
+      catch {
+        this.registrationListeners.delete(listener);
         this.disconnect(new Error('Inbox observer failed'));
       }
     });

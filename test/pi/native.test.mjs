@@ -8,8 +8,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
-import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
-import { listenLocal } from '../../src/host/ipc.ts';
+import { createDaemonInbox as createHostInbox, createHostDaemon } from '../../src/host/index.ts';
 import { createHostClient } from '../../src/host/client.ts';
 
 const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
@@ -39,9 +38,14 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     const body = req.method === 'POST' ? JSON.parse(await new Promise(resolve => {
       let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value));
     })) : undefined;
+    if (req.url === '/v1/hosts/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(': idle\n\n');
+      return;
+    }
     calls.push({ path: req.url, body, authorization: req.headers.authorization });
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok: true, value: { subscription: { id: `fleet:${body?.session?.piSessionId}`, session: body?.session, hostId: 'host-a', cursor: 0 } } }));
+    res.end(JSON.stringify({ ok: true, value: { subscription: { id: `fleet:${body?.session?.piSessionId}`, session: body?.session, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
   });
   server.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
@@ -81,8 +85,9 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     return stream;
   };
   const external = createHostInbox(inboxPath);
-  const ipc = await listenLocal(hostConfig, external);
-  t.after(async () => { release?.(); await session.abort(); await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); await ipc.close(); await external.close(); });
+  const daemon = createHostDaemon(hostConfig, external);
+  const running = daemon.start(new AbortController().signal);
+  t.after(async () => { release?.(); await session.abort(); await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); await daemon.stop(); await running; await external.close(); });
   async function openClient() {
     const client = await createHostClient(inboxPath);
     t.after(() => client.close());

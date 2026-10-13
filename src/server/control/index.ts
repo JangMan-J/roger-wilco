@@ -3,7 +3,7 @@ import {
   ROUTES, isEntityId, isMessageInput, isRegistration, isSessionAddress, sessionKey,
   type ControlHandler, type CoordinatorStore, type HostAuthenticator, type Outcome,
 } from '../../protocol/index.ts';
-import { json, readBody } from '../http.ts';
+import { bearerCredential, closedQuery, json, openQuery, readBody, readBodyError } from '../http.ts';
 
 /** Configure host IDs as keys and their bearer credentials as values. */
 export function createHostAuthenticator(hostCredentials: Readonly<Record<string, string>>, knownHosts: ReadonlySet<string> = new Set(Object.keys(hostCredentials))): HostAuthenticator {
@@ -52,11 +52,9 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
       if (request.method === 'GET' && path === ROUTES.health) {
         json(response, { ok: true, value: { service: 'roger-wilco', version: 1 } }); return;
       }
-      const authorization = request.headers.authorization;
-      const match = typeof authorization === 'string' && /^Bearer ([^\s]+)$/.exec(authorization);
-      const identity = auth.authenticate(match ? match[1]! : null);
+      const identity = auth.authenticate(bearerCredential(request.headers.authorization));
       if (!identity.ok) { json(response, identity); return; }
-      if (url.search && path !== ROUTES.inbox && path !== ROUTES.entity) { json(response, failure('invalid_request', 'Unexpected query')); return; }
+      if (!closedQuery(url) && path !== ROUTES.inbox && path !== ROUTES.entity) { json(response, failure('invalid_request', 'Unexpected query')); return; }
       const host = identity.value;
       if (request.method === 'GET' && path === ROUTES.sessions) {
         json(response, { ok: true, value: store.listSessions() }); return;
@@ -69,8 +67,7 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         const since = parseInteger(params.get('since'), 0, Number.MAX_SAFE_INTEGER);
         const limit = parseInteger(params.get('limit'), 1, 500);
         const session = { namespace: params.get('namespace'), piSessionId: params.get('piSessionId') };
-        if ([...params.keys()].some(key => !['namespace', 'piSessionId', 'since', 'limit'].includes(key)) ||
-            [...params.keys()].some(key => params.getAll(key).length !== 1) || !isSessionAddress(session) || since === null || limit === null) {
+        if (!openQuery(url, ['namespace', 'piSessionId', 'since', 'limit']) || !isSessionAddress(session) || since === null || limit === null) {
           json(response, failure('invalid_request', 'Invalid inbox query')); return;
         }
         json(response, store.inbox(host, session, since, limit)); return;
@@ -80,8 +77,7 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         const id = params.get('id');
         const since = parseInteger(params.get('since'), 0, Number.MAX_SAFE_INTEGER);
         const limit = parseInteger(params.get('limit'), 1, 500);
-        if ([...params.keys()].some(key => !['id', 'since', 'limit'].includes(key)) ||
-            [...params.keys()].some(key => params.getAll(key).length !== 1) || !isEntityId(id) || since === null || limit === null) {
+        if (!openQuery(url, ['id', 'since', 'limit']) || !isEntityId(id) || since === null || limit === null) {
           json(response, failure('invalid_request', 'Invalid entity query')); return;
         }
         json(response, store.entity(id, since, limit)); return;
@@ -91,7 +87,7 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
       let body: unknown;
       try { body = await readBody(request); }
       catch (error) {
-        const { code, message } = error as { code: number; message: string };
+        const { code, message } = readBodyError(error);
         json(response, failure('invalid_request', message), code); return;
       }
       if (path === ROUTES.register) {

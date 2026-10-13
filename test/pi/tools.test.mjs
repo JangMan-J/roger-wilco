@@ -6,8 +6,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import rogerWilco from '../../src/pi/index.ts';
-import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
-import { listenLocal } from '../../src/host/ipc.ts';
+import { createDaemonInbox as createHostInbox, createHostDaemon } from '../../src/host/index.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { nativePi } from '../acceptance/native-pi.ts';
@@ -27,8 +26,9 @@ function context(sessionId, dir) {
 }
 async function hostSocket(t, config) {
   const inbox = createHostInbox(config.inboxPath);
-  const ipc = await listenLocal(config, inbox);
-  t.after(async () => { await ipc.close(); await inbox.close(); });
+  const daemon = createHostDaemon(config, inbox);
+  const running = daemon.start(new AbortController().signal);
+  t.after(async () => { await daemon.stop(); await running; await inbox.close(); });
 }
 
 test('session-bound tools use the invoking UUID; board includes sessions and claims; duplicate runtime conflicts', async t => {
@@ -48,11 +48,24 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
   const requests = [];
   const server = createServer(async (req, res) => {
+    if (req.url === '/v1/hosts/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(': idle\n\n');
+      return;
+    }
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : undefined;
     requests.push({ path: req.url, body, authorization: req.headers.authorization });
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/sessions/register') {
+      const session = body.session;
+      res.end(JSON.stringify({ ok: true, value: {
+        subscription: { id: `${session.namespace}:${session.piSessionId}`, session, hostId: 'host-a', cursor: 0 },
+        rank: 1, lastSeenAt: now,
+      } }));
+      return;
+    }
     const url = new URL(req.url, 'http://localhost');
     const value = req.url === '/v1/sessions' ? [recent, stale, unknown] :
       req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] :
@@ -150,11 +163,23 @@ test('native slash commands show the board without a model turn and report unava
   let savedRank = 1;
   let rankUnavailable = false;
   const server = createServer(async (req, res) => {
+    if (req.url === '/v1/hosts/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(': idle\n\n');
+      return;
+    }
     let raw = '';
     for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : undefined;
-    if (req.url === '/v1/sessions/register') actor = body.session;
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/sessions/register') {
+      actor = body.session;
+      res.end(JSON.stringify({ ok: true, value: {
+        subscription: { id: `${body.session.namespace}:${body.session.piSessionId}`, session: body.session, hostId: 'host-a', cursor: 0 },
+        rank: 1, lastSeenAt: now,
+      } }));
+      return;
+    }
     if (req.url === '/v1/sessions/rank') {
       rankRequests.push({ body, authorization: req.headers.authorization });
       if (rankUnavailable) {

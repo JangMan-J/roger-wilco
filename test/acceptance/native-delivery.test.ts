@@ -9,8 +9,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
-import { createDaemonInbox as createHostInbox, createHostDaemon } from '../../src/host/index.ts';
-import { ROUTES, sessionKey, type HostInbox, type PiConfig, type SessionAddress } from '../../src/protocol/index.ts';
+import { createDaemonInbox as createHostInbox, createHostDaemon, type LocalHostInbox } from '../../src/host/index.ts';
+import { ROUTES, sessionKey, type PiConfig, type SessionAddress } from '../../src/protocol/index.ts';
 import { nativePi, nativePiRuntime, persistedMessages } from './native-pi.ts';
 
 async function until(check: () => boolean | Promise<boolean>, reason: string) {
@@ -39,7 +39,7 @@ async function rig(t: test.TestContext, fault: { dropHostAReceipts?: boolean } =
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
   const url = `http://127.0.0.1:${address.port}`;
-  const hosts: { config: PiConfig; inbox: HostInbox; daemon: ReturnType<typeof createHostDaemon>; running: Promise<void> }[] = [];
+  const hosts: { config: PiConfig; inbox: LocalHostInbox; daemon: ReturnType<typeof createHostDaemon>; running: Promise<void> }[] = [];
   for (const [hostId, credential] of [['host-a', 'token-a'], ['host-b', 'token-b']]) {
     const path = join(dir, hostId, 'inbox.db');
     const config = { coordinatorUrl: url, hostId, credential, inboxPath: path, namespace: 'fleet' };

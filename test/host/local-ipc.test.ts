@@ -126,12 +126,12 @@ test('catch-up finds a pre-bind commit and a hint during reconciliation, isolate
   t.after(() => ipc.close());
   const left = clientFor(t, path);
   const right = clientFor(t, path);
-  assert.equal((await right.bind(b, 'rt-b', 1)).ok, true);
+  assert.equal((await right.bind(b, 'rt-b')).ok, true);
   let rightWakes = 0;
   right.onChange!(() => { rightWakes++; });
   let wakes = 0;
   left.onChange!(() => { wakes++; });
-  const bound = await left.bind(a, 'rt-a', 1);
+  const bound = await left.bind(a, 'rt-a');
   assert.equal(bound.ok, true);
   if (bound.ok) daemonClock(bound.value.leaseExpiresAt);
   const baseline = wakes;
@@ -158,12 +158,12 @@ test('stale grants fail after disconnect and restart; client time does not set t
   let reopened: LocalHostInbox | undefined;
   t.after(async () => { await ipc.close(); await reopened?.close(); });
   const first = clientFor(t, path);
-  const bound = await first.bind(a, 'rt-a', 1);
+  const bound = await first.bind(a, 'rt-a');
   assert.equal(bound.ok, true);
   if (bound.ok) daemonClock(bound.value.leaseExpiresAt);
   const token = first.authority!();
   assert.ok(token);
-  assert.equal((await clientFor(t, path).bind(a, 'rt-a', Date.now())).ok, false);
+  assert.equal((await clientFor(t, path).bind(a, 'rt-a')).ok, false);
   const closing = first.close();
   assert.equal(first.authority!(), undefined);
   await closing;
@@ -179,7 +179,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   }
   raw.destroy();
   const second = clientFor(t, path);
-  assert.equal((await second.bind(a, 'rt-a', 1)).ok, true);
+  assert.equal((await second.bind(a, 'rt-a')).ok, true);
   const retired = second.authority!();
   assert.ok(retired && retired !== token);
   await ipc.close();
@@ -193,7 +193,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   writeFrame(again, 1, 'ack', { token: retired, proof: proof(1, a) });
   conflict(await waiting);
   again.destroy();
-  const rebound = await clientFor(t, path).bind(a, 'rt-a', 0);
+  const rebound = await clientFor(t, path).bind(a, 'rt-a');
   assert.equal(rebound.ok, true);
   if (rebound.ok) daemonClock(rebound.value.leaseExpiresAt);
 });
@@ -218,19 +218,177 @@ test('quiet idle does not select pending inbox or registration rows', async t =>
     await delay(150);
     await modeReady(path);
     const client = clientFor(t, path);
-    const bound = await client.bind(a, 'rt-a', 0);
+    const bound = await client.bind(a, 'rt-a');
     assert.equal(bound.ok, true);
     if (bound.ok) daemonClock(bound.value.leaseExpiresAt);
     assert.deepEqual(await client.pending(a, 'rt-a'), []);
     const watch = watchReads();
     try {
-      const renewed = await client.renew(a, 'rt-a', 1);
+      const renewed = await client.renew(a, 'rt-a');
       assert.equal(renewed.ok, true);
       if (renewed.ok) daemonClock(renewed.value.leaseExpiresAt);
       await delay(650);
       assert.deepEqual(watch.sql(), []);
     } finally { watch.stop(); }
   } finally { await daemon.stop(); await run; }
+});
+
+test('awaitRegistration does not block renew, pending, or ack while the daemon attempt starts past 10s', { timeout: 30_000 }, async t => {
+  const { path, inbox, config } = rig(t);
+  // Two blockers ordered ahead of the target delay its attempt start past
+  // 10s through the real daemon; each blocker responds within the POST
+  // deadline, so no production timeout changes are needed.
+  const blockers: SessionAddress[] = [
+    { namespace: 'fleet', piSessionId: '00000000-0000-4000-8000-000000000000' },
+    { namespace: 'fleet', piSessionId: '11111111-1111-4111-8111-111111111111' },
+  ];
+  await inbox.enqueueRegistration({ session: blockers[0]! });
+  await inbox.enqueueRegistration({ session: blockers[1]! });
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      if (blockers.some(item => item.piSessionId === registration.session.piSessionId)) await delay(6_000);
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  config.coordinatorUrl = `http://127.0.0.1:${address.port}`;
+  const daemon = createHostDaemon(config, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await modeReady(path);
+    const client = clientFor(t, path);
+    assert.equal((await client.bind(b, 'rt-b')).ok, true);
+    const token = client.authority!();
+    await inbox.receive(frame(1, b));
+    const started = Date.now();
+    let settled = false;
+    const waiting = client.awaitRegistration({ session: b, displayName: 'Target' });
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(async () => await count(path, registrationSql) === 3);
+    assert.equal((await client.renew(b, 'rt-b')).ok, true);
+    assert.deepEqual((await client.pending(b, 'rt-b')).map(item => item.id), ['fleet:msg:1']);
+    assert.equal((await client.acknowledgePi(b, 'rt-b', proof(1, b))).ok, true);
+    assert.equal(client.authority!(), token, 'same-socket work completes without retiring the lease');
+    await delay(Math.max(0, 10_500 - (Date.now() - started)));
+    assert.equal(settled, false, 'registration still waits for its own attempt');
+    assert.equal((await client.renew(b, 'rt-b')).ok, true);
+    assert.equal(client.authority!(), token);
+    const registered = await waiting;
+    assert.equal(registered.ok, true);
+    if (registered.ok) assert.equal(registered.value.displayName, 'Target');
+    assert.equal((await client.renew(b, 'rt-b')).ok, true, 'lease survives the long wait');
+  } finally { await daemon.stop(); await run; }
+});
+
+test('a stale snapshotted attempt cannot complete a newer identity request', { timeout: 20_000 }, async t => {
+  const { path, inbox, config } = rig(t);
+  await inbox.enqueueRegistration({ session: a });
+  await inbox.enqueueRegistration({ session: b, displayName: 'Old name' });
+  let releaseA = () => {};
+  const gateA = new Promise<void>(resolve => { releaseA = resolve; });
+  let aStarted = () => {};
+  const aAttempt = new Promise<void>(resolve => { aStarted = resolve; });
+  let releaseFresh = () => {};
+  const gateFresh = new Promise<void>(resolve => { releaseFresh = resolve; });
+  let freshStarted = () => {};
+  const freshAttempt = new Promise<void>(resolve => { freshStarted = resolve; });
+  const applied = new Map<string, string | undefined>();
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      if (registration.session.piSessionId === a.piSessionId) { aStarted(); await gateA; }
+      if (registration.displayName === 'New name') { freshStarted(); await gateFresh; }
+      applied.set(sessionKey(registration.session), registration.displayName);
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  config.coordinatorUrl = `http://127.0.0.1:${address.port}`;
+  const daemon = createHostDaemon(config, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await aAttempt; // daemon has snapshotted both rows and is posting A
+    await modeReady(path);
+    const client = clientFor(t, path);
+    assert.equal((await client.bind(b, 'rt-b')).ok, true);
+    let settled = false;
+    const waiting = client.awaitRegistration({ session: b, displayName: 'New name' });
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => inbox.registrations().some(row => row.session_key === sessionKey(b) && row.registration_json.includes('New name')));
+    releaseA();
+    await freshAttempt; // the stale Old snapshot was skipped, never posted; the New attempt is held
+    assert.equal((await client.renew(b, 'rt-b')).ok, true, 'socket round trip while the New attempt is held');
+    assert.equal(settled, false, 'no stale result may settle the New name waiter');
+    assert.equal(applied.get(sessionKey(b)), undefined, 'stale Old name is never applied');
+    releaseFresh();
+    const registered = await waiting;
+    assert.equal(registered.ok, true);
+    if (registered.ok) assert.equal(registered.value.displayName, 'New name');
+    assert.equal(applied.get(sessionKey(b)), 'New name');
+    assert.equal(inbox.registrations().some(row => row.session_key === sessionKey(b)), false);
+  } finally { releaseA(); releaseFresh(); await daemon.stop(); await run; }
+});
+
+test('a waiter replaced by a newer registration settles as superseded, not with the newer result', async t => {
+  const { path, inbox, config } = rig(t);
+  const ipc = await listenLocal(config, inbox);
+  t.after(() => ipc.close());
+  const client = clientFor(t, path);
+  assert.equal((await client.bind(a, 'rt-a')).ok, true);
+  const waiting = client.awaitRegistration({ session: a, displayName: 'Old name' });
+  void waiting.catch(() => {});
+  await waitFor(async () => await count(path, registrationSql) === 1);
+  await client.enqueueRegistration({ session: a, displayName: 'New name' });
+  assert.deepEqual(await waiting, { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' });
+});
+
+test('a bare waiter follows a newer explicit registration instead of settling superseded', async t => {
+  const { path, inbox, config } = rig(t);
+  const ipc = await listenLocal(config, inbox);
+  t.after(() => ipc.close());
+  const client = clientFor(t, path);
+  assert.equal((await client.bind(a, 'rt-a')).ok, true);
+  const waiting = client.awaitRegistration({ session: a });
+  void waiting.catch(() => {});
+  await waitFor(async () => await count(path, registrationSql) === 1);
+  await client.enqueueRegistration({ session: a, displayName: 'New name' });
+  const row = inbox.registrations()[0]!;
+  inbox.reportRegistration(sessionKey(a), row.registration_json, row.generation,
+    { ok: true, value: { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, displayName: 'New name' } });
+  const registered = await waiting;
+  assert.equal(registered.ok, true);
+  if (registered.ok) assert.equal(registered.value.displayName, 'New name');
+});
+
+test('registered event preserves the coordinator failure code to the client', async t => {
+  const { path, inbox, config } = rig(t);
+  const ipc = await listenLocal(config, inbox);
+  t.after(() => ipc.close());
+  const client = clientFor(t, path);
+  assert.equal((await client.bind(a, 'rt-a')).ok, true);
+  const seen = new Promise<unknown>(resolve => client.onRegistrationResult!(result => resolve(result)));
+  inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 1,
+    { ok: false, error: 'owner_conflict', message: 'Session belongs to another host' });
+  assert.deepEqual(await seen, { ok: false, error: 'owner_conflict', message: 'Session belongs to another host' });
 });
 
 test('lost registration reply leaves a committed row, then the same enqueue drains again', async t => {
@@ -250,7 +408,7 @@ test('lost registration reply leaves a committed row, then the same enqueue drai
       gate = arm();
       await release;
       posts++;
-      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(a), hostId: 'host-a' } } }));
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
       return;
     }
     if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
@@ -292,7 +450,7 @@ test('invalid frames close only their socket, and a slow reader stays bounded', 
   const ipc = await listenLocal(config, inbox);
   t.after(() => ipc.close());
   const healthy = clientFor(t, path);
-  assert.equal((await healthy.bind(b, 'rt-b', 1)).ok, true);
+  assert.equal((await healthy.bind(b, 'rt-b')).ok, true);
   const oversized = Buffer.alloc(MAX_JSON_BYTES + 8192 + 1, 0x61);
   oversized[oversized.length - 1] = 10;
   for (const chunk of [Buffer.from([0xff, 0x0a]), oversized]) {
@@ -301,7 +459,7 @@ test('invalid frames close only their socket, and a slow reader stays bounded', 
     bad.write(chunk);
     await closed;
   }
-  assert.equal((await healthy.renew(b, 'rt-b', 1)).ok, true);
+  assert.equal((await healthy.renew(b, 'rt-b')).ok, true);
   const large = frame(3, a);
   large.message.data = 'x'.repeat(900_000);
   await inbox.receive(large);
@@ -325,7 +483,7 @@ test('invalid frames close only their socket, and a slow reader stays bounded', 
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 8_000);
   assert.ok(read - drained < 8_192);
-  assert.equal((await healthy.renew(b, 'rt-b', 1)).ok, true);
+  assert.equal((await healthy.renew(b, 'rt-b')).ok, true);
 });
 
 test('post-commit notifier failure disconnects readers and reconnect catches up', async t => {
@@ -333,13 +491,13 @@ test('post-commit notifier failure disconnects readers and reconnect catches up'
   const ipc = await listenLocal(config, inbox);
   t.after(() => ipc.close());
   const client = clientFor(t, path);
-  assert.equal((await client.bind(a, 'owner', 0)).ok, true);
+  assert.equal((await client.bind(a, 'owner')).ok, true);
   const previous = client.authority!();
   const removeFault = inbox.subscribe(() => { throw new Error('injected notifier fault'); });
   await assert.rejects(inbox.receive(frame(1, a)), /injected notifier fault/);
   removeFault();
   await waitFor(() => client.authority!() === undefined);
-  assert.equal((await client.bind(a, 'owner', 0)).ok, true);
+  assert.equal((await client.bind(a, 'owner')).ok, true);
   assert.notEqual(client.authority!(), previous);
   assert.deepEqual((await client.pending(a, 'owner')).map(item => item.id), ['fleet:msg:1']);
 });
@@ -384,6 +542,6 @@ test('SIGKILL after inbox commit before hint survives stale-socket recovery with
   ipc = await listenLocal({ inboxPath: path, coordinatorUrl: 'http://127.0.0.1:1',
     hostId: 'host-a', credential: 'offline' }, inbox);
   client = createHostClient(path);
-  assert.equal((await client.bind(a, 'after-crash', 0)).ok, true);
+  assert.equal((await client.bind(a, 'after-crash')).ok, true);
   assert.deepEqual((await client.pending(a, 'after-crash')).map(item => item.id), ['fleet:msg:1']);
 });

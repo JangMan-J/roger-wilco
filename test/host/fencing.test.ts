@@ -9,15 +9,25 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { rollbackInbox } from '../../deploy/rollback-inbox.ts';
-import { sessionKey, type HostInbox, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
+import { sessionKey, type Message, type Outcome, type PiReceipt, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const protocol = new URL('../../src/protocol/index.ts', import.meta.url).href;
 const legacySource = stripTypeScriptTypes(execFileSync('git', ['show', 'edfe56e:src/host/index.ts'], {
   cwd: root, encoding: 'utf8',
 })).replaceAll("'../protocol/index.ts'", JSON.stringify(protocol));
+type LegacyInbox = {
+  receive(frame: StreamFrame): Promise<{ inserted: boolean }>;
+  bind(session: SessionAddress, runtimeId: string, now: number): Promise<Outcome<{ leaseExpiresAt: number }>>;
+  renew(session: SessionAddress, runtimeId: string, now: number): Promise<Outcome<{ leaseExpiresAt: number }>>;
+  release(session: SessionAddress, runtimeId: string): Promise<void>;
+  pending(session: SessionAddress, runtimeId: string): Promise<Message[]>;
+  acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>>;
+  enqueueRegistration(registration: { session: SessionAddress; displayName?: string }): Promise<void>;
+  close(): Promise<void>;
+};
 const legacyModule = await import(`data:text/javascript,${encodeURIComponent(legacySource)}`) as {
-  createHostInbox(path: string): HostInbox;
+  createHostInbox(path: string): LegacyInbox;
 };
 
 const session: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };

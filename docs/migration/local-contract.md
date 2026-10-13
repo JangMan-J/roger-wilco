@@ -11,7 +11,10 @@ methods, and malformed envelopes by closing the connection.
 
 Requests are `{v:1,id,method,args}`. IDs are positive safe integers.
 Responses are `{v:1,id,result}` with an `Outcome` result.
-Events are `{v:1,event:"changed"}`. Events are hints, never receipts.
+Events are `{v:1,event:"changed"}` and `{v:1,event:"registered"}`.
+A failed registration event is `{v:1,event:"registered",error,message}`, where
+`error` is the coordinator's failure code (for example `owner_conflict`), not
+a flattened transport code. Events are hints, never receipts.
 There are at most four outstanding requests per client. Bound output bytes,
 and close a slow socket after five seconds without drain.
 
@@ -30,6 +33,31 @@ Refuse to unlink a socket that accepts a connection.
 | pending | `{token,afterSequence?}` | `{messages,more}` |
 | ack | `{token,proof}` | `null` |
 | enqueueRegistration | `{registration}` | `null` |
+| awaitRegistration | `{registration}` | `RegistrationResult` |
+
+`awaitRegistration` validates and enqueues on the serialized command chain,
+then holds its waiter outside that chain, keyed by request ID, and replies
+asynchronously when the daemon reports the attempt's result. The inbox owns
+correlation: each effective queued registration has a generation (incremented
+only when its stored bytes change; a bare heartbeat that inherits a queued
+explicit `displayName` changes nothing), and the daemon's snapshot, attempt
+notice, and result all carry that generation. A waiter settles only on a
+result for its own generation — a stale snapshot attempted later cannot
+complete a newer request, and the daemon skips (never posts) a snapshot row
+whose generation is no longer current. A bare waiter (no `displayName`)
+follows a newer generation, since any registration of its session satisfies
+it. An explicit waiter whose generation is replaced by a newer enqueue
+before its result reports settles immediately with
+`{ok:false,error:"temporarily_unavailable",message:"Registration superseded
+by a newer registration"}`; it never receives the newer request's result.
+The waiter still counts toward the four-outstanding limit until it replies.
+It is cancelled, without a reply, when its socket closes, when the connection
+releases its lease, and when the daemon shuts down; the client then fails the
+request as a disconnect. Its 15-second deadline starts when the daemon
+begins an attempt for its generation (reported through the inbox attempt
+notice), so queued backoff does not consume the attempt's time; a separate
+45-second guard bounds a wait for any attempt to begin. The client's request
+timeout for this method is 65 seconds, above both bounds combined.
 
 One connection binds once. Bind installs its change listener before replying.
 That reply is the ready barrier. Every successful connection receives a new
@@ -46,7 +74,9 @@ Every new reconciliation starts from the oldest unacknowledged row.
 Page cursors never authorize acknowledgment.
 
 The client exposes the existing inbox methods except receive, plus
-`onChange(listener)` and `authority()`. `authority()` returns its current token
+`onChange(listener)`, `awaitRegistration(registration)`,
+`onRegistrationResult(listener)` (which receives the real failure code), and
+`authority()`. `authority()` returns its current token
 or undefined. It must clear authority synchronously on disconnect and before
 release. An operation captures its token before sending and never retries
 it under a new token. Transport failure closes the connection and rejects

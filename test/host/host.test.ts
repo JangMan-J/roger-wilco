@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { createHostDaemon, createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
-import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type HostInbox, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
+import { createHostDaemon, createDaemonInbox as createHostInbox, type LocalHostInbox } from '../../src/host/index.ts';
+import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
 const b: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
@@ -19,7 +19,7 @@ function message(sequence: number, recipient: string = sessionKey(a)): Message {
 function frame(sequence: number, session: SessionAddress = a, recipient = sessionKey(session)): StreamFrame {
   return { type: 'message', subscriptionId: sessionKey(session), message: message(sequence, recipient) };
 }
-function fixture(t: { after(fn: () => void | Promise<void>): void }): { inbox: HostInbox; path: string } {
+function fixture(t: { after(fn: () => void | Promise<void>): void }): { inbox: LocalHostInbox; path: string } {
   const dir = mkdtempSync(join(tmpdir(), 'roger-host-'));
   const path = join(dir, 'inbox.sqlite');
   const inbox = createHostInbox(path);
@@ -107,7 +107,7 @@ test('host commits before receipt, reconnect replay is idempotent, invalid and o
         res.writeHead(503).end();
       } else {
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), hostId: 'host-a' } }));
+        res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 } }));
       }
       return;
     }
@@ -155,7 +155,7 @@ test('unsupported and malformed events do not block another subscription on the 
       const receipt = JSON.parse(body);
       receipts.push(receipt);
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, value: { id: receipt.subscriptionId, hostId: 'host-a' } }));
+      res.end(JSON.stringify({ ok: true, value: { id: receipt.subscriptionId, session: b, hostId: 'host-a', cursor: 0 } }));
       return;
     }
     res.writeHead(404).end();
@@ -222,7 +222,7 @@ test('silent open stream reconnects and commits the frame offered only on the ne
       assert.deepEqual(JSON.parse(body), { subscriptionId: sessionKey(a), messageId: 'fleet:msg:2' });
       receipts++;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), hostId: 'host-a' } }));
+      res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 } }));
       return;
     }
     res.writeHead(404).end();
@@ -259,7 +259,7 @@ test('stream fetch without response headers times out and reconnects', async t =
       assert.deepEqual(JSON.parse(body), { subscriptionId: sessionKey(a), messageId: 'fleet:msg:3' });
       receipts++;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), hostId: 'host-a' } }));
+      res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 } }));
       return;
     }
     res.writeHead(404).end();
@@ -275,6 +275,47 @@ test('stream fetch without response headers times out and reconnects', async t =
     assert.equal(connections, 2);
     assert.equal((await inbox.bind(a, 'inspect', Date.now())).ok, true);
     assert.deepEqual((await inbox.pending(a, 'inspect')).map(m => m.id), ['fleet:msg:3']);
+  } finally { await daemon.stop(); await run; }
+});
+
+test('a failing first registration does not starve a later session in the same pass', async t => {
+  const { inbox, path } = fixture(t);
+  await inbox.enqueueRegistration({ session: a, displayName: 'Queued A' });
+  await inbox.enqueueRegistration({ session: a }); // bare heartbeat must keep the explicit name
+  assert.match(inbox.registrations()[0]!.registration_json, /Queued A/);
+  await inbox.enqueueRegistration({ session: b });
+  const posts: string[] = [];
+  const results: Array<{ key: string; ok: boolean; error?: string }> = [];
+  inbox.onRegistrationResult((key, _json, _generation, result) => results.push({ key, ok: result.ok, ...(result.ok ? {} : { error: result.error }) }));
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let payload = '';
+      for await (const chunk of req) payload += chunk;
+      const session = (JSON.parse(payload) as { session: SessionAddress }).session;
+      posts.push(session.piSessionId);
+      res.setHeader('content-type', 'application/json');
+      if (session.piSessionId === a.piSessionId) {
+        res.writeHead(409);
+        res.end(JSON.stringify({ ok: false, error: 'owner_conflict', message: 'Session belongs to another host' }));
+      } else {
+        res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(session), session, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
+      }
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const daemon = createHostDaemon({ coordinatorUrl: `http://127.0.0.1:${address.port}`, hostId: 'host-a', credential: 'secret', inboxPath: path }, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await waitFor(() => posts.length >= 2);
+    assert.deepEqual(posts.slice(0, 2), [a.piSessionId, b.piSessionId], 'second session posts in the same pass, before any retry of the first');
+    assert.deepEqual(inbox.registrations().map(row => row.session_key), [sessionKey(a)], 'failed row remains queued, completed row is gone');
+    assert.deepEqual(results.find(row => row.key === sessionKey(b)), { key: sessionKey(b), ok: true });
+    assert.deepEqual(results.find(row => row.key === sessionKey(a)), { key: sessionKey(a), ok: false, error: 'owner_conflict' }, 'coordinator code is preserved');
   } finally { await daemon.stop(); await run; }
 });
 
@@ -296,7 +337,7 @@ test('registration queue survives reopen, retries lost response and stops prompt
       assert.equal(payload, registered);
       if (posts === 1) { res.destroy(); return; }
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(a), hostId: 'host-a' } } }));
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 } }));
       return;
     }
     if (req.url === ROUTES.stream) {
@@ -312,7 +353,7 @@ test('registration queue survives reopen, retries lost response and stops prompt
   const config = { coordinatorUrl: `http://127.0.0.1:${address.port}`, hostId: 'host-a', credential: 'secret', inboxPath: path };
   const daemon = createHostDaemon(config, reopened);
   const run = daemon.start(new AbortController().signal);
-  try { await waitFor(() => posts >= 2); }
+  try { await waitFor(() => posts >= 2 && reopened.registrations().length === 0); }
   finally { await daemon.stop(); await run; }
   // Confirm successful response removed the durable queue: no new registration after restart.
   const again = createHostDaemon(config, reopened);

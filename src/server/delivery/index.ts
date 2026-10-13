@@ -4,7 +4,7 @@ import {
   ROUTES, isReceipt, type ControlHandler, type CoordinatorStore, type HostAuthenticator,
   type FailureCode, type Outcome, type StreamFrame,
 } from '../../protocol/index.ts';
-import { json, readBody } from '../http.ts';
+import { bearerCredential, closedQuery, json, readBody, readBodyError } from '../http.ts';
 
 const KEEPALIVE_MS = 15_000;
 const WRITE_DEADLINE_MS = 5_000;
@@ -44,16 +44,15 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
       if (url.pathname !== ROUTES.stream && url.pathname !== ROUTES.receipt) {
         json(response, error('not_found', 'Unknown route')); return;
       }
-      const match = typeof request.headers.authorization === 'string' && /^Bearer ([^\s]+)$/.exec(request.headers.authorization);
-      const identity = auth.authenticate(match ? match[1]! : null);
+      const identity = auth.authenticate(bearerCredential(request.headers.authorization));
       if (!identity.ok) { json(response, identity); return; }
-      if (url.search) { json(response, error('invalid_request', 'Unexpected query')); return; }
+      if (!closedQuery(url)) { json(response, error('invalid_request', 'Unexpected query')); return; }
       if (url.pathname === ROUTES.receipt) {
         if (request.method !== 'POST') { json(response, error('not_found', 'Unknown route')); return; }
         let body: unknown;
         try { body = await readBody(request); }
         catch (problem) {
-          const { code, message } = problem as { code: number; message: string };
+          const { code, message } = readBodyError(problem);
           json(response, error('invalid_request', message), code); return;
         }
         if (!isReceipt(body)) { json(response, error('invalid_request', 'Invalid receipt')); return; }

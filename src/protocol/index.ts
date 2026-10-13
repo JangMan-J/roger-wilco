@@ -72,46 +72,42 @@ export interface CoordinatorStore {
   close(): void;
 }
 
-/** Lane D owns one SQLite inbox per host. Runtime adapters use its local socket. */
+/** Pi-facing socket adapter. The daemon's SQLite inbox is a separate module and does not implement this. */
 export interface HostInbox {
-  /** Commit hints. Runtime adapters must retain hints received during reconciliation. */
-  onChange?(listener: () => void): () => void;
-  /** A local transport grant, invalidated on disconnect. */
-  authority?(): string | undefined;
-  /** Commit before returning. Dedup lasts until seven days after Pi ACK; later replay checks Pi's JSONL. */
-  receive(frame: StreamFrame): Promise<{ inserted: boolean }>;
-  /** One live runtime per session; lease expiration must preserve pending messages. */
-  bind(session: SessionAddress, runtimeId: string, now: number): Promise<Outcome<{ leaseExpiresAt: number }>>;
-  renew(session: SessionAddress, runtimeId: string, now: number): Promise<Outcome<{ leaseExpiresAt: number }>>;
+  /** Commit hints. The adapter retains hints that arrive during reconciliation. */
+  onChange(listener: () => void): () => void;
+  /** Local transport grant, invalidated on disconnect. Not the caller-supplied runtime id. */
+  authority(): string | undefined;
+  /** One live runtime per session. The daemon clock bounds the lease; callers do not supply one. */
+  bind(session: SessionAddress, runtimeId: string): Promise<Outcome<{ leaseExpiresAt: number }>>;
+  renew(session: SessionAddress, runtimeId: string): Promise<Outcome<{ leaseExpiresAt: number }>>;
   release(session: SessionAddress, runtimeId: string): Promise<void>;
+  /** At most one bounded page batch. The daemon stores the full pending set. */
   pending(session: SessionAddress, runtimeId: string): Promise<Message[]>;
   /** Only after exact JSONL entry observed and file fsynced by lane E; identity is retained. */
   acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>>;
-  /** Durable local registration/outbox queue: unavailable coordinator must not block Pi startup. */
+  /** Durable local registration queue: unavailable coordinator must not block Pi startup. */
   enqueueRegistration(registration: Registration): Promise<void>;
+  /** Wait until the daemon finishes this registration attempt. Startup does not use this. */
+  awaitRegistration(registration: Registration): Promise<Outcome<RegistrationResult>>;
+  /** Daemon registration outcome for this connection's session. */
+  onRegistrationResult(listener: (result: Outcome<null>) => void): () => void;
   close(): Promise<void>;
 }
 
-export type CreateCoordinatorStore = (dbPath: string, namespace: string) => CoordinatorStore;
-export type CreateDaemonInbox = (path: string) => HostInbox;
 export type ControlHandler = (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse) => Promise<void>;
-export type CreateControlHandler = (store: CoordinatorStore, auth: HostAuthenticator) => ControlHandler;
-export type CreateStreamHandler = (store: CoordinatorStore, auth: HostAuthenticator) => ControlHandler;
-export type CreateHostDaemon = (config: HostConfig, inbox: HostInbox) => { start(signal: AbortSignal): Promise<void>; stop(): Promise<void> };
 
-/** Lane C uses SQLite replay, not an event-only in-memory queue. */
-export interface StreamDelivery {
-  subscribe(host: HostPrincipal, signal: AbortSignal): AsyncIterable<StreamFrame>;
-  acknowledge(host: HostPrincipal, receipt: Receipt): Outcome<Subscription>;
-}
 /** Lane B authentication binds a credential to one configured host. */
 export interface HostAuthenticator {
   authenticate(bearer: string | null): Outcome<HostPrincipal>;
 }
-/** Lane E submits a Pi message then observes the persistent session file, never ACKs the void sendMessage call. */
+/** Lane E submits a Pi message, then observes the persistent session file. It never acknowledges the void sendMessage call. */
 export interface PiDelivery {
   bind(session: SessionAddress, runtimeId: string): Promise<Outcome<null>>;
   stop(): Promise<void>;
+  wake(): void;
+  resumeAfterAbort(): Promise<void>;
+  isBound(): boolean;
 }
 
 export function sessionKey(address: SessionAddress): SessionKey {
@@ -196,6 +192,37 @@ export function isReceipt(value: unknown): value is Receipt {
     !isSessionKey(value.subscriptionId) || typeof value.messageId !== 'string') return false;
   const match = /^([a-z][a-z0-9-]{0,62}):msg:([1-9][0-9]*)$/.exec(value.messageId);
   return !!match && Number.isSafeInteger(Number(match[2])) && match[1] === value.subscriptionId.split(':', 1)[0];
+}
+const FAILURE_CODES: readonly FailureCode[] = ['invalid_request', 'unauthorized', 'unknown_host', 'not_found', 'owner_conflict', 'temporarily_unavailable'];
+export function isFailureCode(value: unknown): value is FailureCode {
+  return typeof value === 'string' && FAILURE_CODES.includes(value as FailureCode);
+}
+export function isOutcome(value: unknown): value is Outcome<unknown> {
+  if (!record(value)) return false;
+  if (value.ok === true) return hasKeys(value, ['ok', 'value']) && Object.hasOwn(value, 'value');
+  return value.ok === false && hasKeys(value, ['ok', 'error', 'message']) && isFailureCode(value.error) && typeof value.message === 'string';
+}
+/** Accept a successful coordinator outcome only when its value matches. */
+export function outcomeValue<T>(value: unknown, accept: (value: unknown) => value is T): T | undefined {
+  return isOutcome(value) && value.ok && accept(value.value) ? value.value : undefined;
+}
+export function isSubscription(value: unknown): value is Subscription {
+  return record(value) && hasKeys(value, ['id', 'session', 'hostId', 'cursor']) &&
+    isSessionKey(value.id) && isSessionAddress(value.session) && sessionKey(value.session) === value.id &&
+    typeof value.hostId === 'string' && value.hostId.length > 0 &&
+    Number.isSafeInteger(value.cursor) && (value.cursor as number) >= 0;
+}
+export function isEntityRef(value: unknown): value is EntityRef {
+  return record(value) && hasKeys(value, ['id', 'type', 'label']) && isEntityId(value.id) &&
+    Number.isInteger(value.type) && (value.type as number) >= 0 && (value.type as number) <= 255 &&
+    typeof value.label === 'string' && value.label.length > 0 && value.label.length <= 256;
+}
+export function isRegistrationResult(value: unknown): value is RegistrationResult {
+  return record(value) && hasKeys(value, ['subscription', 'rank', 'displayName', 'lastSeenAt', 'entities']) &&
+    isSubscription(value.subscription) && Number.isInteger(value.rank) && (value.rank as number) >= 1 && (value.rank as number) <= 5 &&
+    (value.displayName === undefined || (typeof value.displayName === 'string' && value.displayName.length <= 200)) &&
+    (value.lastSeenAt === undefined || (Number.isSafeInteger(value.lastSeenAt) && (value.lastSeenAt as number) >= 0)) &&
+    (value.entities === undefined || (Array.isArray(value.entities) && value.entities.every(isEntityRef)));
 }
 export function isStreamFrame(value: unknown): value is StreamFrame {
   return record(value) && hasKeys(value, ['type', 'subscriptionId', 'message']) &&

@@ -3,8 +3,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { listenLocal } from './ipc.ts';
 import {
-  isRegistration, isSessionAddress, isStreamFrame, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
-  type HostConfig, type HostInbox, type Message, type Outcome, type PiReceipt,
+  isFailureCode, isMessage, isOutcome, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, isSubscription, outcomeValue, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
+  type FailureCode, type HostConfig, type Message, type Outcome, type PiReceipt, type RegistrationResult,
   type Registration, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
 
@@ -17,16 +17,21 @@ const HISTORY_MS = 7 * 86400_000;
 const SWEEP_MS = 60_000;
 
 type LeaseRow = { runtime_id: string; expires_at: number };
-type RegistrationRow = { session_key: string; registration_json: string };
+type RegistrationRow = { session_key: string; registration_json: string; generation: number };
 type PendingRow = { message_json: string };
 
-export class LocalHostInbox implements HostInbox {
+export class LocalHostInbox {
   private readonly db: DatabaseSync;
   private readonly lock: DatabaseSync;
   private closed = false;
   private nextSweepAt = 0;
   private readonly changes = new Set<(key: string) => void>();
   private readonly registrationChanges = new Set<() => void>();
+  private readonly registrationResults = new Set<(key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>) => void>();
+  private readonly registrationAttempts = new Set<(key: string, registrationJson: string, generation: number) => void>();
+  private readonly registrationGenerations = new Map<string, number>();
+  private readonly registrationAttempting = new Map<string, number>();
+  private readonly registrationQueued = new Set<(key: string, registrationJson: string, generation: number) => void>();
   private readonly faults = new Set<() => void>();
 
   constructor(path: string) {
@@ -103,6 +108,57 @@ export class LocalHostInbox implements HostInbox {
   onRegistration(listener: () => void): () => void {
     this.registrationChanges.add(listener);
     return () => this.registrationChanges.delete(listener);
+  }
+  onRegistrationResult(listener: (key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>) => void): () => void {
+    this.registrationResults.add(listener);
+    return () => this.registrationResults.delete(listener);
+  }
+  onRegistrationAttempt(listener: (key: string, registrationJson: string, generation: number) => void): () => void {
+    this.registrationAttempts.add(listener);
+    return () => this.registrationAttempts.delete(listener);
+  }
+  onRegistrationQueued(listener: (key: string, registrationJson: string, generation: number) => void): () => void {
+    this.registrationQueued.add(listener);
+    return () => this.registrationQueued.delete(listener);
+  }
+  /** Generation of the attempt currently in flight for a session, if any. */
+  registrationAttemptGeneration(key: string): number | undefined {
+    return this.registrationAttempting.get(key);
+  }
+  isCurrentRegistration(row: RegistrationRow): boolean {
+    return (this.registrationGenerations.get(row.session_key) ?? 0) === row.generation;
+  }
+  reportRegistrationAttempt(key: string, registrationJson: string, generation: number): void {
+    this.registrationAttempting.set(key, generation);
+    let fault: unknown;
+    for (const listener of this.registrationAttempts) {
+      try { listener(key, registrationJson, generation); } catch (problem) { fault = problem; }
+    }
+    if (fault !== undefined) {
+      for (const listener of this.faults) { try { listener(); } catch {} }
+      throw fault;
+    }
+  }
+  reportRegistration(key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>): void {
+    if (this.registrationAttempting.get(key) === generation) this.registrationAttempting.delete(key);
+    let fault: unknown;
+    for (const listener of this.registrationResults) {
+      try { listener(key, registrationJson, generation, result); } catch (problem) { fault = problem; }
+    }
+    if (fault !== undefined) {
+      for (const listener of this.faults) { try { listener(); } catch {} }
+      throw fault;
+    }
+  }
+  private emitQueued(key: string, registrationJson: string, generation: number): void {
+    let fault: unknown;
+    for (const listener of this.registrationQueued) {
+      try { listener(key, registrationJson, generation); } catch (problem) { fault = problem; }
+    }
+    if (fault !== undefined) {
+      for (const listener of this.faults) { try { listener(); } catch {} }
+      throw fault;
+    }
   }
   onFault(listener: () => void): () => void {
     this.faults.add(listener);
@@ -192,7 +248,7 @@ export class LocalHostInbox implements HostInbox {
     if (!isSessionAddress(session) || !runtimeId || !this.owns(session, runtimeId)) return [];
     const rows = this.db.prepare(`SELECT message_json FROM inbox_messages WHERE session_key = ? AND receipt_entry_id IS NULL
       ORDER BY sequence ASC`).all(sessionKey(session)) as PendingRow[];
-    return rows.map(row => JSON.parse(row.message_json) as Message);
+    return rows.map(row => storedMessage(row.message_json));
   }
 
   pendingPage(session: SessionAddress, owner: string, afterSequence = 0): Outcome<{ messages: Message[]; more: boolean }> {
@@ -200,7 +256,8 @@ export class LocalHostInbox implements HostInbox {
     const rows = this.db.prepare(`SELECT message_json FROM inbox_messages
       WHERE session_key = ? AND receipt_entry_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 2`)
       .all(sessionKey(session), afterSequence) as PendingRow[];
-    return { ok: true, value: { messages: rows.slice(0, 1).map(row => JSON.parse(row.message_json)), more: rows.length > 1 } };
+    const message = rows[0] ? storedMessage(rows[0].message_json) : undefined;
+    return { ok: true, value: { messages: message ? [message] : [], more: rows.length > 1 } };
   }
 
   async acknowledgePi(session: SessionAddress, runtimeId: string, proof: PiReceipt): Promise<Outcome<null>> {
@@ -228,38 +285,80 @@ export class LocalHostInbox implements HostInbox {
     return result;
   }
 
-  async enqueueRegistration(registration: Registration): Promise<void> {
+  /** Enqueue and return the effective queued bytes with their generation.
+   * The generation bumps only when the effective bytes change, so a daemon
+   * snapshot, its attempt, and its result all carry the same generation. */
+  async enqueueRegistration(registration: Registration): Promise<{ registrationJson: string; generation: number }> {
     if (!isRegistration(registration)) throw new TypeError('Invalid registration');
+    const key = sessionKey(registration.session);
+    const existing = this.db.prepare('SELECT registration_json FROM inbox_registrations WHERE session_key = ?')
+      .get(key) as { registration_json: string } | undefined;
+    const generation = () => this.registrationGenerations.get(key) ?? 0;
+    // A bare heartbeat must not discard a queued explicit displayName (the
+    // coordinator likewise preserves it); an explicit name replaces the old
+    // one. Preserve without rewriting: the stored bytes are the identity
+    // completeRegistration compares against, and a corrupt row falls through
+    // to the normal replace instead of throwing here.
+    if (existing && registration.displayName === undefined) {
+      try {
+        const queued: unknown = JSON.parse(existing.registration_json);
+        if (isRegistration(queued) && queued.displayName !== undefined)
+          return { registrationJson: existing.registration_json, generation: generation() };
+      } catch { /* replace the corrupt row below */ }
+    }
+    const registrationJson = JSON.stringify(registration);
     const result = this.db.prepare(`INSERT INTO inbox_registrations (session_key, registration_json) VALUES (?, ?)
       ON CONFLICT(session_key) DO UPDATE SET registration_json = excluded.registration_json
       WHERE registration_json <> excluded.registration_json`)
-      .run(sessionKey(registration.session), JSON.stringify(registration));
-    if (result.changes) this.notify(this.registrationChanges, undefined);
+      .run(key, registrationJson);
+    if (result.changes) {
+      const next = generation() + 1;
+      this.registrationGenerations.set(key, next);
+      this.emitQueued(key, registrationJson, next);
+      this.notify(this.registrationChanges, undefined);
+      return { registrationJson, generation: next };
+    }
+    return { registrationJson: existing?.registration_json ?? registrationJson, generation: generation() };
   }
 
   registrations(): RegistrationRow[] {
     this.sweep();
-    return this.db.prepare('SELECT session_key, registration_json FROM inbox_registrations ORDER BY session_key').all() as RegistrationRow[];
+    const rows = this.db.prepare('SELECT session_key, registration_json FROM inbox_registrations ORDER BY session_key')
+      .all() as Array<{ session_key: string; registration_json: string }>;
+    return rows.map(row => ({ ...row, generation: this.registrationGenerations.get(row.session_key) ?? 0 }));
   }
 
   completeRegistration(row: RegistrationRow): void {
-    // A concurrent re-enqueue is not consumed by a response to the earlier request.
+    // A concurrent re-enqueue is not consumed by a response to the earlier
+    // request. The generation guard also covers X->Y->X, where the newer
+    // row has bytes identical to the attempted snapshot.
+    if (!this.isCurrentRegistration(row)) return;
     this.db.prepare('DELETE FROM inbox_registrations WHERE session_key = ? AND registration_json = ?')
       .run(row.session_key, row.registration_json);
   }
 
   async close(): Promise<void> {
-    if (!this.closed) { this.closed = true; this.changes.clear(); this.registrationChanges.clear(); this.faults.clear(); this.db.close(); this.lock.close(); }
+    if (!this.closed) { this.closed = true; this.changes.clear(); this.registrationChanges.clear(); this.registrationResults.clear(); this.registrationAttempts.clear(); this.registrationQueued.clear(); this.registrationGenerations.clear(); this.registrationAttempting.clear(); this.faults.clear(); this.db.close(); this.lock.close(); }
   }
 }
 
 function failure(code: 'invalid_request' | 'owner_conflict' | 'not_found', message: string): Outcome<never> {
   return { ok: false, error: code, message };
 }
+function storedMessage(json: string): Message {
+  const value: unknown = JSON.parse(json);
+  if (!isMessage(value)) throw new TypeError('Invalid stored message');
+  return value;
+}
+function storedRegistration(json: string): Registration {
+  const value: unknown = JSON.parse(json);
+  if (!isRegistration(value)) throw new TypeError('Invalid stored registration');
+  return value;
+}
 
 // Do not restore the old createHostInbox export. A cached legacy Pi adapter
 // imports that name lazily; it must not acquire the new daemon-only writer.
-export function createDaemonInbox(path: string): HostInbox {
+export function createDaemonInbox(path: string): LocalHostInbox {
   return new LocalHostInbox(path);
 }
 
@@ -272,13 +371,30 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+type CoordinatorError = Error & { code?: FailureCode };
+
 async function jsonPost(base: URL, route: string, credential: string, body: unknown, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(new URL(route, base), {
     method: 'POST', headers: { authorization: `Bearer ${credential}`, 'content-type': 'application/json' },
     body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
   });
-  if (!response.ok) throw new Error(`${route}: HTTP ${response.status}`);
-  return response.json();
+  if (!response.ok) {
+    // Preserve the coordinator's real failure code instead of flattening it.
+    const failure: unknown = await response.json().catch(() => undefined);
+    const error: CoordinatorError = new Error(`${route}: HTTP ${response.status}`);
+    if (isOutcome(failure) && !failure.ok) {
+      error.code = failure.error;
+      error.message = failure.message;
+    }
+    throw error;
+  }
+  return await response.json() as unknown;
+}
+function registrationFailure(error: unknown): Outcome<RegistrationResult> {
+  // Only a decoded coordinator code is trusted; transport errors carry
+  // unrelated codes (ECONNREFUSED, timeouts) that are not FailureCodes.
+  const code = (error as CoordinatorError | undefined)?.code;
+  return { ok: false, error: isFailureCode(code) ? code : 'temporarily_unavailable', message: error instanceof Error ? error.message : String(error) };
 }
 
 /** SSE parser: byte-limited records, streaming UTF-8, CRLF, multiline data and comments. */
@@ -337,8 +453,7 @@ async function* frames(stream: ReadableStream<Uint8Array>, signal: AbortSignal, 
   }
 }
 
-export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(signal: AbortSignal): Promise<void>; stop(): Promise<void> } {
-  if (!(inbox instanceof LocalHostInbox)) throw new TypeError('Host daemon requires the durable local inbox');
+export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { start(signal: AbortSignal): Promise<void>; stop(): Promise<void> } {
   const base = new URL(config.coordinatorUrl.endsWith('/') ? config.coordinatorUrl : `${config.coordinatorUrl}/`);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash ||
       !config.hostId || !config.credential) throw new TypeError('Invalid host configuration');
@@ -377,24 +492,40 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
       }
       if (signal.aborted) break;
       registrationDirty = false;
+      let failed = false;
+      let firstError: unknown;
       try {
         for (const row of inbox.registrations()) {
           if (signal.aborted) break;
-          const registration = JSON.parse(row.registration_json) as Registration;
-          const response = await jsonPost(base, ROUTES.register, config.credential, registration, signal) as
-            { ok?: boolean; value?: { subscription?: { id?: string; hostId?: string } } };
-          if (response?.ok !== true || response.value?.subscription?.id !== row.session_key ||
-              response.value.subscription.hostId !== config.hostId) throw new Error('Invalid registration response');
-          inbox.completeRegistration(row);
+          // A row replaced after the snapshot is never posted; the newer
+          // generation is picked up by the next pass its enqueue triggered.
+          if (!inbox.isCurrentRegistration(row)) continue;
+          try {
+            const registration = storedRegistration(row.registration_json);
+            inbox.reportRegistrationAttempt(row.session_key, row.registration_json, row.generation);
+            const value = outcomeValue(await jsonPost(base, ROUTES.register, config.credential, registration, signal), isRegistrationResult);
+            if (!value || value.subscription.id !== row.session_key || value.subscription.hostId !== config.hostId)
+              throw new Error('Invalid registration response');
+            inbox.completeRegistration(row);
+            inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value });
+          } catch (error) {
+            // One bad row must not starve the rest of the pass; it stays queued.
+            failed = true;
+            firstError ??= error;
+            inbox.reportRegistration(row.session_key, row.registration_json, row.generation, registrationFailure(error));
+          }
         }
-        backoff = RETRY_MIN_MS;
       } catch (error) {
-        if (!signal.aborted) report(error);
+        failed = true;
+        firstError ??= error;
+      }
+      if (failed) {
+        if (!signal.aborted) report(firstError);
         await delay(backoff, signal);
         backoff = Math.min(backoff * 2, RETRY_MAX_MS);
         // Retry known failed work, not an empty-queue discovery scan.
         registrationDirty = true;
-      }
+      } else backoff = RETRY_MIN_MS;
     }
   };
   const streamLoop = async (signal: AbortSignal) => {
@@ -422,11 +553,8 @@ export function createHostDaemon(config: HostConfig, inbox: HostInbox): { start(
         for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'), report)) {
           await inbox.receive(frame); // transaction commits before receipt is sent
           const receipt = { subscriptionId: frame.subscriptionId, messageId: frame.message.id };
-          const ack = await jsonPost(base, ROUTES.receipt, config.credential, receipt, signal) as
-            { ok?: boolean; value?: { id?: string; hostId?: string } };
-          if (ack?.ok !== true || ack.value?.id !== receipt.subscriptionId || ack.value.hostId !== config.hostId) {
-            throw new Error('Invalid receipt response');
-          }
+          const ack = outcomeValue(await jsonPost(base, ROUTES.receipt, config.credential, receipt, signal), isSubscription);
+          if (!ack || ack.id !== receipt.subscriptionId || ack.hostId !== config.hostId) throw new Error('Invalid receipt response');
         }
         if (!signal.aborted) throw new Error('Host stream ended');
       } catch (error) {

@@ -368,8 +368,11 @@ It records the addressed session.
 
 The local registration queue survives a coordinator outage.
 Startup binding enqueues registration and returns without a wait for HTTP.
+The host daemon is the only writer of `POST /v1/sessions/register`.
+A tool that needs the result waits for that attempt. Startup does not.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
+The socket closes from the daemon lease expiry. It does not keep a second clock.
 Committed enqueue, startup, and stream reconnect trigger the worker.
 Identical queued registrations do not generate another write or wake.
 A known failed request receives a bounded retry delay.
@@ -529,17 +532,19 @@ This lane does not edit the schema.
 
 ### Lane D
 
-`src/host/index.ts` exports `createDaemonInbox(path: string): HostInbox`.
+`src/host/index.ts` exports `createDaemonInbox(path: string): LocalHostInbox`.
 The legacy `createHostInbox` export is absent.
 A cached old Pi adapter cannot lazily import the new daemon writer under that name.
-It also exports `createHostDaemon(config: HostConfig, inbox: HostInbox): {start(signal: AbortSignal): Promise<void>;stop(): Promise<void>}`.
+`src/host/client.ts` is the only `HostInbox`. The daemon inbox does not implement it.
+It also exports `createHostDaemon(config: HostConfig, inbox: LocalHostInbox): {start(signal: AbortSignal): Promise<void>;stop(): Promise<void>}`.
 Tests live in `test/host/`.
 Lane D is the sole owner of the host schema and the durable local registration queue.
 
 ### Lane E
 
 `src/pi/index.ts` exports the default `(pi: ExtensionAPI): void` Pi extension.
-The bound runtime implements `PiDelivery`.
+`src/pi/delivery.ts` owns `PiDelivery`: bind, stop, wake, abort recovery, and the JSONL receipt.
+The extension does not export the receipt reader.
 It loads `PiConfig`.
 It connects to the lane D socket.
 On session shutdown it closes that connection and relinquishes the lease.

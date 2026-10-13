@@ -7,6 +7,25 @@ const status: Record<FailureCode, number> = {
   not_found: 404, owner_conflict: 409, temporarily_unavailable: 503,
 };
 
+export function bearerCredential(authorization: string | string[] | undefined): string | null {
+  if (typeof authorization !== 'string') return null;
+  const match = /^Bearer ([^\s]+)$/.exec(authorization);
+  return match ? match[1]! : null;
+}
+export function closedQuery(url: URL): boolean {
+  return url.search.length === 0;
+}
+export function openQuery(url: URL, allowed: readonly string[]): boolean {
+  return [...url.searchParams.keys()].every(name => allowed.includes(name) && url.searchParams.getAll(name).length === 1);
+}
+export function readBodyError(error: unknown): { code: number; message: string } {
+  if (error !== null && typeof error === 'object' && 'code' in error && 'message' in error) {
+    const { code, message } = error as { code: unknown; message: unknown };
+    if (typeof code === 'number' && typeof message === 'string') return { code, message };
+  }
+  return { code: 400, message: 'Malformed request body' };
+}
+
 export function json(response: ServerResponse, result: Outcome<unknown>, code?: number): void {
   if (response.writableEnded || response.destroyed) return;
   response.writeHead(code ?? (result.ok ? 200 : status[result.error]), {
