@@ -37,16 +37,18 @@ export type Message = {
 };
 export type Subscription = { id: SessionKey; session: SessionAddress; hostId: string; cursor: number };
 export type Registration = { session: SessionAddress; displayName?: string };
-export type RegistrationResult = { subscription: Subscription; rank: number; displayName?: string; lastSeenAt?: number };
-export type Claim = { key: string; owner: SessionKey; note: string | null; claimedAt: number; expiresAt: number | null };
+export type RegistrationResult = { subscription: Subscription; rank: number; displayName?: string; lastSeenAt?: number; entities?: EntityRef[] };
+export type Claim = { key: string; owner: SessionKey; note: string | null; claimedAt: number; expiresAt: number | null; entities?: EntityRef[] };
 export type HostPrincipal = { hostId: string }; // resolved from bearer credential, never from request body
 export type HostConfig = { coordinatorUrl: string; hostId: string; credential: string; inboxPath: string };
 export type PiConfig = HostConfig & { namespace: string }; // same trusted host credential; sender always bound Pi session
 export type Receipt = { subscriptionId: SessionKey; messageId: DeliveryId };
 export type StreamFrame = { type: 'message'; subscriptionId: SessionKey; message: Message };
 export type PiReceipt = { messageId: DeliveryId; piSessionId: string; entryId: string; sessionFile: string };
-/** Type is one opaque unsigned byte; consumers define meanings beyond generic type 0. */
+/** `type` is the legacy field name for opaque integer metadata, never identity or authority. */
 export type EntityRef = { id: string; type: number; label: string };
+/** An absent integer references the entity without changing its metadata. */
+export type EntityMention = { id: string; type?: number; label: string };
 export type EntityHistory = { entity: EntityRef; messages: Message[] };
 
 /** Lane A. Every operation that changes registration/cursor/claim state is one SQLite transaction. */
@@ -120,27 +122,39 @@ export function entityReference(namespace: string, label: string, type = 0): Ent
     throw new TypeError('Invalid entity reference');
   const canonical = label.normalize('NFC').trim();
   if (!canonical || canonical.length > 256) throw new TypeError('Entity label must contain 1–256 characters');
-  const hash = createHash('sha256').update(JSON.stringify([namespace, type, canonical])).digest('hex').slice(0, 32);
-  return { id: `${namespace}:entity:${type.toString(16).padStart(2, '0')}:${hash}`, type, label: canonical };
+  // Keep existing generic IDs. The zero slot is fixed, not the current metadata.
+  const hash = createHash('sha256').update(JSON.stringify([namespace, 0, canonical])).digest('hex').slice(0, 32);
+  return { id: `${namespace}:entity:00:${hash}`, type, label: canonical };
 }
 export function isEntityId(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z][a-z0-9-]{0,62}:entity:[0-9a-f]{2}:[0-9a-f]{32}$/.test(value);
 }
-/** Flat, single-line [[label]] or [[byte:label]] markers. Malformed and escaped markers stay literal. */
-export function extractEntities(namespace: string, body: string): EntityRef[] {
-  if (!isNamespace(namespace) || typeof body !== 'string') throw new TypeError('Invalid entity text');
-  const entities = new Map<string, EntityRef>();
-  for (const match of body.matchAll(/(?<![\\[])\[\[([^[\]\r\n]*)\]\](?!\])/g)) {
-    if (ENTITY_CONTROLS.test(match[1]!)) continue;
-    const token = match[1]!.trim();
-    const typed = /^(\d+):(.*)$/u.exec(token);
-    try {
-      const entity = entityReference(namespace, typed ? typed[2]! : token, typed ? Number(typed[1]) : 0);
-      entities.set(entity.id, entity);
-    } catch (error) {
-      if (!(error instanceof TypeError)) throw error;
+/** Shared text syntax, including strings nested in JSON. No workflow or harness interpretation. */
+export function extractEntities(namespace: string, ...values: JsonValue[]): EntityMention[] {
+  if (!isNamespace(namespace) || !values.every(isJson)) throw new TypeError('Invalid entity text');
+  const entities = new Map<string, EntityMention>();
+  function visit(value: JsonValue): void {
+    if (Array.isArray(value)) { for (const item of value) visit(item); return; }
+    if (value !== null && typeof value === 'object') {
+      for (const [key, item] of Object.entries(value)) { visit(key); visit(item); }
+      return;
+    }
+    if (typeof value !== 'string') return;
+    for (const match of value.matchAll(/(?<![\\[])\[\[([^[\]\r\n]*)\]\](?!\])/g)) {
+      if (ENTITY_CONTROLS.test(match[1]!)) continue;
+      const token = match[1]!.trim();
+      const typed = /^(\d+):(.*)$/u.exec(token);
+      try {
+        const entity = entityReference(namespace, typed ? typed[2]! : token, typed ? Number(typed[1]) : 0);
+        // Last explicit metadata wins; a bare mention never resets it.
+        if (typed) entities.set(entity.id, entity);
+        else if (!entities.has(entity.id)) entities.set(entity.id, { id: entity.id, label: entity.label });
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
     }
   }
+  for (const value of values) visit(value);
   return [...entities.values()];
 }
 export function isNamespace(value: unknown): value is string {

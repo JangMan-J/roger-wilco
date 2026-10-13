@@ -19,17 +19,29 @@ The `roger_board` tool remains available to the agent.
 
 ## Entity references
 
-Mark a word or phrase with `[[fix-parser]]`.
-Use `[[7:fix-parser]]` to specify an entity type.
-The type is one unsigned byte, from 0 through 255.
-Type 0 is generic.
-Other values have no built-in meaning.
+Mark a word or phrase with `[[Meteor Shower]]`.
+Use `[[153:Meteor Shower]]` to attach integer metadata from 0 through 255.
+The number has no built-in meaning and does not change the entity ID.
+A bare reference preserves existing metadata.
+A new entity starts at 0.
+The last explicit integer in accepted write order becomes its current metadata.
 
-Each namespace, type, and phrase determines one stable hashed ID.
-The coordinator records references in new messages without changing their text.
-The `roger_entity` tool accepts a label and optional type, or an existing ID.
-It returns the entity and its retained mentions across the namespace.
-An entity is not a task, claim, or authority.
+References work in session display names, message bodies, nested JSON strings, claim keys and notes, and successful release keys.
+For example: `Hey Jerry, did you see the [[153:Meteor Shower]] last night?`
+Roger preserves the original text.
+Inbox and lookup reads do not reapply old integers.
+Claim keys remain literal, and release requires the exact key.
+
+The `roger_identity` tool sets the current agent's display name, for example `{"displayName":"[[0:FLEET]]"}`.
+Its session address, ownership, and rank remain unchanged.
+Registration and claim results include current `entities` metadata for their references.
+
+Each namespace and canonical phrase determines one stable hashed ID.
+The `roger_entity` tool accepts a label or an existing ID.
+It returns current metadata and retained message mentions across the namespace.
+The existing `type` field now carries metadata, not identity.
+Its optional lookup argument remains compatible but does not filter or update metadata.
+An entity is not a task, claim, permission, or workflow.
 
 ## Requirements
 

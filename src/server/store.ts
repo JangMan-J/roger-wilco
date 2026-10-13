@@ -1,11 +1,12 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
 import {
-  deliveryId, extractEntities, isEntityId, isMessageInput, isNamespace, isReceipt, isRegistration,
+  deliveryId, entityReference, extractEntities, isEntityId, isMessageInput, isNamespace, isReceipt, isRegistration,
   isSessionAddress, isSessionKey, sessionKey, PROTOCOL_VERSION,
   type Claim, type CoordinatorStore, type EntityHistory, type EntityRef, type HostPrincipal, type Message,
-  type MessageInput, type Outcome, type Receipt, type Registration,
+  type JsonValue, type MessageInput, type Outcome, type Receipt, type Registration,
   type RegistrationResult, type SessionAddress, type StreamFrame, type Subscription,
 } from '../protocol/index.ts';
 
@@ -28,8 +29,18 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient, id);
 CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp);
 CREATE TABLE IF NOT EXISTS entities (
-  id TEXT PRIMARY KEY, type INTEGER NOT NULL, label TEXT NOT NULL
+  id TEXT PRIMARY KEY, type INTEGER NOT NULL, label TEXT NOT NULL, last_seen_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS entity_sources (
+  entity_id TEXT NOT NULL REFERENCES entities(id),
+  kind TEXT NOT NULL CHECK (kind IN ('session', 'claim')), source_key TEXT NOT NULL,
+  PRIMARY KEY (entity_id, kind, source_key)
+);
+CREATE INDEX IF NOT EXISTS entity_sources_source ON entity_sources(kind, source_key);
+CREATE TABLE IF NOT EXISTS entity_aliases (
+  alias_id TEXT PRIMARY KEY, entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS entity_aliases_entity ON entity_aliases(entity_id);
 CREATE TABLE IF NOT EXISTS message_entities (
   entity_id TEXT NOT NULL REFERENCES entities(id),
   message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -75,6 +86,9 @@ class Store implements CoordinatorStore {
     try {
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;');
       this.db.exec(schema);
+      const entityColumns = this.db.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
+      if (!entityColumns.some(column => column.name === 'last_seen_at'))
+        this.db.exec('ALTER TABLE entities ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0');
       const columns = this.db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
       if (!columns.some(column => column.name === 'last_seen_at'))
         this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0');
@@ -90,11 +104,13 @@ class Store implements CoordinatorStore {
         // Pre-presence databases get one retention window, not immediate data loss.
         this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE last_seen_at = 0').run(Date.now());
       });
+      this.migrateEntityMetadata();
       this.sessionRow = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
       this.messageRow = this.db.prepare('SELECT * FROM messages WHERE id = ?');
       this.claimRow = this.db.prepare('SELECT * FROM claims WHERE key = ?');
       this.entityRow = this.db.prepare('SELECT * FROM entities WHERE id = ?');
-      this.insertEntity = this.db.prepare('INSERT INTO entities (id, type, label) VALUES (?, ?, ?)');
+      this.insertEntity = this.db.prepare(`INSERT INTO entities (id, type, label, last_seen_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET type = COALESCE(?, entities.type), last_seen_at = excluded.last_seen_at`);
       this.insertMention = this.db.prepare('INSERT INTO message_entities (entity_id, message_id) VALUES (?, ?)');
       // Two indexed seeks per retained subscription, one bounded result set; no JS N+1 reads.
       this.pendingRows = this.db.prepare(`SELECT m.*, s.id AS subscription_id, s.offered
@@ -118,11 +134,56 @@ class Store implements CoordinatorStore {
       return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
+  private migrateEntityMetadata(): void {
+    this.transaction(() => {
+      const columns = this.db.prepare('PRAGMA table_info(store_config)').all() as { name: string }[];
+      if (!columns.some(column => column.name === 'entity_metadata_version'))
+        this.db.exec('ALTER TABLE store_config ADD COLUMN entity_metadata_version INTEGER NOT NULL DEFAULT 0');
+      const { entity_metadata_version: version } = this.db.prepare('SELECT entity_metadata_version FROM store_config')
+        .get() as { entity_metadata_version: number };
+      if (version === 1) return;
+      if (version !== 0) throw new Error('Unsupported entity metadata version');
+      const rows = this.db.prepare('SELECT * FROM entities').all() as EntityRef[];
+      for (const row of rows) {
+        const canonical = entityReference(this.namespace, row.label);
+        const legacyHash = createHash('sha256').update(JSON.stringify([this.namespace, row.type, row.label])).digest('hex').slice(0, 32);
+        if (row.id !== `${this.namespace}:entity:${row.type.toString(16).padStart(2, '0')}:${legacyHash}`)
+          throw new Error('Entity identity collision');
+        if (canonical.id === row.id) continue;
+        const existing = this.db.prepare('SELECT label FROM entities WHERE id = ?').get(canonical.id);
+        if (existing && existing.label !== canonical.label) throw new Error('Entity identity collision');
+        this.db.prepare('INSERT OR IGNORE INTO entities (id, type, label) VALUES (?, 0, ?)').run(canonical.id, canonical.label);
+        this.db.prepare(`INSERT OR IGNORE INTO message_entities (entity_id, message_id)
+          SELECT ?, message_id FROM message_entities WHERE entity_id = ?`).run(canonical.id, row.id);
+        this.db.prepare('DELETE FROM message_entities WHERE entity_id = ?').run(row.id);
+        this.db.prepare('INSERT INTO entity_aliases (alias_id, entity_id) VALUES (?, ?)').run(row.id, canonical.id);
+        this.db.prepare('DELETE FROM entities WHERE id = ?').run(row.id);
+      }
+      // Replay only indexed mentions, not older messages from before entity tracking.
+      // Sequence order and marker order define the latest explicit metadata.
+      const update = this.db.prepare(`UPDATE entities SET type = ? WHERE id = ?
+        AND EXISTS (SELECT 1 FROM message_entities WHERE entity_id = entities.id AND message_id = ?)`);
+      for (const row of this.db.prepare(`SELECT id, body FROM messages
+        WHERE EXISTS (SELECT 1 FROM message_entities WHERE message_id = messages.id) ORDER BY id`).iterate()) {
+        for (const entity of extractEntities(this.namespace, row.body as string)) {
+          if (entity.type !== undefined) update.run(entity.type, entity.id, row.id);
+        }
+      }
+      this.db.prepare(`UPDATE entities SET last_seen_at = COALESCE(
+        (SELECT MAX(m.timestamp) FROM message_entities e JOIN messages m ON m.id = e.message_id WHERE e.entity_id = entities.id), ?
+      )`).run(Date.now());
+      this.db.exec('UPDATE store_config SET entity_metadata_version = 1');
+    });
+  }
   private maintain(): void {
     const now = Date.now();
     if (now < this.nextMaintenance) return;
     this.transaction(() => {
       this.db.prepare('DELETE FROM sessions WHERE last_seen_at < ?').run(now - RETENTION_MS);
+      this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
+      this.db.exec(`DELETE FROM entity_sources WHERE
+        (kind = 'session' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = source_key)) OR
+        (kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key))`);
       // A sender or unrelated low cursor must not pin history. Broadcasts remain
       // until every retained recipient has acknowledged, or its registration expires.
       this.db.prepare(`DELETE FROM messages WHERE id IN (
@@ -132,9 +193,9 @@ class Store implements CoordinatorStore {
             SELECT 1 FROM sessions WHERE id != messages.sender AND cursor < messages.id
           )) ORDER BY timestamp LIMIT ?
       )`).run(now - RETENTION_MS, COLLECTION_LIMIT);
-      this.db.prepare(`DELETE FROM entities WHERE NOT EXISTS (
+      this.db.prepare(`DELETE FROM entities WHERE last_seen_at < ? AND NOT EXISTS (
         SELECT 1 FROM message_entities WHERE entity_id = entities.id
-      )`).run();
+      ) AND NOT EXISTS (SELECT 1 FROM entity_sources WHERE entity_id = entities.id)`).run(now - RETENTION_MS);
     });
     this.nextMaintenance = now + MAINTENANCE_MS;
   }
@@ -142,9 +203,27 @@ class Store implements CoordinatorStore {
   private subscription(row: SessionRow): Subscription {
     return { id: row.id, session: addressOf(row.id), hostId: row.host_id, cursor: row.cursor };
   }
+  private sourceEntities(kind: 'session' | 'claim', key: string): { entities?: EntityRef[] } {
+    const entities = this.db.prepare(`SELECT e.id, e.type, e.label FROM entities e JOIN entity_sources s ON s.entity_id = e.id
+      WHERE s.kind = ? AND s.source_key = ? ORDER BY e.id`).all(kind, key) as EntityRef[];
+    return entities.length ? { entities: entities.map(entity => ({ ...entity })) } : {};
+  }
+  /** Called only within the accepted mutation's transaction, never while reading or delivering. */
+  private trackEntities(values: JsonValue[], source?: { kind: 'session' | 'claim'; key: string }): string[] {
+    if (source) this.db.prepare('DELETE FROM entity_sources WHERE kind = ? AND source_key = ?').run(source.kind, source.key);
+    const entities = extractEntities(this.namespace, ...values);
+    for (const entity of entities) {
+      const existing = this.entityRow.get(entity.id) as EntityRef | undefined;
+      if (existing && existing.label !== entity.label) throw new Error('Entity identity collision');
+      this.insertEntity.run(entity.id, entity.type ?? 0, entity.label, Date.now(), entity.type ?? null);
+      if (source) this.db.prepare('INSERT INTO entity_sources (entity_id, kind, source_key) VALUES (?, ?, ?)')
+        .run(entity.id, source.kind, source.key);
+    }
+    return entities.map(entity => entity.id);
+  }
   private registration(row: SessionRow): RegistrationResult {
     return { subscription: this.subscription(row), ...(row.display_name === null ? {} : { displayName: row.display_name }),
-      lastSeenAt: row.last_seen_at, rank: row.rank };
+      lastSeenAt: row.last_seen_at, rank: row.rank, ...this.sourceEntities('session', row.id) };
   }
   private message(row: MessageRow): Message {
     return { version: PROTOCOL_VERSION, id: deliveryId(this.namespace, row.id), sequence: row.id,
@@ -152,7 +231,8 @@ class Store implements CoordinatorStore {
       data: JSON.parse(row.data), visibility: row.visibility };
   }
   private claimValue(row: ClaimRow): Claim {
-    return { key: row.key, owner: row.owner, note: row.note, claimedAt: row.claimed_at, expiresAt: row.expires_at };
+    return { key: row.key, owner: row.owner, note: row.note, claimedAt: row.claimed_at, expiresAt: row.expires_at,
+      ...this.sourceEntities('claim', row.key) };
   }
   private assigned(host: HostPrincipal, session: SessionAddress): Outcome<SessionRow> {
     if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace)
@@ -183,6 +263,9 @@ class Store implements CoordinatorStore {
         this.db.prepare('UPDATE sessions SET display_name = COALESCE(?, display_name), last_seen_at = ? WHERE id = ?')
           .run(request.displayName ?? null, now, id);
       }
+      // Heartbeats omit the name. An explicitly supplied name is a metadata write.
+      if (request.displayName !== undefined)
+        this.trackEntities([request.displayName], { kind: 'session', key: id });
       return { ok: true, value: this.registration(this.session(id)!) };
     });
   }
@@ -209,6 +292,7 @@ class Store implements CoordinatorStore {
     return this.transaction(() => {
       const now = Date.now();
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
+      this.db.exec("DELETE FROM entity_sources WHERE kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key)");
       return (this.db.prepare('SELECT * FROM claims ORDER BY key').all() as ClaimRow[])
         .map(row => this.claimValue(row));
     });
@@ -222,12 +306,8 @@ class Store implements CoordinatorStore {
       const result = this.db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)')
         .run(Date.now(), sessionKey(sender), input.recipient, input.body, JSON.stringify(input.data ?? null), input.visibility ?? 'private');
       if (!Number.isSafeInteger(result.lastInsertRowid)) throw new RangeError('Message sequence exceeds safe integer range');
-      for (const entity of extractEntities(this.namespace, input.body)) {
-        const existing = this.entityRow.get(entity.id) as EntityRef | undefined;
-        if (existing && (existing.type !== entity.type || existing.label !== entity.label))
-          throw new Error('Entity identity collision');
-        if (!existing) this.insertEntity.run(entity.id, entity.type, entity.label);
-        this.insertMention.run(entity.id, result.lastInsertRowid);
+      for (const id of this.trackEntities([input.body, input.data ?? null])) {
+        this.insertMention.run(id, result.lastInsertRowid);
       }
       return { ok: true, value: this.message(this.messageRow.get(result.lastInsertRowid) as MessageRow) };
     });
@@ -236,11 +316,12 @@ class Store implements CoordinatorStore {
     if (!isEntityId(id) || !id.startsWith(`${this.namespace}:entity:`) || !validCursor(since) || !validLimit(limit))
       return failure('invalid_request', 'Invalid entity query');
     this.maintain();
-    const entity = this.entityRow.get(id) as EntityRef | undefined;
+    const alias = this.db.prepare('SELECT entity_id FROM entity_aliases WHERE alias_id = ?').get(id);
+    const entity = this.entityRow.get(alias ? alias.entity_id : id) as EntityRef | undefined;
     if (!entity) return failure('not_found', 'Entity is not tracked');
     const rows = this.db.prepare(`SELECT m.* FROM message_entities e JOIN messages m ON m.id = e.message_id
       WHERE e.entity_id = ? AND e.message_id > ? ORDER BY e.message_id LIMIT ?`)
-      .all(id, since, limit) as MessageRow[];
+      .all(entity.id, since, limit) as MessageRow[];
     return { ok: true, value: { entity: { id: entity.id, type: entity.type, label: entity.label },
       messages: rows.map(row => this.message(row)) } };
   }
@@ -317,6 +398,7 @@ class Store implements CoordinatorStore {
         expires_at = excluded.expires_at WHERE claims.owner = excluded.owner
         OR (claims.expires_at IS NOT NULL AND claims.expires_at <= excluded.claimed_at)`)
         .run(key, owner, note ?? null, now, expires);
+      if (result.changes > 0) this.trackEntities([key, note ?? null], { kind: 'claim', key });
       const claim = this.claimValue(this.claimRow.get(key) as ClaimRow);
       return { ok: true, value: { claim, acquired: result.changes > 0 } };
     });
@@ -326,7 +408,14 @@ class Store implements CoordinatorStore {
       return failure('invalid_request', 'Invalid release');
     const assignment = this.assigned(host, addressOf(owner));
     if (!assignment.ok) return assignment;
-    return this.transaction(() => ({ ok: true, value: this.db.prepare('DELETE FROM claims WHERE key = ? AND owner = ?').run(key, owner).changes > 0 }));
+    return this.transaction(() => {
+      const released = this.db.prepare('DELETE FROM claims WHERE key = ? AND owner = ?').run(key, owner).changes > 0;
+      if (released) {
+        this.db.prepare("DELETE FROM entity_sources WHERE kind = 'claim' AND source_key = ?").run(key);
+        this.trackEntities([key]);
+      }
+      return { ok: true, value: released };
+    });
   }
   close(): void { this.db.close(); }
 }

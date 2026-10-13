@@ -36,7 +36,6 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   const recent = { subscription: { id: `fleet:${id}` }, rank: 1, lastSeenAt: now - 90_000 };
   const stale = { subscription: { id: `fleet:${randomUUID()}` }, rank: 3, lastSeenAt: now - 90_001 };
   const unknown = { subscription: { id: `fleet:${randomUUID()}` }, rank: 1 };
-  const generic = entityReference('fleet', 'fix-parser');
   const typed = entityReference('fleet', 'fix-parser', 255);
   const mention = { version: 1, id: 'fleet:msg:3', sequence: 3, timestamp: now, sender: `fleet:${id}`,
     recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
@@ -50,7 +49,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     const url = new URL(req.url, 'http://localhost');
     const value = req.url === '/v1/sessions' ? [recent, stale, unknown] :
       req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] :
-      url.pathname === '/v1/entities' ? { entity: url.searchParams.get('id') === typed.id ? typed : generic, messages: [mention] } : { accepted: true };
+      url.pathname === '/v1/entities' ? { entity: typed, messages: [mention] } : { accepted: true };
     res.end(JSON.stringify({ ok: true, value }));
   });
   server.listen(0, '127.0.0.1');
@@ -70,12 +69,17 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   assert.deepEqual((await first.tools.get('roger_board').execute('', { all: true }, undefined, undefined, ctx)).details,
     { ok: true, value: { sessions: [recent, stale, unknown], claims: [{ key: 'work', owner: `fleet:${id}` }] } });
   const tool = async (name, params) => (await first.tools.get(name).execute('', params, undefined, undefined, ctx)).details;
+  await tool('roger_identity', { displayName: '[[0:FLEET]]' });
+  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', piSessionId: id }, displayName: '[[0:FLEET]]' });
+  assert.equal(requests.at(-1).path, '/v1/sessions/register');
+  await tool('roger_identity', {});
+  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', piSessionId: id } });
   await tool('roger_send', { recipient: '*', body: 'Hello', data: { priority: 2 }, visibility: 'public' });
   await tool('roger_inbox', { since: 2, limit: 20 });
   await tool('roger_claim', { key: 'work', ttlSeconds: 90 });
   await tool('roger_release', { key: 'work' });
   for (const [params, entity, since, limit] of [
-    [{ label: ' fix-parser ' }, generic, 0, 100],
+    [{ label: ' fix-parser ' }, typed, 0, 100],
     [{ label: 'fix-parser', type: 255, since: 2, limit: 1 }, typed, 2, 1],
     [{ id: typed.id }, typed, 0, 100],
   ]) {
@@ -102,6 +106,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   state.sessionId = newId;
   assert.equal((await tool('roger_send', { recipient: '*', body: 'Stale runtime' })).ok, false);
   assert.equal((await tool('roger_entity', { label: 'fix-parser' })).ok, false);
+  assert.equal((await tool('roger_identity', { displayName: '[[99:FLEET]]' })).ok, false);
   assert.equal(requests.length, before, 'old binding cannot act for a new session');
   await first.handlers.get('session_shutdown')({}, ctx);
   await first.handlers.get('session_start')({ reason: 'fork' }, ctx);

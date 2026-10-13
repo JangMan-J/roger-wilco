@@ -86,7 +86,7 @@ test('entity HTTP lookup returns retained mentions with authentication and stric
   query.set('id', entityReference('fleet', 'fix-parser').id);
   query.set('since', '0');
   assert.deepEqual((await request(path + query)).value.value,
-    { entity: entityReference('fleet', 'fix-parser'), messages: [first.value.value] });
+    { entity, messages: [first.value.value] });
   for (const suffix of ['&extra=1', '&id=x', '&since=1', '&limit=2']) {
     assert.equal((await request(path + query + suffix)).status, 400, suffix);
   }
@@ -104,6 +104,176 @@ test('entity HTTP lookup returns retained mentions with authentication and stric
   query.set('id', entityReference('fleet', 'unmentioned').id);
   assert.equal((await request(path + query)).status, 404);
   assert.equal((await request('/v1/entities', {})).status, 404);
+});
+
+test('HTTP routes index tagged registration, nested data, and claim release without rewriting literal text', async t => {
+  const { request } = await fixture(t);
+  const displayName = '[[0:FLEET]]';
+  const fleet = entityReference('fleet', 'FLEET');
+  const shower = entityReference('fleet', 'Meteor Shower');
+  const objectKey = entityReference('fleet', 'object key', 4);
+  const claimKey = 'Observe [[153:Meteor Shower]]';
+  const note = 'Ask [[8:FLEET]]';
+  const body = 'Hey Jerry, did you see the [[153:Meteor Shower]] last night?';
+  const data = { nested: ['[[7:FLEET]]', { '[[4:object key]]': '[[154:Meteor Shower]]' }], flag: true };
+  const bareBody = 'still [[Meteor Shower]]';
+  const laterBody = '[[200:Meteor Shower]]';
+  const byId = (left: { id: string }, right: { id: string }) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  async function lookup(id: string) {
+    return request('/v1/entities?' + new URLSearchParams({ id, since: '0', limit: '10' }));
+  }
+
+  const bobRegistration = await request('/v1/sessions/register', { session: bob }, 'secret-b');
+  assert.equal(bobRegistration.status, 200);
+  assert.equal(bobRegistration.value.value.displayName, undefined);
+  assert.equal(bobRegistration.value.value.entities, undefined);
+  assert.equal(bobRegistration.value.value.subscription.id, sessionKey(bob));
+  assert.deepEqual(bobRegistration.value.value.subscription.session, bob);
+  assert.equal(bobRegistration.value.value.subscription.hostId, 'host-b');
+
+  const registered = await request('/v1/sessions/register', { session: alice, displayName });
+  assert.equal(registered.status, 200);
+  const registration = registered.value.value;
+  assert.equal(registration.displayName, displayName);
+  assert.equal(registration.subscription.id, sessionKey(alice));
+  assert.notEqual(registration.subscription.id, fleet.id);
+  assert.deepEqual(registration.subscription.session, alice);
+  assert.equal(registration.subscription.hostId, 'host-a');
+  assert.equal(registration.rank, 1);
+  assert.equal(typeof registration.subscription.cursor, 'number');
+  assert.equal(typeof registration.lastSeenAt, 'number');
+  assert.match(registration.entities[0].id, /^fleet:entity:00:[0-9a-f]{32}$/);
+  assert.equal(registration.entities[0].id, entityReference('fleet', 'FLEET', 153).id);
+  assert.deepEqual(registration.entities, [fleet]);
+
+  const conflict = await request('/v1/sessions/register', { session: alice, displayName: '[[9:FLEET]]' }, 'secret-b');
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.value.error, 'owner_conflict');
+  assert.deepEqual((await lookup(fleet.id)).value.value, { entity: fleet, messages: [] });
+  const listed = await request('/v1/sessions');
+  const aliceListed = listed.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice));
+  assert.equal(aliceListed.displayName, displayName);
+  assert.deepEqual(aliceListed.subscription, registration.subscription);
+  assert.deepEqual(aliceListed.entities, [fleet]);
+  assert.equal(listed.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(bob)).entities, undefined);
+
+  assert.equal((await request('/v1/messages', {
+    sender: alice, message: { recipient: sessionKey(bob), body: '[[99:FLEET]]', data: { nested: '[[99:Meteor Shower]]' } },
+  }, 'secret-b')).status, 409);
+  assert.equal((await lookup(shower.id)).status, 404);
+  assert.equal((await lookup(fleet.id)).value.value.entity.type, 0);
+
+  const sent = await request('/v1/messages', { sender: alice, message: { recipient: sessionKey(bob), body, data } });
+  assert.equal(sent.status, 200);
+  const message = sent.value.value;
+  assert.equal(message.body, body);
+  assert.deepEqual(message.data, data);
+  assert.equal(message.sender, sessionKey(alice));
+  assert.equal(message.recipient, sessionKey(bob));
+  assert.equal(message.version, 1);
+  assert.equal(message.visibility, 'private');
+  assert.equal(message.id, `fleet:msg:${message.sequence}`);
+  assert.equal(message.entities, undefined);
+  assert.deepEqual((await lookup(shower.id)).value.value, { entity: entityReference('fleet', 'Meteor Shower', 154), messages: [message] });
+  assert.deepEqual((await lookup(fleet.id)).value.value, { entity: entityReference('fleet', 'FLEET', 7), messages: [message] });
+  assert.deepEqual((await lookup(objectKey.id)).value.value, { entity: objectKey, messages: [message] });
+
+  const bareSent = await request('/v1/messages', { sender: alice, message: { recipient: '*', body: bareBody } });
+  assert.equal(bareSent.status, 200);
+  assert.equal(bareSent.value.value.body, bareBody);
+  assert.equal(bareSent.value.value.data, null);
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 154, 'bare ref does not reset metadata');
+
+  const heartbeat = await request('/v1/sessions/register', { session: alice });
+  assert.equal(heartbeat.status, 200);
+  assert.equal(heartbeat.value.value.displayName, displayName);
+  assert.equal(heartbeat.value.value.rank, registration.rank);
+  assert.deepEqual(heartbeat.value.value.subscription, registration.subscription);
+  assert.deepEqual(heartbeat.value.value.entities, [entityReference('fleet', 'FLEET', 7)], 'heartbeat omits displayName and does not reapply its integer');
+
+  const reasserted = await request('/v1/sessions/register', { session: alice, displayName });
+  assert.equal(reasserted.status, 200);
+  assert.equal(reasserted.value.value.displayName, displayName);
+  assert.deepEqual(reasserted.value.value.subscription, registration.subscription);
+  assert.deepEqual(reasserted.value.value.entities, [fleet], 'explicit same displayName reasserts metadata');
+  const fleetAfterName = await lookup(fleet.id);
+  assert.equal(fleetAfterName.value.value.entity.type, 0);
+  assert.equal(fleetAfterName.value.value.messages[0].data.nested[0], '[[7:FLEET]]');
+
+  const plain = await request('/v1/claims', { key: 'plain-task', owner: alice, ttlSeconds: 0 });
+  assert.equal(plain.status, 200);
+  assert.equal(plain.value.value.claim.key, 'plain-task');
+  assert.equal(plain.value.value.claim.note, null);
+  assert.equal(plain.value.value.claim.owner, sessionKey(alice));
+  assert.equal(plain.value.value.claim.entities, undefined);
+  assert.equal((await request('/v1/claims/release', { key: 'plain-task', owner: alice })).value.value, true);
+  assert.deepEqual((await request('/v1/claims')).value.value, []);
+  assert.equal((await lookup(fleet.id)).value.value.entity.type, 0);
+
+  const inboxQuery = `?namespace=fleet&piSessionId=${bob.piSessionId}&since=0&limit=10`;
+  const foreignInbox = await request('/v1/inbox' + inboxQuery);
+  assert.equal(foreignInbox.status, 409);
+  assert.equal(foreignInbox.value.error, 'owner_conflict');
+
+  assert.equal((await request('/v1/claims', { key: claimKey, owner: alice, ttlSeconds: 0, note }, 'secret-b')).status, 409);
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 154);
+  const claimed = await request('/v1/claims', { key: claimKey, owner: alice, ttlSeconds: 0, note });
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.value.value.acquired, true);
+  const claim = claimed.value.value.claim;
+  assert.equal(claim.key, claimKey);
+  assert.equal(claim.note, note);
+  assert.equal(claim.owner, sessionKey(alice));
+  assert.equal(claim.expiresAt, null);
+  assert.equal(typeof claim.claimedAt, 'number');
+  assert.deepEqual(claim.entities, [entityReference('fleet', 'FLEET', 8), entityReference('fleet', 'Meteor Shower', 153)].sort(byId));
+  assert.deepEqual((await request('/v1/claims')).value.value, [claim]);
+
+  const later = await request('/v1/messages', { sender: alice, message: { recipient: '*', body: laterBody } });
+  assert.equal(later.status, 200);
+  assert.equal(later.value.value.body, laterBody);
+  assert.equal(later.value.value.data, null);
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 200);
+  const reread = await request('/v1/sessions');
+  assert.equal(reread.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice)).entities[0].type, 8);
+  assert.equal(reread.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice)).displayName, displayName);
+  const listedClaims = await request('/v1/claims');
+  assert.equal(listedClaims.value.value[0].key, claimKey);
+  assert.equal(listedClaims.value.value[0].note, note);
+  assert.equal(listedClaims.value.value[0].entities.find((entity: { label: string }) => entity.label === 'Meteor Shower').type, 200, 'reads do not replay claim text');
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 200);
+
+  assert.equal((await request('/v1/claims/release', { key: claimKey, owner: alice }, 'secret-b')).status, 409);
+  assert.equal((await request('/v1/claims/release', { key: claimKey, owner: bob })).status, 409);
+  const missed = await request('/v1/claims/release', { key: claimKey, owner: bob }, 'secret-b');
+  assert.equal(missed.status, 200);
+  assert.equal(missed.value.value, false);
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 200);
+  assert.equal((await request('/v1/claims')).value.value.length, 1);
+
+  const released = await request('/v1/claims/release', { key: claimKey, owner: alice });
+  assert.equal(released.status, 200);
+  assert.equal(released.value.value, true);
+  assert.equal(typeof released.value.value, 'boolean');
+  assert.deepEqual((await request('/v1/claims')).value.value, []);
+  const afterRelease = await lookup(shower.id);
+  assert.equal(afterRelease.value.value.entity.type, 153, 'successful release parses its exact key');
+  assert.deepEqual(afterRelease.value.value.messages.map((item: { body: string; data: unknown }) => [item.body, item.data]), [
+    [body, data], [bareBody, null], [laterBody, null],
+  ]);
+  assert.deepEqual((await lookup(fleet.id)).value.value.entity, entityReference('fleet', 'FLEET', 8));
+  assert.deepEqual((await lookup(fleet.id)).value.value.messages, [message]);
+  const aliceAfter = (await request('/v1/sessions')).value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice));
+  assert.equal(aliceAfter.displayName, displayName);
+  assert.deepEqual(aliceAfter.subscription, registration.subscription);
+  assert.deepEqual(aliceAfter.entities, [entityReference('fleet', 'FLEET', 8)]);
+  const inbox = await request('/v1/inbox' + inboxQuery, undefined, 'secret-b');
+  assert.equal(inbox.status, 200);
+  assert.deepEqual(inbox.value.value.map((item: { body: string; data: unknown }) => [item.body, item.data]), [
+    [body, data], [bareBody, null], [laterBody, null],
+  ]);
+  assert.equal((await request('/v1/claims/release', { key: claimKey, owner: alice })).value.value, false);
+  assert.equal((await lookup(shower.id)).value.value.entity.type, 153);
 });
 
 test('authenticated hosts can edit another host session rank with strict HTTP validation', async t => {

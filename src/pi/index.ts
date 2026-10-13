@@ -398,7 +398,16 @@ export default function rogerWilco(pi: ExtensionAPI): void {
   };
   pi.registerCommand('roger', boardCommand);
   pi.registerCommand('roger_board', boardCommand);
-  pi.registerTool({ name: 'roger_send', label: 'Send Agent Message', description: 'Send an agent message to a session address or broadcast (*). Mark entities with [[fix-parser]] (generic type 0) or [[7:fix-parser]] (opaque type byte 0–255); use roger_entity to look up their retained mentions.',
+  pi.registerTool({ name: 'roger_identity', label: 'Agent Identity', description: 'Read or set this session’s display name. Entity references such as [[0:FLEET]] attach opaque integer metadata without changing the session address. Omit displayName to read the registration.',
+    parameters: Type.Object({ displayName: Type.Optional(Type.String({ maxLength: 200 })) }),
+    execute: async (_id, params, _signal, _update, ctx) => {
+      const identity = await bound(ctx);
+      if ('ok' in identity) return text(identity);
+      return action(ctx, ROUTES.register, 'POST', { session: identity.actor,
+        ...(params.displayName === undefined ? {} : { displayName: params.displayName }) });
+    },
+  });
+  pi.registerTool({ name: 'roger_send', label: 'Send Agent Message', description: 'Send a message to a session address or broadcast (*). Text and JSON strings support [[label]] and [[153:Meteor Shower]]. The integer is opaque metadata (0–255), not identity. Bare references preserve it. Use roger_entity for current metadata and retained message mentions.',
     parameters: Type.Object({ recipient: Type.String(), body: Type.String(), data: Type.Optional(Type.Unknown()),
       visibility: Type.Optional(Type.Union([Type.Literal('private'), Type.Literal('public')])) }),
     execute: async (_id, params, _signal, _update, ctx) => {
@@ -419,7 +428,7 @@ export default function rogerWilco(pi: ExtensionAPI): void {
       return action(ctx, `${ROUTES.inbox}?${query}`, 'GET');
     },
   });
-  pi.registerTool({ name: 'roger_entity', label: 'Entity History', description: 'Look up an entity registry record and retained mention messages by label or ID. Type defaults to generic 0; other byte values are opaque, not permissions or work claims.',
+  pi.registerTool({ name: 'roger_entity', label: 'Entity History', description: 'Look up current entity metadata and retained message mentions by label or ID. The legacy type field is optional and never selects another identity or updates metadata. Integer meanings belong to consumers.',
     parameters: Type.Object({ label: Type.Optional(Type.String()), type: Type.Optional(Type.Integer({ minimum: 0, maximum: 255 })),
       id: Type.Optional(Type.String()), since: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })) }),
@@ -445,7 +454,7 @@ export default function rogerWilco(pi: ExtensionAPI): void {
   });
   pi.registerTool({ name: 'roger_board', label: 'Agent Board', description: 'List sessions seen within 90 seconds and active work claims. Presence is not proof of a live Pi lease; set all to include stale registrations.',
     parameters: Type.Object({ all: Type.Optional(Type.Boolean()) }), execute: async (_id, params, _signal, _update, ctx) => board(ctx, params.all) });
-  pi.registerTool({ name: 'roger_claim', label: 'Claim Work', description: 'Acquire or renew a session-owned work claim.',
+  pi.registerTool({ name: 'roger_claim', label: 'Claim Work', description: 'Acquire or renew a session-owned work claim. Key and note strings support [[label]] or [[153:label]] entity metadata. Claim keys remain literal; entity metadata does not grant ownership.',
     parameters: Type.Object({ key: Type.String({ minLength: 1, maxLength: 256 }), ttlSeconds: Type.Optional(Type.Integer({ minimum: 0, maximum: 2147483647 })), note: Type.Optional(Type.String({ maxLength: 4096 })) }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const identity = await bound(ctx);
@@ -453,7 +462,7 @@ export default function rogerWilco(pi: ExtensionAPI): void {
       return action(ctx, ROUTES.claims, 'POST', { owner: identity.actor, key: params.key, ttlSeconds: params.ttlSeconds ?? 900, ...(params.note === undefined ? {} : { note: params.note }) });
     },
   });
-  pi.registerTool({ name: 'roger_release', label: 'Release Work', description: 'Release a claim owned by this session.',
+  pi.registerTool({ name: 'roger_release', label: 'Release Work', description: 'Release a claim owned by this session using its exact key. Entity references in a successfully released key update opaque metadata without changing entity identity.',
     parameters: Type.Object({ key: Type.String({ minLength: 1, maxLength: 256 }) }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const identity = await bound(ctx);

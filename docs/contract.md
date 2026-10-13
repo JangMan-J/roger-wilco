@@ -165,7 +165,7 @@ The coordinator has no MCP endpoint.
 The Pi extension uses HTTP directly.
 The coordinator and host have no third-party runtime dependencies.
 
-Pi exposes `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, `roger_release`, and `roger_entity`.
+Pi exposes `roger_identity`, `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, `roger_release`, and `roger_entity`.
 These tools derive their actor from the invoking Pi session.
 The board defaults to sessions seen within 90 seconds and includes active claims.
 The model tool accepts `{all:true}` to include stale, retained registrations.
@@ -199,16 +199,28 @@ Each sweep collects at most 5,000 messages.
 
 An entity identifies a named subject without defining what that subject represents.
 Entity references do not create claims, tasks, permissions, or rank changes.
-The coordinator indexes references only in the body of each new message.
-It leaves the body, `data`, message envelope, and SSE frame unchanged.
-Existing stored messages are not rescanned during upgrade.
+The shared syntax applies to session display names, message bodies, JSON strings, claim keys and notes, and successful release keys.
+It does not belong to a particular harness.
+The coordinator preserves the original text, message envelope, and SSE frame.
 
-The marker syntax is `[[label]]` or `[[type:label]]`.
-Examples are `[[fix-parser]]` and `[[7:wire format]]`.
-The optional type prefix is a decimal integer from 0 through 255.
-Type 0 is generic and is the default.
-All other byte values remain opaque to Roger-Wilco.
-Consumers assign their meanings without a server-side type catalog.
+The marker syntax is `[[label]]` or `[[integer:label]]`.
+Examples are `[[0:FLEET]]` and `Hey Jerry, did you see the [[153:Meteor Shower]] last night?`
+The optional integer ranges from 0 through 255.
+It is opaque metadata, not part of identity.
+Consumers assign its meaning outside Roger-Wilco.
+The wire field retains the name `type` for compatibility.
+
+A new entity starts with metadata 0.
+Bare references preserve its current value.
+An explicit integer updates it, including explicit zero.
+The last explicit integer in accepted write order wins.
+Within a message, traversal processes the body before `data`.
+JSON traversal visits arrays in order and each object key before its value.
+
+Inbox, entity, board, and claim-list reads do not reapply integers from stored text.
+Unsuccessful claims and releases do not update metadata.
+Claims retain their literal keys and ownership rules.
+A release requires the exact claim key, regardless of entity metadata.
 
 Labels are single-line phrases of 1–256 UTF-16 code units after normalization.
 Normalization uses Unicode NFC and removes surrounding whitespace.
@@ -220,27 +232,52 @@ Invalid markers remain ordinary message text.
 Repeated references to the same entity create one link per message.
 The `^^example^^` notation has no special meaning.
 
-The ID format is `<namespace>:entity:<type-byte-hex>:<hash>`.
-The type occupies two lowercase hexadecimal digits.
+The canonical ID format is `<namespace>:entity:00:<hash>`.
+The `00` slot is fixed to preserve existing generic IDs.
 The hash is the first 32 hexadecimal digits of SHA-256.
-Its input is UTF-8 `JSON.stringify([namespace,type,canonicalLabel])`.
-For example, `[[7:fix-parser]]` in `fleet` resolves to `fleet:entity:07:fae9929240dc225c29962b8cb970472e`.
-Changing the namespace, type, or canonical label changes the identity.
-Message storage and entity links commit in the same transaction.
+Its input is UTF-8 `JSON.stringify([namespace,0,canonicalLabel])`.
+Both `[[fix-parser]]` and `[[7:fix-parser]]` in `fleet` resolve to `fleet:entity:00:09eec042175ea2041754a4d76bc2f603`.
+A different namespace or canonical label produces a different identity.
+Metadata changes preserve identity and mention history.
+The accepted operation, metadata updates, and reference links commit in one transaction.
 A detected hash collision rejects the write rather than merging different entities.
 
 `roger_entity` accepts either `{label,type?}` or `{id}`.
+The compatibility `type` argument validates a byte but does not filter or update metadata.
 Both forms accept optional `since` and `limit` values.
 The default cursor is 0 and the default limit is 100.
 The limit range is 1–500.
 Pagination uses the last returned message sequence as the next `since` value.
 Lookup does not create an entity or acknowledge a message.
 
+`roger_identity` accepts an optional `displayName` of at most 200 characters.
+It reads or updates the invoking session through the existing registration endpoint.
+`{"displayName":"[[0:FLEET]]"}` attaches a named reference without changing the session address or rank.
+Multiple sessions can reference the same entity without sharing ownership.
+Explicit display-name writes apply their integers, even when the name text stays unchanged.
+Heartbeats omit the display name and preserve metadata.
+An empty display name removes its reference associations.
+
+Registration and claim results include an optional `entities` array with current metadata for their attached references.
+These associations survive restart.
+They do not turn an entity label into a routing address.
+
 Entity lookup is namespace-wide for authenticated hosts.
 It includes retained mentions from messages addressed to other sessions, regardless of visibility metadata.
 It is not a session-private inbox view.
-Message collection removes the corresponding links and then unused entity records.
+The `messages` history contains message mentions, including nested JSON references.
+It does not archive registration, claim, or release events as messages.
+Message collection removes the corresponding links.
+Entity collection requires seven days without a reference write and no retained messages or active session/claim associations.
 A later reference recreates the same deterministic ID.
+
+Upgrade merges legacy type-specific records into one canonical record per label.
+Existing type-specific IDs resolve through aliases while their entity remains retained.
+The migration preserves message links, bodies, registration addresses, and delivery cursors.
+Only previously indexed messages participate in the metadata replay.
+Messages from before entity tracking do not gain new reference links during upgrade.
+Coordinator and clients must use the updated package before new metadata writes.
+Rollback requires the pre-upgrade database backup, not an older binary on the migrated database.
 
 ### Examples
 

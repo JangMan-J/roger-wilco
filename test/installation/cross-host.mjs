@@ -86,7 +86,7 @@ try {
   assert.equal(lookup.result.ok, true);
   assert.equal(lookup.result.value.entity.type, 255);
   assert.equal(lookup.result.value.entity.label, entityLabel);
-  assert.match(lookup.result.value.entity.id, /^fleet:entity:ff:[0-9a-f]{32}$/);
+  assert.match(lookup.result.value.entity.id, /^fleet:entity:00:[0-9a-f]{32}$/);
   assert.deepEqual(lookup.result.value.messages.map(message => message.id), [ping.result.value.id, reply.result.value.id]);
   bob.send({ command: 'busy' });
   await bob.wait(e => e.type === 'busy');

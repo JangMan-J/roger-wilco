@@ -342,15 +342,14 @@ test('collection protects relevant unacknowledged deliveries, bounds history, an
 });
 
 function entityRef(label: string, type = 0, namespace = 'fleet') {
-  const hash = createHash('sha256').update(JSON.stringify([namespace, type, label])).digest('hex').slice(0, 32);
-  return { id: `${namespace}:entity:${type.toString(16).padStart(2, '0')}:${hash}`, type, label };
+  const hash = createHash('sha256').update(JSON.stringify([namespace, 0, label])).digest('hex').slice(0, 32);
+  return { id: `${namespace}:entity:00:${hash}`, type, label };
 }
 
-test('entity mentions deduplicate normalized labels, distinguish opaque types, and reopen without message or routing changes', async t => {
+test('entity metadata changes preserve identity, deduplicated history, routing, and persisted state', async t => {
   const path = await fileStore(t);
   let store = createCoordinatorStore(path, 'fleet');
   const generic = entityRef('Café');
-  const typed = entityRef('Café', 7);
   const byte = entityRef('Café', 255);
   try {
     register(store);
@@ -366,11 +365,10 @@ test('entity mentions deduplicate normalized labels, distinguish opaque types, a
     assert.equal(direct.body, body);
     assert.deepEqual(direct.data, data);
     assert.deepEqual(Object.keys(direct).sort(), ['body', 'data', 'id', 'recipient', 'sender', 'sequence', 'timestamp', 'version', 'visibility']);
-    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: generic, messages: [direct, broadcast] });
-    for (const ref of [typed, byte]) assert.deepEqual(ok(store.entity(ref.id, 0, 10)), { entity: ref, messages: [direct] });
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: byte, messages: [direct, broadcast] });
     assert.deepEqual(ok(store.entity(generic.id, 0, 1)).messages, [direct]);
     assert.deepEqual(ok(store.entity(generic.id, direct.sequence, 1)).messages, [broadcast]);
-    assert.deepEqual(ok(store.entity(generic.id, broadcast.sequence, 10)), { entity: generic, messages: [] });
+    assert.deepEqual(ok(store.entity(generic.id, broadcast.sequence, 10)), { entity: byte, messages: [] });
     assert.deepEqual(store.listSessions(), sessions);
     assert.deepEqual(store.listClaims(), claims);
     assert.deepEqual(store.pending(hostB, 10), [{ type: 'message', subscriptionId: sessionKey(c), message: direct }]);
@@ -378,12 +376,140 @@ test('entity mentions deduplicate normalized labels, distinguish opaque types, a
     assert.deepEqual(ok(store.inbox(hostB, c, 0, 10)), [direct, broadcast]);
     assert.equal(store.acknowledge(hostA, { subscriptionId: sessionKey(c), messageId: direct.id }).ok, false);
     assert.equal(ok(store.acknowledge(hostB, { subscriptionId: sessionKey(c), messageId: direct.id })).cursor, direct.sequence);
-    for (const ref of [entityRef('data only'), entityRef('café'), entityRef('Café', 1)]) {
+    assert.deepEqual(ok(store.entity(entityRef('data only').id, 0, 10)), { entity: entityRef('data only'), messages: [direct] });
+    for (const ref of [entityRef('café')]) {
       assert.equal(store.entity(ref.id, 0, 10).ok, false);
     }
     store.close();
     store = createCoordinatorStore(path, 'fleet');
-    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: generic, messages: [direct, broadcast] });
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: byte, messages: [direct, broadcast] });
+    const update = ok(store.send(hostA, a, { recipient: '*', body: '[[7:Café]] [[Café]]' }));
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: { ...generic, type: 7 }, messages: [direct, broadcast, update] });
+    const reset = ok(store.send(hostA, a, { recipient: '*', body: '[[0:Café]] [[Café]]' }));
+    assert.deepEqual(ok(store.entity(generic.id, 0, 10)), { entity: generic, messages: [direct, broadcast, update, reset] });
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal(db.prepare('SELECT count(*) AS count FROM entities').get()!.count, 2);
+      assert.equal(db.prepare('SELECT count(*) AS count FROM message_entities').get()!.count, 5);
+    } finally { db.close(); }
+  } finally { store.close(); }
+});
+
+test('legacy type-keyed entities merge atomically, retain old ID aliases, and preserve all history on reopen', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  register(store);
+  const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[alice]] [[7:alice]]' }));
+  const second = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[7:alice]] [[255:alice]]' }));
+  const third = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[alice]]' }));
+  const sessions = store.listSessions();
+  store.close();
+  const legacy = (type: number) => {
+    const hash = createHash('sha256').update(JSON.stringify(['fleet', type, 'alice'])).digest('hex').slice(0, 32);
+    return `fleet:entity:${type.toString(16).padStart(2, '0')}:${hash}`;
+  };
+  const db = new DatabaseSync(path);
+  try {
+    db.exec(`DELETE FROM message_entities; DELETE FROM entities;
+      DROP TABLE store_config; CREATE TABLE store_config (namespace TEXT NOT NULL);
+      INSERT INTO store_config VALUES ('fleet')`);
+    for (const type of [0, 7, 255]) db.prepare('INSERT INTO entities (id, type, label) VALUES (?, ?, ?)').run(legacy(type), type, 'alice');
+    for (const [type, sequence] of [[0, first.sequence], [7, first.sequence], [7, second.sequence],
+      [255, second.sequence], [0, third.sequence]]) {
+      db.prepare('INSERT INTO message_entities VALUES (?, ?)').run(legacy(type!), sequence!);
+    }
+    // A bad canonical label must roll back the entire migration, including its version marker.
+    db.prepare('UPDATE entities SET label = ? WHERE id = ?').run('different label', legacy(0));
+    assert.throws(() => createCoordinatorStore(path, 'fleet'), /collision/);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM entities').get()!.count, 3);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM message_entities').get()!.count, 5);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM entity_aliases').get()!.count, 0);
+    db.prepare('UPDATE entities SET label = ? WHERE id = ?').run('alice', legacy(0));
+  } finally { db.close(); }
+  store = createCoordinatorStore(path, 'fleet');
+  try {
+    for (const type of [0, 7, 255]) {
+      assert.deepEqual(ok(store.entity(legacy(type), 0, 10)), { entity: entityRef('alice', 255), messages: [first, second, third] });
+    }
+    assert.deepEqual(store.listSessions(), sessions);
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)), [first, second, third]);
+    const reset = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[0:alice]]' }));
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.deepEqual(ok(store.entity(legacy(255), 0, 10)), { entity: entityRef('alice'), messages: [first, second, third, reset] });
+    const check = new DatabaseSync(path);
+    try {
+      assert.equal(check.prepare('SELECT count(*) AS count FROM entities').get()!.count, 1);
+      assert.equal(check.prepare('SELECT count(*) AS count FROM message_entities').get()!.count, 4);
+      assert.deepEqual(check.prepare('PRAGMA foreign_key_check').all(), []);
+    } finally { check.close(); }
+  } finally { store.close(); }
+});
+
+test('session names, JSON strings, claims, and releases share metadata without read-side status replay or identity changes', async t => {
+  const path = await fileStore(t);
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    register(store);
+    const before = store.listSessions().find(row => row.subscription.id === sessionKey(a))!;
+    const identity = ok(store.register(hostA, { session: a, displayName: '[[0:FLEET]]' }));
+    assert.deepEqual(identity.subscription, before.subscription);
+    assert.equal(identity.rank, before.rank);
+    assert.deepEqual(identity.entities, [entityRef('FLEET')]);
+    assert.deepEqual(ok(store.entity(entityRef('FLEET').id, 0, 10)), { entity: entityRef('FLEET'), messages: [] });
+    const body = 'Hey Jerry, did you see the [[153:Meteor Shower]] last night?';
+    const data = { nested: ['[[7:FLEET]]', { '[[4:object key]]': '[[154:Meteor Shower]]' }], flag: true };
+    const message = ok(store.send(hostA, a, { recipient: sessionKey(b), body, data }));
+    assert.equal(message.body, body);
+    assert.deepEqual(message.data, data);
+    assert.equal(ok(store.entity(entityRef('Meteor Shower').id, 0, 10)).entity.type, 154);
+    const identityAgain = ok(store.register(hostA, { session: a }));
+    assert.deepEqual(identityAgain.entities, [entityRef('FLEET', 7)], 'heartbeats do not reapply the old integer');
+    assert.deepEqual(identityAgain.subscription, identity.subscription);
+    assert.deepEqual(ok(store.register(hostA, { session: a, displayName: '[[0:FLEET]]' })).entities,
+      [entityRef('FLEET')], 'an explicit name update reasserts its integer even when its text is unchanged');
+    const claimKey = 'Observe [[153:Meteor Shower]]';
+    const claimed = ok(store.claim(hostA, claimKey, sessionKey(a), 0, 'Ask [[8:FLEET]] and [[1:claim only]]'));
+    assert.equal(claimed.acquired, true);
+    assert.equal(claimed.claim.key, claimKey);
+    assert.ok(claimed.claim.entities?.some(entity => entity.id === entityRef('FLEET').id && entity.type === 8));
+    assert.equal(ok(store.claim(hostA, claimKey, sessionKey(b), 0, '[[99:FLEET]]')).acquired, false);
+    assert.equal(ok(store.releaseClaim(hostA, claimKey, sessionKey(b))), false);
+    ok(store.send(hostA, a, { recipient: '*', body: '[[200:Meteor Shower]]' }));
+    store.listSessions();
+    store.listClaims();
+    assert.deepEqual(ok(store.inbox(hostA, b, 0, 1)), [message], 'inbox preserves the original text and nested payload');
+    assert.equal(ok(store.entity(entityRef('Meteor Shower').id, 0, 10)).entity.type, 200, 'reads do not replay old integers');
+    assert.equal(ok(store.entity(entityRef('FLEET').id, 0, 10)).entity.type, 8, 'failed mutations do not change metadata');
+    assert.equal(ok(store.releaseClaim(hostA, claimKey, sessionKey(a))), true);
+    assert.equal(ok(store.entity(entityRef('Meteor Shower').id, 0, 10)).entity.type, 153, 'successful release processes its key');
+    assert.deepEqual(store.listClaims(), []);
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.deepEqual(store.listSessions().find(row => row.subscription.id === sessionKey(a))!.entities, [entityRef('FLEET', 8)]);
+    assert.equal(ok(store.entity(entityRef('claim only').id, 0, 10)).entity.type, 1, 'released references survive for the retention window');
+    // Active identity/claim associations protect entities even after their last explicit mention ages out.
+    ok(store.claim(hostA, 'keep', sessionKey(a), 0, '[[2:held]]'));
+    now += 7 * 24 * 60 * 60 * 1000;
+    ok(store.register(hostA, { session: a }));
+    now += 60_001;
+    assert.deepEqual(store.listSessions().find(row => row.subscription.id === sessionKey(a))!.entities, [entityRef('FLEET', 8)]);
+    assert.equal(ok(store.entity(entityRef('held').id, 0, 10)).entity.type, 2);
+    assert.equal(store.entity(entityRef('claim only').id, 0, 10).ok, false);
+  } finally { store.close(); }
+});
+
+test('entity extraction accepts message data at the existing JSON depth limit', () => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  try {
+    register(store);
+    let data: import('../../src/protocol/index.ts').JsonValue = '[[153:Meteor Shower]]';
+    for (let i = 0; i < 32; i++) data = [data];
+    const message = ok(store.send(hostA, a, { recipient: sessionKey(b), body: '[[7:Meteor Shower]]', data }));
+    assert.deepEqual(ok(store.entity(entityRef('Meteor Shower').id, 0, 10)),
+      { entity: entityRef('Meteor Shower', 153), messages: [message] });
   } finally { store.close(); }
 });
 
@@ -407,7 +533,7 @@ test('entity queries validate identity and pagination; failed sends and identity
     const db = new DatabaseSync(path);
     try {
       // Simulate the otherwise impractical digest collision at the persisted identity boundary.
-      for (const [type, label] of [[7, ref.label], [ref.type, 'different label']] as const) {
+      for (const [type, label] of [[ref.type, 'different label']] as const) {
         db.prepare('UPDATE entities SET type = ?, label = ? WHERE id = ?').run(type, label, ref.id);
         assert.throws(() => store.send(hostA, a, { recipient: sessionKey(b), body: '[[new before collision]] [[shared]]' }), /collision/i);
         assert.equal((store.entity(entityRef('new before collision').id, 0, 10) as { error: string }).error, 'not_found');

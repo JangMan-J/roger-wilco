@@ -7,11 +7,11 @@ const alice = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655
 const bob = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440001' };
 const message = { version: 1, id: deliveryId('fleet', 1), sequence: 1, timestamp: 123, sender: sessionKey(alice), recipient: sessionKey(bob), body: 'Hello', data: null, visibility: 'private' };
 
-test('entity identity includes namespace, an opaque type byte, and canonical case-sensitive phrase', () => {
+test('entity identity includes namespace and canonical phrase but not integer metadata', () => {
   const generic = entityReference('fleet', 'fix-parser');
   assert.deepEqual(generic, { id: 'fleet:entity:00:09eec042175ea2041754a4d76bc2f603', type: 0, label: 'fix-parser' });
-  assert.equal(entityReference('fleet', 'fix-parser', 7).id, 'fleet:entity:07:fae9929240dc225c29962b8cb970472e');
-  assert.equal(entityReference('fleet', 'fix-parser', 255).id, 'fleet:entity:ff:82ffceb0347ff854f32d3a39d1e1625b');
+  assert.deepEqual(entityReference('fleet', 'fix-parser', 7), { ...generic, type: 7 });
+  assert.deepEqual(entityReference('fleet', 'fix-parser', 255), { ...generic, type: 255 });
   assert.deepEqual(entityReference('fleet', ' café '), entityReference('fleet', 'cafe\u0301'));
   assert.notEqual(entityReference('other', 'fix-parser').id, generic.id);
   assert.notEqual(entityReference('fleet', 'Fix-parser').id, generic.id);
@@ -25,17 +25,20 @@ test('entity identity includes namespace, an opaque type byte, and canonical cas
     assert.equal(isEntityId(id), false);
 });
 
-test('flat entity markers support phrases and type bytes without interpreting arbitrary message text', () => {
+test('flat markers distinguish absent metadata from explicit zero and keep the last explicit value', () => {
   const body = 'Ask about [[fix-parser]], [[0:fix-parser]], [[7:fix-parser]] and [[255:wire format]]. [[ café ]] [[cafe\u0301]]';
   assert.deepEqual(extractEntities('fleet', body), [
-    entityReference('fleet', 'fix-parser'), entityReference('fleet', 'fix-parser', 7),
-    entityReference('fleet', 'wire format', 255), entityReference('fleet', 'café'),
+    entityReference('fleet', 'fix-parser', 7),
+    entityReference('fleet', 'wire format', 255),
+    { id: entityReference('fleet', 'café').id, label: 'café' },
   ]);
   assert.deepEqual(extractEntities('fleet', '^^example^^ [[ ]] [[256:label]] [[two\nlines]] [[[nested]]] \\[[literal]] [[unclosed'), []);
   assert.deepEqual(extractEntities('fleet', '[[7:a\u2028b]] [[7:a\u2029b]] [[\tname]] [[7:\tname]]'), []);
   assert.deepEqual(extractEntities('fleet', '[[https:example]] and [[1: normal phrase ]]'), [
-    entityReference('fleet', 'https:example'), entityReference('fleet', 'normal phrase', 1),
+    { id: entityReference('fleet', 'https:example').id, label: 'https:example' }, entityReference('fleet', 'normal phrase', 1),
   ]);
+  assert.deepEqual(extractEntities('fleet', '[[7:alice]] [[alice]] [[8:alice]] [[alice]]'), [entityReference('fleet', 'alice', 8)]);
+  assert.deepEqual(extractEntities('fleet', '[[7:alice]] [[0:alice]] [[alice]]'), [entityReference('fleet', 'alice', 0)]);
   assert.equal(isMessageInput({ recipient: '*', body }), true, 'entity notation is still ordinary message text');
 });
 

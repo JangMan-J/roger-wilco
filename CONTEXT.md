@@ -5,16 +5,19 @@ Roger-Wilco lets sessions exchange messages and coordinate without defining an a
 ## Language
 
 **Entity**:
-A named subject that messages can reference, independently of tasks, claims, or roles.
-_Example_: Alice and Bob refer to the same `fix-parser` entity in different messages.
-_Confirmed_: 2026-10-12, user request for tracked symbolic words or phrases.
+A named subject that text can reference, independently of tasks, claims, roles, or harnesses.
+Its identity does not change when its metadata changes.
+_Example_: An agent named FLEET and a subject named Meteor Shower can each have entity references.
+_Confirmed_: 2026-10-13, user clarification about agent identities and arbitrary text.
 _Avoid_: Task, claim
 
-**Entity type**:
-A consumer-defined classification of an entity. Roger-Wilco assigns no workflow or authority to it.
-_Example_: A consumer distinguishes two meanings of `fix-parser` with different type values.
-_Confirmed_: 2026-10-12, user request for arbitrary entity types with room for a byte.
+**Entity metadata**:
+An opaque integer attached to an entity, separate from its identity.
+Its meaning belongs to consumers outside Roger-Wilco.
+_Example_: A consumer interprets a change from 0 to 153 as a status change for the same entity.
+_Confirmed_: 2026-10-13, user clarification that the integer is metadata.
+_Avoid_: Entity type, authority, rank
 
 ## Unresolved
 
-- Names and meanings of application-specific entity types belong to consumers.
+- Meanings of metadata values belong to consumers.
