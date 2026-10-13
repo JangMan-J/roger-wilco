@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createHostClient } from '../../src/host/client.ts';
-import { createHostDaemon, createHostInbox, LocalHostInbox } from '../../src/host/index.ts';
+import { createHostDaemon, createDaemonInbox as createHostInbox, LocalHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 import {
   MAX_JSON_BYTES, ROUTES, sessionKey,

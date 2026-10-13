@@ -257,7 +257,9 @@ function failure(code: 'invalid_request' | 'owner_conflict' | 'not_found', messa
   return { ok: false, error: code, message };
 }
 
-export function createHostInbox(path: string): HostInbox {
+// Do not restore the old createHostInbox export. A cached legacy Pi adapter
+// imports that name lazily; it must not acquire the new daemon-only writer.
+export function createDaemonInbox(path: string): HostInbox {
   return new LocalHostInbox(path);
 }
 

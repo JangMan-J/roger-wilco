@@ -95,6 +95,8 @@ Remove legacy index names and create versioned indexes.
 Clear runtime leases on daemon startup. Preserve messages and registration work.
 Reject unsupported schema versions. Old constructors and open writable handles
 must fail to mutate after migration. Test this with actual legacy code.
+The daemon factory is `createDaemonInbox`. The old `createHostInbox` export is absent.
+This also fences an old Pi adapter that lazily imports the new host module.
 
 ## Ownership
 

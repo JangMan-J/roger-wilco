@@ -1,4 +1,4 @@
-import { createHostInbox } from '../../src/host/index.ts';
+import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 
 const inboxPath = process.argv[2];

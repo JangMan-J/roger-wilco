@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
-import { createHostInbox, createHostDaemon } from '../../src/host/index.ts';
+import { createDaemonInbox as createHostInbox, createHostDaemon } from '../../src/host/index.ts';
 import { ROUTES, sessionKey, type HostInbox, type PiConfig, type SessionAddress } from '../../src/protocol/index.ts';
 import { nativePi, nativePiRuntime, persistedMessages } from './native-pi.ts';
 

@@ -2,13 +2,13 @@
 import { mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createHostDaemon, createHostInbox } from '../host/index.ts';
+import { createHostDaemon, createDaemonInbox } from '../host/index.ts';
 import { readHostConfig } from './config.ts';
 
 export async function runHost(configPath?: string) {
   const config = await readHostConfig(configPath);
   await mkdir(dirname(config.inboxPath), { recursive: true, mode: 0o700 });
-  const inbox = createHostInbox(config.inboxPath);
+  const inbox = createDaemonInbox(config.inboxPath);
   const daemon = createHostDaemon(config, inbox);
   const abort = new AbortController();
   let stopped: Promise<void> | undefined;

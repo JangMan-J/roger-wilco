@@ -1,6 +1,6 @@
 # Push delivery and entity metadata migration
 
-Status: implementation and local acceptance passed. Deployment is not complete.
+Status: all 89 tests passed, including the final mixed-version guard. Deployment is in progress.
 
 ## Objective
 
@@ -40,7 +40,7 @@ An idle transport heartbeat must not trigger a database catch-up query.
 The original source baseline is commit `0c20ef3b5514175a612a9ef22cf1f5dfac1c4486`.
 Commit `edfe56e` contains the metadata correction.
 Its complete `npm run check` passed 74 tests with no failures or skips.
-The push migration passes all 88 tests in the current complete suite.
+The final migration passes all 89 tests, including the old-adapter import regression.
 These results do not establish transport migration or production acceptance.
 
 The source baseline contained three ordinary scan loops:

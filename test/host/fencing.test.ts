@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createHostInbox } from '../../src/host/index.ts';
+import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { rollbackInbox } from '../../deploy/rollback-inbox.ts';
 import { sessionKey, type HostInbox, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
@@ -133,4 +133,41 @@ test('transport rollback preserves post-cutover receipts and queued work', async
       assert.equal(cell(check, 'SELECT registration_json FROM registrations'), JSON.stringify({ session, displayName: 'post-cutover' }));
     } finally { check.close(); }
   } finally { await legacy.close(); }
+});
+
+test('a cached legacy Pi adapter cannot lazily open the new daemon writer', async t => {
+  const dir = temporaryDir(t);
+  const path = join(dir, 'inbox.sqlite');
+  const configPath = join(dir, 'host.json');
+  writeFileSync(configPath, JSON.stringify({ namespace: 'fleet', hostId: 'host-a',
+    coordinatorUrl: 'http://127.0.0.1:1', credential: 'offline', inboxPath: path }));
+  const saved = process.env.ROGER_WILCO_CONFIG;
+  process.env.ROGER_WILCO_CONFIG = configPath;
+  let source = stripTypeScriptTypes(execFileSync('git', ['show', 'edfe56e:src/pi/index.ts'],
+    { cwd: root, encoding: 'utf8' }));
+  for (const relative of ['../protocol/index.ts', '../bin/config.ts', '../host/index.ts'])
+    source = source.replaceAll(`'${relative}'`, JSON.stringify(new URL(`../../src/pi/${relative}`, import.meta.url).href));
+  source = source.replaceAll("'typebox'", JSON.stringify(import.meta.resolve('typebox')));
+  const legacy = await import(`data:text/javascript,${encodeURIComponent(source)}`) as { default(api: unknown): void };
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  let status = '';
+  legacy.default({
+    on(name: string, handler: (...args: any[]) => Promise<void>) { handlers.set(name, handler); },
+    registerTool() {}, registerCommand() {}, sendMessage() {},
+  });
+  const ctx = { sessionManager: { getSessionId: () => session.piSessionId,
+    getSessionFile: () => join(dir, 'session.jsonl') }, hasUI: true,
+    ui: { setStatus(_key: string, value: string | undefined) { status = value ?? ''; } } };
+  try {
+    await handlers.get('session_start')!({}, ctx);
+    assert.match(status, /createHostInbox.*not a function/);
+    assert.equal(existsSync(path), false, 'legacy adapter did not open or migrate SQLite');
+    assert.equal(existsSync(`${path}.lock`), false, 'legacy adapter did not take the daemon lock');
+    const daemon = createHostInbox(path);
+    await daemon.close();
+  } finally {
+    await handlers.get('session_shutdown')!({}, ctx);
+    if (saved === undefined) delete process.env.ROGER_WILCO_CONFIG;
+    else process.env.ROGER_WILCO_CONFIG = saved;
+  }
 });

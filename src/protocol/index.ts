@@ -93,7 +93,7 @@ export interface HostInbox {
 }
 
 export type CreateCoordinatorStore = (dbPath: string, namespace: string) => CoordinatorStore;
-export type CreateHostInbox = (path: string) => HostInbox;
+export type CreateDaemonInbox = (path: string) => HostInbox;
 export type ControlHandler = (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse) => Promise<void>;
 export type CreateControlHandler = (store: CoordinatorStore, auth: HostAuthenticator) => ControlHandler;
 export type CreateStreamHandler = (store: CoordinatorStore, auth: HostAuthenticator) => ControlHandler;

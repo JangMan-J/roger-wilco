@@ -9,7 +9,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readHostConfig } from '../../src/bin/config.ts';
-import { createHostInbox } from '../../src/host/index.ts';
+import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 import { createHostClient } from '../../src/host/client.ts';
 import rogerWilco, { createPiDelivery, loadPiConfig, persistedReceipt } from '../../src/pi/index.ts';

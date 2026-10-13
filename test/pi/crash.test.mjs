@@ -7,7 +7,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { createHostInbox } from '../../src/host/index.ts';
+import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { listenLocal } from '../../src/host/ipc.ts';
 import rogerWilco, { persistedReceipt } from '../../src/pi/index.ts';
 

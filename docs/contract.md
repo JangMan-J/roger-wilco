@@ -529,7 +529,9 @@ This lane does not edit the schema.
 
 ### Lane D
 
-`src/host/index.ts` exports `createHostInbox(path: string): HostInbox`.
+`src/host/index.ts` exports `createDaemonInbox(path: string): HostInbox`.
+The legacy `createHostInbox` export is absent.
+A cached old Pi adapter cannot lazily import the new daemon writer under that name.
 It also exports `createHostDaemon(config: HostConfig, inbox: HostInbox): {start(signal: AbortSignal): Promise<void>;stop(): Promise<void>}`.
 Tests live in `test/host/`.
 Lane D is the sole owner of the host schema and the durable local registration queue.

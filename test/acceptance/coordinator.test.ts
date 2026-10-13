@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
-import { createHostDaemon, createHostInbox } from '../../src/host/index.ts';
+import { createHostDaemon, createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { ROUTES, sessionKey, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const namespace = 'fleet';

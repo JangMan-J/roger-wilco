@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { createHostDaemon, createHostInbox } from '../../src/host/index.ts';
+import { createHostDaemon, createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
 import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type HostInbox, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', piSessionId: '550e8400-e29b-41d4-a716-446655440000' };
