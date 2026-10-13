@@ -1,6 +1,7 @@
 # Push delivery and entity metadata migration
 
-Status: all 89 tests passed, including the final mixed-version guard. Deployment is in progress.
+Status: implemented and deployed on both hosts. All 89 tests and installed cross-host acceptance passed.
+The [verification record](verification.md) identifies the deployed revision, preserved state, and existing-session reload requirement.
 
 ## Objective
 
@@ -41,7 +42,7 @@ The original source baseline is commit `0c20ef3b5514175a612a9ef22cf1f5dfac1c4486
 Commit `edfe56e` contains the metadata correction.
 Its complete `npm run check` passed 74 tests with no failures or skips.
 The final migration passes all 89 tests, including the old-adapter import regression.
-These results do not establish transport migration or production acceptance.
+The installed checks in the verification record establish production acceptance separately from these source tests.
 
 The source baseline contained three ordinary scan loops:
 
