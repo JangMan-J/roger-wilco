@@ -45,7 +45,7 @@ An entity is not a task, claim, permission, or workflow.
 
 ## Requirements
 
-- Node 26.11.1, pinned in `.node-version`.
+- Node >=24, pinned for development in `.node-version`.
 - The supported Pi 1.1.0 build with persistent session files.
 - One coordinator and one daemon for each host.
 - HTTPS between hosts and the coordinator.

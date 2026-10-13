@@ -47,7 +47,8 @@ Evidence (this working tree, local host only):
   (no `lastSeenAt`) validates; `null`, string, fractional, and unsafe
   timestamps are rejected.
 - `npm run check` (typecheck plus full suite): 95 tests, 95 pass, 0 fail,
-  0 skipped, on 2026-10-13. The review's `registration-race.mjs` probe no
+  0 skipped, on 2026-10-13, on both Node 26.11.1 and Node 24.21.0; the
+  stated floor is therefore `>=24`. The review's `registration-race.mjs` probe no
   longer returns the false success; its waiter now remains pending on the
   probe's held fresh response (the probe releases that response only in its
   cleanup, so as written it ends on its own 10-second timer — the in-repo

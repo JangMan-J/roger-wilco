@@ -10,7 +10,7 @@
     "roger-wilco-coordinator": "./src/bin/coordinator.ts",
     "roger-wilco-host": "./src/bin/host.ts"
   },
-  "engines": { "node": ">=26.11.1" },
+  "engines": { "node": ">=24" },
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./src/pi/index.ts"] },
   "scripts": {

@@ -3,8 +3,9 @@
 ## Scope and runtime
 
 This contract describes the current implementation.
-The minimum Node version is `>=26.11.1`.
-The pin in `.node-version` is 26.11.1.
+The minimum Node version is `>=24`.
+The development pin in `.node-version` is 24.21.0.
+The full check passes on both Node 24.21.0 and Node 26.11.1.
 The runtime uses `node:sqlite` and `DatabaseSync`.
 Runtime code does not import a reference project.
 Shared declarations and validators live in `src/protocol/index.ts`.
