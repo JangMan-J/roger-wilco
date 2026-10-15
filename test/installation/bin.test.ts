@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -14,8 +15,11 @@ test('packaged entry-point composition starts, serves health, and exits on SIGTE
   const path = join(dir, 'coordinator.json');
   await writeFile(path, JSON.stringify({ namespace: 'fleet', databasePath: join(dir, 'coordinator.sqlite'),
     listenHost: '127.0.0.1', port: 0, hostCredentials: { host: 'test-token' } }));
+  // The settings file is read at startup; this one also proves its values reach /health.
+  const settings = join(dir, 'roger-wilco.conf');
+  await writeFile(settings, 'presence_window = 2m\nretention = 3d # comment\n');
   const coordinator = spawn(process.execPath, [fileURLToPath(new URL('../../src/bin/coordinator.ts', import.meta.url)), path],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ROGER_WILCO_SETTINGS: settings } });
   t.after(() => coordinator.kill('SIGKILL'));
   let stderr = '';
   coordinator.stderr.on('data', chunk => { stderr += chunk; });
@@ -28,7 +32,9 @@ test('packaged entry-point composition starts, serves health, and exits on SIGTE
     });
     coordinator.once('error', reject);
   });
-  assert.equal((await fetch(`${url}/health`)).status, 200);
+  const health = await fetch(`${url}/health`);
+  assert.equal(health.status, 200);
+  assert.equal(((await health.json()) as { value: { presenceWindowMs: number } }).value.presenceWindowMs, 120_000);
   const hostConfig = join(dir, 'host.json');
   await writeFile(hostConfig, JSON.stringify({ namespace: 'fleet', coordinatorUrl: url, hostId: 'host', credential: 'test-token', inboxPath: join(dir, 'inbox.sqlite') }));
   const host = spawn(process.execPath, [fileURLToPath(new URL('../../src/bin/host.ts', import.meta.url)), hostConfig],
@@ -47,6 +53,24 @@ test('packaged entry-point composition starts, serves health, and exits on SIGTE
     assert.equal(await hostDone, 0);
     assert.equal(await done, 0);
   } finally { clearTimeout(deadline); }
+});
+
+test('coordinator startup fails on an invalid settings file', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'rw-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'coordinator.json');
+  await writeFile(path, JSON.stringify({ namespace: 'fleet', databasePath: join(dir, 'coordinator.sqlite'),
+    listenHost: '127.0.0.1', port: 0, hostCredentials: { host: 'test-token' } }));
+  const settings = join(dir, 'roger-wilco.conf');
+  await writeFile(settings, 'window = 1000\n');
+  const coordinator = spawn(process.execPath, [fileURLToPath(new URL('../../src/bin/coordinator.ts', import.meta.url)), path],
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ROGER_WILCO_SETTINGS: settings } });
+  t.after(() => coordinator.kill('SIGKILL'));
+  let stderr = '';
+  coordinator.stderr.on('data', chunk => { stderr += chunk; });
+  const [code] = await once(coordinator, 'exit') as [number | null];
+  assert.notEqual(code, 0);
+  assert.match(stderr, /roger-wilco\.conf:1: window is outside its bounds/);
 });
 
 test('host configuration rejects callback fields and off-host plaintext HTTP', async t => {

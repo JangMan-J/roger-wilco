@@ -126,8 +126,21 @@ export interface CoordinatorStore {
   acknowledge(host: HostPrincipal, receipt: Receipt): Outcome<Subscription>;
   claim(host: HostPrincipal, key: string, owner: SessionKey, ttlSeconds: number, note?: string): Outcome<{ claim: Claim; acquired: boolean }>;
   releaseClaim(host: HostPrincipal, key: string, owner: SessionKey): Outcome<boolean>;
+  /** Host stream v2. Creates the `hosts` row (cut-over, FULL) or checks the bookmark against it. */
+  openHost(host: HostPrincipal, bookmark?: { stream?: string; after?: number }): Outcome<HostStart>;
+  /** One read snapshot: members and up to `limit` owed messages with ids in (from, min(tail, from + span)]. */
+  hostBatch(host: HostPrincipal, from: number, limit: number): HostBatch;
+  /** Monotone `C := max(C, through)`; returns the new C, or undefined without a `hosts` row. */
+  advanceHost(host: HostPrincipal, through: number): number | undefined;
+  /** C for a v2 host; undefined means the host is on protocol 1. */
+  hostAcked(host: HostPrincipal): number | undefined;
+  /** Refreshes this host's listed sessions; never creates, wakes or moves a start. */
+  presence(host: HostPrincipal, request: Presence): Outcome<PresenceResult>;
   close(): void;
 }
+/** `acked` is C; `resume` is where the stream starts; `stream` is the coordinator log id. */
+export type HostStart = { acked: number; resume: number; stream: string };
+export type HostBatch = { members: Array<{ session: SessionKey; start: number }>; messages: Message[]; scanned: number; tail: number };
 
 /** Adapter-facing socket client. The daemon's SQLite inbox is a separate module and does not implement this. */
 export interface HostInbox {

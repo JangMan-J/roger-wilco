@@ -6,18 +6,23 @@ import { pathToFileURL } from 'node:url';
 import { createCoordinatorStore } from '../server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../server/control/index.ts';
 import { createStreamHandler } from '../server/delivery/index.ts';
-import { ROUTES } from '../protocol/index.ts';
+import { ROUTES, type Settings } from '../protocol/index.ts';
 import { readCoordinatorConfig, type CoordinatorConfig } from './config.ts';
+import { readSettings } from './settings.ts';
 
-export async function startCoordinator(config: CoordinatorConfig) {
+const STREAM_ROUTES: ReadonlySet<string> = new Set([ROUTES.stream, ROUTES.receipt, ROUTES.streamV2, ROUTES.receiptV2]);
+
+/** Settings default to the settings file (`$ROGER_WILCO_SETTINGS` or ~/.config/roger-wilco/roger-wilco.conf). */
+export async function startCoordinator(config: CoordinatorConfig, settings?: Settings) {
+  settings ??= await readSettings();
   await mkdir(dirname(config.databasePath), { recursive: true, mode: 0o700 });
-  const store = createCoordinatorStore(config.databasePath, config.namespace);
+  const store = createCoordinatorStore(config.databasePath, config.namespace, { retentionMs: settings.retentionMs });
   const auth = createHostAuthenticator(config.hostCredentials);
-  const control = createControlHandler(store, auth);
-  const stream = createStreamHandler(store, auth);
+  const control = createControlHandler(store, auth, settings);
+  const stream = createStreamHandler(store, auth, settings);
   const server = createServer((request, response) => {
     const path = new URL(request.url ?? '/', 'http://localhost').pathname;
-    const handler = path === ROUTES.stream || path === ROUTES.receipt ? stream : control;
+    const handler = STREAM_ROUTES.has(path) ? stream : control;
     void handler(request, response).catch(error => {
       console.error('Roger-Wilco request failed:', error instanceof Error ? error.message : 'unknown error');
       if (!response.headersSent) response.writeHead(500, { 'content-type': 'application/json' });
@@ -51,7 +56,8 @@ export async function startCoordinator(config: CoordinatorConfig) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   if (process.argv.includes('--help')) {
-    console.log('Usage: roger-wilco-coordinator [config.json]\nDefault: $ROGER_WILCO_SERVER_CONFIG or ~/.config/roger-wilco/coordinator.json');
+    console.log('Usage: roger-wilco-coordinator [config.json]\nDefault: $ROGER_WILCO_SERVER_CONFIG or ~/.config/roger-wilco/coordinator.json\n' +
+      'Settings: $ROGER_WILCO_SETTINGS or ~/.config/roger-wilco/roger-wilco.conf (absent: defaults)');
   } else {
     const runtime = await startCoordinator(await readCoordinatorConfig(process.argv[2]));
     console.log(JSON.stringify({ service: 'roger-wilco-coordinator', url: runtime.url }));

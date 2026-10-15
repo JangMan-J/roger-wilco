@@ -7,7 +7,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import v8 from 'node:v8';
 import vm from 'node:vm';
-import { createCoordinatorStore } from '../../src/server/store.ts';
+import { createCoordinatorStore, SCAN_SPAN } from '../../src/server/store.ts';
+import { rollbackHostV2 } from '../../deploy/rollback-host-v2.ts';
+import { restoreCoordinator } from '../../deploy/restore-coordinator.ts';
 import { sessionKey, type CoordinatorStore, type Receipt, type Registration, type SessionAddress } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
@@ -947,4 +949,389 @@ test('opening a database removes session entity sources left by display names; t
     assert.equal(store.listSessions().length, 1);
     assert.equal(store.entity(fleet.id, 0, 10).ok, false);
   } finally { store.close(); }
+});
+
+// ---- Host stream v2 (docs/protocol-v2.md, test plan 3-14) ----
+
+const hostC = { hostId: 'host-c' };
+const hostD = { hostId: 'host-d' };
+const x: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440010' };
+const y: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440011' };
+const ghost = 'fleet:ghost';
+/** Directly set cursors, standing in for v1 receipts that already moved them. */
+function setCursor(path: string, session: SessionAddress, cursor: number): void {
+  const db = new DatabaseSync(path);
+  try { db.prepare('UPDATE sessions SET cursor = ? WHERE id = ?').run(cursor, sessionKey(session)); }
+  finally { db.close(); }
+}
+function cursors(store: CoordinatorStore): Record<string, number> {
+  return Object.fromEntries(store.listSessions().map(row => [row.subscription.id, row.subscription.cursor]));
+}
+/** `count` rows nobody is owed (an unregistered recipient), written in one transaction with valid hashes. */
+function irrelevant(path: string, count: number, sender = sessionKey(x)): void {
+  const db = new DatabaseSync(path);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const insert = db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)');
+    const hash = db.prepare('UPDATE messages SET hash = ? WHERE id = ?');
+    for (let i = 0; i < count; i++) {
+      const timestamp = Date.now();
+      const id = Number(insert.run(timestamp, sender, ghost, 'noise', 'null', 'private').lastInsertRowid);
+      const message = { version: 1, id: `fleet:msg:${id}`, sequence: id, timestamp, sender, recipient: ghost, body: 'noise', data: null, visibility: 'private' };
+      hash.run(createHash('sha256').update(JSON.stringify(message)).digest('hex'), id);
+    }
+    db.exec('COMMIT');
+  } finally { db.close(); }
+}
+function fill(store: CoordinatorStore, count: number): void {
+  for (let i = 0; i < count; i++) ok(store.send(hostB, x, { recipient: ghost, body: `noise ${i}` }));
+}
+
+test('v2 cut-over: C0 is the lowest cursor, members carry the frozen cursors, a second open is a no-op', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostB, { session: x }));
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  ok(store.register(hostA, { session: c }));
+  ok(store.register(hostD, { session: y }));
+  irrelevant(path, 100);
+  setCursor(path, a, 10); setCursor(path, b, 50); setCursor(path, c, 90); setCursor(path, y, 60);
+  const before = cursors(store);
+  const start = ok(store.openHost(hostA));
+  assert.equal(start.acked, 10);
+  assert.equal(start.resume, 10);
+  assert.match(start.stream, /^[0-9a-f]{32}$/);
+  assert.equal(store.hostAcked(hostA), 10);
+  assert.deepEqual(store.hostBatch(hostA, start.resume, 32).members,
+    [{ session: sessionKey(a), start: 10 }, { session: sessionKey(b), start: 50 }, { session: sessionKey(c), start: 90 }]);
+  assert.deepEqual(cursors(store), before, 'cut-over changes no cursor');
+  assert.deepEqual(ok(store.openHost(hostA)), start, 'a second open changes nothing');
+  assert.equal(store.hostAcked(hostA), 10);
+  // A host with no sessions starts at the tail.
+  assert.deepEqual(ok(store.openHost(hostC)), { acked: 100, resume: 100, stream: start.stream });
+  // `after` on creation lowers C0 and never raises it.
+  assert.equal(ok(store.openHost(hostD, { stream: start.stream, after: 40 })).acked, 40);
+  ok(store.register(hostB, { session: { ...y, sessionId: '550e8400-e29b-41d4-a716-446655440012' } }));
+  const lowB = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440012' };
+  setCursor(path, lowB, 20);
+  setCursor(path, x, 30);
+  assert.equal(ok(store.openHost(hostB, { stream: start.stream, after: 70 })).acked, 20);
+});
+
+test('v2 open rules: bookmark ahead of tail, foreign stream and behind C fail; resume is the coordinator copy', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    ok(store.register(hostB, { session: x }));
+    ok(store.register(hostA, { session: a }));
+    fill(store, 5);
+    setCursor(path, a, 2);
+    const { stream } = ok(store.openHost(hostA));
+    const tail = 5;
+    const ahead = store.openHost(hostA, { stream, after: tail + 1 });
+    assert.deepEqual(ahead, { ok: false, error: 'owner_conflict', message: 'Bookmark is ahead of the coordinator tail' });
+    assert.equal((store.openHost(hostA, { stream: 'f'.repeat(32), after: 2 }) as { message: string }).message,
+      'Bookmark belongs to another coordinator log');
+    assert.equal(store.openHost(hostA, { stream: 'NOT-HEX', after: 2 }).ok, false);
+    store.advanceHost(hostA, 3);
+    assert.equal((store.openHost(hostA, { stream, after: 2 }) as { message: string }).message, 'Bookmark is behind the receipted position');
+    // after > C is accepted; the stream resumes from the coordinator's knowledge and C stays.
+    assert.deepEqual(ok(store.openHost(hostA, { stream, after: 5 })), { acked: 3, resume: 3, stream });
+    assert.equal(store.hostAcked(hostA), 3);
+    setCursor(path, a, 4);
+    assert.equal(ok(store.openHost(hostA, { stream, after: 5 })).resume, 4, 'resume = max(C, minStart)');
+    // No sessions left: resume is the tail.
+    assert.deepEqual(ok(store.openHost(hostC)), { acked: tail, resume: tail, stream });
+    const db = new DatabaseSync(path);
+    try { db.prepare('DELETE FROM sessions WHERE host_id = ?').run(hostA.hostId); } finally { db.close(); }
+    assert.deepEqual(ok(store.openHost(hostA, { stream, after: 4 })), { acked: 3, resume: tail, stream });
+    store.close();
+    store = createCoordinatorStore(path, 'fleet');
+    assert.equal(ok(store.openHost(hostA)).stream, stream, 'a second constructor run keeps stream_id');
+    assert.equal(store.hostAcked(hostA), 3);
+  } finally { store.close(); }
+});
+
+test('hostBatch filters by host, start and sender, honours its limit, and bounds each scan by SCAN_SPAN', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostB, { session: x }));
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  ok(store.register(hostC, { session: c }));
+  const early = ok(store.send(hostB, x, { recipient: sessionKey(b), body: 'below b start' }));
+  setCursor(path, b, early.sequence);
+  const toA = ok(store.send(hostB, x, { recipient: sessionKey(a), body: 'directed to a' }));
+  ok(store.send(hostB, x, { recipient: sessionKey(x), body: 'another host' }));
+  ok(store.send(hostB, x, { recipient: ghost, body: 'unregistered' }));
+  const toB = ok(store.send(hostB, x, { recipient: sessionKey(b), body: 'directed to b above start' }));
+  const fromX = ok(store.send(hostB, x, { recipient: '*', body: 'broadcast from another host' }));
+  const fromC = ok(store.send(hostC, c, { recipient: '*', body: 'broadcast whose host has only its sender' }));
+  const fromA = ok(store.send(hostA, a, { recipient: '*', body: 'broadcast from a member' }));
+  const all = store.hostBatch(hostA, 0, 32);
+  assert.deepEqual(all.messages.map(message => message.id), [toA.id, toB.id, fromX.id, fromC.id, fromA.id]);
+  assert.equal(all.scanned, all.tail);
+  assert.equal(all.tail, fromA.sequence);
+  assert.deepEqual(store.hostBatch(hostC, 0, 32).messages.map(message => message.id), [fromX.id, fromA.id],
+    'a broadcast whose only eligible host session is its sender is not sent to that host');
+  const two = store.hostBatch(hostA, 0, 2);
+  assert.deepEqual(two.messages.map(message => message.id), [toA.id, toB.id]);
+  assert.equal(two.scanned, toB.sequence, 'a full batch scans only through its last row');
+  assert.deepEqual(store.hostBatch(hostA, two.scanned, 2).messages.map(message => message.id), [fromX.id, fromC.id]);
+  // 10 000 irrelevant ids give no rows, and each call advances by at most SCAN_SPAN.
+  irrelevant(path, 10_000);
+  let from = fromA.sequence;
+  const spans: number[] = [];
+  while (true) {
+    const batch = store.hostBatch(hostA, from, 32);
+    assert.deepEqual(batch.messages, []);
+    assert.equal(batch.tail, fromA.sequence + 10_000);
+    spans.push(batch.scanned - from);
+    from = batch.scanned;
+    if (from === batch.tail) break;
+  }
+  assert.deepEqual(spans, [SCAN_SPAN, SCAN_SPAN, 10_000 - 2 * SCAN_SPAN]);
+  assert.throws(() => store.hostBatch(hostA, 0, 0), /Invalid host batch/);
+});
+
+test('hostBatch reads members and messages from one snapshot; a registration sees only later broadcasts', async t => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostB, { session: x }));
+  const before = ok(store.send(hostB, x, { recipient: '*', body: 'before registration' }));
+  const first = store.hostBatch(hostC, 0, 32);
+  assert.deepEqual(first.members, []);
+  assert.deepEqual(first.messages, []);
+  ok(store.register(hostC, { session: c }));
+  const after = ok(store.send(hostB, x, { recipient: '*', body: 'after registration' }));
+  const second = store.hostBatch(hostC, 0, 32);
+  assert.deepEqual(second.members, [{ session: sessionKey(c), start: before.sequence }]);
+  assert.deepEqual(second.messages.map(message => message.id), [after.id]);
+});
+
+test('I1: a rolled-back send leaves no hole; the next send takes the next id and readers see a prefix', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostB, { session: x }));
+  ok(store.register(hostA, { session: a }));
+  const first = ok(store.send(hostB, x, { recipient: sessionKey(a), body: '[[shared]] first' }));
+  const db = new DatabaseSync(path);
+  db.exec("UPDATE entities SET label = 'different label'");
+  db.close();
+  assert.throws(() => store.send(hostB, x, { recipient: sessionKey(a), body: '[[shared]] rolled back' }), /collision/i);
+  assert.equal(store.hostBatch(hostA, 0, 32).tail, first.sequence);
+  const second = ok(store.send(hostB, x, { recipient: sessionKey(a), body: 'second' }));
+  assert.equal(second.sequence, first.sequence + 1);
+  const batch = store.hostBatch(hostA, 0, 32);
+  assert.deepEqual(batch.messages.map(message => message.sequence), [first.sequence, second.sequence]);
+  assert.equal(batch.scanned, second.sequence);
+});
+
+test('a v1 receipt racing the cut-over is either counted in C0 or refused with the cursor unchanged', async t => {
+  for (const order of ['receipt first', 'cut-over first'] as const) {
+    const store = createCoordinatorStore(':memory:', 'fleet');
+    try {
+      ok(store.register(hostB, { session: x }));
+      ok(store.register(hostA, { session: a }));
+      const sent = ok(store.send(hostB, x, { recipient: sessionKey(a), body: 'racing' }));
+      store.pending(hostA, 10);
+      const receipt = { subscriptionId: sessionKey(a), messageId: sent.id };
+      if (order === 'receipt first') {
+        ok(store.acknowledge(hostA, receipt));
+        assert.equal(ok(store.openHost(hostA)).acked, sent.sequence);
+      } else {
+        assert.equal(ok(store.openHost(hostA)).acked, 0);
+        assert.deepEqual(store.acknowledge(hostA, receipt), { ok: false, error: 'owner_conflict', message: 'Host uses protocol 2' });
+        assert.equal(cursors(store)[sessionKey(a)], 0);
+      }
+    } finally { store.close(); }
+  }
+});
+
+test('collection: v2 acked and v1 cursors pin only owed messages; idle hosts, senders and unrelated cursors pin nothing', async t => {
+  const path = await fileStore(t);
+  const week = 7 * 24 * 60 * 60 * 1000;
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostB, { session: x }));
+  ok(store.register(hostB, { session: y }));
+  ok(store.openHost(hostA));
+  ok(store.openHost(hostC)); // a v2 host with no sessions and C = 0
+  const toA = ok(store.send(hostB, y, { recipient: sessionKey(a), body: 'owed to a v2 member' }));
+  const toY = ok(store.send(hostA, a, { recipient: sessionKey(y), body: 'owed to a v1 session' }));
+  const broadcast = ok(store.send(hostB, y, { recipient: '*', body: 'owed to a and x, not to its sender y' }));
+  const stored = () => {
+    const db = new DatabaseSync(path);
+    try { return (db.prepare('SELECT id FROM messages ORDER BY id').all() as { id: number }[]).map(row => row.id); }
+    finally { db.close(); }
+  };
+  const collect = () => {
+    ok(store.presence(hostA, { sessions: [sessionKey(a)] }));
+    ok(store.register(hostB, { session: x }));
+    ok(store.register(hostB, { session: y }));
+    now += 60_001;
+    store.listSessions();
+  };
+  now += week;
+  collect();
+  assert.deepEqual(stored(), [toA.sequence, toY.sequence, broadcast.sequence], 'old messages still owed are kept');
+  assert.equal(store.advanceHost(hostA, broadcast.sequence), broadcast.sequence);
+  collect();
+  // x's and y's low cursors are unrelated to toA; host-c pins nothing.
+  assert.deepEqual(stored(), [toY.sequence, broadcast.sequence], 'v2 acked passed toA; v1 cursors still pin theirs');
+  for (const frame of store.pending(hostB, 10)) ok(store.acknowledge(hostB, { subscriptionId: frame.subscriptionId, messageId: frame.message.id }));
+  assert.deepEqual(cursors(store)[sessionKey(y)], toY.sequence, 'y, the broadcast sender, stays below it');
+  collect();
+  assert.deepEqual(stored(), []);
+});
+
+test('presence refreshes only this host’s sessions, reports the rest as unknown, creates nothing and wakes nothing', async t => {
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostB, { session: x }));
+  const woken: Array<string | undefined> = [];
+  t.after(store.subscribe(host => { woken.push(host); }));
+  assert.deepEqual(store.presence(hostA, { sessions: [sessionKey(a)] }), { ok: false, error: 'owner_conflict', message: 'Host is not on protocol 2' });
+  ok(store.openHost(hostA));
+  now += 1000;
+  assert.deepEqual(ok(store.presence(hostA, { sessions: [sessionKey(a), sessionKey(x), ghost] })), { unknown: [sessionKey(x), ghost] });
+  const seen = Object.fromEntries(store.listSessions().map(row => [row.subscription.id, row.lastSeenAt]));
+  assert.deepEqual(seen, { [sessionKey(a)]: now, [sessionKey(x)]: now - 1000 });
+  assert.deepEqual(woken, []);
+  assert.equal(store.presence(hostA, { sessions: ['Fleet:bad key'] } as never).ok, false);
+  // Registration on a v2 host: no wake, and a retry keeps the frozen start.
+  const start = cursors(store)[sessionKey(a)];
+  fill(store, 3);
+  woken.length = 0;
+  ok(store.register(hostA, { session: b }));
+  assert.equal(ok(store.register(hostA, { session: a })).subscription.cursor, start);
+  assert.deepEqual(woken, []);
+});
+
+test('v2 sync classes: creating openHost is FULL; receipts, presence, maintenance, register and reads are NORMAL', async t => {
+  const path = await fileStore(t);
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  const levels: number[] = [];
+  let connection: DatabaseSync | undefined;
+  const exec = DatabaseSync.prototype.exec;
+  t.mock.method(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, sql: string) {
+    connection = this;
+    if (sql === 'COMMIT') levels.push((this.prepare('PRAGMA synchronous').get() as { synchronous: number }).synchronous);
+    return exec.call(this, sql);
+  });
+  const commits = (action: () => unknown): number[] => { levels.length = 0; action(); return [...levels]; };
+  const NORMAL = 1, FULL = 2;
+  assert.deepEqual(commits(() => ok(store.register(hostA, { session: a }))), [NORMAL]);
+  ok(store.register(hostB, { session: x }));
+  assert.deepEqual(commits(() => ok(store.openHost(hostA))), [FULL]);
+  assert.deepEqual(commits(() => ok(store.openHost(hostA))), [NORMAL]);
+  assert.deepEqual(commits(() => ok(store.send(hostB, x, { recipient: sessionKey(a), body: 'durable' }))), [FULL]);
+  assert.deepEqual(commits(() => ok(store.claim(hostA, 'work', sessionKey(a), 60))), [FULL]);
+  assert.deepEqual(commits(() => store.hostBatch(hostA, 0, 32)), [NORMAL]);
+  assert.deepEqual(commits(() => store.advanceHost(hostA, 1)), [NORMAL]);
+  assert.deepEqual(commits(() => ok(store.presence(hostA, { sessions: [sessionKey(a)] }))), [NORMAL]);
+  now += 60_001;
+  assert.deepEqual(commits(() => store.listSessions()), [NORMAL], 'maintenance');
+  assert.equal((connection!.prepare('PRAGMA synchronous').get() as { synchronous: number }).synchronous, NORMAL, 'outside transactions');
+  const probe = new DatabaseSync(':memory:');
+  try {
+    probe.exec('BEGIN');
+    assert.throws(() => probe.exec('PRAGMA synchronous = FULL'), /Safety level may not be changed inside a transaction/);
+  } finally { probe.close(); }
+});
+
+test('a v2 msg carries the same message bytes and hash as the v1 frame for the same row', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostB, { session: x }));
+  ok(store.register(hostB, { session: y }));
+  ok(store.openHost(hostA));
+  const sent = ok(store.send(hostB, x, { recipient: '*', body: 'same [[bytes]]', data: { n: 1.5, list: [1, 'two'] } }));
+  const [v1] = store.pending(hostB, 10);
+  const [v2] = store.hostBatch(hostA, 0, 32).messages;
+  assert.equal(v1?.subscriptionId, sessionKey(y));
+  const db = new DatabaseSync(path);
+  const stored = (db.prepare('SELECT hash FROM messages WHERE id = ?').get(sent.sequence) as { hash: string }).hash;
+  db.close();
+  assert.equal(JSON.stringify(v2), JSON.stringify(v1!.message));
+  assert.equal(createHash('sha256').update(JSON.stringify(v2)).digest('hex'), stored);
+});
+
+test('rollback-host-v2 lifts cursors to C and removes the row; the v1 stream then serves the host', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    ok(store.register(hostA, { session: a }));
+    ok(store.register(hostA, { session: b }));
+    ok(store.register(hostB, { session: x }));
+    const sent = [1, 2, 3, 4].map(n => ok(store.send(hostB, x, { recipient: sessionKey(a), body: `m${n}` })));
+    setCursor(path, b, 4);
+    // v1 left an offered mark on a; the cut-over freezes the cursors as they are.
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [sent[0]!.id]);
+    assert.equal(ok(store.openHost(hostA)).acked, 0);
+    store.advanceHost(hostA, 2);
+    store.close();
+    assert.deepEqual(rollbackHostV2(path, hostA.hostId), { acked: 2 });
+    assert.deepEqual(rollbackHostV2(path, hostA.hostId), { acked: null }, 'idempotent');
+    store = createCoordinatorStore(path, 'fleet');
+    assert.equal(store.hostAcked(hostA), undefined);
+    assert.equal(cursors(store)[sessionKey(a)], 2);
+    assert.equal(cursors(store)[sessionKey(b)], 4, 'a cursor above C stays');
+    assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [sent[2]!.id]);
+    ok(store.acknowledge(hostA, { subscriptionId: sessionKey(a), messageId: sent[2]!.id }));
+  } finally { store.close(); }
+});
+
+test('restore-coordinator raises the id floor and rotates stream_id, so old bookmarks are refused', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  try {
+    ok(store.register(hostA, { session: a }));
+    ok(store.register(hostB, { session: x }));
+    const { stream } = ok(store.openHost(hostA));
+    fill(store, 3);
+    store.close();
+    const restored = restoreCoordinator(path, 50);
+    assert.equal(restored.tail, 50);
+    assert.notEqual(restored.stream, stream);
+    assert.equal(restoreCoordinator(path, 10).tail, 50, 'the floor never lowers the watermark');
+    store = createCoordinatorStore(path, 'fleet');
+    const old = store.openHost(hostA, { stream, after: 3 });
+    assert.equal((old as { message: string }).message, 'Bookmark belongs to another coordinator log');
+    const current = ok(store.openHost(hostA));
+    assert.notEqual(current.stream, stream);
+    assert.equal(ok(store.send(hostB, x, { recipient: sessionKey(a), body: 'above the floor' })).sequence, 51);
+  } finally { store.close(); }
+});
+
+test('retention comes from settings: registration expiry and collection use it; out-of-bounds retention is refused', async t => {
+  const day = 24 * 60 * 60 * 1000;
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  assert.throws(() => createCoordinatorStore(':memory:', 'fleet', { retentionMs: day - 1 }), /Invalid retention/);
+  const store = createCoordinatorStore(':memory:', 'fleet', { retentionMs: day });
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostB, { session: x }));
+  ok(store.send(hostB, x, { recipient: ghost, body: 'nobody needs this' }));
+  now += day / 2;
+  ok(store.register(hostB, { session: x }));
+  now += day / 2 + 60_001;
+  assert.deepEqual(store.listSessions().map(row => row.subscription.id), [sessionKey(x)], 'a expired after one day');
+  assert.deepEqual(ok(store.inbox(hostB, x, 0, 10)), [], 'the message was collected after one day');
 });

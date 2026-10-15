@@ -167,6 +167,7 @@ The other allowed value is `public`.
 ### Fixed routes
 
 All routes except `GET /health` require `Authorization: Bearer <host credential>`.
+`GET /health` returns `{service:'roger-wilco', version:1, presenceWindowMs}`.
 The content type for JSON writes is `application/json`.
 Each successful control JSON response contains `{ok:true,value:...}`.
 The coordinator HTTP entry handles these fixed paths.
@@ -184,6 +185,9 @@ The coordinator HTTP entry handles these fixed paths.
 | `POST /v1/claims/release` | `{key,owner:SessionAddress}` | A boolean. Release is owner-only. |
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
 | `POST /v1/hosts/receipts` | `Receipt` | `Subscription`. The coordinator accepts a receipt only for a delivered message on that authenticated host's own subscription. The per-subscription cursor advances monotonically and contiguously. A repeated receipt is idempotent. A forged ID is rejected. An undelivered future ID is rejected. |
+| `GET /v2/hosts/stream[?stream=S&after=D]` | `Accept: text/event-stream`; `stream` and `after` together or not at all | Host stream version 2 (`docs/protocol-v2.md`). The open runs before any SSE header; a refused open is a JSON outcome. The first event is `hello`. Opening creates the host's `hosts` row (cut-over); from then on the two v1 host routes answer that host with 409 "Host uses protocol 2", before any supersede. |
+| `POST /v2/hosts/receipts` | `HostReceipt` | `HostReceiptResult`. Cumulative "stored through N", bounded by the live connection's sent position. |
+| `POST /v2/hosts/presence` | `Presence` | `PresenceResult`. Refreshes the listed sessions of a protocol 2 host and returns the rest as `unknown`. It creates nothing and wakes nothing. |
 
 A registration request is `{session}`. It carries no name.
 Registration results contain `subscription` and `rank` and can also contain `lastSeenAt`.
@@ -218,13 +222,14 @@ Session rows show rank, presence age, and `lastSeenAt`.
 
 ### Retention
 
-The coordinator removes registrations unseen for more than seven days.
+The coordinator removes registrations unseen for longer than `retention` (settings file, default seven days).
 The 90-second board filter does not stop delivery.
 Until registration expiry, offline sessions retain direct and broadcast delivery through their host.
 After expiry, registration starts at the durable message sequence watermark.
 It does not replay messages from the expired subscription.
 
-Messages older than seven days are eligible for collection.
+Messages older than `retention` are eligible for collection.
+A message owed to a session on a protocol 2 host is also kept until that host's receipted position passes it.
 The coordinator keeps each message that a retained recipient still needs.
 Unrelated low cursors do not keep old messages.
 A broadcast uses one coordinator row, not one stored copy per session.
@@ -617,7 +622,7 @@ If the recovery turn also aborts, the original stays pending for later input or 
 
 ### Lane A
 
-`src/server/store.ts` exports `createCoordinatorStore(dbPath: string, namespace: string): CoordinatorStore`.
+`src/server/store.ts` exports `createCoordinatorStore(dbPath: string, namespace: string, options?: {retentionMs?: number}): CoordinatorStore`.
 Tests live in `test/store/`.
 Lane A is the one schema owner.
 It uses WAL, parameterized `node:sqlite`, and synchronous transactions.
@@ -625,7 +630,7 @@ It has no release-watcher tables and no feed tables.
 
 ### Lane B
 
-`src/server/control/index.ts` exports `createControlHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler`.
+`src/server/control/index.ts` exports `createControlHandler(store: CoordinatorStore, auth: HostAuthenticator, settings?: Settings): ControlHandler`.
 Tests live in `test/control/`.
 The bin composes this handler with lane C.
 This lane does not edit the schema.
@@ -633,12 +638,12 @@ It serves the fixed HTTP control routes.
 
 ### Lane C
 
-`src/server/delivery/index.ts` exports `createStreamHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler`.
+`src/server/delivery/index.ts` exports `createStreamHandler(store: CoordinatorStore, auth: HostAuthenticator, settings?: Settings): ControlHandler`.
 Tests live in `test/delivery/`.
-It serves the stream route and the receipt route.
+It serves the v1 and v2 stream and receipt routes from one map of live connections keyed by host.
 One host stream covers all subscribed sessions.
 Store commits and receipts trigger durable replay reads.
-Keepalive writes do not query pending messages.
+v1 keepalive writes do not query pending messages. The v2 keepalive tick runs one batch when the window has room, then sends `through`.
 This lane does not edit the schema.
 
 ### Lane D
