@@ -391,11 +391,11 @@ Only lane A changes coordinator schemas.
 
 The coordinator database runs in WAL mode at `synchronous=NORMAL`.
 A NORMAL commit survives a coordinator process crash; an OS crash or power loss can roll back the most recent NORMAL commits.
-The `send` transaction commits at `synchronous=FULL`, because a message insert lost after a success response is a lost message.
+The `send` and `claim` transactions commit at `synchronous=FULL`. A message insert lost after a success response is a lost message, and a claim lost after it was granted could be granted again to another owner.
 A FULL commit also syncs every earlier WAL frame, so a registration that a later message depends on reaches stable storage with that message.
 The offered mark is connection state.
-A lost cursor update replays one message: the stream offers it again, the daemon deduplicates it by message ID, and the daemon sends its receipt again, which the coordinator accepts.
-Registrations, ranks, and claims also commit at NORMAL; the host daemon repeats registration on its heartbeat, and a claim lost to power loss can be acquired again by another owner.
+Lost cursor updates replay messages: after an OS crash the cursor can roll back over several acknowledged messages, the stream offers each again in order, the daemon deduplicates them by message ID, and the daemon sends each receipt again, which the coordinator accepts.
+Registrations, ranks, and claim releases commit at NORMAL. The host daemon repeats registration on its heartbeat, and a lost release only keeps the claim until it expires.
 
 ### Host stream deadlines
 

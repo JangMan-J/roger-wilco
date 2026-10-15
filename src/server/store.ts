@@ -528,7 +528,10 @@ class Store implements CoordinatorStore {
       if (result.changes > 0) this.trackEntities([key, note ?? null], { kind: 'claim', key });
       const claim = this.claimValue(this.claimRow.get(key) as ClaimRow);
       return { ok: true, value: { claim, acquired: result.changes > 0 } };
-    });
+      // A claim granted and then lost to a power failure could be granted again to
+      // another owner, so it commits at FULL like a send. A lost release only keeps
+      // the claim until it expires, which is safe at NORMAL.
+    }, true);
   }
   releaseClaim(host: HostPrincipal, key: string, owner: string): Outcome<boolean> {
     if (!validHost(host) || !validClaimKey(key) || !isSessionKey(owner))

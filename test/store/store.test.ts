@@ -696,7 +696,7 @@ test('a non-UUID session registers beside Pi UUIDs; namespace and host checks st
   } finally { store.close(); }
 });
 
-test('send commits at synchronous=FULL; every other commit, including after a send, runs at NORMAL', async t => {
+test('send and claim commit at synchronous=FULL; every other commit, including after them, runs at NORMAL', async t => {
   const path = await fileStore(t);
   const store = createCoordinatorStore(path, 'fleet');
   t.after(() => store.close());
@@ -713,7 +713,7 @@ test('send commits at synchronous=FULL; every other commit, including after a se
   assert.deepEqual(commits(() => { sent = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'durable' })); }), [FULL]);
   assert.deepEqual(commits(() => store.pending(hostA, 10)), [NORMAL]);
   assert.deepEqual(commits(() => ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: sent.id }))), [NORMAL]);
-  assert.deepEqual(commits(() => ok(store.claim(hostA, 'work', sessionKey(a), 60))), [NORMAL]);
+  assert.deepEqual(commits(() => ok(store.claim(hostA, 'work', sessionKey(a), 60))), [FULL]);
   // A send that rolls back still restores NORMAL for the next commit.
   ok(store.send(hostA, a, { recipient: '*', body: '[[shared]]' }));
   const db = new DatabaseSync(path);
