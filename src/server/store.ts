@@ -13,6 +13,7 @@ import {
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_MS = 60_000;
 const COLLECTION_LIMIT = 5000;
+const VERIFIED_CACHE_LIMIT = 4096;
 
 const schema = `
 CREATE TABLE IF NOT EXISTS store_config (namespace TEXT NOT NULL);
@@ -63,6 +64,14 @@ const failure = <T>(error: 'invalid_request' | 'not_found' | 'owner_conflict', m
 const validHost = (host: HostPrincipal): boolean => !!host && typeof host.hostId === 'string' && host.hostId.length > 0;
 const validLimit = (limit: number): boolean => Number.isSafeInteger(limit) && limit > 0 && limit <= 500;
 const validCursor = (cursor: number): boolean => Number.isSafeInteger(cursor) && cursor >= 0;
+const validClaimKey = (key: unknown): key is string => typeof key === 'string' && key.length <= 256 && key.trim().length > 0;
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 const addressOf = (key: string): SessionAddress => {
   const index = key.indexOf(':');
   return { namespace: key.slice(0, index), sessionId: key.slice(index + 1) };
@@ -73,6 +82,12 @@ class Store implements CoordinatorStore {
   private readonly namespace: string;
   private readonly rotation = new Map<string, string>();
   private readonly listeners = new Set<(hostId: string | undefined) => void>();
+  /**
+   * Verified Message objects by row id, so each stored hash is checked once per process.
+   * Rows are never updated after commit and AUTOINCREMENT never reuses an id. The cache
+   * holds no delivery state: cursors and offered marks are read from SQLite on every call.
+   */
+  private readonly verified = new Map<number, Message>();
   private nextMaintenance = 0;
   private readonly pendingRows: StatementSync;
   private readonly offer: StatementSync;
@@ -89,7 +104,14 @@ class Store implements CoordinatorStore {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     try {
-      this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;');
+      // Durability classes. Commits run at synchronous=NORMAL: in WAL mode they survive a
+      // process crash, and an OS crash or power loss can roll back the most recent ones.
+      // send() commits at FULL, because a message insert lost after a success response is
+      // a lost message; a FULL commit also syncs every earlier WAL frame. The offered mark
+      // is connection state. A lost cursor update replays one message, which the daemon
+      // deduplicates by message ID (INSERT OR IGNORE) and receipts again.
+      this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;`);
       this.db.exec(schema);
       const entityColumns = this.db.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
       if (!entityColumns.some(column => column.name === 'last_seen_at'))
@@ -135,19 +157,24 @@ class Store implements CoordinatorStore {
             UNION ALL
             SELECT MIN(id) AS id FROM messages WHERE recipient = '*' AND sender != s.id AND id > s.cursor
           )
-        ) WHERE s.host_id = ? ORDER BY (s.id <= ?), s.id LIMIT ?`);
+        ) WHERE s.host_id = ? AND s.id NOT IN (SELECT value FROM json_each(?))
+        ORDER BY (s.id <= ?), s.id LIMIT ?`);
       this.offer = this.db.prepare('UPDATE sessions SET offered = ? WHERE id = ?');
       this.maintain();
     } catch (error) { this.db.close(); throw error; }
   }
 
-  private transaction<T>(action: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE');
+  /** `full` commits at synchronous=FULL; SQLite rejects a safety-level change inside a transaction. */
+  private transaction<T>(action: () => T, full = false): T {
+    if (full) this.db.exec('PRAGMA synchronous = FULL');
     try {
-      const result = action();
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = action();
+        this.db.exec('COMMIT');
+        return result;
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    } finally { if (full) this.db.exec('PRAGMA synchronous = NORMAL'); }
   }
   private migrateEntityMetadata(): void {
     this.transaction(() => {
@@ -255,6 +282,8 @@ class Store implements CoordinatorStore {
       lastSeenAt: row.last_seen_at, rank: row.rank, ...(found?.length ? { entities: found } : {}) };
   }
   private message(row: MessageRow): Message {
+    const cached = this.verified.get(row.id);
+    if (cached) return cached;
     let data: unknown;
     try { data = JSON.parse(row.data); }
     catch { throw new Error(row.hash ? 'Message hash mismatch' : 'Invalid stored message'); }
@@ -267,6 +296,10 @@ class Store implements CoordinatorStore {
     // are rejected, not re-validated.
     if (row.hash) {
       if (messageHash(message as Message) !== row.hash) throw new Error('Message hash mismatch');
+      // Only committed, hashed rows are cached; send() reads its own row before the
+      // hash exists, and a rolled-back insert can release its id for reuse.
+      if (this.verified.size >= VERIFIED_CACHE_LIMIT) this.verified.delete(this.verified.keys().next().value!);
+      this.verified.set(row.id, deepFreeze(message as Message));
       return message as Message;
     }
     if (!isMessage(message)) throw new TypeError('Invalid stored message');
@@ -304,7 +337,9 @@ class Store implements CoordinatorStore {
     if (!validHost(host) || !isRegistration(request) || request.session.namespace !== this.namespace)
       return failure('invalid_request', 'Invalid registration');
     this.maintain();
-    const outcome: Outcome<RegistrationResult> = this.transaction(() => {
+    // No stream wake: a registration makes nothing deliverable. A new session starts at
+    // the tail, and an existing one keeps its cursor and host.
+    return this.transaction((): Outcome<RegistrationResult> => {
       const id = sessionKey(request.session);
       let row = this.session(id);
       if (row && row.host_id !== host.hostId) return failure('owner_conflict', 'Session belongs to another host');
@@ -324,8 +359,6 @@ class Store implements CoordinatorStore {
         this.trackEntities([request.displayName], { kind: 'session', key: id });
       return { ok: true, value: this.registration(this.session(id)!) };
     });
-    if (outcome.ok) this.notify(host.hostId);
-    return outcome;
   }
   setRank(host: HostPrincipal, session: SessionAddress, rank: number): Outcome<RegistrationResult> {
     if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace ||
@@ -376,7 +409,7 @@ class Store implements CoordinatorStore {
       const value = this.message(row);
       this.db.prepare('UPDATE messages SET hash = ? WHERE id = ?').run(messageHash(value), row.id);
       return { ok: true, value };
-    });
+    }, true);
     if (outcome.ok) {
       // Transport notification, not a session wake: a broadcast notifies every
       // host so each stores it; a directed send notifies only the recipient's
@@ -414,11 +447,14 @@ class Store implements CoordinatorStore {
       .all(since, id, id, limit) as MessageRow[];
     return { ok: true, value: rows.map(row => this.message(row)) };
   }
-  pending(host: HostPrincipal, limit: number): StreamFrame[] {
+  pending(host: HostPrincipal, limit: number, inFlight: Iterable<string> = []): StreamFrame[] {
     if (!validHost(host) || !validLimit(limit)) throw new TypeError('Invalid host or limit');
+    const skip = JSON.stringify([...inFlight]);
     this.maintain();
     return this.transaction(() => {
-      const rows = this.pendingRows.all(host.hostId, this.rotation.get(host.hostId) ?? '', limit) as
+      // In-flight subscriptions are excluded in SQL, so their rows are neither read nor
+      // verified, and they do not count toward the limit.
+      const rows = this.pendingRows.all(host.hostId, skip, this.rotation.get(host.hostId) ?? '', limit) as
         (MessageRow & { subscription_id: string; offered: number | null })[];
       if (!rows.length) { this.rotation.delete(host.hostId); return []; }
       const frames = rows.map(row => {
@@ -460,7 +496,7 @@ class Store implements CoordinatorStore {
     return outcome;
   }
   claim(host: HostPrincipal, key: string, owner: string, ttlSeconds: number, note?: string): Outcome<{ claim: Claim; acquired: boolean }> {
-    if (!validHost(host) || typeof key !== 'string' || key.length < 1 || key.length > 256 || !isSessionKey(owner) ||
+    if (!validHost(host) || !validClaimKey(key) || !isSessionKey(owner) ||
         !Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0 || ttlSeconds > 2147483647 ||
         (note !== undefined && (typeof note !== 'string' || note.length > 4096))) return failure('invalid_request', 'Invalid claim');
     const assignment = this.assigned(host, addressOf(owner));
@@ -480,7 +516,7 @@ class Store implements CoordinatorStore {
     });
   }
   releaseClaim(host: HostPrincipal, key: string, owner: string): Outcome<boolean> {
-    if (!validHost(host) || typeof key !== 'string' || key.length < 1 || key.length > 256 || !isSessionKey(owner))
+    if (!validHost(host) || !validClaimKey(key) || !isSessionKey(owner))
       return failure('invalid_request', 'Invalid release');
     const assignment = this.assigned(host, addressOf(owner));
     if (!assignment.ok) return assignment;

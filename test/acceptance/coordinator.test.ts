@@ -237,6 +237,46 @@ test('registration response loss retries the same atomic starting cursor instead
   assert.equal(stream.frames[0]?.message.id, newMessage.result.value.id);
 });
 
+test('registration does not rescan the stream; delivery after registration works, skips in-flight work, and re-offers on reconnect', async t => {
+  const h = await fixture(t);
+  const store = h.store;
+  const scans: string[][] = [];
+  const pending = store.pending.bind(store);
+  t.mock.method(store, 'pending', (host: { hostId: string }, limit: number, inFlight?: Iterable<string>) => {
+    const ids = [...(inFlight ?? [])];
+    if (host.hostId === 'host-a') scans.push(ids);
+    return pending(host, limit, ids);
+  });
+  assert.equal((await h.register('host-a', a)).status, 200);
+  const first = await connect(h.url, 'host-a');
+  t.after(() => first.close());
+  await until(() => scans.length >= 1, 'initial catch-up scan');
+  await delay(50);
+  const settled = scans.length;
+  assert.equal((await h.register('host-a', b)).status, 200);
+  assert.equal((await h.register('host-a', a)).status, 200);
+  await delay(100);
+  assert.equal(scans.length, settled, 'registration and heartbeat make no deliverable work');
+  assert.equal((await h.register('host-b', c)).status, 200);
+  const sent = await h.send('host-b', c, sessionKey(b), 'after registration');
+  assert.equal(sent.status, 200);
+  await until(() => first.frames.length === 1, 'delivery after registration');
+  assert.equal(first.frames[0]?.message.id, sent.result.value.id);
+  // With b in flight, the next scan for this host is told so and skips it.
+  const other = await h.send('host-b', c, sessionKey(a), 'second subscription');
+  await until(() => first.frames.length === 2, 'second subscription delivered');
+  assert.ok(scans.some(ids => ids.includes(sessionKey(b))), 'in-flight IDs reach the store');
+  assert.equal(first.frames[1]?.message.id, other.result.value.id);
+  // A new connection holds nothing in flight and re-offers both unacknowledged messages.
+  await first.close();
+  const second = await connect(h.url, 'host-a');
+  t.after(() => second.close());
+  await until(() => second.frames.length === 2, 're-offer on a new connection');
+  assert.deepEqual(second.frames.map(frame => frame.message.id).sort(), [sent.result.value.id, other.result.value.id].sort());
+  for (const frame of second.frames)
+    assert.equal((await h.request('host-a', ROUTES.receipt, { subscriptionId: frame.subscriptionId, messageId: frame.message.id })).status, 200);
+});
+
 test('disconnected host cannot hold up another; catch-up/live transition retains an in-flight message', async t => {
   const h = await fixture(t);
   await h.register('host-a', a); await h.register('host-b', c);
