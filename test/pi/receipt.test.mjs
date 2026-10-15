@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { persistedReceipt } from '../../src/pi/delivery.ts';
+import { deliveryEntry } from '../../src/pi/session-file.ts';
 
 test('repeated pending IDs reuse an unchanged disk snapshot; mutations invalidate receipts', async t => {
   const dir = await fs.mkdtemp(join(tmpdir(), 'rw-receipt-'));
@@ -99,4 +100,26 @@ test('mutation during scan or fsync cannot return a stale receipt', async t => {
     syncBuiltinESMExports();
     assert.equal(await persistedReceipt(file, session, 'fleet:msg:1'), undefined);
   }
+});
+
+test('an entry whose content is another message is not evidence for its delivery ID', async t => {
+  const dir = await fs.mkdtemp(join(tmpdir(), 'rw-receipt-forged-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'session.jsonl');
+  const session = { namespace: 'fleet', sessionId: randomUUID() };
+  const header = `${JSON.stringify({ type: 'session', id: session.sessionId })}\n`;
+  const message = sequence => ({
+    version: 1, id: `fleet:msg:${sequence}`, sequence, timestamp: 1, sender: 'fleet:peer', recipient: `fleet:${session.sessionId}`,
+    body: `body ${sequence}`, data: null, visibility: 'private',
+  });
+  const line = (id, entry) => `${JSON.stringify({ type: 'custom_message', id, ...entry })}\n`;
+  // Message 2's content under message 1's delivery ID.
+  const forged = line('forged', { ...deliveryEntry(message(2)), details: { deliveryId: 'fleet:msg:1' } });
+  await fs.writeFile(file, header + forged);
+  assert.equal(await persistedReceipt(file, session, 'fleet:msg:1'), undefined, 'mismatched content ID is not a receipt');
+  assert.equal(await persistedReceipt(file, session, 'fleet:msg:2'), undefined, 'details decide which delivery an entry claims');
+  await fs.writeFile(file, header + line('garbled', { ...deliveryEntry(message(1)), content: 'not a message' }));
+  assert.equal(await persistedReceipt(file, session, 'fleet:msg:1'), undefined, 'content that is not a message is not a receipt');
+  await fs.writeFile(file, header + forged + line('genuine', deliveryEntry(message(1))));
+  assert.equal((await persistedReceipt(file, session, 'fleet:msg:1')).entryId, 'genuine', 'a forged earlier entry does not shadow the genuine one');
 });

@@ -247,3 +247,93 @@ test('Claude Code entry imports no other adapter', async () => {
   assert.ok([...seen].some(file => file.endsWith(join('src', 'evidence.ts'))));
   assert.equal([...seen].some(file => file.includes(join('src', 'pi')) || file.includes(join('src', 'muse'))), false);
 });
+
+test('a harness session change fails closed: no call, no delivery, no acknowledgement', async t => {
+  const h = await stack(t);
+  const session = claudeSessionAddress(claudeSessionId, namespace);
+  const otherSessionId = '191ef82e-07c3-4d1a-a11a-38d707efd125';
+  let current = claudeSessionId;
+  let switchAfterDeliver = false;
+  const delivered: Message[] = [];
+  const harness: ClaudeHarness = {
+    sessionId: () => current,
+    transcriptPath: () => h.transcript,
+    deliver: async message => {
+      delivered.push(message);
+      await appendFile(h.transcript, toolResult(`${deliveredLine(message)}\n`));
+      if (switchAfterDeliver) current = otherSessionId;
+    },
+  };
+  const requests: string[] = [];
+  let switchDuringRegistration = false;
+  let registrations = 0;
+  const adapter = createClaudeAdapter(harness, {
+    loadConfig: async () => h.config,
+    connectHost: async config => {
+      const inbox = await connectHost(config);
+      const awaitRegistration = inbox.awaitRegistration.bind(inbox);
+      inbox.awaitRegistration = async registration => {
+        registrations += 1;
+        const result = await awaitRegistration(registration);
+        if (switchDuringRegistration) current = otherSessionId;
+        return result;
+      };
+      return inbox;
+    },
+    request: (config, route, method, body) => { requests.push(route); return requestCoordinator(config, route, method, body); },
+  });
+  t.after(() => adapter.stop());
+  await adapter.start();
+  assert.equal((await adapter.tool('roger_identity', {})).ok, true);
+  const first = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'one' });
+  const second = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'two' });
+  assert.ok(first.ok && second.ok);
+  await until(() => receipt(h.inboxPath, second.value.id) !== undefined, 'both messages reach the local inbox');
+
+  // The harness now runs another session; the runtime still holds the old lease.
+  const before = registrations;
+  current = otherSessionId;
+  const reason = new RegExp(`Session changed: harness session fleet:${otherSessionId} is not bound session fleet:${claudeSessionId}`);
+  assert.equal(adapter.isBound(), false);
+  const identity = await adapter.bound();
+  assert.ok('ok' in identity && !identity.ok);
+  assert.match(identity.message, reason);
+  const sent = await adapter.tool('roger_send', { recipient: sessionKey(peer), body: 'stale' });
+  assert.equal(sent.ok, false);
+  assert.match(!sent.ok ? sent.message : '', reason);
+  const board = await adapter.tool('roger_board', {});
+  assert.equal(board.ok, false);
+  assert.match(!board.ok ? board.message : '', reason);
+  const direct = await adapter.call(ROUTES.sessions, 'GET');
+  assert.equal(direct.ok, false);
+  assert.match(!direct.ok ? direct.message : '', reason);
+  assert.deepEqual(requests, [], 'no coordinator call as the stale session');
+  assert.equal(registrations, before, 'no registration wait as the stale session');
+
+  // The session changes while call() waits for registration: the request is still refused.
+  current = claudeSessionId;
+  switchDuringRegistration = true;
+  const raced = await adapter.call(ROUTES.sessions, 'GET');
+  switchDuringRegistration = false;
+  assert.equal(raced.ok, false);
+  assert.match(!raced.ok ? raced.message : '', reason);
+  assert.deepEqual(requests, [], 'no coordinator call after a change during registration');
+  await assert.rejects(adapter.receive(), reason);
+  assert.equal(delivered.length, 0, 'nothing delivered to the other session');
+
+  // The session changes during a delivery: the delivered message is not acknowledged, the next is not delivered.
+  current = claudeSessionId;
+  switchAfterDeliver = true;
+  await assert.rejects(adapter.receive(), reason);
+  assert.deepEqual(delivered.map(message => message.body), ['one']);
+  assert.equal(receipt(h.inboxPath, first.value.id).evidence_record_id, null, 'transcript evidence is not acknowledged after the change');
+  assert.equal(receipt(h.inboxPath, second.value.id).evidence_record_id, null);
+
+  // Back on the bound session, the next pass acknowledges the first and delivers the second.
+  current = claudeSessionId;
+  switchAfterDeliver = false;
+  await adapter.receive();
+  assert.deepEqual(delivered.map(message => message.body), ['one', 'two']);
+  assert.match(receipt(h.inboxPath, first.value.id).evidence_record_id ?? '', /^00000000-0000-4000-8000-\d{12}$/);
+  assert.match(receipt(h.inboxPath, second.value.id).evidence_record_id ?? '', /^00000000-0000-4000-8000-\d{12}$/);
+});

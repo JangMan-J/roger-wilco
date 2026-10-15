@@ -26,9 +26,9 @@ const credential = 'token-a';
 const peer: SessionAddress = { namespace, sessionId: '550e8400-e29b-41d4-a716-446655440000' };
 const agentBin = fileURLToPath(new URL('../../src/bin/agent.ts', import.meta.url));
 
-function message(body: string): Message {
+function message(body: string, sequence = 1): Message {
   return {
-    version: 1, id: 'fleet:msg:1', sequence: 1, timestamp: 1, sender: 'fleet:tracer-1', recipient: sessionKey(peer),
+    version: 1, id: `fleet:msg:${sequence}`, sequence, timestamp: 1, sender: 'fleet:tracer-1', recipient: sessionKey(peer),
     body, data: null, visibility: 'private',
   };
 }
@@ -149,6 +149,19 @@ test('evidence reuses the record id for a delivery that was persisted and not ye
   assert.equal(await readFile(path, 'utf8'), `${JSON.stringify(first)}\n`);
 });
 
+test('concurrent deliveries get distinct record ids derived from the message sequence', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'rw-evidence-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'evidence.jsonl');
+  const sequences = [3, 7, 8, 12, 20, 21, 40, 41];
+  const records = await Promise.all(sequences.map(sequence => persistEvidence(path, message(`m${sequence}`, sequence))));
+  assert.deepEqual(records.map(record => record.id), sequences.map(sequence => `rec-${sequence}`));
+  const stored = await readEvidence(path);
+  assert.equal(stored.length, sequences.length);
+  assert.equal(new Set(stored.map(record => record.id)).size, sequences.length, 'no two stored records share an id');
+  for (const record of stored) assert.equal(record.id, `rec-${record.message.sequence}`);
+});
+
 test('tracer and a Pi-shaped peer exchange messages through the host daemon', async t => {
   const h = await stack(t);
   const tracer = agentSession(h.config);
@@ -175,7 +188,7 @@ test('tracer and a Pi-shaped peer exchange messages through the host daemon', as
   assert.deepEqual(await client.pending(tracer, h.config.runtimeId), []);
   const evidence = await readEvidence(h.evidencePath);
   assert.deepEqual(evidence.map(record => record.message.body), ['from peer']);
-  assert.equal(evidence[0]!.id, 'rec-1');
+  assert.equal(evidence[0]!.id, `rec-${inbound.value.sequence}`);
   const stored = receipt(h.inboxPath, inbound.value.id);
   assert.equal(stored.evidence_record_id, evidence[0]!.id);
   assert.equal(stored.evidence_location, resolve(h.evidencePath));
@@ -190,7 +203,7 @@ test('agent process restart does not redeliver an acknowledged message', async t
   const acked = h.store.send({ hostId }, peer, { recipient: 'fleet:tracer-1', body: 'while-up' });
   assert.equal(acked.ok, true);
   const delivered = await first.line(value => value.event === 'delivered' && value.messageId === acked.value.id, 'acked delivery');
-  assert.equal(delivered.recordId, 'rec-1');
+  assert.equal(delivered.recordId, `rec-${acked.value.sequence}`);
   assert.equal(await first.stop(), 0);
   const snapshot = await readFile(h.evidencePath, 'utf8');
 
@@ -206,13 +219,14 @@ test('agent process restart does not redeliver an acknowledged message', async t
   await second.line(value => value.event === 'ready', 'second ready');
   const redelivered = await second.line(value => value.event === 'delivered', 'unacknowledged redelivery');
   assert.equal(redelivered.messageId, waiting.value.id);
-  assert.equal(redelivered.recordId, 'rec-2');
+  assert.equal(redelivered.recordId, `rec-${waiting.value.sequence}`);
   assert.equal(second.lines.filter(line => line.includes('"event":"delivered"')).length, 1);
   const evidence = await readEvidence(h.evidencePath);
-  assert.deepEqual(evidence.map(record => [record.id, record.message.body]), [['rec-1', 'while-up'], ['rec-2', 'while-down']]);
+  assert.deepEqual(evidence.map(record => [record.id, record.message.body]),
+    [[`rec-${acked.value.sequence}`, 'while-up'], [`rec-${waiting.value.sequence}`, 'while-down']]);
   assert.equal((await readFile(h.evidencePath, 'utf8')).startsWith(snapshot), true, 'restart appends; it does not rewrite acknowledged evidence');
-  assert.equal(receipt(h.inboxPath, acked.value.id).evidence_record_id, 'rec-1');
-  assert.equal(receipt(h.inboxPath, waiting.value.id).evidence_record_id, 'rec-2');
+  assert.equal(receipt(h.inboxPath, acked.value.id).evidence_record_id, `rec-${acked.value.sequence}`);
+  assert.equal(receipt(h.inboxPath, waiting.value.id).evidence_record_id, `rec-${waiting.value.sequence}`);
 
   const sent = spawnAgent(t, configPath, ['send', sessionKey(peer), 'after restart']);
   const outbound = await sent.line(value => value.event === 'sent', 'send after restart');

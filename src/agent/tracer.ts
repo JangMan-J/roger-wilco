@@ -81,7 +81,11 @@ export async function sendMessage(config: AgentConfig, recipient: string, body: 
   return result.value;
 }
 
-/** Append-only JSONL. A record id is evidence only after this fsyncs the line. */
+/**
+ * Append-only JSONL. A record id is evidence only after this fsyncs the line.
+ * The id derives from the message sequence, which is unique within the namespace,
+ * so concurrent deliveries that read the same file snapshot still get distinct ids.
+ */
 export async function persistEvidence(path: string, message: Message): Promise<EvidenceRecord> {
   if (!isMessage(message)) throw new TypeError('Invalid message');
   const sessionFile = resolve(path);
@@ -101,7 +105,7 @@ export async function persistEvidence(path: string, message: Message): Promise<E
       await handle.sync();
       return existing;
     }
-    const id = `rec-${records.length + 1}`;
+    const id = `rec-${message.sequence}`;
     const line = `${JSON.stringify({ id, messageId: message.id, message })}\n`;
     // A torn tail has no newline. Seal it before appending so the new record stays one line.
     if (size > 0 && !text.endsWith('\n')) await handle.write('\n');
