@@ -347,7 +347,9 @@ Frames are ordered by global sequence per subscription.
 The stream passes the subscription IDs it holds in flight on its connection.
 The store skips those subscriptions before it reads or verifies any row, and they do not count toward the limit.
 A new connection holds nothing in flight, so it receives every unacknowledged offer again from SQLite.
-The store keeps a bounded cache of verified messages by row ID, so it checks each row hash once per process.
+The store keeps a cache of verified messages by row ID, so it checks each row hash once per process.
+The cache is bounded by entry count (4096) and by stored text (4 MiB of body and data JSON).
+A row with more than 64 KiB of stored text is not cached; its hash is checked on each read.
 The cache holds no delivery state; cursors and offers always come from SQLite.
 The stream checks that result first.
 It then waits for database changes.

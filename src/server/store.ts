@@ -14,6 +14,12 @@ const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_MS = 60_000;
 const COLLECTION_LIMIT = 5000;
 const VERIFIED_CACHE_LIMIT = 4096;
+// The verified-message cache is also bounded by stored text (body plus data JSON, in
+// UTF-16 code units). Parsed JSON can take about 20 times its text length in heap, so
+// 4 MiB of text bounds the cache near 100 MB in the worst case. A row above the entry
+// limit is verified on every read instead, so a page of large rows cannot flush the cache.
+const VERIFIED_CACHE_TEXT = 4 * 1024 * 1024;
+const VERIFIED_ENTRY_TEXT = 64 * 1024;
 
 const schema = `
 CREATE TABLE IF NOT EXISTS store_config (namespace TEXT NOT NULL);
@@ -86,8 +92,10 @@ class Store implements CoordinatorStore {
    * Verified Message objects by row id, so each stored hash is checked once per process.
    * Rows are never updated after commit and AUTOINCREMENT never reuses an id. The cache
    * holds no delivery state: cursors and offered marks are read from SQLite on every call.
+   * Insertion order is eviction order; `verifiedText` is the sum of the entries' text sizes.
    */
-  private readonly verified = new Map<number, Message>();
+  private readonly verified = new Map<number, { message: Message; text: number }>();
+  private verifiedText = 0;
   private nextMaintenance = 0;
   private readonly pendingRows: StatementSync;
   private readonly offer: StatementSync;
@@ -283,7 +291,7 @@ class Store implements CoordinatorStore {
   }
   private message(row: MessageRow): Message {
     const cached = this.verified.get(row.id);
-    if (cached) return cached;
+    if (cached) return cached.message;
     let data: unknown;
     try { data = JSON.parse(row.data); }
     catch { throw new Error(row.hash ? 'Message hash mismatch' : 'Invalid stored message'); }
@@ -298,8 +306,15 @@ class Store implements CoordinatorStore {
       if (messageHash(message as Message) !== row.hash) throw new Error('Message hash mismatch');
       // Only committed, hashed rows are cached; send() reads its own row before the
       // hash exists, and a rolled-back insert can release its id for reuse.
-      if (this.verified.size >= VERIFIED_CACHE_LIMIT) this.verified.delete(this.verified.keys().next().value!);
-      this.verified.set(row.id, deepFreeze(message as Message));
+      const text = row.body.length + row.data.length;
+      if (text > VERIFIED_ENTRY_TEXT) return message as Message;
+      for (const [id, entry] of this.verified) {
+        if (this.verified.size < VERIFIED_CACHE_LIMIT && this.verifiedText + text <= VERIFIED_CACHE_TEXT) break;
+        this.verified.delete(id);
+        this.verifiedText -= entry.text;
+      }
+      this.verified.set(row.id, { message: deepFreeze(message as Message), text });
+      this.verifiedText += text;
       return message as Message;
     }
     if (!isMessage(message)) throw new TypeError('Invalid stored message');

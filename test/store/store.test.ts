@@ -5,6 +5,8 @@ import crypto, { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { sessionKey, type CoordinatorStore, type Receipt, type SessionAddress } from '../../src/protocol/index.ts';
 
@@ -831,6 +833,51 @@ test('each stored row hash is verified once into a bounded, frozen message cache
   const again = t.mock.method(crypto.Hash.prototype, 'digest');
   ok(store.inbox(hostA, b, 0, 1));
   assert.equal(again.mock.callCount(), 1);
+});
+
+test('the verified-message cache is bounded by stored text, and a large row is verified on every read', t => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const send = (size: number) => ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'sized', data: { pad: 'x'.repeat(size) } }));
+  const digest = t.mock.method(crypto.Hash.prototype, 'digest');
+  const hashes = (action: () => unknown): number => { digest.mock.resetCalls(); action(); return digest.mock.callCount(); };
+  // A row above the 64 KiB entry limit is not cached.
+  const large = send(70_000);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, large.sequence - 1, 1))), 1);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, large.sequence - 1, 1))), 1);
+  // 80 rows of 60 KB stay far below the 4096-entry limit but exceed 4 MiB of text,
+  // so reading them all evicts the oldest cached row.
+  const first = send(60_000);
+  for (let index = 1; index < 80; index++) send(60_000);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 1);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 0);
+  ok(store.inbox(hostA, b, first.sequence, 500));
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 1);
+});
+
+test('reading many large messages does not retain them in the coordinator heap', t => {
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc') as () => void;
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const pad = 'x'.repeat(1_000_000);
+  for (let index = 0; index < 100; index++) ok(store.send(hostA, a, { recipient: sessionKey(b), body: `large ${index}`, data: { pad } }));
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  for (let since = 0; ;) {
+    const page = ok(store.inbox(hostA, b, since, 10));
+    if (!page.length) break;
+    since = page.at(-1)!.sequence;
+  }
+  store.pending(hostA, 500);
+  gc();
+  const retained = process.memoryUsage().heapUsed - before;
+  // 100 MB of message text was read; an unbounded cache would keep all of it.
+  assert.ok(retained < 32 * 1024 * 1024, `retained ${Math.round(retained / 1024 / 1024)} MB`);
 });
 
 test('claim and release reject whitespace-only keys in the store itself', () => {
