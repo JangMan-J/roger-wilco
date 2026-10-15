@@ -10,6 +10,8 @@ import {
 import { bearerCredential, closedQuery, json, readBody, readBodyError } from '../http.ts';
 
 const WRITE_DEADLINE_MS = 5_000;
+/** v1 keepalive. v1 daemons have a fixed 45 s idle deadline, so the `keepalive` setting applies to v2 only. */
+const V1_KEEPALIVE_MS = 15_000;
 /** Unreceipted msg bytes per v2 connection. The window W bounds the frame count. */
 export const INFLIGHT_BYTE_CAP = 16 * 1024 * 1024;
 
@@ -144,10 +146,10 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
         if (wrote && frames.length === 500) connection.dirty = true;
         if (connection.dirty) continue;
       }
-      await wait(connection, () => connection.dirty, lastWrite + K);
+      await wait(connection, () => connection.dirty, lastWrite + V1_KEEPALIVE_MS);
       if (signal.aborted) break;
       if (connection.dirty) continue;
-      if (Date.now() - lastWrite >= K) {
+      if (Date.now() - lastWrite >= V1_KEEPALIVE_MS) {
         if (!await write(response, ': keepalive\n\n', signal)) { connection.abort.abort(); break; }
         lastWrite = Date.now();
       }

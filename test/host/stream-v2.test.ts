@@ -476,6 +476,25 @@ test('on v2 a heartbeat that the lifetime registration answers completes locally
   await waitFor(() => posts.length === 2);
 });
 
+test('a session that expired while no stream was open: the next hello clears its registration, so the adapter start posts at once', async t => {
+  const { daemon, streams, posts } = await registrationRig(t);
+  await waitFor(() => daemon.inbox.presenceActive);
+  const first = client(t, daemon.path);
+  assert.equal((await first.bind(s1, 'rt-1')).ok, true);
+  await first.enqueueRegistration({ session: s1 });
+  await waitFor(() => posts.length === 1 && daemon.inbox.registeredResult(key(s1)) !== undefined);
+  await first.release(s1, 'rt-1');
+  // The stream drops; s1 expires at the coordinator meanwhile, so the new
+  // connection has no member for it and no leave (it never sent one).
+  (await streams.next(1)).end();
+  (await streams.next(2)).write(sse(hello(0)));
+  await waitFor(() => bookmark(daemon.path).stream_id === STREAM && daemon.requests(ROUTES.presence).length >= 2);
+  const second = client(t, daemon.path);
+  assert.equal((await second.bind(s1, 'rt-2')).ok, true);
+  await second.enqueueRegistration({ session: s1 });
+  await waitFor(() => posts.length === 2, 2000, 'a registration POST for the restarted adapter');
+});
+
 test('presence unknown clears the registration and posts exactly once; a session now on another host gets the owner_conflict event', async t => {
   reports(t);
   const { daemon, streams, posts, unknown } = await registrationRig(t, { conflict: s2 });
@@ -633,6 +652,37 @@ test('a restored older inbox (after < C) gets 409 with no writes; after --reset-
   (await streams.next(1)).write(sse(hello(C)));
   await waitFor(() => bookmark(daemon.path).bookmark === C);
   assert.equal(daemon.requests(ROUTES.streamV2).at(-1)!.search, '');
+});
+
+test('--reset-bookmark keeps D as a skip floor: the next open sends no query, a replay below D writes nothing and a reissued id fails closed', async t => {
+  const seen = reports(t);
+  const streams = streamQueue();
+  const daemon = await rig(t, { [ROUTES.streamV2]: streams.route });
+  const receipts = () => daemon.requests(ROUTES.receiptV2).map(entry => entry.body.through);
+  (await streams.next(1)).write(sse(hello(0), member(s1, 0), msg(1, s2, s1), msg(2, s2, s1), msg(3, s2, s1)));
+  await waitFor(() => receipts().includes(3));
+  // Row 2 was acknowledged long ago and swept.
+  const writer = new DatabaseSync(daemon.path);
+  writer.prepare("DELETE FROM inbox_messages WHERE message_id = 'fleet:msg:2'").run();
+  writer.close();
+  await daemon.stop();
+  assert.deepEqual(daemon.inbox.resetBookmark(), { highWater: 3 });
+  assert.deepEqual(bookmark(daemon.path), { stream_id: null, bookmark: 3 });
+  daemon.start();
+  // A restored coordinator log resumes at 0 and replays 1-3; the restore floor makes the next id 4.
+  (await streams.next(2)).write(sse(hello(0, { stream: OTHER_STREAM }), member(s1, 0), msg(1, s2, s1), msg(2, s2, s1), msg(3, s2, s1), msg(4, s2, s1)));
+  await waitFor(() => receipts().includes(4));
+  assert.equal(daemon.requests(ROUTES.streamV2)[1]!.search, '', 'no stream: no query');
+  assert.deepEqual(rows(daemon.path).map(row => row.sequence), [1, 3, 4], 'the swept row does not come back');
+  assert.deepEqual(bookmark(daemon.path), { stream_id: OTHER_STREAM, bookmark: 4 });
+  // A floor too low: a reissued id at or below D with other bytes is a conflict, not a silent skip.
+  await daemon.stop();
+  daemon.inbox.resetBookmark();
+  daemon.start();
+  (await streams.next(3)).write(sse(hello(0), member(s1, 0), msg(3, s2, s1, 'reissued')));
+  await waitFor(() => seen.some(entry => entry.text.includes(`Message identity conflict: session ${key(s1)}, message fleet:msg:3`)));
+  assert.deepEqual(bookmark(daemon.path), { stream_id: STREAM, bookmark: 4 }, 'D unchanged');
+  assert.deepEqual(rows(daemon.path).map(row => row.sequence), [1, 3, 4]);
 });
 
 /**

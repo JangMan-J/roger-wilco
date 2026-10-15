@@ -85,7 +85,7 @@ The route selects the version. There is no handshake field.
   - A host with a `hosts` row is on v2. For such a host, `GET /v1/hosts/stream` and `POST /v1/hosts/receipts` return `409 owner_conflict` "Host uses protocol 2". The stream route answers **before** it supersedes any live connection, so a stale v1 daemon cannot kill a v2 stream.
   - A v2 open supersedes any live v1 or v2 connection for the host.
 - **Daemon.**
-  - **Bookmark NULL.** The daemon sends `GET /v2/hosts/stream` with **no query**.
+  - **Bookmark NULL.** The daemon sends `GET /v2/hosts/stream` with **no query**. (After `--reset-bookmark` the stream is NULL and the bookmark is kept: the request has no query, and the daemon does not fall back.)
     - A v1 coordinator routes `/v2/*` to the control handler. After authentication it returns `404 not_found` "Unknown route" (`control/index.ts`). On that 404 the daemon issues one v1 stream request with the unchanged v1 loop. When that stream ends, the next attempt tries `/v2` again after the normal backoff.
     - A query on that first request would get `400 invalid_request` from `closedQuery` instead, so the first request MUST carry no query.
   - **Bookmark present.** The daemon MUST NOT fall back. It reports 404, 400 and 409, then backs off and retries.
@@ -359,7 +359,7 @@ CREATE TABLE inbox_stream (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   stream_id TEXT,                  -- coordinator log the bookmark belongs to
   bookmark INTEGER,                -- D; NULL until the first v2 hello commits
-  CHECK ((stream_id IS NULL) = (bookmark IS NULL))
+  CHECK (stream_id IS NULL OR bookmark IS NOT NULL)   -- --reset-bookmark clears only stream_id
 );
 INSERT INTO inbox_stream (id) VALUES (1);
 PRAGMA user_version = 4;
@@ -373,7 +373,7 @@ PRAGMA user_version = 4;
 
 ### Connect and hello
 
-1. If `bookmark IS NULL`, the daemon sends `GET /v2/hosts/stream` with no query. Otherwise it sends `?stream=<stream_id>&after=<bookmark>`. The header deadline is 10 s.
+1. If `stream_id IS NULL`, the daemon sends `GET /v2/hosts/stream` with no query. Otherwise it sends `?stream=<stream_id>&after=<bookmark>`. The header deadline is 10 s.
 2. Response handling:
    - `404` with a NULL bookmark: issue one v1 stream request with the unchanged v1 loop. When it ends, the next attempt tries `/v2` after the normal backoff.
    - Any other non-SSE reply: report, back off between 250 ms and 10 s, and retry.
@@ -386,7 +386,7 @@ PRAGMA user_version = 4;
    bookmark  := max(bookmark ?? 0, hello.resume)
    ```
    `resume > D` is accepted, because the coordinator has stated that nothing is owed up to `resume`. `resume < D` means the coordinator copy lags, and the replayed frames `≤ D` are skipped.
-5. In memory: `members := new Map()`, `last := hello.resume`, `lastReceipted := hello.resume`, idle deadline `3 × keepaliveMs`. The presence timer is (re)armed at `presenceWindowMs / 3`, with the first tick immediately, and `inbox.presenceActive := true` (§Registration).
+5. In memory: `members := new Map()`, `registered` cleared (§Registration), `last := hello.resume`, `lastReceipted := hello.resume`, idle deadline `3 × keepaliveMs`. The presence timer is (re)armed at `presenceWindowMs / 3`, with the first tick immediately, and `inbox.presenceActive := true` (§Registration).
 
 ### Ingest: batching, start-point filter, local fan-out
 
@@ -400,19 +400,19 @@ for f in batch, in order:
   msg | through:
      require f.seq > last                                   else VIOLATION('position order')
      last := f.seq
-     if f.seq <= D: continue                                -- replay of stored range: no write
+     replay := f.seq <= D                                   -- replay of stored range: no write
      if msg:
         json := JSON.stringify(f.message); hash := sha256(json)
         targets := f.message.recipient === '*'
            ? [s for (s, start) in members if start < f.seq and s ≠ f.message.sender]
-           : (members.get(rcpt) < f.seq ? [rcpt] : VIOLATION('directed message for a non-member'))
+           : (members.get(rcpt) < f.seq ? [rcpt] : replay ? [] : VIOLATION('directed message for a non-member'))
         for s in targets:
-           INSERT INTO inbox_messages (session_key, message_id, sequence, message_json, hash)
-             VALUES (s, f.message.id, f.seq, json, hash) ON CONFLICT(session_key, message_id) DO NOTHING
-           if changes = 0 and (SELECT hash ... WHERE session_key=s AND message_id=id) ≠ hash
-              → VIOLATION('message identity conflict')
-           else if changes = 1: touched += s
-     D := f.seq
+           if not replay:
+              INSERT INTO inbox_messages (session_key, message_id, sequence, message_json, hash)
+                VALUES (s, f.message.id, f.seq, json, hash) ON CONFLICT(session_key, message_id) DO NOTHING
+           if changes = 1: touched += s
+           else if a row (s, id) exists and its hash ≠ hash → VIOLATION('message identity conflict')
+     if not replay: D := f.seq
 UPDATE inbox_stream SET bookmark = D
 COMMIT
 then: changed(s) once per s in touched; receipts.offer(conn, last)
@@ -439,6 +439,7 @@ The poster is bound to one connection. At most one POST is in flight. Values are
 `registered` is the existing per-lifetime map. `reportRegistration` already clears it on a non-transient refusal. Two new `LocalHostInbox` members expose what the daemon loop needs:
 
 - `forgetRegistration(key)`: `registered.delete(key)`. Called on `leave` and on presence `unknown`.
+- `forgetRegistrations()`: `registered.clear()`. Called at every hello commit. A session that expires while no stream is open gets no `leave`, because the new connection starts with empty `sentMembers`.
 - `presenceActive: boolean`: set by the daemon when it arms the presence timer after the first v2 hello of this process. It is never reset in that process. Presence keeps running across reconnects, with the last hello's `presenceWindowMs`.
 
 When `presenceActive` holds, the IPC `enqueueRegistration` handler completes locally exactly when the existing predicate `inbox.registeredResult(registration)` returns a result (key in `registered`, no queued row, no attempt in flight). "Completes locally" means no row, no POST, and an unchanged IPC reply. The adapters' 30 s heartbeat timers therefore cost nothing and need no change. When `presenceActive` is false, nothing changes. `completeRegistration` is unchanged: fan-out never depends on a registration response. The `displayName` clause in `registeredResult` (`host/index.ts:186`) and the IPC waiter's `bare` flag (`ipc.ts:133`, `:147`, `:159`) are removed with the names branch. This rule does not use them.
@@ -460,7 +461,7 @@ DELETE FROM inbox_messages
 - **Coordinator.** Presence refreshes `sessions.last_seen_at`, which is both the board's "seen" time and the expiry clock.
   - A session with no lease is not refreshed and expires after `retention`, as a v1 session with no running adapter did. A running adapter without the lease exists only while another runtime of the same session holds it (so the key is in presence), or until its bind retry succeeds.
   - A registration lost to coordinator power loss comes back as `unknown` on the next tick. It is then re-registered with `start = tail`.
-  - A session that expires sends `leave`, which clears `registered`. A later start of its adapter therefore posts at once. Presence cannot cover this case, because an expired session has no lease.
+  - A session that expires sends `leave`, which clears `registered`. A session that expires while no stream is open is cleared by the next hello, which clears all of `registered`. A later start of its adapter therefore posts at once. Presence cannot cover this case, because an expired session has no lease.
 - **Board.** The board's "present" filter is `presenceWindowMs`. `createControlHandler(store, auth, settings)` serves it in `/health`. Adapter tools (`pi|claude|muse/tools.ts`) read it once per process through a new `CoreAccess.health()`, which fetches `GET /health` without registering. They fall back to 90 s when the field is absent (a v1 coordinator).
 - **`requirements.md`.** "Presence is the registration and heartbeat record" becomes "Presence is the registration and host presence record."
 
@@ -476,7 +477,7 @@ The settings file is `~/.config/roger-wilco/roger-wilco.conf`, overridden by `$R
 |---|---|---|---|
 | `window` | 32 | 1–256 | W: unreceipted `msg` frames per host stream (coordinator only) |
 | `retention` | 7d | 1d–90d | Registration expiry and message collection age (coordinator only) |
-| `keepalive` | 15s | 5s–60s | SSE keepalive and `through` cadence |
+| `keepalive` | 15s | 5s–60s | v2 SSE keepalive and `through` cadence. The v1 keepalive stays 15 s, inside the v1 daemon's fixed 45 s idle deadline |
 | `presence_window` | 90s | 15s–15m | How stale the board may be |
 
 Derived values have no setting of their own. Each is computed in one place:
@@ -510,7 +511,7 @@ Fixed in code, not settings:
 | Cut-over committed, daemon crashed before the hello commit | `hosts` row, `D = NULL` | — | Reconnect without a query. `resume = max(C0, minStart)`. Rows already stored hit `(session, id)` dedup. |
 | v1 receipt racing the cut-over | — | — | Serialised by `BEGIN IMMEDIATE`. If it commits before, it is counted in `MIN(cursor)`. If after, it gets `409`, and the message is replayed and deduplicated. |
 | Session registers mid-stream | `sessions` row | Its start at the daemon | A `member` frame from the same snapshot precedes every message owed to it (I2, I6). There is no race with the registration response. |
-| Session expires at the coordinator | Row deleted | — | `leave` precedes later frames, and `registered` is cleared. The next registration (presence `unknown` or adapter start) posts and gets `start = tail` (v1 expiry semantics). |
+| Session expires at the coordinator | Row deleted | — | `leave` precedes later frames, and `registered` is cleared. If no stream is open, the next hello clears all of `registered`. The next registration (presence `unknown` or adapter start) posts and gets `start = tail` (v1 expiry semantics). |
 | Invalid frame, position order violation, directed message to a non-member, dedup hash conflict | `D` unchanged | — | The batch rolls back. Report, abort, back off, reconnect. Nothing is skipped. |
 | `after < C` | — | The inbox went backwards (restored file) or two daemons share one credential | `409`, fail closed. The operator runs `roger-wilco-host --reset-bookmark` (§Coordinator restore). The next connect resumes at `C`. |
 | `after > tail` or `stream` mismatch | — | Coordinator DB replaced or restored | `409`, fail closed. Follow §Coordinator restore. |
@@ -524,9 +525,9 @@ Fixed in code, not settings:
 A restored coordinator database reissues `ns:msg:<n>` ids above its backup tail. Message ids do not contain `stream_id`, so rotating the stream alone does not prevent reuse. The procedure is:
 
 1. Keep the coordinator stopped.
-2. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. The command takes the inbox singleton lock and fails if a daemon holds it. In one transaction it reads `highWater = max(bookmark ?? 0, MAX(inbox_messages.sequence) ?? 0)`, sets `stream_id` and `bookmark` to NULL, and prints `{"highWater": N}`. A host still on the v1 daemon binary has no such command. The operator reads `SELECT MAX(sequence) FROM inbox_messages` there instead.
+2. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. The command takes the inbox singleton lock and fails if a daemon holds it. In one transaction it reads `highWater = max(bookmark ?? 0, MAX(inbox_messages.sequence) ?? 0)`, sets `stream_id` to NULL, keeps `bookmark` as a skip floor, and prints `{"highWater": N}`. A host still on the v1 daemon binary has no such command. The operator reads `SELECT MAX(sequence) FROM inbox_messages` there instead.
 3. Run `node deploy/restore-coordinator.ts --sequence-floor N DB-PATH` with N at least the maximum `highWater`. In one FULL transaction it sets the `messages` row of `sqlite_sequence` to `max(seq, N)` (inserting the row if it is absent), and sets `store_config.stream_id` to a new random value.
-4. Start the coordinator, then the daemons. Each daemon resumes at the restored `C`. Ids at or below the backup tail are the same messages with the same bytes, so dedup absorbs them. New ids are above every id stored on any host.
+4. Start the coordinator, then the daemons. Each daemon resumes at the restored `C` and writes nothing at or below its kept `D`, so a row its session acknowledged and the sweep removed does not come back. Ids at or below the backup tail are the same messages with the same bytes. Ids above it and at or below `D` are never issued again, because the floor is at least `highWater`. A stored copy at or below `D` is still checked against the frame's hash. New ids are above every id stored on any host.
 
 A dedup hash conflict after this means that the floor was too low or an inbox was not counted. It stays fail-closed and reports the session and message id. The core cannot decide which of two messages with one id is real, so recovery is a manual operator decision. There is no automatic quarantine.
 
@@ -700,7 +701,7 @@ A dedup hash conflict after this means that the floor was too low or an inbox wa
     - 0→4, 2→4 and 3→4 upgrades each end with `inbox_stream` present and `user_version = 4`.
     - An old daemon fails closed on 4.
     - `--stream-clients-stopped` gives 4→3. `--legacy-clients-stopped` and `--contract-clients-stopped` accept 4.
-    - `--reset-bookmark` fails while a daemon holds the lock. Otherwise it clears both columns in one transaction and prints `highWater`.
+    - `--reset-bookmark` fails while a daemon holds the lock. Otherwise it clears `stream_id`, keeps `bookmark`, and prints `highWater`, in one transaction.
 
 **Crash tests**
 
@@ -711,7 +712,7 @@ A dedup hash conflict after this means that the floor was too low or an inbox wa
 39. SIGKILL between the cut-over commit and the daemon's hello commit: the second connect produces the same final inbox.
 40. **Restore.**
     - A restored, older inbox file (`D < C`) gives 409 with no writes. `--reset-bookmark` then resumes at `C`.
-    - A restored coordinator file gives 409 for each bookmarked daemon. After `--reset-bookmark` on each host and `restore-coordinator.ts --sequence-floor max(highWater)`, new messages get ids above the floor, replayed ids deduplicate, and no hash conflict occurs.
+    - A restored coordinator file gives 409 for each bookmarked daemon. After `--reset-bookmark` on each host and `restore-coordinator.ts --sequence-floor max(highWater)`, new messages get ids above the floor, replayed ids deduplicate, and no hash conflict occurs. A replayed id whose row its session acknowledged and the host swept is not stored again.
     - A floor below a host's `highWater` produces a fail-closed hash conflict that names the session and message id.
 
 **Migration and acceptance (`test/acceptance/`, `test/installation/`)**
@@ -821,3 +822,9 @@ Designed for, not built:
     - Crash tests 35, 36 and 39 kill a daemon child with SIGKILL and test 37 kills a coordinator child after the send COMMIT. The randomised model (43) runs in one process, so its daemon "kills" make the next COMMIT at a named point throw (the transaction rolls back) and then restart the daemon with a fresh inbox handle; lost receipts are dropped before or after the coordinator answers. The window is checked on the server, at every `msg` write, against the receipts `advanceHost` accepted.
     - Test 40's floor case: a floor below `highWater` reissues an id; the conflict surfaces on the host whose session already stored that id, which stays fail-closed with `D` below it.
     - Gate 46 lives in `test/perf/gates.perf.ts` (`npm run test:perf`, not in `npm test`). Its limits are round trips × 60 ms plus 250 ms of local work. The 1,000-session gate counts requests, so its daemon talks to the coordinator directly; through the proxy, the thousand startup registrations alone would take 1,000 round trips.
+42. Review fixes (after the end-to-end tests):
+    - Expiry while no stream is open: a new connection has empty `sentMembers`, so it sends no `leave` for a session that expired meanwhile, and the daemon kept its `registered` entry until a presence tick. Every hello commit now clears all of `registered` (`forgetRegistrations()`). Each running adapter's next heartbeat posts once per reconnect.
+    - `--reset-bookmark` keeps `D`: it clears only `stream_id`, and the `inbox_stream` CHECK is relaxed to `stream_id IS NULL OR bookmark IS NOT NULL`. Before this, clearing `D` let a coordinator restore re-insert a row that its session had acknowledged and the sweep had removed, because the replay from the restored `C` passed through it. The connect sends a query only when `stream_id` is set, and falls back to v1 only when `bookmark` is NULL. Schema 4 was not released, so the CHECK is changed in place.
+    - A replayed frame at or below `D` still writes nothing, but the copy stored for each target is checked against the frame's hash. A directed replay to a non-member is skipped. With `D` kept across a reset, this keeps a floor that is too low fail-closed (test 40) instead of a silent skip.
+    - The inbox constructor hashes every row whose `hash` is NULL on every open, not only when it adds the column. The rollback flags keep the column, and a daemon older than packet hashes (`9d9eae4`) inserts rows without a hash. v2 ingest compared that NULL with the frame's hash, which gave a permanent identity conflict.
+    - The v1 stream keepalive stays a fixed 15 s. The `keepalive` setting applies only to v2, because v1 daemons have a fixed 45 s idle deadline and the setting allows up to 60 s.

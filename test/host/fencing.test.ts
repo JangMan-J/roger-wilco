@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -337,7 +338,7 @@ test('--stream-clients-stopped returns 4 to 3; --contract-clients-stopped and --
   finally { await old.close(); }
 });
 
-test('--reset-bookmark fails while a daemon holds the lock, otherwise clears the bookmark and prints highWater', async t => {
+test('--reset-bookmark fails while a daemon holds the lock, otherwise clears the stream, keeps D as a skip floor and prints highWater', async t => {
   const dir = temporaryDir(t);
   const path = join(dir, 'inbox.sqlite');
   const configPath = join(dir, 'host.json');
@@ -352,10 +353,29 @@ test('--reset-bookmark fails while a daemon holds the lock, otherwise clears the
   assert.deepEqual(inbox.streamPosition(), { stream: '0123456789abcdef0123456789abcdef', bookmark: 120 }, 'a refused reset changes nothing');
   await inbox.close();
   assert.deepEqual(JSON.parse(reset()), { highWater: 130 });
-  assert.deepEqual(streamRow(path).row, { id: 1, stream_id: null, bookmark: null });
+  assert.deepEqual(streamRow(path).row, { id: 1, stream_id: null, bookmark: 120 });
   // With the bookmark above every stored row, the bookmark is the high water.
   const again = new DatabaseSync(path);
   again.exec("UPDATE inbox_stream SET stream_id = '0123456789abcdef0123456789abcdef', bookmark = 500");
   again.close();
   assert.deepEqual(JSON.parse(reset()), { highWater: 500 });
+});
+
+test('a row stored with no hash by a daemon older than packet hashes is hashed when the inbox is upgraded again', async t => {
+  const path = join(temporaryDir(t), 'inbox.sqlite');
+  await createHostInbox(path).close();
+  // --contract-clients-stopped keeps the hash column; a schema 2 daemon from
+  // before packet hashes then inserts rows without one.
+  rollbackInboxContract(path);
+  const old = new DatabaseSync(path);
+  old.prepare('INSERT INTO inbox_messages (session_key, message_id, sequence, message_json) VALUES (?, ?, ?, ?)')
+    .run(key, message.id, message.sequence, JSON.stringify(message));
+  old.close();
+  const inbox = createHostInbox(path);
+  try {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal(cell(db, 'SELECT hash FROM inbox_messages'), createHash('sha256').update(JSON.stringify(message)).digest('hex')); }
+    finally { db.close(); }
+    assert.deepEqual(await inbox.receive(frame), { inserted: false });
+  } finally { await inbox.close(); }
 });

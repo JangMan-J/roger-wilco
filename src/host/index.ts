@@ -131,23 +131,24 @@ export class LocalHostInbox {
       }
       if (version === 2) { migrateNeutralEvidence(this.db); version = 3; }
       const inboxColumns = this.db.prepare('PRAGMA table_info(inbox_messages)').all() as Array<{ name: string }>;
-      if (!inboxColumns.some(column => column.name === 'hash')) {
-        this.db.exec('ALTER TABLE inbox_messages ADD COLUMN hash TEXT');
-        // Rows already stored were verified when their frames were ingested;
-        // hash them once here so later reads are equality checks.
-        const backfill = this.db.prepare('UPDATE inbox_messages SET hash = ? WHERE message_id = ? AND session_key = ?');
-        for (const row of this.db.prepare('SELECT session_key, message_id, message_json FROM inbox_messages').all() as
-          Array<{ session_key: string; message_id: string; message_json: string }>)
-          backfill.run(packetHash(row.message_json), row.message_id, row.session_key);
-      }
+      if (!inboxColumns.some(column => column.name === 'hash')) this.db.exec('ALTER TABLE inbox_messages ADD COLUMN hash TEXT');
+      // Rows already stored were verified when their frames were ingested;
+      // hash them here so later reads are equality checks. This runs on every
+      // open: a daemon older than packet hashes, run after a rollback that
+      // keeps the column, inserts rows with a NULL hash.
+      const backfill = this.db.prepare('UPDATE inbox_messages SET hash = ? WHERE message_id = ? AND session_key = ?');
+      for (const row of this.db.prepare('SELECT session_key, message_id, message_json FROM inbox_messages WHERE hash IS NULL').all() as
+        Array<{ session_key: string; message_id: string; message_json: string }>)
+        backfill.run(packetHash(row.message_json), row.message_id, row.session_key);
       if (version === 3) {
         // Schema 3 -> 4. The bookmark is NULL until the first v2 hello commits.
+        // `--reset-bookmark` clears stream_id and keeps the bookmark as a skip floor.
         this.db.exec(`
           CREATE TABLE inbox_stream (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             stream_id TEXT,
             bookmark INTEGER,
-            CHECK ((stream_id IS NULL) = (bookmark IS NULL))
+            CHECK (stream_id IS NULL OR bookmark IS NOT NULL)
           );
           INSERT INTO inbox_stream (id) VALUES (1);
           PRAGMA user_version = 4;
@@ -205,6 +206,11 @@ export class LocalHostInbox {
    * Called on a v2 `leave` and on presence `unknown`. */
   forgetRegistration(key: string): void {
     this.registered.delete(key);
+  }
+  /** Drop every lifetime registration. Called at each v2 hello: a session that
+   * expired while no stream was open gets no `leave`, so the next heartbeat posts. */
+  forgetRegistrations(): void {
+    this.registered.clear();
   }
   reportRegistration(key: string, result: Outcome<RegistrationResult>): void {
     // An outage keeps the last result; a coordinator refusal withdraws it.
@@ -409,20 +415,23 @@ export class LocalHostInbox {
     return [...this.leases].filter(([, lease]) => lease.expiresAt > now).map(([key]) => key).sort();
   }
 
-  /** The v2 bookmark: the coordinator log it belongs to and D. Both NULL until the first hello commits. */
+  /** The v2 bookmark: the coordinator log it belongs to and D. Both NULL until the first hello
+   * commits; after `--reset-bookmark` the stream is NULL and D stays as a skip floor. */
   streamPosition(): { stream: string | null; bookmark: number | null } {
     const row = this.db.prepare('SELECT stream_id, bookmark FROM inbox_stream WHERE id = 1').get() as
       { stream_id: string | null; bookmark: number | null };
     return { stream: row.stream_id, bookmark: row.bookmark };
   }
 
-  /** Clear the bookmark in one transaction, for `--reset-bookmark`. `highWater`
-   * is the highest position this inbox has seen, the floor a coordinator restore needs. */
+  /** Unbind the bookmark from its coordinator log in one transaction, for `--reset-bookmark`.
+   * D stays as a skip floor: rows at or below it may have been swept, and a replay below D
+   * never inserts, so a swept row cannot come back. `highWater` is the highest position this
+   * inbox has seen, the floor a coordinator restore needs; ids at or below it are never issued again. */
   resetBookmark(): { highWater: number } {
     return this.tx(() => {
       const row = this.db.prepare(`SELECT MAX(COALESCE((SELECT bookmark FROM inbox_stream WHERE id = 1), 0),
         COALESCE((SELECT MAX(sequence) FROM inbox_messages), 0)) AS high`).get() as { high: number };
-      this.db.prepare('UPDATE inbox_stream SET stream_id = NULL, bookmark = NULL WHERE id = 1').run();
+      this.db.prepare('UPDATE inbox_stream SET stream_id = NULL WHERE id = 1').run();
       return { highWater: row.high };
     });
   }
@@ -441,8 +450,9 @@ export class LocalHostInbox {
 
   /**
    * One v2 batch in one FULL transaction, with the bookmark in the same
-   * transaction (I3). Applies membership in order, skips positions at or below
-   * D, copies each message to its local recipients, and advances D. Throws
+   * transaction (I3). Applies membership in order, writes nothing at or below D
+   * (a stored copy there must still match), copies each message to its local
+   * recipients, and advances D. Throws
    * StreamViolation and rolls back on a rule violation; `state.last` is then
    * restored. Returns whether the batch held a position frame.
    */
@@ -474,7 +484,8 @@ export class LocalHostInbox {
           if (frame.seq <= state.last) throw new StreamViolation(`Position ${frame.seq} is not above ${state.last}`);
           state.last = frame.seq;
           positioned = true;
-          if (frame.seq <= bookmark) continue; // replay of the stored range: no write
+          // A replay of the stored range writes nothing: the row may have been swept.
+          const replay = frame.seq <= bookmark;
           if (frame.type === 'msg') {
             const message = frame.message;
             namespace(message.sender);
@@ -485,16 +496,18 @@ export class LocalHostInbox {
               targets = [...state.members].filter(([key, from]) => from < frame.seq && key !== message.sender).map(([key]) => key);
             } else {
               const from = state.members.get(message.recipient);
-              if (from === undefined || from >= frame.seq) throw new StreamViolation(`Directed message ${message.id} for a non-member ${message.recipient}`);
-              targets = [message.recipient];
+              if (from !== undefined && from < frame.seq) targets = [message.recipient];
+              else if (replay) targets = [];
+              else throw new StreamViolation(`Directed message ${message.id} for a non-member ${message.recipient}`);
             }
             for (const key of targets) {
-              if (insert.run(key, message.id, frame.seq, json, hash).changes === 1) { touched.add(key); continue; }
-              const row = stored.get(key, message.id) as { hash: string | null } | undefined;
-              if (row?.hash !== hash) throw new StreamViolation(`Message identity conflict: session ${key}, message ${message.id}`);
+              if (!replay && insert.run(key, message.id, frame.seq, json, hash).changes === 1) { touched.add(key); continue; }
+              // A stored copy must be the same message, so a reissued id fails closed.
+              const row = stored.get(key, message.id) as { hash: string } | undefined;
+              if (row && row.hash !== hash) throw new StreamViolation(`Message identity conflict: session ${key}, message ${message.id}`);
             }
           }
-          bookmark = frame.seq;
+          if (!replay) bookmark = frame.seq;
         }
         if (bookmark !== start) this.db.prepare('UPDATE inbox_stream SET bookmark = ? WHERE id = 1').run(bookmark);
       });
@@ -866,6 +879,9 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
           if (hello.type !== 'hello') throw new StreamViolation('The first v2 frame is not hello');
           if (hello.host !== config.hostId) throw new StreamViolation('hello.host does not match this host');
           inbox[commitHello](hello);
+          // Membership restarts empty, and so does the lifetime registration: a session
+          // that expired while no stream was open gets no `leave` on this one.
+          inbox.forgetRegistrations();
           state = { members: new Map(), last: hello.resume };
           idleMs = streamIdleMs(hello.keepaliveMs);
           armDeadline(idleMs, 'Host stream idle timed out');
@@ -923,7 +939,8 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
         const { stream, bookmark } = inbox.streamPosition();
         // With no bookmark the first request carries no query, so a v1
         // coordinator answers 404 (unknown route), not 400 (unexpected query).
-        const query = bookmark === null ? '' : `?${new URLSearchParams({ stream: stream!, after: String(bookmark) })}`;
+        // After --reset-bookmark the stream is NULL: no query, and D stays as a skip floor.
+        const query = stream === null ? '' : `?${new URLSearchParams({ stream, after: String(bookmark) })}`;
         armDeadline(REQUEST_TIMEOUT_MS, 'Host stream response timed out');
         const response = await fetch(new URL(`${ROUTES.streamV2}${query}`, base), { headers, signal: streamSignal });
         if (response.status === 404 && bookmark === null) {

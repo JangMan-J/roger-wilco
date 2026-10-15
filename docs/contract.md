@@ -433,8 +433,8 @@ A host with a `hosts` row is on version 2.
 For that host, `GET /v1/hosts/stream` and `POST /v1/hosts/receipts` return 409 `owner_conflict` "Host uses protocol 2".
 The stream route answers before it supersedes any live connection, so a stale version 1 daemon cannot end a version 2 stream.
 A version 2 open supersedes any live version 1 or version 2 connection for the host.
-A daemon with no bookmark sends `GET /v2/hosts/stream` with no query.
-A version 1 coordinator answers that request with 404 `not_found`; the daemon then runs one version 1 stream request and tries `/v2` again after the normal backoff.
+A daemon with no stored stream (no bookmark, or after `--reset-bookmark`) sends `GET /v2/hosts/stream` with no query.
+A version 1 coordinator answers that request with 404 `not_found`; a daemon with no bookmark then runs one version 1 stream request and tries `/v2` again after the normal backoff.
 A daemon with a bookmark sends `?stream=<stream_id>&after=<bookmark>` and never falls back; it reports 400, 404 and 409, backs off and retries.
 
 ### Open
@@ -486,7 +486,7 @@ On the keepalive tick (`keepaliveMs`) the stream runs one batch if the window ha
 
 While the daemon runs version 2 it sends one `POST /v2/hosts/presence {sessions}` every `presenceWindowMs / 3`, listing the sessions that hold a live lease (at most 4096, in key order).
 The coordinator refreshes `last_seen_at` of the listed sessions registered to that host and returns every other listed key in `unknown`. It creates nothing, wakes nothing and changes no start.
-The daemon registers each `unknown` key again; a `leave` also clears the remembered registration, so the next heartbeat posts.
+The daemon registers each `unknown` key again; a `leave` also clears the remembered registration, and every `hello` clears all of them, so the next heartbeat posts.
 
 ### Sync classes
 
@@ -508,7 +508,7 @@ The daemon takes `keepaliveMs` and `presenceWindowMs` from `hello`: its idle dea
 
 A restored coordinator database would issue again ids above its backup tail. With the coordinator stopped:
 
-1. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. It takes the inbox lock (it fails while a daemon runs), clears the bookmark in one transaction and prints `{"highWater": N}`. On a host still on a version 1 daemon, read `SELECT MAX(sequence) FROM inbox_messages` instead.
+1. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. It takes the inbox lock (it fails while a daemon runs), clears the stream in one transaction, keeps the bookmark as a skip floor (nothing at or below it is written again), and prints `{"highWater": N}`. On a host still on a version 1 daemon, read `SELECT MAX(sequence) FROM inbox_messages` instead.
 2. Run `node deploy/restore-coordinator.ts --sequence-floor N DB-PATH` with N at least the largest `highWater`. In one FULL transaction it raises the message id watermark to N and gives the log a new `stream_id`.
 3. Start the coordinator, then the daemons. Each resumes at the restored `C`; ids at or below the backup tail come back with the same bytes and deduplicate.
 
@@ -533,7 +533,8 @@ The daemon uses one durable local SQLite database per host.
 `src/host/client.ts` implements the runtime-facing inbox methods through local IPC.
 Only the daemon opens the database and performs schema work.
 The current inbox schema is version 4.
-Version 4 adds `inbox_stream`, the host stream v2 bookmark (`stream_id`, `bookmark`), both NULL until the first v2 hello commits.
+Version 4 adds `inbox_stream`, the host stream v2 bookmark (`stream_id`, `bookmark`), both NULL until the first v2 hello commits; `--reset-bookmark` clears only `stream_id`.
+The daemon hashes any row stored without a hash (by a daemon older than packet hashes, after a rollback) when it opens the inbox.
 `node deploy/rollback-inbox.ts --stream-clients-stopped INBOX-PATH` returns a stopped inbox to version 3; the other rollback flags also accept version 4.
 Version 3 renames the evidence columns to `evidence_record_id` and `evidence_location`.
 It also rewrites queued registration JSON from `piSessionId` to `sessionId`.
@@ -748,7 +749,7 @@ Tests live in `test/delivery/`.
 It serves the v1 and v2 stream and receipt routes from one map of live connections keyed by host.
 One host stream covers all subscribed sessions.
 Store commits and receipts trigger durable replay reads.
-v1 keepalive writes do not query pending messages. The v2 keepalive tick runs one batch when the window has room, then sends `through`.
+v1 keepalive writes do not query pending messages and stay at a fixed 15 seconds; the `keepalive` setting applies to v2 only. The v2 keepalive tick runs one batch when the window has room, then sends `through`.
 This lane does not edit the schema.
 
 ### Lane D

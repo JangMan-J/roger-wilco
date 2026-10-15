@@ -257,6 +257,10 @@ for (const floor of ['max highWater', 'too low'] as const) {
     await b.stop();
     const highWater = Math.max(resetBookmark(dir, a.config).highWater, resetBookmark(dir, b.config).highWater);
     assert.equal(highWater, lost[1]!.sequence);
+    // The reset unbinds the log and keeps D as a skip floor.
+    const floorB = bookmark(b.config.inboxPath);
+    assert.equal(floorB.stream, null);
+    assert.ok(floorB.bookmark! >= lost[0]!.sequence);
     const sequenceFloor = floor === 'too low' ? early[1]!.sequence : highWater;
     execFileSync(process.execPath, [join(ROOT, 'deploy/restore-coordinator.ts'), '--sequence-floor', String(sequenceFloor), c.dbPath], { encoding: 'utf8' });
     await c.start();
@@ -271,7 +275,7 @@ for (const floor of ['max highWater', 'too low'] as const) {
       assert.equal(next.sequence, lost[0]!.sequence, 'a reissued id');
       await waitFor(() => seen.some(text => text.includes(`Message identity conflict: session ${key(b1)}, message ${next.id}`)), 'fail-closed conflict');
       assert.deepEqual(stored(b.config.inboxPath).get(key(b1)), [early[0]!.sequence, lost[0]!.sequence], 'the conflicting copy is not stored');
-      assert.ok(bookmark(b.config.inboxPath).bookmark! < next.sequence, 'D stays below the conflict');
+      assert.equal(bookmark(b.config.inboxPath).bookmark, floorB.bookmark, 'the conflicting batch leaves D unchanged');
       return;
     }
     assert.ok(next.sequence > highWater, 'new ids are above every id stored on any host');
@@ -280,3 +284,37 @@ for (const floor of ['max highWater', 'too low'] as const) {
     assert.ok(!seen.some(text => text.includes('identity conflict')));
   });
 }
+
+test('a coordinator restore does not bring back a row that its session acknowledged and the host swept (test 40)', async t => {
+  const seen = reports(t);
+  const dir = tempDir(t);
+  const c = await coordinator(t, dir);
+  const [a1, b1] = [address(1), address(2)];
+  await register(c.url, 'host-a', a1);
+  await register(c.url, 'host-b', b1);
+  const a = daemon(t, dir, 'host-a', c.url);
+  await waitFor(() => hostAcked(c.dbPath, 'host-a') === 0, 'cut over');
+  // Host A is behind when the backup is taken: its receipts have not landed.
+  const release = w.hold(item => item.path === ROUTES.receiptV2 && item.host === 'host-a');
+  const sent = [await send(c.url, 'host-b', b1, a1, 'one'), await send(c.url, 'host-b', b1, a1, 'two'), await send(c.url, 'host-b', b1, a1, 'three')];
+  await waitFor(() => bookmark(a.config.inboxPath).bookmark === sent[2]!.sequence, 'stored');
+  const backup = join(dir, 'coordinator.backup');
+  mutate(c.dbPath, `VACUUM INTO '${backup}'`);
+  release();
+  await waitFor(() => hostAcked(c.dbPath, 'host-a') === sent[2]!.sequence, 'receipted');
+  await a.stop();
+  // The session acknowledged message two more than HISTORY_MS ago; the sweep at open removes it.
+  mutate(a.config.inboxPath, `UPDATE inbox_messages SET evidence_record_id = 'r2', evidence_location = 'loc', acknowledged_at = 1 WHERE sequence = ?`, sent[1]!.sequence);
+  await c.stop();
+  const { highWater } = resetBookmark(dir, a.config);
+  assert.equal(highWater, sent[2]!.sequence);
+  assert.deepEqual(stored(a.config.inboxPath).get(key(a1)), [sent[0]!.sequence, sent[2]!.sequence], 'swept');
+  copyDatabase(backup, c.dbPath);
+  execFileSync(process.execPath, [join(ROOT, 'deploy/restore-coordinator.ts'), '--sequence-floor', String(highWater), c.dbPath], { encoding: 'utf8' });
+  await c.start();
+  a.start();
+  await waitFor(() => hostAcked(c.dbPath, 'host-a') === sent[2]!.sequence, 'the replay is receipted');
+  assert.ok(w.v2('host-a', 'msg').some(f => f.seq === sent[1]!.sequence), 'message two was replayed');
+  assert.deepEqual(stored(a.config.inboxPath).get(key(a1)), [sent[0]!.sequence, sent[2]!.sequence], 'and not stored again');
+  assert.ok(!seen.some(text => text.includes('identity conflict')), seen.join('\n'));
+});

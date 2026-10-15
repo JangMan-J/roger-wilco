@@ -682,3 +682,27 @@ test('v2 isolation and keepalive: a stalled host closes alone; an idle host gets
   assert.ok(Date.now() - started < 2000, 'close() returns promptly');
   assert.equal(await s.closed(), true);
 });
+
+test('the v1 keepalive stays at 15 s whatever the keepalive setting, inside the 45 s idle deadline of a v1 daemon', async t => {
+  const f = await v2Fixture(t, { keepaliveMs: 60_000 });
+  const realTimeout = globalThis.setTimeout;
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const socket = connectSocket(Number(new URL(f.base).port), '127.0.0.1');
+  t.after(() => { socket.destroy(); });
+  let received = '';
+  socket.setEncoding('utf8');
+  socket.on('data', (chunk: string) => { received += chunk; });
+  socket.write(`GET ${ROUTES.stream} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer a\r\nAccept: text/event-stream\r\n\r\n`);
+  const until = async (check: () => boolean, what: string) => {
+    const end = performance.now() + 3000;
+    while (!check()) {
+      if (performance.now() > end) assert.fail(`Timed out waiting for ${what}: ${JSON.stringify(received)}`);
+      await new Promise(resolve => realTimeout(resolve, 10));
+    }
+  };
+  await until(() => received.includes('\r\n\r\n'), 'the stream headers');
+  assert.match(received, /^HTTP\/1\.1 200/);
+  assert.ok(!received.includes(': keepalive'));
+  t.mock.timers.tick(15_000);
+  await until(() => received.includes(': keepalive'), 'a v1 keepalive after 15 s');
+});

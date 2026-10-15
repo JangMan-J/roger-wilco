@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createDaemonInbox } from '../../src/host/index.ts';
 import { ROUTES, type Message, type StreamFrame } from '../../src/protocol/index.ts';
 import {
   ROOT, TOKENS, address, bookmark, call, coordinator, coordinatorProcess, cursors, daemon, freePort, hostAcked, inboxRows, key,
@@ -196,4 +197,31 @@ test('a daemon left on v2 after a coordinator-only rollback cuts over again with
   assert.ok(w.v2('host-a', 'hello')[0]!.resume <= 2, 'C0 = min(MIN(cursor), after)');
   assert.deepEqual(stored(a.config.inboxPath).get(key(a1)), [1, 3]);
   assert.deepEqual(stored(a.config.inboxPath).get(key(a2)), [2, 3]);
+});
+
+test('rows a pre-hash daemon stored after --contract-clients-stopped replay at the cut-over without an identity conflict', async t => {
+  const seen = reports(t);
+  const dir = tempDir(t);
+  const c = await coordinator(t, dir);
+  const [a1, b1] = [address(1), address(2)];
+  await register(c.url, 'host-a', a1);
+  await register(c.url, 'host-b', b1);
+  // Host A's inbox was at schema 4, then rolled back to schema 2, which keeps the hash column.
+  const inboxPath = join(dir, 'host-a', 'inbox.sqlite');
+  await createDaemonInbox(inboxPath).close();
+  execFileSync(process.execPath, [join(ROOT, 'deploy/rollback-inbox.ts'), '--contract-clients-stopped', inboxPath]);
+  // A schema 2 daemon from before packet hashes stores message 1 with no hash; its v1 receipt is lost.
+  const m1 = await send(c.url, 'host-b', b1, a1, 'one');
+  const db = new DatabaseSync(inboxPath);
+  db.prepare('INSERT INTO inbox_messages (session_key, message_id, sequence, message_json) VALUES (?, ?, ?, ?)')
+    .run(key(a1), m1.id, m1.sequence, JSON.stringify(m1));
+  db.close();
+  assert.equal(cursors(c.dbPath).get(key(a1)), 0);
+  const a = daemon(t, dir, 'host-a', c.url);
+  assert.equal(a.config.inboxPath, inboxPath);
+  const m2 = await send(c.url, 'host-b', b1, a1, 'two');
+  await waitFor(() => hostAcked(c.dbPath, 'host-a') === m2.sequence, 'message two delivered');
+  assert.deepEqual(stored(inboxPath).get(key(a1)), [m1.sequence, m2.sequence]);
+  assert.ok(inboxRows(inboxPath).every(row => row.hash !== null));
+  assert.ok(!seen.some(text => text.includes('identity conflict')), seen.join('\n'));
 });
