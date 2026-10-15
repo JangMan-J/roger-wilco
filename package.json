@@ -30,8 +30,7 @@
     "coordinator": "node src/bin/coordinator.ts",
     "host": "node src/bin/host.ts",
     "setup:sdk": "node scripts/link-sdk.mjs",
-    "prepack": "node scripts/pack-lock.mjs",
-    "prepublishOnly": "npm run typecheck"
+    "prepack": "node scripts/pack-lock.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
