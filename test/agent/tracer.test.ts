@@ -68,7 +68,7 @@ async function stack(t: TestContext) {
     if (!abort.signal.aborted) throw error;
   });
   const config: AgentConfig = {
-    coordinatorUrl: url, credential, namespace, sessionId: 'tracer-1', inboxPath, evidencePath, runtimeId: 'tracer-rt', displayName: 'tracer',
+    coordinatorUrl: url, credential, namespace, sessionId: 'tracer-1', inboxPath, evidencePath, runtimeId: 'tracer-rt',
   };
   t.after(async () => {
     abort.abort();
@@ -169,7 +169,7 @@ test('tracer and a Pi-shaped peer exchange messages through the host daemon', as
   const peerClient = createHostClient(h.inboxPath);
   t.after(() => client.close());
   t.after(() => peerClient.close());
-  const registered = await registerSession(client, tracer, 'tracer');
+  const registered = await registerSession(client, tracer);
   assert.equal(registered.subscription.id, 'fleet:tracer-1');
   assert.equal(registered.subscription.session.sessionId, 'tracer-1');
   assert.equal((await client.bind(tracer, h.config.runtimeId)).ok, true);
@@ -282,4 +282,15 @@ test('agent config accepts an opaque session id and rejects a foreign field', as
   await writeFile(path, JSON.stringify(config));
   assert.equal((await readAgentConfig(path)).sessionId, 'tracer-1');
   await rm(dir, { recursive: true, force: true });
+});
+
+test('a version 1 agent config with displayName still loads, and the name is ignored', () => {
+  const root = join(tmpdir(), 'rw-agent-config');
+  const base = {
+    coordinatorUrl: 'http://127.0.0.1:9', credential: 'token', namespace: 'fleet', sessionId: 'tracer-1',
+    inboxPath: join(root, 'inbox.sqlite'), evidencePath: join(root, 'evidence.jsonl'),
+  };
+  const config = parseAgentConfig({ ...base, displayName: 'tracer' });
+  assert.deepEqual(config, parseAgentConfig(base));
+  assert.equal('displayName' in config, false);
 });

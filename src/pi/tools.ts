@@ -2,7 +2,7 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import {
-  ROUTES, entityReference, isEntityId, isMessageInput, sessionKey,
+  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, sessionKey,
   type Claim, type Outcome, type RegistrationResult, type SessionAddress,
 } from '../protocol/index.ts';
 
@@ -21,6 +21,10 @@ export interface CoreAccess {
 }
 
 const text = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }], details: value });
+/** Sessions have no names; a call sign is an entity the session names in its own messages. */
+const IDENTITY_DESCRIPTION = 'Register this session and return its address, host, rank, and last-seen time. ' +
+  'It takes no name. To use a call sign, name an entity in a message (for example [[0:FLEET]] with roger_send) ' +
+  'and look it up with roger_entity. The core routes only by address.';
 const rankLabel = (rank: number) => rank === 1 ? 'fleet (rank 1)' : `Rank ${rank}`;
 
 export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
@@ -29,7 +33,9 @@ export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
     if (!first.ok) return first;
     const second = await core.call(ctx, ROUTES.claims, 'GET');
     const now = Date.now();
-    const visible = all ? first.value : first.value.filter(row =>
+    // A version 1 coordinator can still list displayName and session entities.
+    const rows = first.value.map(ownRegistrationResult);
+    const visible = all ? rows : rows.filter(row =>
       typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= PRESENCE_MS);
     return second.ok ? { ok: true, value: { sessions: visible, claims: second.value } } : second;
   }
@@ -45,7 +51,7 @@ export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
       const address = sessionKey(identity.actor);
       const labels = result.value.sessions.map(row =>
         `${row.subscription.id}${row.subscription.id === address ? ' (you)' : ''} — host ${JSON.stringify(row.subscription.hostId)}` +
-        (row.displayName ? ` — ${JSON.stringify(row.displayName)}` : '') + ` — ${rankLabel(row.rank)}`);
+        ` — ${rankLabel(row.rank)}`);
       ctx.ui.notify([
         'Roger-Wilco',
         `Your address: ${address}`,
@@ -79,13 +85,12 @@ export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
   };
   pi.registerCommand('roger', boardCommand);
   pi.registerCommand('roger_board', boardCommand);
-  pi.registerTool({ name: 'roger_identity', label: 'Agent Identity', description: 'Read or set this session’s display name. Entity references such as [[0:FLEET]] attach opaque integer metadata without changing the session address. Omit displayName to read the registration.',
-    parameters: Type.Object({ displayName: Type.Optional(Type.String({ maxLength: 200 })) }),
-    execute: async (_id, params, _signal, _update, ctx) => {
+  pi.registerTool({ name: 'roger_identity', label: 'Agent Identity', description: IDENTITY_DESCRIPTION,
+    parameters: Type.Object({}),
+    execute: async (_id, _params, _signal, _update, ctx) => {
       const identity = await core.bound(ctx);
       if ('ok' in identity) return text(identity);
-      return text(await core.call(ctx, ROUTES.register, 'POST', { session: identity.actor,
-        ...(params.displayName === undefined ? {} : { displayName: params.displayName }) }));
+      return text(await core.call(ctx, ROUTES.register, 'POST', { session: identity.actor }));
     },
   });
   pi.registerTool({ name: 'roger_send', label: 'Send Agent Message', description: 'Send a message to a session address or broadcast (*). Text and JSON strings support [[label]] and [[153:Meteor Shower]]. The integer is opaque metadata (0–255), not identity. Bare references preserve it. Use roger_entity for current metadata and retained message mentions.',

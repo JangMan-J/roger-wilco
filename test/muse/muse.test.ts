@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runMuseCli } from '../../src/muse/cli.ts';
 import { createMuseAdapter, type MuseHarness } from '../../src/muse/adapter.ts';
 import { museSessionAddress } from '../../src/muse/identity.ts';
 import { museTranscriptEvidence } from '../../src/muse/transcript.ts';
@@ -208,6 +209,10 @@ test('a delivery is not acknowledged until the transcript records it', async t =
   await adapter.start();
   // First registration sets the subscription cursor at the tail; register before the peer sends.
   assert.equal((await adapter.tool('roger_identity', {})).ok, true);
+  // A stray version 1 name argument is ignored; nothing returns a name.
+  const named = await adapter.tool('roger_identity', { displayName: 'Ignored' });
+  assert.equal(named.ok, true);
+  if (named.ok) assert.equal('displayName' in (named.value as object), false);
   const inbound = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'needs evidence' });
   assert.equal(inbound.ok, true);
   await until(async () => (await adapter.receive()).length === 1, 'handed to the harness once');
@@ -331,4 +336,9 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
   assert.deepEqual(delivered.map(message => message.body), ['one', 'two']);
   assert.match(receipt(h.inboxPath, first.value.id).evidence_record_id ?? '', /^line-\d+$/);
   assert.match(receipt(h.inboxPath, second.value.id).evidence_record_id ?? '', /^line-\d+$/);
+});
+
+test('the Muse CLI register and identity commands take no name', async () => {
+  for (const command of ['register', 'identity'])
+    await assert.rejects(runMuseCli([command, 'Alice']), /takes no name; a call sign is an entity/);
 });

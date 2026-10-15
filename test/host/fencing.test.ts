@@ -103,7 +103,8 @@ test('open legacy inbox cannot mutate daemon tables after migration', async t =>
   // The fence view keeps the legacy column names.
   assert.equal(cell(writer, 'SELECT COUNT(receipt_entry_id) + COUNT(receipt_session_file) FROM messages'), 0);
   assert.equal(cell(writer, 'SELECT COUNT(*) FROM inbox_leases'), 0);
-  // The queued legacy registration now uses the current address field, byte-identical to a current enqueue.
+  // The queued legacy registration now uses the current address field. Its version 1
+  // displayName stays in the row; the daemon drops it when it posts or replaces the row.
   assert.equal(cell(writer, 'SELECT registration_json FROM inbox_registrations'), JSON.stringify({ session, displayName: 'kept' }));
   assert.equal(existsSync(`${path}.lock`), true);
   await inbox.close();
@@ -138,7 +139,7 @@ test('transport rollback preserves post-cutover receipts and queued work', async
   await inbox.receive(frame);
   await inbox.receive({ ...frame, message: { ...message, id: 'fleet:msg:2', sequence: 2 } });
   assert.equal((await inbox.acknowledgeDelivery(session, 'owner', evidence)).ok, true);
-  await inbox.enqueueRegistration({ session, displayName: 'post-cutover' });
+  await inbox.enqueueRegistration({ session });
   await inbox.close();
   rollbackInbox(path);
   const legacy = legacyModule.createHostInbox(path);
@@ -151,7 +152,7 @@ test('transport rollback preserves post-cutover receipts and queued work', async
     try {
       assert.equal(cell(check, "SELECT receipt_entry_id FROM messages WHERE message_id = 'fleet:msg:1'"), proof.entryId);
       assert.equal(cell(check, "SELECT receipt_session_file FROM messages WHERE message_id = 'fleet:msg:1'"), proof.sessionFile);
-      assert.equal(cell(check, 'SELECT registration_json FROM registrations'), JSON.stringify({ session: legacySession, displayName: 'post-cutover' }));
+      assert.equal(cell(check, 'SELECT registration_json FROM registrations'), JSON.stringify({ session: legacySession }));
     } finally { check.close(); }
   } finally { await legacy.close(); }
 });
@@ -223,7 +224,7 @@ test('a schema 2 inbox from the pre-contract daemon migrates to schema 3 and sur
   for (let round = 0; round < 2; round++) {
     const inbox = createHostInbox(path);
     try {
-      // Bytes match what a current client enqueues, so the queue stays idempotent.
+      // The address field is current; a version 1 displayName stays until the row is posted or replaced.
       assert.deepEqual(inbox.registrations().map(row => row.registration_json), migrated);
       assert.equal((await inbox.bind(session, `new-${round}`, Date.now())).ok, true);
       assert.deepEqual((await inbox.pending(session, `new-${round}`)).map(item => item.id), [second.id]);

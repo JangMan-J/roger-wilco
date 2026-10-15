@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runClaudeCli } from '../../src/claude/cli.ts';
 import { createClaudeAdapter, type ClaudeHarness } from '../../src/claude/adapter.ts';
 import { claudeSessionAddress } from '../../src/claude/identity.ts';
 import { claudeTranscriptEvidence } from '../../src/claude/transcript.ts';
@@ -217,6 +218,10 @@ test('a delivery a human pastes is never acknowledged; the tool result is', asyn
   t.after(() => adapter.stop());
   await adapter.start();
   assert.equal((await adapter.tool('roger_identity', {})).ok, true);
+  // A stray version 1 name argument is ignored; nothing returns a name.
+  const named = await adapter.tool('roger_identity', { displayName: 'Ignored' });
+  assert.equal(named.ok, true);
+  if (named.ok) assert.equal('displayName' in (named.value as object), false);
   const inbound = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'prove it' });
   assert.equal(inbound.ok, true);
   await until(async () => (await adapter.receive()).length === 1, 'handed to the harness once');
@@ -336,4 +341,9 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
   assert.deepEqual(delivered.map(message => message.body), ['one', 'two']);
   assert.match(receipt(h.inboxPath, first.value.id).evidence_record_id ?? '', /^00000000-0000-4000-8000-\d{12}$/);
   assert.match(receipt(h.inboxPath, second.value.id).evidence_record_id ?? '', /^00000000-0000-4000-8000-\d{12}$/);
+});
+
+test('the Claude CLI register and identity commands take no name', async () => {
+  for (const command of ['register', 'identity'])
+    await assert.rejects(runClaudeCli([command, 'Alice']), /takes no name; a call sign is an entity/);
 });

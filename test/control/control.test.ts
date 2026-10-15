@@ -40,9 +40,10 @@ test('real HTTP authentication, strict validation, host-bound sender and claim o
     headers: { accept: 'application/json, text/event-stream' },
   })).status, 404);
   assert.equal((await request('/v1/sessions/register', { session: alice, callbackUrl: 'http://x' })).status, 400);
+  // A version 1 peer may still send displayName; it is accepted and ignored.
   const registration = await request('/v1/sessions/register', { session: alice, displayName: 'Alice' });
   assert.equal(registration.status, 200);
-  assert.equal(registration.value.value.displayName, 'Alice');
+  assert.equal('displayName' in registration.value.value, false);
   assert.equal(typeof registration.value.value.lastSeenAt, 'number');
   assert.equal((await request('/v1/sessions/register', { session: bob }, 'secret-b')).status, 200);
   assert.deepEqual((await request('/v1/sessions')).value.value.map((entry: { subscription: { id: string } }) => entry.subscription.id).sort(),
@@ -109,9 +110,10 @@ test('entity HTTP lookup returns retained mentions with authentication and stric
   assert.equal((await request('/v1/entities', {})).status, 404);
 });
 
-test('HTTP routes index tagged registration, nested data, and claim release without rewriting literal text', async t => {
+test('HTTP routes index nested data and claim release without rewriting literal text; a v1 displayName creates nothing', async t => {
   const { request } = await fixture(t);
-  const displayName = '[[0:FLEET]]';
+  const keys = (value: object) => Object.keys(value).sort();
+  const registrationKeys = ['lastSeenAt', 'rank', 'subscription'];
   const fleet = entityReference('fleet', 'FLEET');
   const shower = entityReference('fleet', 'Meteor Shower');
   const objectKey = entityReference('fleet', 'object key', 4);
@@ -134,10 +136,11 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.deepEqual(bobRegistration.value.value.subscription.session, bob);
   assert.equal(bobRegistration.value.value.subscription.hostId, 'host-b');
 
-  const registered = await request('/v1/sessions/register', { session: alice, displayName });
+  // What a version 1 peer sends. The name is not stored, returned, or indexed.
+  const registered = await request('/v1/sessions/register', { session: alice, displayName: '[[0:FLEET]]' });
   assert.equal(registered.status, 200);
   const registration = registered.value.value;
-  assert.equal(registration.displayName, displayName);
+  assert.deepEqual(keys(registration), registrationKeys);
   assert.equal(registration.subscription.id, sessionKey(alice));
   assert.notEqual(registration.subscription.id, fleet.id);
   assert.deepEqual(registration.subscription.session, alice);
@@ -145,26 +148,24 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.equal(registration.rank, 1);
   assert.equal(typeof registration.subscription.cursor, 'number');
   assert.equal(typeof registration.lastSeenAt, 'number');
-  assert.match(registration.entities[0].id, /^fleet:entity:00:[0-9a-f]{32}$/);
-  assert.equal(registration.entities[0].id, entityReference('fleet', 'FLEET', 153).id);
-  assert.deepEqual(registration.entities, [fleet]);
+  assert.match(fleet.id, /^fleet:entity:00:[0-9a-f]{32}$/);
+  assert.equal(fleet.id, entityReference('fleet', 'FLEET', 153).id);
 
   const conflict = await request('/v1/sessions/register', { session: alice, displayName: '[[9:FLEET]]' }, 'secret-b');
   assert.equal(conflict.status, 409);
   assert.equal(conflict.value.error, 'owner_conflict');
-  assert.deepEqual((await lookup(fleet.id)).value.value, { entity: fleet, messages: [] });
+  assert.equal((await lookup(fleet.id)).status, 404, 'a display name is not an entity mention');
   const listed = await request('/v1/sessions');
   const aliceListed = listed.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice));
-  assert.equal(aliceListed.displayName, displayName);
+  assert.deepEqual(keys(aliceListed), registrationKeys);
   assert.deepEqual(aliceListed.subscription, registration.subscription);
-  assert.deepEqual(aliceListed.entities, [fleet]);
-  assert.equal(listed.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(bob)).entities, undefined);
+  assert.deepEqual(keys(listed.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(bob))), registrationKeys);
 
   assert.equal((await request('/v1/messages', {
     sender: alice, message: { recipient: sessionKey(bob), body: '[[99:FLEET]]', data: { nested: '[[99:Meteor Shower]]' } },
   }, 'secret-b')).status, 409);
   assert.equal((await lookup(shower.id)).status, 404);
-  assert.equal((await lookup(fleet.id)).value.value.entity.type, 0);
+  assert.equal((await lookup(fleet.id)).status, 404);
 
   const sent = await request('/v1/messages', { sender: alice, message: { recipient: sessionKey(bob), body, data } });
   assert.equal(sent.status, 200);
@@ -189,18 +190,15 @@ test('HTTP routes index tagged registration, nested data, and claim release with
 
   const heartbeat = await request('/v1/sessions/register', { session: alice });
   assert.equal(heartbeat.status, 200);
-  assert.equal(heartbeat.value.value.displayName, displayName);
+  assert.deepEqual(keys(heartbeat.value.value), registrationKeys);
   assert.equal(heartbeat.value.value.rank, registration.rank);
   assert.deepEqual(heartbeat.value.value.subscription, registration.subscription);
-  assert.deepEqual(heartbeat.value.value.entities, [entityReference('fleet', 'FLEET', 7)], 'heartbeat omits displayName and does not reapply its integer');
 
-  const reasserted = await request('/v1/sessions/register', { session: alice, displayName });
-  assert.equal(reasserted.status, 200);
-  assert.equal(reasserted.value.value.displayName, displayName);
-  assert.deepEqual(reasserted.value.value.subscription, registration.subscription);
-  assert.deepEqual(reasserted.value.value.entities, [fleet], 'explicit same displayName reasserts metadata');
+  const renamed = await request('/v1/sessions/register', { session: alice, displayName: '[[0:FLEET]]' });
+  assert.equal(renamed.status, 200);
+  assert.deepEqual(keys(renamed.value.value), registrationKeys);
   const fleetAfterName = await lookup(fleet.id);
-  assert.equal(fleetAfterName.value.value.entity.type, 0);
+  assert.equal(fleetAfterName.value.value.entity.type, 7, 'a v1 displayName does not write entity metadata');
   assert.equal(fleetAfterName.value.value.messages[0].data.nested[0], '[[7:FLEET]]');
 
   const plain = await request('/v1/claims', { key: 'plain-task', owner: alice, ttlSeconds: 0 });
@@ -211,7 +209,7 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.equal(plain.value.value.claim.entities, undefined);
   assert.equal((await request('/v1/claims/release', { key: 'plain-task', owner: alice })).value.value, true);
   assert.deepEqual((await request('/v1/claims')).value.value, []);
-  assert.equal((await lookup(fleet.id)).value.value.entity.type, 0);
+  assert.equal((await lookup(fleet.id)).value.value.entity.type, 7);
 
   const inboxQuery = `?namespace=fleet&sessionId=${bob.sessionId}&since=0&limit=10`;
   const foreignInbox = await request('/v1/inbox' + inboxQuery);
@@ -238,8 +236,7 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.equal(later.value.value.data, null);
   assert.equal((await lookup(shower.id)).value.value.entity.type, 200);
   const reread = await request('/v1/sessions');
-  assert.equal(reread.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice)).entities[0].type, 8);
-  assert.equal(reread.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice)).displayName, displayName);
+  assert.deepEqual(keys(reread.value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice))), registrationKeys);
   const listedClaims = await request('/v1/claims');
   assert.equal(listedClaims.value.value[0].key, claimKey);
   assert.equal(listedClaims.value.value[0].note, note);
@@ -267,9 +264,8 @@ test('HTTP routes index tagged registration, nested data, and claim release with
   assert.deepEqual((await lookup(fleet.id)).value.value.entity, entityReference('fleet', 'FLEET', 8));
   assert.deepEqual((await lookup(fleet.id)).value.value.messages, [message]);
   const aliceAfter = (await request('/v1/sessions')).value.value.find((row: { subscription: { id: string } }) => row.subscription.id === sessionKey(alice));
-  assert.equal(aliceAfter.displayName, displayName);
+  assert.deepEqual(keys(aliceAfter), registrationKeys);
   assert.deepEqual(aliceAfter.subscription, registration.subscription);
-  assert.deepEqual(aliceAfter.entities, [entityReference('fleet', 'FLEET', 8)]);
   const inbox = await request('/v1/inbox' + inboxQuery, undefined, 'secret-b');
   assert.equal(inbox.status, 200);
   assert.deepEqual(inbox.value.value.map((item: { body: string; data: unknown }) => [item.body, item.data]), [

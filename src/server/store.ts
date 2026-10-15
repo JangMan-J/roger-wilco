@@ -23,6 +23,7 @@ const VERIFIED_ENTRY_TEXT = 64 * 1024;
 
 const schema = `
 CREATE TABLE IF NOT EXISTS store_config (namespace TEXT NOT NULL);
+-- display_name is unused. It stays so older databases open unchanged.
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, host_id TEXT NOT NULL, display_name TEXT,
   last_seen_at INTEGER NOT NULL DEFAULT 0, rank INTEGER NOT NULL DEFAULT 1,
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS claims (
   claimed_at INTEGER NOT NULL, expires_at INTEGER
 );`;
 
-type SessionRow = { id: string; host_id: string; display_name: string | null; last_seen_at: number; rank: number; cursor: number; initial_cursor: number; offered: number | null };
+type SessionRow = { id: string; host_id: string; last_seen_at: number; rank: number; cursor: number; initial_cursor: number; offered: number | null };
 type MessageRow = { id: number; timestamp: number; sender: string; recipient: string; body: string; data: string; visibility: 'private' | 'public'; hash: string | null };
 /** The packet identity: SHA-256 over the exact JSON text of the verified message. */
 function messageHash(message: Message): string {
@@ -143,6 +144,10 @@ class Store implements CoordinatorStore {
         this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE last_seen_at = 0').run(Date.now());
       });
       this.migrateEntityMetadata();
+      // Only registration display names created session entity sources. Those names
+      // are gone, so the sources are removed here; the entities stay and age out under
+      // the entity retention rule. Running this on every open is idempotent.
+      this.db.exec("DELETE FROM entity_sources WHERE kind = 'session'");
       // Rows written before packet hashes existed are verified once, here,
       // and hashed; after this pass every read is an equality check.
       this.transaction(() => {
@@ -231,9 +236,7 @@ class Store implements CoordinatorStore {
     this.transaction(() => {
       this.db.prepare('DELETE FROM sessions WHERE last_seen_at < ?').run(now - RETENTION_MS);
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
-      this.db.exec(`DELETE FROM entity_sources WHERE
-        (kind = 'session' AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = source_key)) OR
-        (kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key))`);
+      this.db.exec("DELETE FROM entity_sources WHERE kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key)");
       // A sender or unrelated low cursor must not pin history. Broadcasts remain
       // until every retained recipient has acknowledged, or its registration expires.
       this.db.prepare(`DELETE FROM messages WHERE id IN (
@@ -253,13 +256,13 @@ class Store implements CoordinatorStore {
   private subscription(row: SessionRow): Subscription {
     return { id: row.id, session: addressOf(row.id), hostId: row.host_id, cursor: row.cursor };
   }
-  private sourceEntities(kind: 'session' | 'claim', key: string): { entities?: EntityRef[] } {
+  private claimEntities(key: string): { entities?: EntityRef[] } {
     const entities = this.db.prepare(`SELECT e.id, e.type, e.label FROM entities e JOIN entity_sources s ON s.entity_id = e.id
-      WHERE s.kind = ? AND s.source_key = ? ORDER BY e.id`).all(kind, key) as EntityRef[];
+      WHERE s.kind = 'claim' AND s.source_key = ? ORDER BY e.id`).all(key) as EntityRef[];
     return entities.length ? { entities: entities.map(entity => ({ ...entity })) } : {};
   }
   /** Called only within the accepted mutation's transaction, never while reading or delivering. */
-  private trackEntities(values: JsonValue[], source?: { kind: 'session' | 'claim'; key: string }): string[] {
+  private trackEntities(values: JsonValue[], source?: { kind: 'claim'; key: string }): string[] {
     if (source) this.db.prepare('DELETE FROM entity_sources WHERE kind = ? AND source_key = ?').run(source.kind, source.key);
     const entities = extractEntities(this.namespace, ...values);
     for (const entity of entities) {
@@ -271,11 +274,11 @@ class Store implements CoordinatorStore {
     }
     return entities.map(entity => entity.id);
   }
-  /** All entities for one source kind in a single joined query, grouped by source key. */
-  private sourceEntitiesByKey(kind: 'session' | 'claim'): Map<string, EntityRef[]> {
+  /** All claim entities in a single joined query, grouped by claim key. */
+  private claimEntitiesByKey(): Map<string, EntityRef[]> {
     const rows = this.db.prepare(`SELECT s.source_key AS source_key, e.id, e.type, e.label FROM entities e
-      JOIN entity_sources s ON s.entity_id = e.id WHERE s.kind = ? ORDER BY s.source_key, e.id`)
-      .all(kind) as Array<EntityRef & { source_key: string }>;
+      JOIN entity_sources s ON s.entity_id = e.id WHERE s.kind = 'claim' ORDER BY s.source_key, e.id`)
+      .all() as Array<EntityRef & { source_key: string }>;
     const byKey = new Map<string, EntityRef[]>();
     for (const row of rows) {
       const list = byKey.get(row.source_key) ?? [];
@@ -284,10 +287,8 @@ class Store implements CoordinatorStore {
     }
     return byKey;
   }
-  private registration(row: SessionRow, entities?: EntityRef[]): RegistrationResult {
-    const found = entities ?? this.sourceEntities('session', row.id).entities;
-    return { subscription: this.subscription(row), ...(row.display_name === null ? {} : { displayName: row.display_name }),
-      lastSeenAt: row.last_seen_at, rank: row.rank, ...(found?.length ? { entities: found } : {}) };
+  private registration(row: SessionRow): RegistrationResult {
+    return { subscription: this.subscription(row), lastSeenAt: row.last_seen_at, rank: row.rank };
   }
   private message(row: MessageRow): Message {
     const cached = this.verified.get(row.id);
@@ -321,7 +322,7 @@ class Store implements CoordinatorStore {
     return message;
   }
   private claimValue(row: ClaimRow, entities?: EntityRef[]): Claim {
-    const found = entities ?? this.sourceEntities('claim', row.key).entities;
+    const found = entities ?? this.claimEntities(row.key).entities;
     return { key: row.key, owner: row.owner, note: row.note, claimedAt: row.claimed_at, expiresAt: row.expires_at,
       ...(found?.length ? { entities: found } : {}) };
   }
@@ -363,15 +364,11 @@ class Store implements CoordinatorStore {
         // AUTOINCREMENT's durable watermark survives collection of the entire history.
         const tail = (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS tail")
           .get() as { tail: number }).tail;
-        this.db.prepare('INSERT INTO sessions (id, host_id, display_name, last_seen_at, initial_cursor, cursor) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(id, host.hostId, request.displayName ?? null, now, tail, tail);
+        this.db.prepare('INSERT INTO sessions (id, host_id, last_seen_at, initial_cursor, cursor) VALUES (?, ?, ?, ?, ?)')
+          .run(id, host.hostId, now, tail, tail);
       } else {
-        this.db.prepare('UPDATE sessions SET display_name = COALESCE(?, display_name), last_seen_at = ? WHERE id = ?')
-          .run(request.displayName ?? null, now, id);
+        this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(now, id);
       }
-      // Heartbeats omit the name. An explicitly supplied name is a metadata write.
-      if (request.displayName !== undefined)
-        this.trackEntities([request.displayName], { kind: 'session', key: id });
       return { ok: true, value: this.registration(this.session(id)!) };
     });
   }
@@ -390,9 +387,8 @@ class Store implements CoordinatorStore {
   }
   listSessions(): RegistrationResult[] {
     this.maintain();
-    const entities = this.sourceEntitiesByKey('session');
     return (this.db.prepare('SELECT * FROM sessions ORDER BY id').all() as SessionRow[])
-      .map(row => this.registration(row, entities.get(row.id)));
+      .map(row => this.registration(row));
   }
   listClaims(): Claim[] {
     this.maintain();
@@ -400,7 +396,7 @@ class Store implements CoordinatorStore {
       const now = Date.now();
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
       this.db.exec("DELETE FROM entity_sources WHERE kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key)");
-      const entities = this.sourceEntitiesByKey('claim');
+      const entities = this.claimEntitiesByKey();
       return (this.db.prepare('SELECT * FROM claims ORDER BY key').all() as ClaimRow[])
         .map(row => this.claimValue(row, entities.get(row.key)));
     });

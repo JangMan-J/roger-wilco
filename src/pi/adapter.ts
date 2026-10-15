@@ -6,7 +6,7 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import {
-  ROUTES, isRegistration, sessionKey,
+  ROUTES, sessionKey,
   type HostInbox, type Outcome, type SessionAddress,
 } from '../protocol/index.ts';
 import type { PiConfig } from './config.ts';
@@ -127,8 +127,7 @@ export function createPiAdapter(pi: ExtensionAPI, options: PiAdapterOptions): vo
       const identity = await bound(ctx);
       if ('ok' in identity) return identity;
       const { actor, owner } = identity;
-      const registration = route === ROUTES.register && isRegistration(body) ? body : { session: actor };
-      const registered = await owner.inbox.awaitRegistration(registration);
+      const registered = await owner.inbox.awaitRegistration({ session: actor });
       if (!registered.ok) { status(ctx, `Roger-Wilco registration: ${registered.error}: ${registered.message}`); return registered; }
       status(ctx, undefined);
       if (runtime !== owner || owner.stopped || !isPiSession(ctx, actor)) return error('Session changed');

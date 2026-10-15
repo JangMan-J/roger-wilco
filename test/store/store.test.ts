@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import v8 from 'node:v8';
 import vm from 'node:vm';
 import { createCoordinatorStore } from '../../src/server/store.ts';
-import { sessionKey, type CoordinatorStore, type Receipt, type SessionAddress } from '../../src/protocol/index.ts';
+import { sessionKey, type CoordinatorStore, type Receipt, type Registration, type SessionAddress } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
 const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
@@ -24,6 +24,10 @@ async function fileStore(t: { after(fn: () => Promise<void>): void }) {
 function ok<T>(outcome: { ok: true; value: T } | { ok: false; error: string }): T {
   assert.equal(outcome.ok, true, !outcome.ok ? outcome.error : 'expected success');
   return (outcome as { ok: true; value: T }).value;
+}
+/** What a version 1 peer sends: the session plus its old displayName field. */
+function v1Registration(session: SessionAddress, displayName: string): Registration {
+  return { session, displayName } as Registration;
 }
 function register(store: CoordinatorStore) {
   ok(store.register(hostA, { session: a }));
@@ -70,9 +74,8 @@ test('registration snapshots the current tail atomically; retry and reopen prese
   try {
     ok(store.register(hostA, { session: a }));
     const old = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'before registration' }));
-    const registered = ok(store.register(hostA, { session: b, displayName: 'Bee' }));
+    const registered = ok(store.register(hostA, { session: b }));
     assert.equal(registered.subscription.cursor, old.sequence);
-    assert.equal(registered.displayName, 'Bee');
     assert.equal(typeof registered.lastSeenAt, 'number');
     assert.deepEqual(store.pending(hostA, 100), []);
     assert.deepEqual(ok(store.inbox(hostA, b, 0, 10)).map(message => message.id), [old.id]);
@@ -82,16 +85,14 @@ test('registration snapshots the current tail atomically; retry and reopen prese
     const db = new DatabaseSync(path);
     try { db.prepare('UPDATE sessions SET last_seen_at = 1 WHERE id = ?').run(sessionKey(b)); }
     finally { db.close(); }
-    const retried = ok(store.register(hostA, { session: b, displayName: 'Bee again' }));
+    const retried = ok(store.register(hostA, { session: b }));
     assert.equal(retried.subscription.cursor, old.sequence);
-    assert.equal(retried.displayName, 'Bee again');
     assert.ok(retried.lastSeenAt! > 1);
     assert.deepEqual(store.pending(hostA, 1).map(frame => frame.message.id), [current.id]);
     store.close();
     store = createCoordinatorStore(path, 'fleet');
     const resumed = ok(store.register(hostA, { session: b }));
     assert.equal(resumed.subscription.cursor, old.sequence);
-    assert.equal(resumed.displayName, 'Bee again');
     assert.deepEqual(store.listSessions().find(result => result.subscription.id === sessionKey(b)), resumed);
     assert.deepEqual(store.pending(hostA, 1).map(frame => frame.message.id), [current.id]);
     assert.equal(ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: current.id })).cursor, current.sequence);
@@ -120,11 +121,11 @@ test('opening a pre-presence sessions table retains bindings and upgrades metada
   } finally { db.close(); }
   const store = createCoordinatorStore(path, 'fleet');
   try {
-    assert.equal(store.listSessions()[0]?.displayName, 'Original');
     assert.equal(store.listSessions()[0]?.rank, 1);
+    assert.equal('displayName' in store.listSessions()[0]!, false, 'a stored display_name is never returned');
     const retry = ok(store.register(hostA, { session: a }));
     assert.equal(retry.subscription.cursor, 0);
-    assert.equal(retry.displayName, 'Original');
+    assert.equal('displayName' in retry, false);
     assert.ok(retry.lastSeenAt! > 0);
     const ref = entityRef('legacy');
     assert.equal((store.entity(ref.id, 0, 10) as { error: string }).error, 'not_found');
@@ -141,7 +142,7 @@ test('rank is persistent cross-host metadata without presence, cursor, or delive
   let store = createCoordinatorStore(path, 'fleet');
   try {
     ok(store.register(hostA, { session: a }));
-    assert.equal(ok(store.register(hostA, { session: b, displayName: 'Bee' })).rank, 1);
+    assert.equal(ok(store.register(hostA, { session: b })).rank, 1);
     const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'acknowledged' }));
     store.pending(hostA, 10);
     ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }));
@@ -481,30 +482,20 @@ test('legacy type-keyed entities merge atomically, retain old ID aliases, and pr
   } finally { store.close(); }
 });
 
-test('session names, JSON strings, claims, and releases share metadata without read-side status replay or identity changes', async t => {
+test('JSON strings, claims, and releases share metadata without read-side status replay or identity changes', async t => {
   const path = await fileStore(t);
   let now = 1_800_000_000_000;
   t.mock.method(Date, 'now', () => now);
   let store = createCoordinatorStore(path, 'fleet');
   try {
     register(store);
-    const before = store.listSessions().find(row => row.subscription.id === sessionKey(a))!;
-    const identity = ok(store.register(hostA, { session: a, displayName: '[[0:FLEET]]' }));
-    assert.deepEqual(identity.subscription, before.subscription);
-    assert.equal(identity.rank, before.rank);
-    assert.deepEqual(identity.entities, [entityRef('FLEET')]);
-    assert.deepEqual(ok(store.entity(entityRef('FLEET').id, 0, 10)), { entity: entityRef('FLEET'), messages: [] });
     const body = 'Hey Jerry, did you see the [[153:Meteor Shower]] last night?';
     const data = { nested: ['[[7:FLEET]]', { '[[4:object key]]': '[[154:Meteor Shower]]' }], flag: true };
     const message = ok(store.send(hostA, a, { recipient: sessionKey(b), body, data }));
     assert.equal(message.body, body);
     assert.deepEqual(message.data, data);
     assert.equal(ok(store.entity(entityRef('Meteor Shower').id, 0, 10)).entity.type, 154);
-    const identityAgain = ok(store.register(hostA, { session: a }));
-    assert.deepEqual(identityAgain.entities, [entityRef('FLEET', 7)], 'heartbeats do not reapply the old integer');
-    assert.deepEqual(identityAgain.subscription, identity.subscription);
-    assert.deepEqual(ok(store.register(hostA, { session: a, displayName: '[[0:FLEET]]' })).entities,
-      [entityRef('FLEET')], 'an explicit name update reasserts its integer even when its text is unchanged');
+    assert.equal(ok(store.entity(entityRef('FLEET').id, 0, 10)).entity.type, 7);
     const claimKey = 'Observe [[153:Meteor Shower]]';
     const claimed = ok(store.claim(hostA, claimKey, sessionKey(a), 0, 'Ask [[8:FLEET]] and [[1:claim only]]'));
     assert.equal(claimed.acquired, true);
@@ -523,14 +514,13 @@ test('session names, JSON strings, claims, and releases share metadata without r
     assert.deepEqual(store.listClaims(), []);
     store.close();
     store = createCoordinatorStore(path, 'fleet');
-    assert.deepEqual(store.listSessions().find(row => row.subscription.id === sessionKey(a))!.entities, [entityRef('FLEET', 8)]);
+    assert.equal(ok(store.entity(entityRef('FLEET').id, 0, 10)).entity.type, 8);
     assert.equal(ok(store.entity(entityRef('claim only').id, 0, 10)).entity.type, 1, 'released references survive for the retention window');
-    // Active identity/claim associations protect entities even after their last explicit mention ages out.
+    // Active claim associations protect entities even after their last explicit mention ages out.
     ok(store.claim(hostA, 'keep', sessionKey(a), 0, '[[2:held]]'));
     now += 7 * 24 * 60 * 60 * 1000;
     ok(store.register(hostA, { session: a }));
     now += 60_001;
-    assert.deepEqual(store.listSessions().find(row => row.subscription.id === sessionKey(a))!.entities, [entityRef('FLEET', 8)]);
     assert.equal(ok(store.entity(entityRef('held').id, 0, 10)).entity.type, 2);
     assert.equal(store.entity(entityRef('claim only').id, 0, 10).ok, false);
   } finally { store.close(); }
@@ -645,7 +635,7 @@ test('a non-UUID session registers beside Pi UUIDs; namespace and host checks st
     const upper = { ...a, sessionId: a.sessionId.toUpperCase() };
     assert.equal(sessionKey(upper), `fleet:${a.sessionId}`);
     assert.notEqual(sessionKey(agent), sessionKey(lower));
-    const registered = ok(store.register(hostA, { session: agent, displayName: 'Tracer' }));
+    const registered = ok(store.register(hostA, { session: agent }));
     assert.equal(registered.subscription.id, `fleet:${agent.sessionId}`);
     assert.deepEqual(registered.subscription.session, agent);
     assert.equal(registered.rank, 1);
@@ -763,14 +753,14 @@ test('a cursor update lost after commit replays the next message, which is re-of
   }
 });
 
-test('registration, heartbeat, and renaming do not wake store subscribers', () => {
+test('registration, heartbeat, and a version 1 displayName do not wake store subscribers', () => {
   const store = createCoordinatorStore(':memory:', 'fleet');
   try {
     const woken: Array<string | undefined> = [];
     store.subscribe(hostId => { woken.push(hostId); });
     ok(store.register(hostA, { session: a }));
     ok(store.register(hostA, { session: a }));
-    ok(store.register(hostA, { session: a, displayName: 'Ay' }));
+    ok(store.register(hostA, v1Registration(a, 'Ay')));
     ok(store.register(hostB, { session: c }));
     assert.deepEqual(woken, []);
     ok(store.send(hostA, a, { recipient: sessionKey(c), body: 'still wakes' }));
@@ -895,5 +885,66 @@ test('claim and release reject whitespace-only keys in the store itself', () => 
     assert.deepEqual(store.listClaims(), []);
     assert.equal(ok(store.claim(hostA, ' padded ', sessionKey(a), 60)).acquired, true);
     assert.equal(ok(store.releaseClaim(hostA, ' padded ', sessionKey(a))), true);
+  } finally { store.close(); }
+});
+
+test('a version 1 displayName is accepted and ignored: not stored, not returned, and no entity is created', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  try {
+    const plain = ok(store.register(hostA, { session: b }));
+    const named = ok(store.register(hostA, v1Registration(a, '[[0:FLEET]]')));
+    assert.deepEqual(Object.keys(named).sort(), Object.keys(plain).sort());
+    assert.deepEqual(Object.keys(named).sort(), ['lastSeenAt', 'rank', 'subscription']);
+    assert.equal(ok(store.register(hostA, v1Registration(a, 'Renamed'))).subscription.id, sessionKey(a));
+    for (const row of store.listSessions()) assert.deepEqual(Object.keys(row).sort(), ['lastSeenAt', 'rank', 'subscription']);
+    assert.equal(store.entity(entityRef('FLEET').id, 0, 10).ok, false, 'a display name creates no entity');
+    // A v1 field of the wrong shape is still an invalid request.
+    assert.equal(store.register(hostA, { session: a, displayName: 7 } as unknown as Registration).ok, false);
+  } finally { store.close(); }
+  const db = new DatabaseSync(path);
+  try {
+    assert.deepEqual(db.prepare('SELECT display_name FROM sessions').all().map(row => row.display_name), [null, null]);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM entity_sources').get() as { n: number }).n, 0);
+  } finally { db.close(); }
+});
+
+test('opening a database removes session entity sources left by display names; the column stays and the entities age out', async t => {
+  const path = await fileStore(t);
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  let store = createCoordinatorStore(path, 'fleet');
+  ok(store.register(hostA, { session: a }));
+  store.close();
+  // What an older coordinator wrote for {"displayName":"[[3:FLEET]]"}.
+  const fleet = entityRef('FLEET', 3);
+  let db = new DatabaseSync(path);
+  try {
+    db.prepare('UPDATE sessions SET display_name = ? WHERE id = ?').run('[[3:FLEET]]', sessionKey(a));
+    db.prepare('INSERT INTO entities (id, type, label, last_seen_at) VALUES (?, ?, ?, ?)').run(fleet.id, fleet.type, fleet.label, now);
+    db.prepare("INSERT INTO entity_sources (entity_id, kind, source_key) VALUES (?, 'session', ?)").run(fleet.id, sessionKey(a));
+  } finally { db.close(); }
+  for (let open = 0; open < 2; open++) {
+    store = createCoordinatorStore(path, 'fleet');
+    try {
+      const [row] = store.listSessions();
+      assert.deepEqual(Object.keys(row!).sort(), ['lastSeenAt', 'rank', 'subscription'], 'no name or name entities on the board');
+      assert.deepEqual(ok(store.entity(fleet.id, 0, 10)).entity, fleet, 'the entity itself is kept until retention');
+    } finally { store.close(); }
+  }
+  db = new DatabaseSync(path);
+  try {
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM entity_sources').get() as { n: number }).n, 0);
+    assert.equal((db.prepare('SELECT display_name FROM sessions').get() as { display_name: string }).display_name, '[[3:FLEET]]', 'the column is kept, not rewritten');
+  } finally { db.close(); }
+  // The session stays live by heartbeating; without its source the entity ages out.
+  store = createCoordinatorStore(path, 'fleet');
+  try {
+    for (let beat = 0; beat < 2; beat++) {
+      now += 4 * 24 * 60 * 60 * 1000;
+      ok(store.register(hostA, { session: a }));
+    }
+    assert.equal(store.listSessions().length, 1);
+    assert.equal(store.entity(fleet.id, 0, 10).ok, false);
   } finally { store.close(); }
 });

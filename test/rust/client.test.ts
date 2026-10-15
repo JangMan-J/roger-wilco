@@ -93,6 +93,7 @@ test('the Rust client interoperates with the TypeScript coordinator and daemon',
   // Registration through the daemon socket, from the contract alone.
   const registered = JSON.parse(await run(['register'], env)) as { ok: boolean };
   assert.equal(registered.ok, true);
+  await assert.rejects(run(['register', 'Alice'], env), /takes no name/);
 
   assert.equal(store.register({ hostId }, { session: peer }).ok, true);
   // Send through the coordinator HTTP API, as the bound Rust session.
