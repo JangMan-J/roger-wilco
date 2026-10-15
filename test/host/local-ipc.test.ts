@@ -15,7 +15,7 @@ import { createHostDaemon, createDaemonInbox as createHostInbox, LocalHostInbox 
 import { listenLocal } from '../../src/host/ipc.ts';
 import {
   MAX_JSON_BYTES, ROUTES, sessionKey,
-  type HostConfig, type HostInbox, type Message, type Outcome, type RegistrationResult, type DeliveryEvidence, type SessionAddress, type StreamFrame,
+  type HostConfig, type HostInbox, type Message, type Outcome, type Registration, type RegistrationResult, type DeliveryEvidence, type SessionAddress, type StreamFrame,
 } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
@@ -247,9 +247,9 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
     if (req.url === ROUTES.register) {
       let body = '';
       for await (const chunk of req) body += chunk;
-      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      const registration = JSON.parse(body) as Registration;
       if (blockers.some(item => item.sessionId === registration.session.sessionId)) await delay(6_000);
-      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1 } }));
       return;
     }
     if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
@@ -271,7 +271,7 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
     await inbox.receive(frame(1, b));
     const started = Date.now();
     let settled = false;
-    const waiting = client.awaitRegistration({ session: b, displayName: 'Target' });
+    const waiting = client.awaitRegistration({ session: b });
     void waiting.then(() => { settled = true; }, () => { settled = true; });
     await waitFor(async () => await count(path, registrationSql) === 3);
     assert.equal((await client.renew(b, 'rt-b')).ok, true);
@@ -284,15 +284,20 @@ test('awaitRegistration does not block renew, pending, or ack while the daemon a
     assert.equal(client.authority!(), token);
     const registered = await waiting;
     assert.equal(registered.ok, true);
-    if (registered.ok) assert.equal(registered.value.displayName, 'Target');
+    if (registered.ok) assert.equal(registered.value.subscription.id, sessionKey(b));
     assert.equal((await client.renew(b, 'rt-b')).ok, true, 'lease survives the long wait');
   } finally { await daemon.stop(); await run; }
 });
 
-test('a stale snapshotted attempt cannot complete a newer identity request', { timeout: 20_000 }, async t => {
+test('a stale snapshot of an older daemon\'s named row is skipped; the canonical row posts once', { timeout: 20_000 }, async t => {
   const { path, inbox, config } = rig(t);
   await inbox.enqueueRegistration({ session: a });
-  await inbox.enqueueRegistration({ session: b, displayName: 'Old name' });
+  // A row an older daemon queued for b, with its version 1 name.
+  const writer = new DatabaseSync(path);
+  try {
+    writer.prepare('INSERT INTO inbox_registrations (session_key, registration_json) VALUES (?, ?)')
+      .run(sessionKey(b), JSON.stringify({ session: b, displayName: 'Old name' }));
+  } finally { writer.close(); }
   let releaseA = () => {};
   const gateA = new Promise<void>(resolve => { releaseA = resolve; });
   let aStarted = () => {};
@@ -301,16 +306,15 @@ test('a stale snapshotted attempt cannot complete a newer identity request', { t
   const gateFresh = new Promise<void>(resolve => { releaseFresh = resolve; });
   let freshStarted = () => {};
   const freshAttempt = new Promise<void>(resolve => { freshStarted = resolve; });
-  const applied = new Map<string, string | undefined>();
+  const bodies: unknown[] = [];
   const server = createServer(async (req, res) => {
     if (req.url === ROUTES.register) {
       let body = '';
       for await (const chunk of req) body += chunk;
-      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      const registration = JSON.parse(body) as Registration;
       if (registration.session.sessionId === a.sessionId) { aStarted(); await gateA; }
-      if (registration.displayName === 'New name') { freshStarted(); await gateFresh; }
-      applied.set(sessionKey(registration.session), registration.displayName);
-      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      else { bodies.push(JSON.parse(body)); freshStarted(); await gateFresh; }
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 }, rank: 1 } }));
       return;
     }
     if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
@@ -330,52 +334,67 @@ test('a stale snapshotted attempt cannot complete a newer identity request', { t
     const client = clientFor(t, path);
     assert.equal((await client.bind(b, 'rt-b')).ok, true);
     let settled = false;
-    const waiting = client.awaitRegistration({ session: b, displayName: 'New name' });
+    const waiting = client.awaitRegistration({ session: b });
     void waiting.then(() => { settled = true; }, () => { settled = true; });
-    await waitFor(() => inbox.registrations().some(row => row.session_key === sessionKey(b) && row.registration_json.includes('New name')));
+    await waitFor(() => inbox.registrations().some(row => row.session_key === sessionKey(b) && row.registration_json === JSON.stringify({ session: b })));
     releaseA();
-    await freshAttempt; // the stale Old snapshot was skipped, never posted; the New attempt is held
-    assert.equal((await client.renew(b, 'rt-b')).ok, true, 'socket round trip while the New attempt is held');
-    assert.equal(settled, false, 'no stale result may settle the New name waiter');
-    assert.equal(applied.get(sessionKey(b)), undefined, 'stale Old name is never applied');
+    await freshAttempt; // the stale snapshot was skipped, never posted; the canonical attempt is held
+    assert.equal((await client.renew(b, 'rt-b')).ok, true, 'socket round trip while the canonical attempt is held');
+    assert.equal(settled, false, 'no stale result may settle the waiter');
     releaseFresh();
     const registered = await waiting;
     assert.equal(registered.ok, true);
-    if (registered.ok) assert.equal(registered.value.displayName, 'New name');
-    assert.equal(applied.get(sessionKey(b)), 'New name');
+    assert.deepEqual(bodies, [{ session: b }], 'b posts once, without a name');
     assert.equal(inbox.registrations().some(row => row.session_key === sessionKey(b)), false);
   } finally { releaseA(); releaseFresh(); await daemon.stop(); await run; }
 });
 
-test('a waiter replaced by a newer registration settles as superseded, not with the newer result', async t => {
+test('a version 1 waiter that sends displayName is an ordinary waiter: a later named request neither supersedes it nor changes the queue', async t => {
   const { path, inbox, config } = rig(t);
   const ipc = await listenLocal(config, inbox);
   t.after(() => ipc.close());
-  const client = clientFor(t, path);
-  assert.equal((await client.bind(a, 'rt-a')).ok, true);
-  const waiting = client.awaitRegistration({ session: a, displayName: 'Old name' });
-  void waiting.catch(() => {});
+  // Raw frames, as a version 1 client sends them; the current client never sends a name.
+  const raw = await sock(path);
+  t.after(() => { raw.destroy(); });
+  writeFrame(raw, 1, 'awaitRegistration', { registration: { session: a, displayName: 'Old name' } });
+  const waiting = readResult(raw, 1);
   await waitFor(async () => await count(path, registrationSql) === 1);
-  await client.enqueueRegistration({ session: a, displayName: 'New name' });
-  assert.deepEqual(await waiting, { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' });
+  const [queued] = inbox.registrations();
+  assert.equal(queued!.registration_json, JSON.stringify({ session: a }));
+  const enqueued = readResult(raw, 2);
+  writeFrame(raw, 2, 'enqueueRegistration', { registration: { session: a, displayName: 'New name' } });
+  assert.deepEqual(await enqueued, { ok: true, value: null });
+  assert.deepEqual(inbox.registrations(), [queued], 'the same canonical row and generation');
+  const value: RegistrationResult = { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 };
+  inbox.completeRegistration(queued!);
+  inbox.reportRegistration(sessionKey(a), queued!.registration_json, queued!.generation, { ok: true, value });
+  assert.deepEqual(await waiting, { ok: true, value });
 });
 
-test('a bare waiter follows a newer explicit registration instead of settling superseded', async t => {
+test('a waiter follows a newer generation of its session row and ignores the older result', async t => {
   const { path, inbox, config } = rig(t);
   const ipc = await listenLocal(config, inbox);
   t.after(() => ipc.close());
   const client = clientFor(t, path);
   assert.equal((await client.bind(a, 'rt-a')).ok, true);
+  let settled = false;
   const waiting = client.awaitRegistration({ session: a });
-  void waiting.catch(() => {});
+  void waiting.then(() => { settled = true; }, () => { settled = true; });
   await waitFor(async () => await count(path, registrationSql) === 1);
-  await client.enqueueRegistration({ session: a, displayName: 'New name' });
-  const row = inbox.registrations()[0]!;
-  inbox.reportRegistration(sessionKey(a), row.registration_json, row.generation,
-    { ok: true, value: { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, displayName: 'New name' } });
-  const registered = await waiting;
-  assert.equal(registered.ok, true);
-  if (registered.ok) assert.equal(registered.value.displayName, 'New name');
+  const older = inbox.registrations()[0]!;
+  inbox.completeRegistration(older); // consumed before its result is reported
+  await client.enqueueRegistration({ session: a });
+  const newer = inbox.registrations()[0]!;
+  assert.ok(newer.generation > older.generation);
+  inbox.reportRegistration(sessionKey(a), older.registration_json, older.generation, { ok: false, error: 'owner_conflict', message: 'older' });
+  await delay(100);
+  assert.equal(settled, false, 'the waiter follows the newer generation');
+  // A version 1 daemon could add displayName and session entities; the client drops them.
+  const value: RegistrationResult = { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 2 };
+  inbox.completeRegistration(newer);
+  inbox.reportRegistration(sessionKey(a), newer.registration_json, newer.generation,
+    { ok: true, value: { ...value, displayName: 'Old name', entities: [] } as RegistrationResult });
+  assert.deepEqual(await waiting, { ok: true, value });
 });
 
 test('registered event preserves the coordinator failure code to the client', async t => {
@@ -548,15 +567,15 @@ test('SIGKILL after inbox commit before hint survives stale-socket recovery with
 
 test('awaitRegistration for a session registered in this daemon lifetime makes no coordinator POST', { timeout: 20_000 }, async t => {
   const { path, inbox, config } = rig(t);
-  const posts: Array<string | undefined> = [];
+  const posts: unknown[] = [];
   const server = createServer(async (req, res) => {
     if (req.url === ROUTES.register) {
       let body = '';
       for await (const chunk of req) body += chunk;
-      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
-      posts.push(registration.displayName);
+      posts.push(JSON.parse(body));
+      const registration = JSON.parse(body) as Registration;
       res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 },
-        rank: 1, lastSeenAt: posts.length, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+        rank: 1, lastSeenAt: posts.length } }));
       return;
     }
     if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
@@ -588,21 +607,24 @@ test('awaitRegistration for a session registered in this daemon lifetime makes n
     // A heartbeat still posts, and its result answers later waits.
     await client.enqueueRegistration({ session: a });
     await waitFor(async () => posts.length === 2 && await count(path, registrationSql) === 0);
-    assert.equal(lastSeen(await client.awaitRegistration({ session: a })), 2);
+    const second = await client.awaitRegistration({ session: a });
+    assert.equal(lastSeen(second), 2);
     assert.equal(posts.length, 2);
-    // A new explicit display name posts; the registered name does not.
-    const named = await client.awaitRegistration({ session: a, displayName: 'Named' });
-    assert.equal(named.ok && named.value.displayName, 'Named');
-    assert.equal(posts.length, 3);
-    assert.deepEqual(await client.awaitRegistration({ session: a, displayName: 'Named' }), named);
-    assert.deepEqual(await client.awaitRegistration({ session: a }), named);
-    assert.equal(posts.length, 3);
+    // A version 1 client's displayName does not bypass the shortcut, and is never posted.
+    const raw = await sock(path);
+    t.after(() => { raw.destroy(); });
+    const named = readResult(raw, 1);
+    writeFrame(raw, 1, 'awaitRegistration', { registration: { session: a, displayName: 'Named' } });
+    assert.deepEqual(await named, second);
+    assert.equal(posts.length, 2);
+    assert.equal(await count(path, registrationSql), 0);
     // A coordinator refusal withdraws the result; an outage keeps it.
     inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'temporarily_unavailable', message: 'offline' });
-    assert.deepEqual(await client.awaitRegistration({ session: a }), named);
+    assert.deepEqual(await client.awaitRegistration({ session: a }), second);
     inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'owner_conflict', message: 'moved' });
     assert.equal((await client.awaitRegistration({ session: a })).ok, true);
-    assert.equal(posts.length, 4);
+    assert.equal(posts.length, 3);
+    assert.ok(posts.every(body => JSON.stringify(body) === JSON.stringify({ session: a })), 'every POST carries the session only');
     // A new daemon lifetime registers again.
     await daemon.stop(); await run;
     await inbox.close();
@@ -611,28 +633,26 @@ test('awaitRegistration for a session registered in this daemon lifetime makes n
     run = daemon.start(new AbortController().signal);
     await modeReady(path);
     assert.equal((await clientFor(t, path).awaitRegistration({ session: a })).ok, true);
-    assert.equal(posts.length, 5);
+    assert.equal(posts.length, 4);
   } finally { await daemon.stop(); await run; }
 });
 
-test('a rename back to the registered name while a rename is in flight posts again and wins', { timeout: 20_000 }, async t => {
+test('an await while a heartbeat is in flight waits for that attempt, not the remembered result', { timeout: 20_000 }, async t => {
   const { path, inbox, config } = rig(t);
-  const posts: Array<string | undefined> = [];
-  let applied: string | undefined;
-  let releaseTwo = () => {};
-  const gateTwo = new Promise<void>(resolve => { releaseTwo = resolve; });
-  let twoStarted = () => {};
-  const twoPosted = new Promise<void>(resolve => { twoStarted = resolve; });
+  let posts = 0;
+  let releaseSecond = () => {};
+  const gateSecond = new Promise<void>(resolve => { releaseSecond = resolve; });
+  let secondStarted = () => {};
+  const secondPosted = new Promise<void>(resolve => { secondStarted = resolve; });
   const server = createServer(async (req, res) => {
     if (req.url === ROUTES.register) {
       let body = '';
       for await (const chunk of req) body += chunk;
-      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
-      posts.push(registration.displayName);
-      if (registration.displayName === 'Two') { twoStarted(); await gateTwo; }
-      applied = registration.displayName;
+      const registration = JSON.parse(body) as Registration;
+      const seen = ++posts;
+      if (seen === 2) { secondStarted(); await gateSecond; }
       res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 },
-        rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+        rank: 1, lastSeenAt: seen } }));
       return;
     }
     if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
@@ -646,26 +666,22 @@ test('a rename back to the registered name while a rename is in flight posts aga
   config.coordinatorUrl = `http://127.0.0.1:${address.port}`;
   const daemon = createHostDaemon(config, inbox);
   const run = daemon.start(new AbortController().signal);
+  const lastSeen = (result: Outcome<unknown>) => result.ok ? (result.value as RegistrationResult).lastSeenAt : undefined;
   try {
     await modeReady(path);
     const client = clientFor(t, path);
-    const one = await client.awaitRegistration({ session: a, displayName: 'One' });
-    assert.equal(one.ok && one.value.displayName, 'One');
-    const two = client.awaitRegistration({ session: a, displayName: 'Two' });
-    void two.catch(() => {});
-    await twoPosted; // 'Two' is in flight at the coordinator
-    let revertSettled = false;
-    const revert = client.awaitRegistration({ session: a, displayName: 'One' });
-    void revert.then(() => { revertSettled = true; }, () => { revertSettled = true; });
-    await waitFor(() => revertSettled || inbox.registrations().some(row => row.registration_json.includes('"One"')));
-    assert.equal(revertSettled, false, 'the revert is not answered from the remembered result while Two is in flight');
-    releaseTwo();
-    assert.deepEqual(await two, { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' });
-    const reverted = await revert;
-    assert.equal(reverted.ok && reverted.value.displayName, 'One');
-    assert.deepEqual(posts, ['One', 'Two', 'One']);
-    assert.equal(applied, 'One', 'the coordinator ends on the name the caller was told succeeded');
-  } finally { releaseTwo(); await daemon.stop(); await run; }
+    assert.equal(lastSeen(await client.awaitRegistration({ session: a })), 1);
+    await client.enqueueRegistration({ session: a });
+    await secondPosted; // the heartbeat is in flight at the coordinator
+    let settled = false;
+    const waiting = client.awaitRegistration({ session: a });
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await delay(150);
+    assert.equal(settled, false, 'not answered from the remembered result while an attempt is in flight');
+    releaseSecond();
+    assert.equal(lastSeen(await waiting), 2);
+    assert.equal(posts, 2);
+  } finally { releaseSecond(); await daemon.stop(); await run; }
 });
 
 test('a queued registration keeps awaitRegistration off the remembered result, including during an outage', async t => {
@@ -675,34 +691,32 @@ test('a queued registration keeps awaitRegistration off the remembered result, i
   const client = clientFor(t, path);
   assert.equal((await client.bind(a, 'rt-a')).ok, true);
   const key = sessionKey(a);
-  const result = (displayName: string): Outcome<RegistrationResult> => ({ ok: true, value: { subscription: { id: key, session: a, hostId: 'host-a', cursor: 0 }, rank: 1, displayName } });
-  const nameOf = (outcome: Outcome<unknown>) => outcome.ok ? (outcome.value as RegistrationResult).displayName : undefined;
-  inbox.reportRegistration(key, JSON.stringify({ session: a, displayName: 'One' }), 0, result('One'));
-  assert.equal(nameOf(await client.awaitRegistration({ session: a })), 'One', 'nothing pending: answered from memory');
-  // A bare await behind a queued rename waits for that rename.
-  await client.enqueueRegistration({ session: a, displayName: 'Two' });
-  let bareSettled = false;
-  const bare = client.awaitRegistration({ session: a });
-  void bare.then(() => { bareSettled = true; }, () => { bareSettled = true; });
+  const json = JSON.stringify({ session: a });
+  const result = (lastSeenAt: number): Outcome<RegistrationResult> => ({ ok: true, value: { subscription: { id: key, session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt } });
+  const seenOf = (outcome: Outcome<unknown>) => outcome.ok ? (outcome.value as RegistrationResult).lastSeenAt : undefined;
+  inbox.reportRegistration(key, json, 0, result(1));
+  assert.equal(seenOf(await client.awaitRegistration({ session: a })), 1, 'nothing pending: answered from memory');
+  // An await behind a queued heartbeat waits for that heartbeat.
+  await client.enqueueRegistration({ session: a });
+  let settled = false;
+  const behind = client.awaitRegistration({ session: a });
+  void behind.then(() => { settled = true; }, () => { settled = true; });
   await delay(150);
-  assert.equal(bareSettled, false, 'a bare await does not return the old name while a rename is queued');
+  assert.equal(settled, false, 'an await does not return the old result while a heartbeat is queued');
   let row = inbox.registrations()[0]!;
   inbox.completeRegistration(row);
-  inbox.reportRegistration(key, row.registration_json, row.generation, result('Two'));
-  assert.equal(nameOf(await bare), 'Two');
-  // An outage leaves 'Three' queued and keeps the remembered 'Two'; a revert
-  // to 'Two' replaces the queued row instead of answering from memory.
-  await client.enqueueRegistration({ session: a, displayName: 'Three' });
+  inbox.reportRegistration(key, row.registration_json, row.generation, result(2));
+  assert.equal(seenOf(await behind), 2);
+  // An outage leaves the heartbeat queued and keeps the remembered result in
+  // memory; an await joins the queued row and reports its last attempt, not
+  // the remembered success.
+  await client.enqueueRegistration({ session: a });
   row = inbox.registrations()[0]!;
-  inbox.reportRegistration(key, row.registration_json, row.generation, { ok: false, error: 'temporarily_unavailable', message: 'offline' });
-  let revertSettled = false;
-  const revert = client.awaitRegistration({ session: a, displayName: 'Two' });
-  void revert.then(() => { revertSettled = true; }, () => { revertSettled = true; });
-  await waitFor(() => revertSettled || inbox.registrations().some(r => r.registration_json.includes('"Two"')));
-  assert.equal(revertSettled, false, 'the revert is queued, not answered from memory');
-  row = inbox.registrations()[0]!;
-  assert.ok(row.registration_json.includes('"Two"'), 'the revert replaced the queued Three');
+  const offline: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'offline' };
+  inbox.reportRegistration(key, row.registration_json, row.generation, offline);
+  assert.deepEqual(await client.awaitRegistration({ session: a }), offline);
+  assert.deepEqual(inbox.registrations(), [row], 'the row stays queued for the retry');
   inbox.completeRegistration(row);
-  inbox.reportRegistration(key, row.registration_json, row.generation, result('Two'));
-  assert.equal(nameOf(await revert), 'Two');
+  inbox.reportRegistration(key, row.registration_json, row.generation, result(3));
+  assert.equal(seenOf(await client.awaitRegistration({ session: a })), 3, 'nothing pending again: answered from memory');
 });

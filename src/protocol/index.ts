@@ -21,7 +21,7 @@ export const ROUTES = {
 export type Visibility = 'private' | 'public';
 /** `sessionId` is one opaque session id. */
 export type SessionAddress = { namespace: string; sessionId: string };
-export type SessionKey = string; // `${namespace}:${canonical session id}`; one colon; never a display name or host ID
+export type SessionKey = string; // `${namespace}:${canonical session id}`; one colon; never an entity label or host ID
 export type DeliveryId = string; // `${namespace}:msg:${positive SQLite message id}`
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type FailureCode = 'invalid_request' | 'unauthorized' | 'unknown_host' | 'not_found' | 'owner_conflict' | 'temporarily_unavailable';
@@ -39,8 +39,9 @@ export type Message = {
   visibility: Visibility; // public is metadata only, not confidentiality
 };
 export type Subscription = { id: SessionKey; session: SessionAddress; hostId: string; cursor: number };
-export type Registration = { session: SessionAddress; displayName?: string };
-export type RegistrationResult = { subscription: Subscription; rank: number; displayName?: string; lastSeenAt?: number; entities?: EntityRef[] };
+/** A registration names the session only. Call signs are entities that consumers associate with an address. */
+export type Registration = { session: SessionAddress };
+export type RegistrationResult = { subscription: Subscription; rank: number; lastSeenAt?: number };
 export type Claim = { key: string; owner: SessionKey; note: string | null; claimedAt: number; expiresAt: number | null; entities?: EntityRef[] };
 export type HostPrincipal = { hostId: string }; // resolved from bearer credential, never from request body
 export type HostConfig = { coordinatorUrl: string; hostId: string; credential: string; inboxPath: string };
@@ -189,9 +190,17 @@ export function isSessionKey(value: unknown): value is SessionKey {
   const address = { namespace: value.slice(0, colon), sessionId: value.slice(colon + 1) };
   return colon > 0 && isSessionAddress(address) && value === sessionKey(address);
 }
+/**
+ * Version 1 peers may still send `displayName`; it is accepted when it has its old
+ * shape and ignored. Use `ownRegistration` before storing or forwarding.
+ */
 export function isRegistration(value: unknown): value is Registration {
   return record(value) && hasKeys(value, ['session', 'displayName']) && isSessionAddress(value.session) &&
     (value.displayName === undefined || (typeof value.displayName === 'string' && value.displayName.length <= 200));
+}
+/** The registration without fields from older peers. */
+export function ownRegistration(registration: Registration): Registration {
+  return { session: registration.session };
 }
 export function isMessageInput(value: unknown): value is MessageInput {
   return record(value) && hasKeys(value, ['recipient', 'body', 'data', 'visibility']) &&
@@ -240,12 +249,21 @@ export function isEntityRef(value: unknown): value is EntityRef {
     Number.isInteger(value.type) && (value.type as number) >= 0 && (value.type as number) <= 255 &&
     typeof value.label === 'string' && value.label.length > 0 && value.label.length <= 256;
 }
+/**
+ * A version 1 coordinator or daemon may still return `displayName` and session
+ * `entities`; they are accepted when they have their old shape and ignored.
+ * Use `ownRegistrationResult` before storing or returning.
+ */
 export function isRegistrationResult(value: unknown): value is RegistrationResult {
-  return record(value) && hasKeys(value, ['subscription', 'rank', 'displayName', 'lastSeenAt', 'entities']) &&
+  return record(value) && hasKeys(value, ['subscription', 'rank', 'lastSeenAt', 'displayName', 'entities']) &&
     isSubscription(value.subscription) && Number.isInteger(value.rank) && (value.rank as number) >= 1 && (value.rank as number) <= 5 &&
-    (value.displayName === undefined || (typeof value.displayName === 'string' && value.displayName.length <= 200)) &&
     (value.lastSeenAt === undefined || (Number.isSafeInteger(value.lastSeenAt) && (value.lastSeenAt as number) >= 0)) &&
+    (value.displayName === undefined || (typeof value.displayName === 'string' && value.displayName.length <= 200)) &&
     (value.entities === undefined || (Array.isArray(value.entities) && value.entities.every(isEntityRef)));
+}
+/** The registration result without fields from older peers. */
+export function ownRegistrationResult(result: RegistrationResult): RegistrationResult {
+  return { subscription: result.subscription, rank: result.rank, ...(result.lastSeenAt === undefined ? {} : { lastSeenAt: result.lastSeenAt }) };
 }
 export function isStreamFrame(value: unknown): value is StreamFrame {
   return record(value) && hasKeys(value, ['type', 'subscriptionId', 'message']) &&

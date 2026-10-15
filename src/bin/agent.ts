@@ -7,7 +7,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (process.argv.includes('--help')) {
     console.log(`Usage: roger-wilco-agent <config.json> <register|send|serve> [recipient] [body]
 Config: coordinatorUrl, credential, namespace, sessionId, inboxPath, evidencePath
-Optional: runtimeId, displayName
+Optional: runtimeId
 sessionId is one opaque token, for example tracer-1.`);
   } else {
     try { await runAgent(process.argv.slice(2)); }

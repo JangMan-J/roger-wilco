@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createHostDaemon, createDaemonInbox as createHostInbox, type LocalHostInbox } from '../../src/host/index.ts';
-import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type Message, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
+import { ROUTES, MAX_STREAM_EVENT_BYTES, sessionKey, type Message, type Registration, type RegistrationResult, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
 const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
@@ -296,9 +296,7 @@ test('stream fetch without response headers times out and reconnects', async t =
 
 test('a failing first registration does not starve a later session in the same pass', async t => {
   const { inbox, path } = fixture(t);
-  await inbox.enqueueRegistration({ session: a, displayName: 'Queued A' });
-  await inbox.enqueueRegistration({ session: a }); // bare heartbeat must keep the explicit name
-  assert.match(inbox.registrations()[0]!.registration_json, /Queued A/);
+  await inbox.enqueueRegistration({ session: a });
   await inbox.enqueueRegistration({ session: b });
   const posts: string[] = [];
   const results: Array<{ key: string; ok: boolean; error?: string }> = [];
@@ -332,6 +330,50 @@ test('a failing first registration does not starve a later session in the same p
     assert.deepEqual(inbox.registrations().map(row => row.session_key), [sessionKey(a)], 'failed row remains queued, completed row is gone');
     assert.deepEqual(results.find(row => row.key === sessionKey(b)), { key: sessionKey(b), ok: true });
     assert.deepEqual(results.find(row => row.key === sessionKey(a)), { key: sessionKey(a), ok: false, error: 'owner_conflict' }, 'coordinator code is preserved');
+  } finally { await daemon.stop(); await run; }
+});
+
+test('a version 1 displayName is dropped at enqueue, an older daemon\'s queued name is not posted, and a v1 coordinator\'s name is not kept', async t => {
+  const { inbox, path } = fixture(t);
+  await inbox.enqueueRegistration({ session: a, displayName: 'Named A' } as Registration);
+  assert.deepEqual(inbox.registrations().map(row => row.registration_json), [JSON.stringify({ session: a })]);
+  await inbox.close();
+  // A row an older daemon queued for b, with its name.
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare('INSERT INTO inbox_registrations (session_key, registration_json) VALUES (?, ?)')
+      .run(sessionKey(b), JSON.stringify({ session: b, displayName: 'Named B' }));
+  } finally { db.close(); }
+  const reopened = createHostInbox(path);
+  t.after(() => reopened.close());
+  const bodies: unknown[] = [];
+  const results: RegistrationResult[] = [];
+  reopened.onRegistrationResult((_key, _json, _generation, result) => { if (result.ok) results.push(result.value); });
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let payload = '';
+      for await (const chunk of req) payload += chunk;
+      const { session } = JSON.parse(payload) as { session: SessionAddress };
+      bodies.push(JSON.parse(payload));
+      // A version 1 coordinator returns the stored name and its entities.
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(session), session, hostId: 'host-a', cursor: 0 }, rank: 1,
+        lastSeenAt: 1, displayName: 'Old name', entities: [{ id: 'fleet:entity:00:09eec042175ea2041754a4d76bc2f603', type: 0, label: 'fix-parser' }] } }));
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const daemon = createHostDaemon({ coordinatorUrl: `http://127.0.0.1:${address.port}`, hostId: 'host-a', credential: 'secret', inboxPath: path }, reopened);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await waitFor(() => results.length === 2);
+    assert.deepEqual(bodies, [{ session: a }, { session: b }]);
+    for (const result of results) assert.deepEqual(Object.keys(result).sort(), ['lastSeenAt', 'rank', 'subscription']);
+    assert.deepEqual(Object.keys(reopened.registeredResult(sessionKey(b))!).sort(), ['lastSeenAt', 'rank', 'subscription']);
   } finally { await daemon.stop(); await run; }
 });
 

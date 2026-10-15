@@ -6,7 +6,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import {
-  ROUTES, isRegistration, sessionKey,
+  ROUTES, sessionKey,
   type HostInbox, type Message, type Outcome, type SessionAddress,
 } from '../protocol/index.ts';
 import type { MuseConfig } from './config.ts';
@@ -144,8 +144,7 @@ export function createMuseAdapter(harness: MuseHarness, options: MuseAdapterOpti
       if (!rt || rt.stopped || !rt.bound) return error('Roger-Wilco session is not bound');
       let changed = sessionChange(rt);
       if (changed) return error(changed);
-      const registration = route === ROUTES.register && isRegistration(body) ? body : { session: rt.session };
-      const registered = await rt.inbox.awaitRegistration(registration);
+      const registered = await rt.inbox.awaitRegistration({ session: rt.session });
       if (!registered.ok) return registered;
       if (runtime !== rt || rt.stopped) return error('Session changed');
       changed = sessionChange(rt);

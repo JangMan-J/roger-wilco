@@ -4,7 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { listenLocal } from './ipc.ts';
 import {
-  isDeliveryEvidence, isFailureCode, isMessage, isOutcome, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, isSubscription, outcomeValue, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
+  isDeliveryEvidence, isFailureCode, isMessage, isOutcome, isRegistration, isRegistrationResult, isSessionAddress, ownRegistration, ownRegistrationResult, isStreamFrame, isSubscription, outcomeValue, sessionKey, ROUTES, MAX_STREAM_EVENT_BYTES,
   type FailureCode, type HostConfig, type Message, type Outcome, type DeliveryEvidence, type RegistrationResult,
   type Registration, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
@@ -176,14 +176,11 @@ export class LocalHostInbox {
   }
   /** The result that answers an awaitRegistration without a coordinator
    * POST: the session registered successfully during this daemon's lifetime,
-   * the request names no display name other than the registered one, and no
-   * registration for the session is queued or in flight. A pending row would
-   * land at the coordinator after this answer, so the caller waits for it. */
-  registeredResult(registration: Registration): RegistrationResult | undefined {
-    const key = sessionKey(registration.session);
+   * and no registration for the session is queued or in flight. A pending row
+   * would land at the coordinator after this answer, so the caller waits for it. */
+  registeredResult(key: string): RegistrationResult | undefined {
     const result = this.registered.get(key);
     if (!result) return undefined;
-    if (registration.displayName !== undefined && registration.displayName !== result.displayName) return undefined;
     if (this.registrationAttempting.has(key)) return undefined;
     if (this.db.prepare('SELECT 1 FROM inbox_registrations WHERE session_key = ?').get(key)) return undefined;
     return result;
@@ -373,19 +370,9 @@ export class LocalHostInbox {
     const existing = this.db.prepare('SELECT registration_json FROM inbox_registrations WHERE session_key = ?')
       .get(key) as { registration_json: string } | undefined;
     const generation = () => this.registrationGenerations.get(key) ?? 0;
-    // A bare heartbeat must not discard a queued explicit displayName (the
-    // coordinator likewise preserves it); an explicit name replaces the old
-    // one. Preserve without rewriting: the stored bytes are the identity
-    // completeRegistration compares against, and a corrupt row falls through
-    // to the normal replace instead of throwing here.
-    if (existing && registration.displayName === undefined) {
-      try {
-        const queued: unknown = JSON.parse(existing.registration_json);
-        if (isRegistration(queued) && queued.displayName !== undefined)
-          return { registrationJson: existing.registration_json, generation: generation() };
-      } catch { /* replace the corrupt row below */ }
-    }
-    const registrationJson = JSON.stringify(registration);
+    // A version 1 peer's displayName is dropped here, so the queue holds one
+    // canonical row per session and an older daemon's named row is replaced.
+    const registrationJson = JSON.stringify(ownRegistration(registration));
     const result = this.db.prepare(`INSERT INTO inbox_registrations (session_key, registration_json) VALUES (?, ?)
       ON CONFLICT(session_key) DO UPDATE SET registration_json = excluded.registration_json
       WHERE registration_json <> excluded.registration_json`)
@@ -436,10 +423,11 @@ function storedMessage(json: string, hash?: string | null): Message {
   if (!isMessage(value)) throw new TypeError('Invalid stored message');
   return value;
 }
+/** A row queued by an older daemon can carry displayName; it is not posted. */
 function storedRegistration(json: string): Registration {
   const value: unknown = JSON.parse(json);
   if (!isRegistration(value)) throw new TypeError('Invalid stored registration');
-  return value;
+  return ownRegistration(value);
 }
 
 /**
@@ -627,7 +615,8 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
             if (!value || value.subscription.id !== row.session_key || value.subscription.hostId !== config.hostId)
               throw new Error('Invalid registration response');
             inbox.completeRegistration(row);
-            inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value });
+            // A version 1 coordinator can still return displayName and session entities.
+            inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value: ownRegistrationResult(value) });
           } catch (error) {
             // One bad row must not starve the rest of the pass; it stays queued.
             failed = true;

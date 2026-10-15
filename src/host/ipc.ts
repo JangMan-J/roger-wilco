@@ -53,7 +53,7 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
     let expiry: NodeJS.Timeout | undefined, pressure: NodeJS.Timeout | undefined;
     let unsubscribe: (() => void) | undefined;
     let unsubscribeRegistration: (() => void) | undefined;
-    type RegWaiter = { id: number; key: string; generation?: number; bare: boolean; timer?: NodeJS.Timeout; attempted: boolean;
+    type RegWaiter = { id: number; key: string; generation?: number; timer?: NodeJS.Timeout; attempted: boolean;
       offResult: () => void; offAttempt: () => void; offQueued: () => void };
     const regWaiters = new Map<number, RegWaiter>();
     socket.setTimeout(10_000, () => socket.destroy());
@@ -123,14 +123,13 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
         // the session: answer without a queue write or a coordinator POST.
         // Heartbeat enqueues still post, and their results replace this one,
         // so presence stays fresh.
-        const known = inbox.registeredResult(registration);
+        const known = inbox.registeredResult(key);
         if (known) return ok(known);
         const timedOut: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration timed out' };
-        const superseded: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' };
         // The inbox owns correlation: enqueue returns the effective queued
         // generation, and attempts/results carry it. Install the waiter
         // before enqueueing so a fast attempt cannot report unheard.
-        const waiter: RegWaiter = { id, key, bare: registration.displayName === undefined, attempted: false, offResult: () => {}, offAttempt: () => {}, offQueued: () => {} };
+        const waiter: RegWaiter = { id, key, attempted: false, offResult: () => {}, offAttempt: () => {}, offQueued: () => {} };
         waiter.offResult = inbox.onRegistrationResult((got, _json, generation, result) => {
           if (got === key && waiter.generation !== undefined && generation === waiter.generation) settleWaiter(waiter, result);
         });
@@ -141,11 +140,8 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
           waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_ATTEMPT_MS);
         });
         waiter.offQueued = inbox.onRegistrationQueued((got, _json, generation) => {
-          if (got !== key || waiter.generation === undefined || generation === waiter.generation) return;
-          // A bare waiter only needs the session registered, so it follows
-          // the newer generation; an explicit waiter is superseded.
-          if (waiter.bare) waiter.generation = generation;
-          else settleWaiter(waiter, superseded);
+          // A waiter only needs the session registered, so it follows the newer generation.
+          if (got === key && waiter.generation !== undefined) waiter.generation = generation;
         });
         waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_QUEUE_MS);
         regWaiters.set(id, waiter);
@@ -155,10 +151,7 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
         } catch (error) { settleWaiter(waiter); throw error; }
         // A newer enqueue may have landed while this one was in flight.
         const current = inbox.registrations().find(row => row.session_key === key);
-        if (current && current.generation !== waiter.generation) {
-          if (waiter.bare) waiter.generation = current.generation;
-          else settleWaiter(waiter, superseded);
-        }
+        if (current) waiter.generation = current.generation;
         // A fast completion may already have been reported while this enqueue
         // was in flight, before the waiter's generation was assigned and its
         // result listener could match it.

@@ -44,6 +44,8 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   const stale = { subscription: { id: `fleet:${randomUUID()}` }, rank: 3, lastSeenAt: now - 90_001 };
   const unknown = { subscription: { id: `fleet:${randomUUID()}` }, rank: 1 };
   const typed = entityReference('fleet', 'fix-parser', 255);
+  // A version 1 coordinator still lists displayName and session entities; roger_board drops them.
+  const recentV1 = { ...recent, displayName: 'Alice', entities: [entityReference('fleet', 'FLEET', 0)] };
   const mention = { version: 1, id: 'fleet:msg:3', sequence: 3, timestamp: now, sender: `fleet:${id}`,
     recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
   const requests = [];
@@ -67,7 +69,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
       return;
     }
     const url = new URL(req.url, 'http://localhost');
-    const value = req.url === '/v1/sessions' ? [recent, stale, unknown] :
+    const value = req.url === '/v1/sessions' ? [recentV1, stale, unknown] :
       req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] :
       url.pathname === '/v1/entities' ? { entity: typed, messages: [mention] } : { accepted: true };
     res.end(JSON.stringify({ ok: true, value }));
@@ -91,12 +93,21 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   assert.deepEqual((await first.tools.get('roger_board').execute('', { all: true }, undefined, undefined, ctx)).details,
     { ok: true, value: { sessions: [recent, stale, unknown], claims: [{ key: 'work', owner: `fleet:${id}` }] } });
   const tool = async (name, params) => (await first.tools.get(name).execute('', params, undefined, undefined, ctx)).details;
-  await tool('roger_identity', { displayName: '[[0:FLEET]]' });
-  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', sessionId: id }, displayName: '[[0:FLEET]]' });
-  assert.equal(requests.at(-1).path, '/v1/sessions/register');
+  const identityTool = first.tools.get('roger_identity');
+  assert.deepEqual(Object.keys(identityTool.parameters.properties), [], 'roger_identity takes no name');
+  assert.match(identityTool.description, /call sign/);
+  assert.match(identityTool.description, /roger_entity/);
   const registered = requests.length;
-  assert.equal((await tool('roger_identity', {})).ok, true);
+  const identity = await tool('roger_identity', {});
+  assert.equal(identity.ok, true);
+  assert.deepEqual(identity.value.subscription.session, { namespace: 'fleet', sessionId: id });
+  // A stray version 1 argument is ignored: no name is sent or returned.
+  const stray = await tool('roger_identity', { displayName: '[[0:FLEET]]' });
+  assert.deepEqual(stray, identity);
   assert.equal(requests.length, registered, 'a session registered in this daemon lifetime reads its registration without a POST');
+  const registrations = requests.filter(r => r.path === '/v1/sessions/register');
+  assert.ok(registrations.length > 0);
+  for (const r of registrations) assert.deepEqual(r.body, { session: { namespace: 'fleet', sessionId: id } }, 'registration carries the session only');
   await tool('roger_send', { recipient: '*', body: 'Hello', data: { priority: 2 }, visibility: 'public' });
   await tool('roger_inbox', { since: 2, limit: 20 });
   await tool('roger_claim', { key: 'work', ttlSeconds: 90 });
@@ -130,7 +141,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   state.sessionId = newId;
   assert.equal((await tool('roger_send', { recipient: '*', body: 'Stale runtime' })).ok, false);
   assert.equal((await tool('roger_entity', { label: 'fix-parser' })).ok, false);
-  assert.equal((await tool('roger_identity', { displayName: '[[99:FLEET]]' })).ok, false);
+  assert.equal((await tool('roger_identity', {})).ok, false);
   assert.equal(requests.length, before, 'old binding cannot act for a new session');
   await first.handlers.get('session_shutdown')({}, ctx);
   await first.handlers.get('session_start')({ reason: 'fork' }, ctx);
@@ -228,7 +239,9 @@ test('native slash commands show the board without a model turn and report unava
     const notice = notices.at(-1);
     assert.equal(notice.type, 'info');
     assert.ok(notice.message.includes(`Your address: fleet:${native.id}`));
-    assert.ok(notice.message.includes(`fleet:${native.id} (you) — host "host-a" — "Alice"`));
+    // The fake coordinator lists a version 1 displayName; the board does not show it.
+    assert.ok(notice.message.includes(`fleet:${native.id} (you) — host "host-a" — fleet (rank 1)`));
+    assert.ok(!notice.message.includes('Alice'));
     assert.ok(notice.message.includes(`"build" — fleet:${native.id}`));
     assert.ok(!notice.message.includes('offline-secret'));
     assert.ok(!notice.message.includes(staleId));
@@ -283,7 +296,7 @@ test('native rank picker persists another host’s session metadata through the 
   let store = createCoordinatorStore(database, 'fleet');
   t.after(() => store.close());
   const target = { namespace: 'fleet', sessionId: randomUUID() };
-  const registration = store.register({ hostId: 'host-b' }, { session: target, displayName: 'Other host' });
+  const registration = store.register({ hostId: 'host-b' }, { session: target });
   assert.equal(registration.ok, true);
   assert.equal(registration.value.rank, 1);
   const handler = createControlHandler(store, createHostAuthenticator({ 'host-a': 'offline-secret', 'host-b': 'other-secret' }));

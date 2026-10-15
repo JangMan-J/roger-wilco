@@ -7,13 +7,15 @@ import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runMuseCli } from '../../src/muse/cli.ts';
 import { createMuseAdapter, type MuseHarness } from '../../src/muse/adapter.ts';
 import { museSessionAddress } from '../../src/muse/identity.ts';
 import { museTranscriptEvidence } from '../../src/muse/transcript.ts';
 import { createHostClient } from '../../src/host/client.ts';
 import { connectHost, requestCoordinator } from '../../src/host/http.ts';
 import { createDaemonInbox, createHostDaemon } from '../../src/host/index.ts';
-import { ROUTES, sessionKey, type Message, type SessionAddress } from '../../src/protocol/index.ts';
+import { createMuseTools } from '../../src/muse/tools.ts';
+import { ROUTES, entityReference, sessionKey, type Message, type SessionAddress } from '../../src/protocol/index.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
@@ -208,6 +210,10 @@ test('a delivery is not acknowledged until the transcript records it', async t =
   await adapter.start();
   // First registration sets the subscription cursor at the tail; register before the peer sends.
   assert.equal((await adapter.tool('roger_identity', {})).ok, true);
+  // A stray version 1 name argument is ignored; nothing returns a name.
+  const named = await adapter.tool('roger_identity', { displayName: 'Ignored' });
+  assert.equal(named.ok, true);
+  if (named.ok) assert.equal('displayName' in (named.value as object), false);
   const inbound = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'needs evidence' });
   assert.equal(inbound.ok, true);
   await until(async () => (await adapter.receive()).length === 1, 'handed to the harness once');
@@ -331,4 +337,23 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
   assert.deepEqual(delivered.map(message => message.body), ['one', 'two']);
   assert.match(receipt(h.inboxPath, first.value.id).evidence_record_id ?? '', /^line-\d+$/);
   assert.match(receipt(h.inboxPath, second.value.id).evidence_record_id ?? '', /^line-\d+$/);
+});
+
+test('the Muse CLI register and identity commands take no name', async () => {
+  for (const command of ['register', 'identity'])
+    await assert.rejects(runMuseCli([command, 'Alice']), /takes no name; a call sign is an entity/);
+});
+
+test('Muse roger_board drops a version 1 coordinator\'s displayName and session entities', async t => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const row = { subscription: { id: sessionKey(peer), session: peer, hostId, cursor: 0 }, rank: 2, lastSeenAt: now };
+  const v1 = { ...row, displayName: 'Alice', entities: [entityReference(namespace, 'FLEET')] };
+  const claims = [{ key: 'work', owner: sessionKey(peer) }];
+  const tools = createMuseTools({
+    bound: async () => ({ actor: peer, hostId }),
+    call: async route => ({ ok: true, value: route === ROUTES.sessions ? [v1] : claims }),
+  });
+  for (const params of [{}, { all: true }])
+    assert.deepEqual(await tools('roger_board', params), { ok: true, value: { sessions: [row], claims } }, JSON.stringify(params));
 });

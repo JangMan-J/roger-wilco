@@ -1,6 +1,6 @@
 /** Muse tool surface. It sees the core only through CoreAccess; it never touches the lease, delivery, or Muse session IDs. */
 import {
-  ROUTES, entityReference, isEntityId, isMessageInput, sessionKey,
+  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, sessionKey,
   type Claim, type Outcome, type RegistrationResult, type SessionAddress,
 } from '../protocol/index.ts';
 
@@ -27,7 +27,9 @@ export function createMuseTools(core: CoreAccess): (name: string, params?: Recor
     if (!first.ok) return first;
     const second = await core.call(ROUTES.claims, 'GET');
     const now = Date.now();
-    const visible = all ? first.value : first.value.filter(row =>
+    // A version 1 coordinator can still list displayName and session entities.
+    const rows = first.value.map(ownRegistrationResult);
+    const visible = all ? rows : rows.filter(row =>
       typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= PRESENCE_MS);
     return second.ok ? { ok: true, value: { sessions: visible, claims: (second.value as Claim[]) } } : second;
   }
@@ -37,8 +39,7 @@ export function createMuseTools(core: CoreAccess): (name: string, params?: Recor
       case 'roger_identity': {
         const identity = await core.bound();
         if ('ok' in identity) return identity;
-        return core.call(ROUTES.register, 'POST', { session: identity.actor,
-          ...(typeof params.displayName === 'string' ? { displayName: params.displayName } : {}) });
+        return core.call(ROUTES.register, 'POST', { session: identity.actor });
       }
       case 'roger_send': {
         const identity = await core.bound();

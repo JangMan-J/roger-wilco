@@ -18,7 +18,6 @@ export type AgentConfig = {
   inboxPath: string;
   evidencePath: string;
   runtimeId: string;
-  displayName?: string;
 };
 
 export type EvidenceRecord = { id: string; messageId: string; message: Message };
@@ -30,6 +29,7 @@ export function agentSession(config: AgentConfig): SessionAddress {
 export function parseAgentConfig(value: unknown): AgentConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Configuration must be an object');
   const record = value as Record<string, unknown>;
+  // displayName is accepted and ignored, so a configuration written for version 1 still loads.
   if (Object.keys(record).some(key => !['coordinatorUrl', 'credential', 'namespace', 'sessionId', 'inboxPath', 'evidencePath', 'runtimeId', 'displayName'].includes(key)))
     throw new Error('Unknown agent configuration field');
   const coordinatorUrl = text(record.coordinatorUrl, 'coordinatorUrl');
@@ -44,12 +44,9 @@ export function parseAgentConfig(value: unknown): AgentConfig {
   if (!isAbsolute(inboxPath) || !isAbsolute(evidencePath)) throw new Error('inboxPath and evidencePath must be absolute');
   const runtimeId = record.runtimeId === undefined ? 'tracer' : text(record.runtimeId, 'runtimeId');
   if (runtimeId.length > 200) throw new Error('Invalid runtimeId');
-  if (record.displayName !== undefined && (typeof record.displayName !== 'string' || record.displayName.length > 200))
-    throw new Error('Invalid displayName');
   return {
     coordinatorUrl, credential: text(record.credential, 'credential'), namespace: record.namespace,
     sessionId: record.sessionId, inboxPath, evidencePath, runtimeId,
-    ...(record.displayName === undefined ? {} : { displayName: record.displayName }),
   };
 }
 
@@ -57,9 +54,8 @@ export async function readAgentConfig(path: string): Promise<AgentConfig> {
   return parseAgentConfig(JSON.parse(await readFile(path, 'utf8')));
 }
 
-export async function registerSession(client: HostInbox, session: SessionAddress, displayName?: string): Promise<RegistrationResult> {
-  const registration = displayName === undefined ? { session } : { session, displayName };
-  const result = await client.awaitRegistration(registration);
+export async function registerSession(client: HostInbox, session: SessionAddress): Promise<RegistrationResult> {
+  const result = await client.awaitRegistration({ session });
   if (!result.ok) throw new Error(`${result.error}: ${result.message}`);
   if (!isRegistrationResult(result.value) || result.value.subscription.id !== sessionKey(session))
     throw new Error('Invalid registration response');
@@ -151,7 +147,7 @@ export async function serve(config: AgentConfig, signal: AbortSignal): Promise<v
   const unsubscribe = client.onChange(() => wake.signal());
   signal.addEventListener('abort', () => { wake.signal(); void client.close(); }, { once: true });
   try {
-    await registerSession(client, session, config.displayName);
+    await registerSession(client, session);
     await holdLease(client, session, config.runtimeId);
     console.log(JSON.stringify({ service: 'roger-wilco-agent', event: 'ready', session: sessionKey(session) }));
     wake.signal();
@@ -180,7 +176,7 @@ export async function runAgent(args: string[]): Promise<void> {
   if (command === 'register') {
     const client = createHostClient(config.inboxPath);
     try {
-      const result = await registerSession(client, agentSession(config), config.displayName);
+      const result = await registerSession(client, agentSession(config));
       console.log(JSON.stringify({ event: 'registered', session: result.subscription.id }));
     } finally { await client.close(); }
     return;

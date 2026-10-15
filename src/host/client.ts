@@ -3,7 +3,7 @@ import { lstat } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import {
-  isDeliveryEvidence, isFailureCode, isRegistration, isRegistrationResult, isSessionAddress, isStreamFrame, MAX_JSON_BYTES, sessionKey,
+  isDeliveryEvidence, isFailureCode, isRegistration, isRegistrationResult, isSessionAddress, ownRegistration, ownRegistrationResult, isStreamFrame, MAX_JSON_BYTES, sessionKey,
   type FailureCode, type HostInbox, type Message, type Outcome, type DeliveryEvidence,
   type Registration, type RegistrationResult, type SessionAddress, type StreamFrame,
 } from '../protocol/index.ts';
@@ -37,7 +37,8 @@ function parseOutcome(method: string, value: unknown): Outcome<unknown> | undefi
       : rec(body) && (method === 'bind' ? exact(body, ['token', 'leaseExpiresAt']) && validToken(body.token) && safeTime(body.leaseExpiresAt)
         : method === 'renew' ? exact(body, ['leaseExpiresAt']) && safeTime(body.leaseExpiresAt)
           : method === 'pending' && exact(body, ['messages', 'more']) && Array.isArray(body.messages) && body.messages.length <= 32 && typeof body.more === 'boolean');
-    return ok ? { ok: true, value: body } : undefined;
+    // A version 1 daemon can still return displayName and session entities.
+    return ok ? { ok: true, value: method === 'awaitRegistration' ? ownRegistrationResult(body as RegistrationResult) : body } : undefined;
   }
   if (value.ok === false && exact(value, ['ok', 'error', 'message']) && isFailure(value.error) && typeof value.message === 'string')
     return { ok: false, error: value.error, message: value.message };
@@ -176,7 +177,7 @@ class HostClient implements HostInbox {
     if (this.closed) throw new Error('Host client is closed');
     if (!isRegistration(registration)) throw new TypeError('Invalid registration');
     if (!this.socket?.writable) await this.open();
-    const result = await this.send('enqueueRegistration', { registration });
+    const result = await this.send('enqueueRegistration', { registration: ownRegistration(registration) });
     if (!result.ok) throw new Error(`${result.error}: ${result.message}`);
   }
   async awaitRegistration(registration: Registration): Promise<Outcome<RegistrationResult>> {
@@ -184,7 +185,7 @@ class HostClient implements HostInbox {
     if (!isRegistration(registration)) return failure('invalid_request', 'Invalid registration');
     try {
       if (!this.socket?.writable) await this.open();
-      return await this.send('awaitRegistration', { registration }, AWAIT_REQUEST_MS) as Outcome<RegistrationResult>;
+      return await this.send('awaitRegistration', { registration: ownRegistration(registration) }, AWAIT_REQUEST_MS) as Outcome<RegistrationResult>;
     } catch (error) {
       return failure('temporarily_unavailable', error instanceof Error ? error.message : String(error));
     }

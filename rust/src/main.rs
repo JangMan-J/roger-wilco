@@ -36,13 +36,11 @@ fn run() -> Result<(), String> {
     match command {
         // Registration goes through the daemon socket, like every adapter.
         "register" => {
+            if args.len() > 1 {
+                return Err("register takes no name; a call sign is an entity, for example [[0:FLEET]] in a message".to_string());
+            }
             let mut client = ipc()?;
-            let registration = if let Some(name) = args.get(1) {
-                json!({ "session": me, "displayName": name })
-            } else {
-                json!({ "session": me })
-            };
-            print(&client.invoke("awaitRegistration", json!({ "registration": registration }))?);
+            print(&client.invoke("awaitRegistration", json!({ "registration": { "session": me } }))?);
         }
         // Tool calls go to the coordinator, as the bound session.
         "send" => {

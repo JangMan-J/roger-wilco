@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deliveryId, isDeliveryEvidence, isJson, isMessage, isMessageInput, isRegistration, isRegistrationResult, isSessionAddress, isSessionId, isSessionKey, isStreamFrame, sessionKey, ROUTES,
+import { ownRegistration, ownRegistrationResult, type Registration, deliveryId, isDeliveryEvidence, isJson, isMessage, isMessageInput, isRegistration, isRegistrationResult, isSessionAddress, isSessionId, isSessionKey, isStreamFrame, sessionKey, ROUTES,
   MAX_JSON_BYTES, MAX_SESSION_ID_LENGTH, MAX_STREAM_EVENT_BYTES, entityReference, extractEntities, isEntityId } from '../../src/protocol/index.ts';
 
 const alice = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
@@ -84,6 +84,16 @@ test('versioned namespace+Pi UUID identity and strict envelope validation', () =
   assert.equal(isRegistration({ session: alice }), true);
   assert.equal(isRegistration({ session: alice, callbackUrl: 'http://localhost' }), false);
   assert.equal(isRegistration({ session: { ...alice, callbackUrl: 'http://localhost' } }), false);
+  // Version 1 fields are accepted in their old shape and dropped by the own* helpers.
+  const result = { subscription: { id: sessionKey(alice), session: alice, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 };
+  assert.equal(isRegistration({ session: alice, displayName: 'Alice' }), true);
+  assert.equal(isRegistration({ session: alice, displayName: 'x'.repeat(201) }), false);
+  assert.deepEqual(ownRegistration({ session: alice, displayName: 'Alice' } as Registration), { session: alice });
+  const v1Result = { ...result, displayName: 'Alice', entities: [{ id: 'fleet:entity:00:09eec042175ea2041754a4d76bc2f603', type: 0, label: 'fix-parser' }] };
+  assert.equal(isRegistrationResult(v1Result), true);
+  assert.equal(isRegistrationResult({ ...result, displayName: 7 }), false);
+  assert.deepEqual(ownRegistrationResult(v1Result), result);
+  assert.deepEqual(ownRegistrationResult({ subscription: result.subscription, rank: 2 }), { subscription: result.subscription, rank: 2 });
   const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
   assert.equal(isJson(cyclic), false);
   assert.equal(ROUTES.stream, '/v1/hosts/stream');

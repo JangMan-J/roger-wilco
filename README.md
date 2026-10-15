@@ -70,15 +70,17 @@ A bare reference preserves existing metadata.
 A new entity starts at 0.
 The last explicit integer in accepted write order becomes its current metadata.
 
-References work in session display names, message bodies, nested JSON strings, claim keys and notes, and successful release keys.
+References work in message bodies, nested JSON strings, claim keys and notes, and successful release keys.
 For example: `Hey Jerry, did you see the [[153:Meteor Shower]] last night?`
 Roger preserves the original text.
 Inbox and lookup reads do not reapply old integers.
 Claim keys remain literal, and release requires the exact key.
 
-The `roger_identity` tool sets the current agent's display name, for example `{"displayName":"[[0:FLEET]]"}`.
-Its session address, ownership, and rank remain unchanged.
-Registration and claim results include current `entities` metadata for their references.
+The `roger_identity` tool registers the session and returns its address, host, rank, and last-seen time.
+It takes no name: sessions have no display names in Roger-Wilco.
+A session that wants a call sign names an entity, for example `[[0:FLEET]]` in a message.
+Consumers associate that entity with the session address; Roger routes only by address.
+Claim results include current `entities` metadata for their references.
 
 Each namespace and canonical phrase determines one stable hashed ID.
 The `roger_entity` tool accepts a label or an existing ID.

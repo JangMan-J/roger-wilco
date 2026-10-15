@@ -59,6 +59,8 @@ export async function runClaudeCli(args: string[]): Promise<void> {
   const [command, ...tail] = rest;
   if (!command) throw new Error('Usage: roger-wilco-claude [--config <host.json>] [--session <id>] <address|register|board|send|inbox|identity|entity|claim|release|receive|serve>');
 
+  if ((command === 'register' || command === 'identity') && tail.length)
+    throw new Error(`${command} takes no name; a call sign is an entity, for example [[0:FLEET]] in a message`);
   if (command === 'serve') {
     if (tail.length) throw new Error('serve takes no arguments');
     await withAdapter(overrides, async adapter => {
@@ -85,7 +87,7 @@ export async function runClaudeCli(args: string[]): Promise<void> {
         print({ session: sessionKey(identity.actor) });
         return;
       case 'register':
-        print(await adapter.tool('roger_identity', tail[0] ? { displayName: tail.join(' ') } : {}));
+        print(await adapter.tool('roger_identity', {}));
         return;
       case 'board':
         print(await adapter.tool('roger_board', { all: tail.includes('--all') || tail.includes('all') }));
@@ -100,7 +102,7 @@ export async function runClaudeCli(args: string[]): Promise<void> {
         print(await adapter.tool('roger_inbox', {}));
         return;
       case 'identity':
-        print(await adapter.tool('roger_identity', tail[0] ? { displayName: tail.join(' ') } : {}));
+        print(await adapter.tool('roger_identity', {}));
         return;
       case 'entity': {
         const label = tail.join(' ');

@@ -51,7 +51,7 @@ A colon would make the address split ambiguous.
 These characters are URL-safe, so the inbox query cannot hide another parameter.
 The 128-character limit keeps three session keys inside the stream event limit.
 The address is `namespace:` plus the canonical session id.
-Display names are not routing keys.
+Entity labels and call signs are not routing keys.
 
 One legacy rule remains.
 An id shaped like a UUID is canonicalized to lowercase in `sessionKey`.
@@ -185,7 +185,11 @@ The coordinator HTTP entry handles these fixed paths.
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
 | `POST /v1/hosts/receipts` | `Receipt` | `Subscription`. The coordinator accepts a receipt only for a delivered message on that authenticated host's own subscription. The per-subscription cursor advances monotonically and contiguously. A repeated receipt is idempotent. A forged ID is rejected. An undelivered future ID is rejected. |
 
-Registration results contain `rank` and can also contain `displayName` and `lastSeenAt`.
+A registration request is `{session}`. It carries no name.
+Registration results contain `subscription` and `rank` and can also contain `lastSeenAt`.
+A version 1 peer can still send `displayName`, a string of at most 200 characters.
+The coordinator and the host daemon accept it, ignore it, and never store or return it.
+A current client accepts `displayName` and `entities` in a registration result from a version 1 coordinator or daemon, and drops them.
 A registration retry refreshes presence without resetting the subscription cursor.
 Presence timestamps do not prove that a Pi runtime still owns its local lease.
 
@@ -236,7 +240,7 @@ Each sweep collects at most 5,000 messages.
 
 An entity identifies a named subject without defining what that subject represents.
 Entity references do not create claims, tasks, permissions, or rank changes.
-The shared syntax applies to session display names, message bodies, JSON strings, claim keys and notes, and successful release keys.
+The shared syntax applies to message bodies, JSON strings, claim keys and notes, and successful release keys.
 It does not belong to a particular harness.
 The coordinator preserves the original text, message envelope, and SSE frame.
 
@@ -287,15 +291,18 @@ The limit range is 1–500.
 Pagination uses the last returned message sequence as the next `since` value.
 Lookup does not create an entity or acknowledge a message.
 
-`roger_identity` accepts an optional `displayName` of at most 200 characters.
-It reads or updates the invoking session through the existing registration endpoint.
-`{"displayName":"[[0:FLEET]]"}` attaches a named reference without changing the session address or rank.
+`roger_identity` takes no parameters.
+It registers the invoking session through the registration endpoint and returns the registration result.
+The core has no display-name function.
+A session that wants a call sign names an entity, for example `[[0:FLEET]]` in a message, and a consumer associates that entity with the session address.
 Multiple sessions can reference the same entity without sharing ownership.
-Explicit display-name writes apply their integers, even when the name text stays unchanged.
-Heartbeats omit the display name and preserve metadata.
-An empty display name removes its reference associations.
 
-Registration and claim results include an optional `entities` array with current metadata for their attached references.
+Claim results include an optional `entities` array with current metadata for their attached references.
+Registration results carry no entities.
+The coordinator keeps the unused `sessions.display_name` column, so older databases open unchanged; it does not read or write it.
+Only display names created `entity_sources` rows of kind `session`.
+Each coordinator open deletes those rows; the step is idempotent.
+The entities stay, and age out under the entity retention rule unless something else references them.
 These associations survive restart.
 They do not turn an entity label into a routing address.
 
@@ -321,7 +328,7 @@ Rollback requires the pre-upgrade database backup, not an older binary on the mi
 Registration request:
 
 ```json
-{"session":{"namespace":"fleet","sessionId":"550e8400-e29b-41d4-a716-446655440000"},"displayName":"Alice"}
+{"session":{"namespace":"fleet","sessionId":"550e8400-e29b-41d4-a716-446655440000"}}
 ```
 
 Successful registration value:
@@ -464,8 +471,10 @@ The local registration queue survives a coordinator outage.
 Startup binding enqueues registration and returns without a wait for HTTP.
 The host daemon is the only writer of `POST /v1/sessions/register`.
 A tool that needs the result waits for that attempt. Startup does not.
-The wait returns at once, without a queue write or a coordinator request, when the session registered successfully during the current daemon process and the request names no display name other than the registered one.
-A registration for the session that is still queued or in flight disables this shortcut: the request enqueues and waits, so the coordinator ends on the latest request.
+The wait returns at once, without a queue write or a coordinator request, when the session registered successfully during the current daemon process.
+A registration for the session that is still queued or in flight disables this shortcut: the request joins that registration and waits for its attempt.
+Every request for a session queues the same bytes, so a new request never supersedes a waiting one.
+A row queued by a version 1 daemon can carry `displayName`; the daemon posts it without the name, and the next enqueue replaces it.
 A queued heartbeat always posts, and its result replaces the remembered one.
 A coordinator refusal withdraws the remembered result; an unreachable coordinator does not.
 The host daemon drains and retries registrations.
