@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import {
-  ROUTES, isEntityId, isMessageInput, isRegistration, isSessionAddress, sessionKey,
-  type ControlHandler, type CoordinatorStore, type HostAuthenticator, type Outcome,
+  DEFAULT_SETTINGS, ROUTES, isEntityId, isMessageInput, isPresence, isRegistration, isSessionAddress, sessionKey,
+  type ControlHandler, type CoordinatorStore, type HostAuthenticator, type Outcome, type Settings,
 } from '../../protocol/index.ts';
 import { bearerCredential, closedQuery, json, openQuery, readBody, readBodyError } from '../http.ts';
 
@@ -43,14 +43,19 @@ function parseInteger(text: string | null, min: number, max: number): number | n
   const value = Number(text);
   return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
 }
-/** HTTP control only; stream and receipt routes belong to lane C and return 404 here. */
-export function createControlHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler {
+/**
+ * HTTP control only; stream and receipt routes belong to lane C and return 404 here.
+ * `/health` publishes `presenceWindowMs`, the board's "present" filter. Host presence
+ * uses only the store, so it is served here.
+ */
+export function createControlHandler(store: CoordinatorStore, auth: HostAuthenticator, settings: Settings = DEFAULT_SETTINGS): ControlHandler {
+  const health = { service: 'roger-wilco', version: 1, presenceWindowMs: settings.presenceWindowMs };
   return async (request, response) => {
     try {
       const url = new URL(request.url ?? '/', 'http://localhost');
       const path = url.pathname;
       if (request.method === 'GET' && path === ROUTES.health) {
-        json(response, { ok: true, value: { service: 'roger-wilco', version: 1 } }); return;
+        json(response, { ok: true, value: health }); return;
       }
       const identity = auth.authenticate(bearerCredential(request.headers.authorization));
       if (!identity.ok) { json(response, identity); return; }
@@ -82,13 +87,16 @@ export function createControlHandler(store: CoordinatorStore, auth: HostAuthenti
         }
         json(response, store.entity(id, since, limit)); return;
       }
-      const post: string[] = [ROUTES.register, ROUTES.rank, ROUTES.messages, ROUTES.claims, ROUTES.claimRelease];
+      const post: string[] = [ROUTES.register, ROUTES.rank, ROUTES.messages, ROUTES.claims, ROUTES.claimRelease, ROUTES.presence];
       if (request.method !== 'POST' || !post.includes(path)) { json(response, failure('not_found', 'Unknown route')); return; }
       let body: unknown;
       try { body = await readBody(request); }
       catch (error) {
         const { code, message } = readBodyError(error);
         json(response, failure('invalid_request', message), code); return;
+      }
+      if (path === ROUTES.presence) {
+        json(response, isPresence(body) ? store.presence(host, body) : failure('invalid_request', 'Invalid presence')); return;
       }
       if (path === ROUTES.register) {
         json(response, isRegistration(body) ? store.register(host, body) : failure('invalid_request', 'Invalid registration')); return;

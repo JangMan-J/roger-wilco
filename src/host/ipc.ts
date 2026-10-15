@@ -53,8 +53,8 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
     let expiry: NodeJS.Timeout | undefined, pressure: NodeJS.Timeout | undefined;
     let unsubscribe: (() => void) | undefined;
     let unsubscribeRegistration: (() => void) | undefined;
-    type RegWaiter = { id: number; key: string; generation?: number; timer?: NodeJS.Timeout; attempted: boolean;
-      offResult: () => void; offAttempt: () => void; offQueued: () => void };
+    type RegWaiter = { id: number; key: string; timer?: NodeJS.Timeout; attempted: boolean;
+      offResult: () => void; offAttempt: () => void };
     const regWaiters = new Map<number, RegWaiter>();
     socket.setTimeout(10_000, () => socket.destroy());
     const close = () => { socket.destroy(); };
@@ -88,7 +88,7 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
       !!token && args.token === token && !!session && !socket.destroyed;
     const watchRegistration = () => {
       if (unsubscribeRegistration || !session) return;
-      unsubscribeRegistration = inbox.onRegistrationResult((key, _json, _generation, result) => {
+      unsubscribeRegistration = inbox.onRegistrationResult((key, result) => {
         if (!session || sessionKey(session) !== key || socket.destroyed) return;
         send(result.ok ? { v: 1, event: 'registered' } : { v: 1, event: 'registered', error: result.error, message: result.message });
       });
@@ -98,7 +98,7 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
     const settleWaiter = (waiter: RegWaiter, result?: Outcome<RegistrationResult>) => {
       if (!regWaiters.delete(waiter.id)) return;
       clearTimeout(waiter.timer);
-      waiter.offResult(); waiter.offAttempt(); waiter.offQueued();
+      waiter.offResult(); waiter.offAttempt();
       if (result !== undefined) send({ v: 1, id: waiter.id, result });
       queued--;
       if (!regWaiters.size && !token && !socket.destroyed) socket.setTimeout(10_000, () => socket.destroy());
@@ -116,53 +116,39 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
         // Only validation and enqueue stay on the serialized chain. The wait
         // moves to a waiter keyed by request ID so renew/pending/ack proceed.
         if (method === 'enqueueRegistration') {
-          await inbox.enqueueRegistration(registration);
+          // On protocol 2, presence keeps a registered session fresh, so a
+          // heartbeat that the lifetime registration answers completes locally:
+          // no row, no POST, the same reply.
+          if (!(inbox.presenceActive && inbox.registeredResult(key))) await inbox.enqueueRegistration(registration);
           return ok(null);
         }
         // Registered during this daemon's lifetime with nothing pending for
         // the session: answer without a queue write or a coordinator POST.
-        // Heartbeat enqueues still post, and their results replace this one,
-        // so presence stays fresh.
         const known = inbox.registeredResult(key);
         if (known) return ok(known);
         const timedOut: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration timed out' };
-        // The inbox owns correlation: enqueue returns the effective queued
-        // generation, and attempts/results carry it. Install the waiter
-        // before enqueueing so a fast attempt cannot report unheard.
-        const waiter: RegWaiter = { id, key, attempted: false, offResult: () => {}, offAttempt: () => {}, offQueued: () => {} };
-        waiter.offResult = inbox.onRegistrationResult((got, _json, generation, result) => {
-          if (got === key && waiter.generation !== undefined && generation === waiter.generation) settleWaiter(waiter, result);
-        });
-        waiter.offAttempt = inbox.onRegistrationAttempt((got, _json, generation) => {
-          if (got !== key || waiter.attempted || waiter.generation === undefined || generation !== waiter.generation) return;
+        // Every request for a session queues the same bytes, so the next
+        // result for the session answers this waiter. Install it before
+        // enqueueing so a fast attempt cannot report unheard.
+        const waiter: RegWaiter = { id, key, attempted: false, offResult: () => {}, offAttempt: () => {} };
+        const attempted = () => {
+          if (waiter.attempted) return;
           waiter.attempted = true;
           clearTimeout(waiter.timer);
           waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_ATTEMPT_MS);
-        });
-        waiter.offQueued = inbox.onRegistrationQueued((got, _json, generation) => {
-          // A waiter only needs the session registered, so it follows the newer generation.
-          if (got === key && waiter.generation !== undefined) waiter.generation = generation;
-        });
+        };
+        waiter.offResult = inbox.onRegistrationResult((got, result) => { if (got === key) settleWaiter(waiter, result); });
+        waiter.offAttempt = inbox.onRegistrationAttempt(got => { if (got === key) attempted(); });
         waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_QUEUE_MS);
         regWaiters.set(id, waiter);
         socket.setTimeout(0); // a held waiter is activity, not idleness
-        try {
-          waiter.generation = (await inbox.enqueueRegistration(registration)).generation;
-        } catch (error) { settleWaiter(waiter); throw error; }
-        // A newer enqueue may have landed while this one was in flight.
-        const current = inbox.registrations().find(row => row.session_key === key);
-        if (current) waiter.generation = current.generation;
-        // A fast completion may already have been reported while this enqueue
-        // was in flight, before the waiter's generation was assigned and its
-        // result listener could match it.
-        const completed = waiter.generation === undefined ? undefined : inbox.registrationCompletion(key, waiter.generation);
-        if (completed && regWaiters.has(id)) settleWaiter(waiter, completed);
-        // An attempt for this generation may already be in flight.
-        if (!socket.destroyed && regWaiters.has(id) && inbox.registrationAttemptGeneration(key) === waiter.generation && !waiter.attempted) {
-          waiter.attempted = true;
-          clearTimeout(waiter.timer);
-          waiter.timer = setTimeout(() => settleWaiter(waiter, timedOut), AWAIT_ATTEMPT_MS);
-        }
+        try { await inbox.enqueueRegistration(registration); }
+        catch (error) { settleWaiter(waiter); throw error; }
+        // A queued row that already failed answers with that attempt; an
+        // attempt for the session may instead be in flight.
+        const failed = inbox.queuedFailure(key);
+        if (failed) settleWaiter(waiter, failed);
+        else if (!socket.destroyed && regWaiters.has(id) && inbox.isRegistrationAttempting(key)) attempted();
         return undefined;
       }
       if (method === 'bind') {

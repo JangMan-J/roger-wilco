@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -8,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createDaemonInbox as createHostInbox } from '../../src/host/index.ts';
-import { rollbackInbox, rollbackInboxContract } from '../../deploy/rollback-inbox.ts';
+import { rollbackInbox, rollbackInboxContract, rollbackInboxStream } from '../../deploy/rollback-inbox.ts';
 import { sessionKey, type Message, type Outcome, type SessionAddress, type StreamFrame } from '../../src/protocol/index.ts';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -86,7 +87,7 @@ test('open legacy inbox cannot mutate daemon tables after migration', async t =>
   assert.throws(() => remove.run(), /view/);
   assert.throws(() => legacyModule.createHostInbox(path), /view/);
   assert.throws(() => createHostInbox(path), /locked/);
-  assert.equal(cell(writer, 'PRAGMA user_version'), 3);
+  assert.equal(cell(writer, 'PRAGMA user_version'), 4);
   assert.deepEqual(writer.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()
     .map(row => Object.values(row)[0]), ['inbox_messages_acknowledged', 'inbox_messages_due']);
   for (const name of ['messages', 'leases', 'registrations']) {
@@ -203,7 +204,7 @@ const preContractModule = await import(`data:text/javascript,${encodeURIComponen
   createDaemonInbox(path: string): LegacyInbox & { registrations(): Array<{ session_key: string; registration_json: string }> };
 };
 
-test('a schema 2 inbox from the pre-contract daemon migrates to schema 3 and survives reopen and contract rollback', async t => {
+test('a schema 2 inbox from the pre-contract daemon migrates to schema 4 and survives reopen and contract rollback', async t => {
   const path = join(temporaryDir(t), 'inbox.sqlite');
   const other: SessionAddress = { namespace: 'fleet', sessionId: 'Tracer-1' };
   const legacyOther: LegacyAddress = { namespace: 'fleet', piSessionId: other.sessionId };
@@ -236,7 +237,7 @@ test('a schema 2 inbox from the pre-contract daemon migrates to schema 3 and sur
     } finally { await inbox.close(); }
     const check = new DatabaseSync(path, { readOnly: true });
     try {
-      assert.equal(cell(check, 'PRAGMA user_version'), 3);
+      assert.equal(cell(check, 'PRAGMA user_version'), 4);
       assert.equal(cell(check, `SELECT evidence_record_id || ' ' || evidence_location FROM inbox_messages WHERE message_id = '${message.id}'`),
         `${proof.entryId} ${proof.sessionFile}`);
       assert.equal(cell(check, `SELECT COUNT(*) FROM inbox_messages WHERE evidence_record_id IS NULL`), 1);
@@ -245,7 +246,7 @@ test('a schema 2 inbox from the pre-contract daemon migrates to schema 3 and sur
   }
 
   // An older daemon binary fails closed on the migrated file instead of misreading it.
-  assert.throws(() => preContractModule.createDaemonInbox(path), /Unsupported inbox schema version: 3/);
+  assert.throws(() => preContractModule.createDaemonInbox(path), /Unsupported inbox schema version: 4/);
   rollbackInboxContract(path);
   const restored = preContractModule.createDaemonInbox(path);
   try {
@@ -261,4 +262,120 @@ test('a schema 2 inbox from the pre-contract daemon migrates to schema 3 and sur
   const again = createHostInbox(path);
   try { assert.deepEqual(again.registrations().map(row => row.registration_json), migrated); }
   finally { await again.close(); }
+});
+
+// The daemon from before host stream v2 (schema 3), against its own protocol.
+const preStreamProtocol = `data:text/javascript,${encodeURIComponent(show('2269c2b:src/protocol/index.ts'))}`;
+const preStreamModule = await import(`data:text/javascript,${encodeURIComponent(show('2269c2b:src/host/index.ts')
+  .replaceAll("'../protocol/index.ts'", JSON.stringify(preStreamProtocol))
+  .replaceAll("'./ipc.ts'", JSON.stringify(new URL('../../src/host/ipc.ts', import.meta.url).href)))}`) as {
+  createDaemonInbox(path: string): { receive(frame: StreamFrame): Promise<{ inserted: boolean }>; close(): Promise<void> };
+};
+function streamRow(path: string): { version: unknown; row: unknown } {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const table = cell(db, "SELECT name FROM sqlite_schema WHERE name = 'inbox_stream'");
+    return { version: cell(db, 'PRAGMA user_version'),
+      row: table ? { ...db.prepare('SELECT id, stream_id, bookmark FROM inbox_stream').get() } : undefined };
+  } finally { db.close(); }
+}
+
+test('schema 0, 2 and 3 inboxes upgrade to 4 with an empty bookmark; a pre-v2 daemon fails closed on 4', async t => {
+  const dir = temporaryDir(t);
+  const producers: Array<[string, number, (path: string) => Promise<void>]> = [
+    ['legacy', 0, async path => { const old = legacyModule.createHostInbox(path); await old.receive(frame); await old.close(); }],
+    ['pre-contract', 2, async path => { const old = preContractModule.createDaemonInbox(path); await old.receive(frame); await old.close(); }],
+    ['pre-stream', 3, async path => { const old = preStreamModule.createDaemonInbox(path); await old.receive(frame); await old.close(); }],
+  ];
+  for (const [name, version, produce] of producers) {
+    const path = join(dir, `${name}.sqlite`);
+    await produce(path);
+    assert.equal(streamRow(path).version, version, name);
+    const inbox = createHostInbox(path);
+    try {
+      assert.deepEqual(inbox.streamPosition(), { stream: null, bookmark: null }, name);
+      assert.equal((await inbox.bind(session, 'owner', Date.now())).ok, true);
+      assert.deepEqual((await inbox.pending(session, 'owner')).map(item => item.id), [message.id], name);
+    } finally { await inbox.close(); }
+    assert.deepEqual(streamRow(path), { version: 4, row: { id: 1, stream_id: null, bookmark: null } }, name);
+    assert.throws(() => preStreamModule.createDaemonInbox(path), /Unsupported inbox schema version: 4/, name);
+  }
+});
+
+test('--stream-clients-stopped returns 4 to 3; --contract-clients-stopped and --legacy-clients-stopped accept 4', async t => {
+  const dir = temporaryDir(t);
+  const make = (name: string) => {
+    const path = join(dir, `${name}.sqlite`);
+    const db = createHostInbox(path);
+    return { path, db };
+  };
+  const stream = make('stream');
+  await stream.db.receive(frame);
+  await stream.db.close();
+  execFileSync(process.execPath, [join(root, 'deploy/rollback-inbox.ts'), '--stream-clients-stopped', stream.path], { stdio: 'pipe' });
+  assert.deepEqual(streamRow(stream.path), { version: 3, row: undefined });
+  const preStream = preStreamModule.createDaemonInbox(stream.path);
+  try { assert.deepEqual(await preStream.receive(frame), { inserted: false }, 'the stored row survives'); }
+  finally { await preStream.close(); }
+  assert.throws(() => rollbackInboxStream(stream.path), /Expected inbox schema version 4/);
+
+  const contract = make('contract');
+  await contract.db.receive(frame);
+  await contract.db.close();
+  rollbackInboxContract(contract.path);
+  assert.equal(streamRow(contract.path).version, 2);
+  const preContract = preContractModule.createDaemonInbox(contract.path);
+  try { assert.deepEqual(await preContract.receive(frame), { inserted: false }); }
+  finally { await preContract.close(); }
+
+  const legacy = make('legacy');
+  await legacy.db.receive(frame);
+  await legacy.db.close();
+  rollbackInbox(legacy.path);
+  assert.equal(streamRow(legacy.path).version, 0);
+  const old = legacyModule.createHostInbox(legacy.path);
+  try { assert.deepEqual(await old.receive(frame), { inserted: false }); }
+  finally { await old.close(); }
+});
+
+test('--reset-bookmark fails while a daemon holds the lock, otherwise clears the stream, keeps D as a skip floor and prints highWater', async t => {
+  const dir = temporaryDir(t);
+  const path = join(dir, 'inbox.sqlite');
+  const configPath = join(dir, 'host.json');
+  writeFileSync(configPath, JSON.stringify({ hostId: 'host-a', coordinatorUrl: 'http://127.0.0.1:1', credential: 'offline', inboxPath: path }));
+  const reset = () => execFileSync(process.execPath, [join(root, 'src/bin/host.ts'), '--reset-bookmark', configPath], { encoding: 'utf8', stdio: 'pipe' });
+  const inbox = createHostInbox(path);
+  await inbox.receive({ ...frame, message: { ...message, id: 'fleet:msg:130', sequence: 130 } });
+  const writer = new DatabaseSync(path);
+  writer.exec("UPDATE inbox_stream SET stream_id = '0123456789abcdef0123456789abcdef', bookmark = 120");
+  writer.close();
+  assert.throws(reset, /locked/);
+  assert.deepEqual(inbox.streamPosition(), { stream: '0123456789abcdef0123456789abcdef', bookmark: 120 }, 'a refused reset changes nothing');
+  await inbox.close();
+  assert.deepEqual(JSON.parse(reset()), { highWater: 130 });
+  assert.deepEqual(streamRow(path).row, { id: 1, stream_id: null, bookmark: 120 });
+  // With the bookmark above every stored row, the bookmark is the high water.
+  const again = new DatabaseSync(path);
+  again.exec("UPDATE inbox_stream SET stream_id = '0123456789abcdef0123456789abcdef', bookmark = 500");
+  again.close();
+  assert.deepEqual(JSON.parse(reset()), { highWater: 500 });
+});
+
+test('a row stored with no hash by a daemon older than packet hashes is hashed when the inbox is upgraded again', async t => {
+  const path = join(temporaryDir(t), 'inbox.sqlite');
+  await createHostInbox(path).close();
+  // --contract-clients-stopped keeps the hash column; a schema 2 daemon from
+  // before packet hashes then inserts rows without one.
+  rollbackInboxContract(path);
+  const old = new DatabaseSync(path);
+  old.prepare('INSERT INTO inbox_messages (session_key, message_id, sequence, message_json) VALUES (?, ?, ?, ?)')
+    .run(key, message.id, message.sequence, JSON.stringify(message));
+  old.close();
+  const inbox = createHostInbox(path);
+  try {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { assert.equal(cell(db, 'SELECT hash FROM inbox_messages'), createHash('sha256').update(JSON.stringify(message)).digest('hex')); }
+    finally { db.close(); }
+    assert.deepEqual(await inbox.receive(frame), { inserted: false });
+  } finally { await inbox.close(); }
 });

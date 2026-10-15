@@ -7,6 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { DatabaseSync } from 'node:sqlite';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
@@ -21,7 +22,8 @@ async function until(check: () => boolean | Promise<boolean>, reason: string) {
 }
 
 /** Actual coordinator, HTTP and two independently configured host daemons using separate SQLite files. */
-async function rig(t: test.TestContext, fault: { dropHostAReceipts?: boolean } = {}) {
+/** `protocol: 2` routes like the coordinator binary; `protocol: 1` is a v1 coordinator, which answers /v2 with 404. */
+async function rig(t: test.TestContext, fault: { dropHostAReceipts?: boolean } = {}, protocol: 1 | 2 = 2) {
   const dir = await mkdtemp(join(tmpdir(), 'rw-native-'));
   const store = createCoordinatorStore(join(dir, 'server.db'), 'fleet');
   const auth = createHostAuthenticator({ 'host-a': 'token-a', 'host-b': 'token-b' });
@@ -30,12 +32,13 @@ async function rig(t: test.TestContext, fault: { dropHostAReceipts?: boolean } =
   let receiptAttempts = 0;
   const server = createServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://localhost').pathname;
-    if (path === ROUTES.receipt && req.headers.authorization === 'Bearer token-a' && fault.dropHostAReceipts) {
+    if ((path === ROUTES.receipt || path === ROUTES.receiptV2) && req.headers.authorization === 'Bearer token-a' && fault.dropHostAReceipts) {
       receiptAttempts++;
       req.socket.destroy(); // transport loss after host inbox commit, before coordinator receipt
       return;
     }
-    void (path === ROUTES.stream || path === ROUTES.receipt ? stream : control)(req, res);
+    const streamRoutes: string[] = protocol === 2 ? [ROUTES.stream, ROUTES.receipt, ROUTES.streamV2, ROUTES.receiptV2] : [ROUTES.stream, ROUTES.receipt];
+    void (streamRoutes.includes(path) ? stream : control)(req, res);
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -114,6 +117,34 @@ test('native Pi idle and busy delivery isolates two sessions on one host, host B
   assert.equal((await persistedMessages(alice.file)).some(m => m.details?.deliveryId === closed.id), false);
 });
 
+test('native Pi over host stream v2: a fan-out broadcast is recorded with no model turn; a directed message starts one (test 42)', async t => {
+  const h = await rig(t);
+  const alice = await nativePi(t, h.dir);
+  const remote = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
+  await h.hosts[1]!.inbox.enqueueRegistration({ session: remote });
+  await until(() => h.store.listSessions().length === 2, 'both sessions registered');
+  await until(() => h.store.hostAcked({ hostId: 'host-a' }) !== undefined && h.store.hostAcked({ hostId: 'host-b' }) !== undefined, 'both hosts on v2');
+  // Pi writes its session file with the first turn; a message that starts no turn needs the file.
+  await alice.session.prompt('Establish the session file');
+  const turns = alice.calls.length;
+  const broadcast = await h.send(remote, '*', 'Broadcast over v2');
+  await until(async () => (await persistedMessages(alice.file)).some(m => m.details?.deliveryId === broadcast.id), 'broadcast persisted in Pi');
+  const acknowledged = () => {
+    const db = new DatabaseSync(h.hosts[0]!.config.inboxPath, { readOnly: true });
+    try { return db.prepare('SELECT evidence_record_id FROM inbox_messages WHERE message_id = ?').get(broadcast.id)?.evidence_record_id; }
+    finally { db.close(); }
+  };
+  await until(() => !!acknowledged(), 'broadcast acknowledged from Pi evidence');
+  await delay(300);
+  assert.equal(alice.calls.length, turns, 'a broadcast starts no model turn');
+  const own = new DatabaseSync(h.hosts[1]!.config.inboxPath, { readOnly: true });
+  try { assert.equal(own.prepare('SELECT COUNT(*) AS n FROM inbox_messages').get()!.n, 0, 'the sender stores no copy of its own broadcast'); }
+  finally { own.close(); }
+  const directed = await h.send(remote, sessionKey({ namespace: 'fleet', sessionId: alice.id }), 'Directed over v2');
+  await until(async () => (await persistedMessages(alice.file)).some(m => m.details?.deliveryId === directed.id), 'directed persisted in Pi');
+  await until(() => alice.calls.length > turns, 'a directed message starts a model turn');
+});
+
 test('Pi starts despite unavailable coordinator URL; queued registration is retried by the host daemon', async t => {
   const h = await rig(t);
   await writeFile(process.env.ROGER_WILCO_CONFIG!, JSON.stringify({
@@ -125,9 +156,13 @@ test('Pi starts despite unavailable coordinator URL; queued registration is retr
     'durable registration queued by Pi is retried by connected host daemon');
 });
 
-test('host restart after local commit but lost receipt replays one durable inbox event', async t => {
+for (const protocol of [1, 2] as const) test(`host restart after local commit but lost receipt replays one durable inbox event (protocol ${protocol})`, async t => {
   const fault = { dropHostAReceipts: true };
-  const h = await rig(t, fault);
+  const h = await rig(t, fault, protocol);
+  // v1 moves the session cursor; v2 moves the host's receipted position and keeps the cursor as the start.
+  const receipted = () => protocol === 1
+    ? h.store.listSessions().find(item => item.subscription.id === sessionKey(recipient))?.subscription.cursor
+    : h.store.hostAcked({ hostId: 'host-a' });
   const recipient = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440088' };
   const sender = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440099' };
   await h.hosts[0]!.inbox.enqueueRegistration({ session: recipient });
@@ -147,8 +182,8 @@ test('host restart after local commit but lost receipt replays one durable inbox
   host.daemon = createHostDaemon(host.config, host.inbox);
   host.running = host.daemon.start(new AbortController().signal);
   void host.running.catch(() => {});
-  await until(() => h.store.listSessions().find(item => item.subscription.id === sessionKey(recipient))?.subscription.cursor === 1,
-    'coordinator advances after replayed receipt');
+  await until(() => receipted() === 1, 'coordinator advances after replayed receipt');
+  if (protocol === 2) assert.equal(h.store.listSessions().find(item => item.subscription.id === sessionKey(recipient))?.subscription.cursor, 0);
   const owner = await host.inbox.bind(recipient, 'inspector', Date.now());
   assert.equal(owner.ok, true);
   assert.deepEqual((await host.inbox.pending(recipient, 'inspector')).map(item => item.id), [message.id], 'one event after replay');

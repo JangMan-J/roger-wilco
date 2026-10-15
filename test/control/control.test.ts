@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
-import { entityReference, sessionKey } from '../../src/protocol/index.ts';
+import { DEFAULT_SETTINGS, ROUTES, entityReference, sessionKey } from '../../src/protocol/index.ts';
 
 const alice = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440001' };
 const bob = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
@@ -319,4 +319,32 @@ test('bounded JSON parsing rejects oversized, malformed, wrong media type', asyn
   const malformed = await fetch(base + '/v1/sessions/register', { method: 'POST', headers: { authorization: 'Bearer secret-a', 'content-type': 'application/json' }, body: '{' });
   assert.equal(malformed.status, 400);
   assert.equal((await request('/v1/sessions/register', { session: alice }, 'secret-a', { headers: { 'content-type': 'text/plain' } })).status, 415);
+});
+
+test('health publishes presenceWindowMs from settings; host presence is served for v2 hosts only', async t => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  const settings = { ...DEFAULT_SETTINGS, presenceWindowMs: 120_000 };
+  const handler = createControlHandler(store, createHostAuthenticator({ 'host-a': 'secret-a', 'host-b': 'secret-b' }), settings);
+  const server = createServer((req, res) => { void handler(req, res); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await new Promise<void>(resolve => server.close(() => resolve())); store.close(); });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `http://127.0.0.1:${address.port}`;
+  assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ok: true, value: { service: 'roger-wilco', version: 1, presenceWindowMs: 120_000 } });
+  const presence = async (body: unknown, token = 'secret-a') => {
+    const response = await fetch(`${base}${ROUTES.presence}`, { method: 'POST', body: JSON.stringify(body),
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' } });
+    return { status: response.status, value: await response.json() as Record<string, unknown> };
+  };
+  assert.equal((await presence({ sessions: [sessionKey(alice)] }, 'bad')).status, 401);
+  assert.equal((await presence({ sessions: [sessionKey(alice)], extra: 1 })).status, 400);
+  assert.equal((await presence({ sessions: [sessionKey(alice), sessionKey(alice)] })).status, 400);
+  assert.equal((await presence({ sessions: [sessionKey(alice)] })).status, 409, 'a v1 host has no hosts row');
+  assert.equal(store.register({ hostId: 'host-a' }, { session: alice }).ok, true);
+  assert.equal(store.openHost({ hostId: 'host-a' }).ok, true);
+  assert.deepEqual((await presence({ sessions: [sessionKey(alice), sessionKey(bob)] })).value, { ok: true, value: { unknown: [sessionKey(bob)] } });
+  assert.equal((await fetch(`${base}${ROUTES.presence}`, { headers: { authorization: 'Bearer secret-a' } })).status, 404);
+  // A v1 coordinator answers the query-less v2 stream request with 404; the control handler still does.
+  assert.equal((await fetch(`${base}${ROUTES.streamV2}`, { headers: { authorization: 'Bearer secret-a', accept: 'text/event-stream' } })).status, 404);
 });

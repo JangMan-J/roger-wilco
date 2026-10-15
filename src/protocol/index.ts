@@ -1,4 +1,4 @@
-/** Roger-Wilco wire and lane contracts, version 1. No reference-project imports. */
+/** Roger-Wilco wire and lane contracts: message envelope version 1, host stream version 2. No reference-project imports. */
 import { createHash } from 'node:crypto';
 
 const ENTITY_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
@@ -17,7 +17,39 @@ export const ROUTES = {
   sessions: '/v1/sessions', messages: '/v1/messages', inbox: '/v1/inbox',
   claims: '/v1/claims', claimRelease: '/v1/claims/release',
   stream: '/v1/hosts/stream', receipt: '/v1/hosts/receipts',
+  streamV2: '/v2/hosts/stream', receiptV2: '/v2/hosts/receipts', presence: '/v2/hosts/presence',
 } as const;
+/** Host stream protocol selected by route. The message envelope stays PROTOCOL_VERSION 1. */
+export const HOST_STREAM_VERSION = 2 as const;
+export const MAX_PRESENCE_KEYS = 4096;
+/** Fixed bounds and defaults; the one source for the settings parser and isHostFrame. */
+export const SETTING_BOUNDS = {
+  window:           { min: 1,          max: 256,           default: 32 },
+  retentionMs:      { min: 86_400_000, max: 7_776_000_000, default: 604_800_000 },
+  keepaliveMs:      { min: 5_000,      max: 60_000,        default: 15_000 },
+  presenceWindowMs: { min: 15_000,     max: 900_000,       default: 90_000 },
+} as const;
+export type SettingName = keyof typeof SETTING_BOUNDS;
+/** Coordinator settings, each a safe integer inside SETTING_BOUNDS. Durations are milliseconds. */
+export type Settings = { readonly [K in SettingName]: number };
+export const DEFAULT_SETTINGS: Settings = Object.freeze({
+  window: SETTING_BOUNDS.window.default,
+  retentionMs: SETTING_BOUNDS.retentionMs.default,
+  keepaliveMs: SETTING_BOUNDS.keepaliveMs.default,
+  presenceWindowMs: SETTING_BOUNDS.presenceWindowMs.default,
+});
+export function isSettingValue(name: SettingName, value: unknown): value is number {
+  const bounds = SETTING_BOUNDS[name];
+  return Number.isSafeInteger(value) && (value as number) >= bounds.min && (value as number) <= bounds.max;
+}
+/** Daemon stream idle deadline, derived from `hello.keepaliveMs`. */
+export function streamIdleMs(keepaliveMs: number): number {
+  return 3 * keepaliveMs;
+}
+/** Daemon presence report interval, derived from `hello.presenceWindowMs`; whole milliseconds, rounded down. */
+export function presenceIntervalMs(presenceWindowMs: number): number {
+  return Math.floor(presenceWindowMs / 3);
+}
 export type Visibility = 'private' | 'public';
 /** `sessionId` is one opaque session id. */
 export type SessionAddress = { namespace: string; sessionId: string };
@@ -47,6 +79,19 @@ export type HostPrincipal = { hostId: string }; // resolved from bearer credenti
 export type HostConfig = { coordinatorUrl: string; hostId: string; credential: string; inboxPath: string };
 export type Receipt = { subscriptionId: SessionKey; messageId: DeliveryId };
 export type StreamFrame = { type: 'message'; subscriptionId: SessionKey; message: Message };
+/** Host stream v2 event payload (`event: v2`). `msg` and `through` are position frames. */
+export type HostFrame =
+  | { type: 'hello'; stream: string; host: string; conn: string; resume: number;
+      keepaliveMs: number; presenceWindowMs: number }
+  | { type: 'member'; session: SessionKey; start: number }
+  | { type: 'leave'; session: SessionKey }
+  | { type: 'msg'; seq: number; message: Message }
+  | { type: 'through'; seq: number };
+/** "This inbox has durably stored every message owed to this host with seq <= through." */
+export type HostReceipt = { conn: string; through: number };
+export type HostReceiptResult = { through: number };
+export type Presence = { sessions: SessionKey[] };
+export type PresenceResult = { unknown: SessionKey[] };
 /**
  * Adapter-supplied evidence that one message is durably persisted in the session's own store.
  * `recordId` names the record inside that store; `location` names the store. The host compares
@@ -81,8 +126,21 @@ export interface CoordinatorStore {
   acknowledge(host: HostPrincipal, receipt: Receipt): Outcome<Subscription>;
   claim(host: HostPrincipal, key: string, owner: SessionKey, ttlSeconds: number, note?: string): Outcome<{ claim: Claim; acquired: boolean }>;
   releaseClaim(host: HostPrincipal, key: string, owner: SessionKey): Outcome<boolean>;
+  /** Host stream v2. Creates the `hosts` row (cut-over, FULL) or checks the bookmark against it. */
+  openHost(host: HostPrincipal, bookmark?: { stream?: string; after?: number }): Outcome<HostStart>;
+  /** One read snapshot: members and up to `limit` owed messages with ids in (from, min(tail, from + span)]. */
+  hostBatch(host: HostPrincipal, from: number, limit: number): HostBatch;
+  /** Monotone `C := max(C, through)`; returns the new C, or undefined without a `hosts` row. */
+  advanceHost(host: HostPrincipal, through: number): number | undefined;
+  /** C for a v2 host; undefined means the host is on protocol 1. */
+  hostAcked(host: HostPrincipal): number | undefined;
+  /** Refreshes this host's listed sessions; never creates, wakes or moves a start. */
+  presence(host: HostPrincipal, request: Presence): Outcome<PresenceResult>;
   close(): void;
 }
+/** `acked` is C; `resume` is where the stream starts; `stream` is the coordinator log id. */
+export type HostStart = { acked: number; resume: number; stream: string };
+export type HostBatch = { members: Array<{ session: SessionKey; start: number }>; messages: Message[]; scanned: number; tail: number };
 
 /** Adapter-facing socket client. The daemon's SQLite inbox is a separate module and does not implement this. */
 export interface HostInbox {
@@ -271,6 +329,57 @@ export function isStreamFrame(value: unknown): value is StreamFrame {
     (value.message.recipient === value.subscriptionId ||
       (value.message.recipient === '*' && value.message.sender !== value.subscriptionId &&
         value.message.sender.split(':', 1)[0] === value.subscriptionId.split(':', 1)[0]));
+}
+/** Coordinator log identity: 32 lowercase hex digits. */
+const STREAM_ID = /^[0-9a-f]{32}$/;
+/** Connection id: a lowercase UUID, as `randomUUID()` produces. */
+const CONN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const own = Object.keys(value);
+  return own.length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+function position(value: unknown, min: number): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= min;
+}
+/** Shape only. Order, membership and namespace rules are enforced by the daemon on the connection. */
+export function isHostFrame(value: unknown): value is HostFrame {
+  if (!record(value)) return false;
+  switch (value.type) {
+    case 'hello':
+      return exactKeys(value, ['type', 'stream', 'host', 'conn', 'resume', 'keepaliveMs', 'presenceWindowMs']) &&
+        typeof value.stream === 'string' && STREAM_ID.test(value.stream) &&
+        typeof value.host === 'string' && value.host.length > 0 &&
+        typeof value.conn === 'string' && CONN_ID.test(value.conn) && position(value.resume, 0) &&
+        isSettingValue('keepaliveMs', value.keepaliveMs) && isSettingValue('presenceWindowMs', value.presenceWindowMs);
+    case 'member':
+      return exactKeys(value, ['type', 'session', 'start']) && isSessionKey(value.session) && position(value.start, 0);
+    case 'leave':
+      return exactKeys(value, ['type', 'session']) && isSessionKey(value.session);
+    case 'msg':
+      return exactKeys(value, ['type', 'seq', 'message']) && position(value.seq, 1) &&
+        isMessage(value.message) && value.message.sequence === value.seq;
+    case 'through':
+      return exactKeys(value, ['type', 'seq']) && position(value.seq, 1);
+    default:
+      return false;
+  }
+}
+export function isHostReceipt(value: unknown): value is HostReceipt {
+  return record(value) && exactKeys(value, ['conn', 'through']) &&
+    typeof value.conn === 'string' && CONN_ID.test(value.conn) && position(value.through, 0);
+}
+export function isHostReceiptResult(value: unknown): value is HostReceiptResult {
+  return record(value) && exactKeys(value, ['through']) && position(value.through, 0);
+}
+function sessionKeySet(value: unknown): value is SessionKey[] {
+  return Array.isArray(value) && value.length <= MAX_PRESENCE_KEYS &&
+    value.every(isSessionKey) && new Set(value).size === value.length;
+}
+export function isPresence(value: unknown): value is Presence {
+  return record(value) && exactKeys(value, ['sessions']) && sessionKeySet(value.sessions);
+}
+export function isPresenceResult(value: unknown): value is PresenceResult {
+  return record(value) && exactKeys(value, ['unknown']) && sessionKeySet(value.unknown);
 }
 export function isMessage(value: unknown): value is Message {
   if (!record(value) || !hasKeys(value, ['version', 'id', 'sequence', 'timestamp', 'sender', 'recipient', 'body', 'data', 'visibility'])) return false;

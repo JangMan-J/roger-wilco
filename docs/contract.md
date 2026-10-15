@@ -167,6 +167,7 @@ The other allowed value is `public`.
 ### Fixed routes
 
 All routes except `GET /health` require `Authorization: Bearer <host credential>`.
+`GET /health` returns `{service:'roger-wilco', version:1, presenceWindowMs}`.
 The content type for JSON writes is `application/json`.
 Each successful control JSON response contains `{ok:true,value:...}`.
 The coordinator HTTP entry handles these fixed paths.
@@ -184,6 +185,9 @@ The coordinator HTTP entry handles these fixed paths.
 | `POST /v1/claims/release` | `{key,owner:SessionAddress}` | A boolean. Release is owner-only. |
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
 | `POST /v1/hosts/receipts` | `Receipt` | `Subscription`. The coordinator accepts a receipt only for a delivered message on that authenticated host's own subscription. The per-subscription cursor advances monotonically and contiguously. A repeated receipt is idempotent. A forged ID is rejected. An undelivered future ID is rejected. |
+| `GET /v2/hosts/stream[?stream=S&after=D]` | `Accept: text/event-stream`; `stream` and `after` together or not at all | Host stream version 2 (`docs/protocol-v2.md`). The open runs before any SSE header; a refused open is a JSON outcome. The first event is `hello`. Opening creates the host's `hosts` row (cut-over); from then on the two v1 host routes answer that host with 409 "Host uses protocol 2", before any supersede. |
+| `POST /v2/hosts/receipts` | `HostReceipt` | `HostReceiptResult`. Cumulative "stored through N", bounded by the live connection's sent position. |
+| `POST /v2/hosts/presence` | `Presence` | `PresenceResult`. Refreshes the listed sessions of a protocol 2 host and returns the rest as `unknown`. It creates nothing and wakes nothing. |
 
 A registration request is `{session}`. It carries no name.
 Registration results contain `subscription` and `rank` and can also contain `lastSeenAt`.
@@ -208,7 +212,7 @@ The coordinator and host have no third-party runtime dependencies.
 
 Pi exposes `roger_identity`, `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, `roger_release`, and `roger_entity`.
 These tools derive their actor from the invoking Pi session.
-The board defaults to sessions seen within 90 seconds and includes active claims.
+The board defaults to sessions seen within `presenceWindowMs`, read once per process from `/health` (default 90 seconds; 90 seconds when a version 1 coordinator omits the field), and includes active claims.
 The model tool accepts `{all:true}` to include stale, retained registrations.
 The user commands `/roger` and `/roger_board` display the board without a model turn.
 They offer a session picker followed by a rank picker.
@@ -218,13 +222,14 @@ Session rows show rank, presence age, and `lastSeenAt`.
 
 ### Retention
 
-The coordinator removes registrations unseen for more than seven days.
-The 90-second board filter does not stop delivery.
+The coordinator removes registrations unseen for longer than `retention` (settings file, default seven days).
+The board's presence filter does not stop delivery.
 Until registration expiry, offline sessions retain direct and broadcast delivery through their host.
 After expiry, registration starts at the durable message sequence watermark.
 It does not replay messages from the expired subscription.
 
-Messages older than seven days are eligible for collection.
+Messages older than `retention` are eligible for collection.
+A message owed to a session on a protocol 2 host is also kept until that host's receipted position passes it.
 The coordinator keeps each message that a retained recipient still needs.
 Unrelated low cursors do not keep old messages.
 A broadcast uses one coordinator row, not one stored copy per session.
@@ -402,12 +407,12 @@ The `send` and `claim` transactions commit at `synchronous=FULL`. A message inse
 A FULL commit also syncs every earlier WAL frame, so a registration that a later message depends on reaches stable storage with that message.
 The offered mark is connection state.
 Lost cursor updates replay messages: after an OS crash the cursor can roll back over several acknowledged messages, the stream offers each again in order, the daemon deduplicates them by message ID, and the daemon sends each receipt again, which the coordinator accepts.
-Registrations, ranks, and claim releases commit at NORMAL. The host daemon repeats registration on its heartbeat, and a lost release only keeps the claim until it expires.
+Registrations, ranks, and claim releases commit at NORMAL. A v1 host daemon repeats registration on its heartbeat; a v2 host daemon registers again on a presence `unknown` and after a `leave`. A lost release only keeps the claim until it expires.
 
 ### Host stream deadlines
 
 The host stream client uses a 10-second deadline for response headers.
-After the response headers arrive, the idle deadline is 45 seconds.
+After the response headers arrive, the idle deadline is 45 seconds on v1, and `3 × keepaliveMs` from `hello` on v2.
 A nonempty read resets that idle deadline.
 SSE comments are nonempty reads.
 Keepalive comments therefore reset the idle deadline.
@@ -417,6 +422,109 @@ Host JSON posts also use a 10-second deadline.
 When a stream deadline expires, the host aborts that stream read.
 It then reconnects with the capped exponential backoff.
 
+## Host stream v2
+
+The full design is in [protocol-v2.md](protocol-v2.md). This section states the contract.
+
+### Version selection
+
+The route selects the version; there is no handshake field.
+A host with a `hosts` row is on version 2.
+For that host, `GET /v1/hosts/stream` and `POST /v1/hosts/receipts` return 409 `owner_conflict` "Host uses protocol 2".
+The stream route answers before it supersedes any live connection, so a stale version 1 daemon cannot end a version 2 stream.
+A version 2 open supersedes any live version 1 or version 2 connection for the host.
+A daemon with no stored stream (no bookmark, or after `--reset-bookmark`) sends `GET /v2/hosts/stream` with no query.
+A version 1 coordinator answers that request with 404 `not_found`; a daemon with no bookmark then runs one version 1 stream request and tries `/v2` again after the normal backoff.
+A daemon with a bookmark sends `?stream=<stream_id>&after=<bookmark>` and never falls back; it reports 400, 404 and 409, backs off and retries.
+
+### Open
+
+`stream` and `after` appear together or not at all, each once. `stream` is 32 lowercase hexadecimal characters; `after` is a decimal safe integer of at least 0. Anything else is 400 `invalid_request`.
+The open runs before any SSE header, so a refused open is a JSON outcome:
+
+- `stream` differs from the coordinator log identity: 409 "Bookmark belongs to another coordinator log".
+- `after` is above the message tail: 409 "Bookmark is ahead of the coordinator tail".
+- `after` is below the receipted position `C` of an existing `hosts` row: 409 "Bookmark is behind the receipted position".
+
+The first open creates the `hosts` row (the cut-over) with `C = MIN(cursor)` over the host's sessions, or the tail when it has none, lowered to `after` when `after` is given.
+From that commit on the host's session cursors are frozen as start points.
+The stream resumes at `resume = max(C, MIN(start))`, or the tail when the host has no sessions.
+The coordinator never sets `C` from the daemon's `after`.
+
+### Frames
+
+Every event is `event: v2` with one `data:` line of JSON and no `id:` line. Keepalive is the comment `: keepalive`.
+
+- `hello {stream, host, conn, resume, keepaliveMs, presenceWindowMs}` comes first and once.
+- `member {session, start}` adds a member or replaces its start; `leave {session}` removes it. Membership is read in the same snapshot as the messages it governs and is diffed against what the connection last sent.
+- `msg {seq, message}` carries a message owed to this host; `seq` equals `message.sequence`. The message bytes and SHA-256 are the version 1 bytes.
+- `through {seq}` states that nothing else is owed up to `seq`.
+
+`msg` and `through` are position frames. Their `seq` strictly increases, and the first is above `resume`.
+A message is owed to a host when it is directed to a member whose start is below its `seq`, or when it is a broadcast and some member other than its sender has a start below its `seq`.
+A broadcast crosses the wire once per host; the daemon copies it to every eligible member, with `recipient` kept as `*`.
+The daemon aborts the connection on any frame it cannot accept: an invalid or oversized event, an unknown type, a position out of order, a directed message for a non-member, a message outside the stream namespace, a message id already stored with a different hash, or a `hello` for another host or log. The batch is not committed and no receipt is sent.
+
+### Window and receipts
+
+At most `window` (W) `msg` frames, and at most 16 MiB of them, are unreceipted on one connection; the frame that crosses the byte cap is still sent.
+The daemon commits each read of frames in one transaction at `synchronous=FULL`, with the bookmark `D` in the same transaction, and only then posts a receipt.
+`POST /v2/hosts/receipts {conn, through}` means "this inbox has stored every message owed to this host up to `through`". The coordinator answers:
+
+1. 400 for a body that is not an exact `HostReceipt`.
+2. 409 "Host is not on protocol 2" for a host with no `hosts` row.
+3. 200 with the current `C` when `through ≤ C`, from any connection, with no change.
+4. 409 "Superseded connection" when `conn` is not the host's live version 2 connection. Every `conn` is unknown after a coordinator restart.
+5. 400 "Receipt is ahead of the sent position" when `through` is above the highest position sent on the connection.
+6. Otherwise `C := through` at NORMAL, the covered frames leave the window, and the reply is 200 with `through`.
+
+The daemon keeps at most one receipt in flight per connection and coalesces to the latest committed position. It retries a transport error or 503, aborts the connection on 400 or 409, and ignores a reply that arrives after its connection ended.
+`C ≤ D` holds whenever the inbox has a bookmark.
+On the keepalive tick (`keepaliveMs`) the stream runs one batch if the window has room and sends `through` for traffic that never woke the host, so an idle host's `C` advances.
+
+### Presence
+
+While the daemon runs version 2 it sends one `POST /v2/hosts/presence {sessions}` every `presenceWindowMs / 3`, listing the sessions that hold a live lease (at most 4096, in key order).
+The coordinator refreshes `last_seen_at` of the listed sessions registered to that host and returns every other listed key in `unknown`. It creates nothing, wakes nothing and changes no start.
+The daemon registers each `unknown` key again; a `leave` also clears the remembered registration, and every `hello` clears all of them, so the next heartbeat posts.
+
+### Sync classes
+
+| Transaction | Class |
+|---|---|
+| `send`, `claim`, the `openHost` that creates the `hosts` row | FULL |
+| `register`, rank, claim release, version 2 receipt, presence, maintenance, a non-creating `openHost` | NORMAL |
+| Daemon hello commit and batch commit | FULL |
+| Daemon acknowledgement | NORMAL |
+
+The coordinator connection default stays NORMAL; FULL is set before `BEGIN` and restored after `COMMIT`.
+
+### Settings
+
+The coordinator reads `$ROGER_WILCO_SETTINGS` or `~/.config/roger-wilco/roger-wilco.conf`: `window` (default 32, 1-256), `retention` (7d, 1d-90d), `keepalive` (15s, 5s-60s) and `presence_window` (90s, 15s-15m). An unknown key or a value out of bounds fails startup; an absent file gives the defaults.
+The daemon takes `keepaliveMs` and `presenceWindowMs` from `hello`: its idle deadline is `3 × keepaliveMs` and its presence interval `presenceWindowMs / 3`.
+
+### Coordinator restore
+
+A restored coordinator database would issue again ids above its backup tail. With the coordinator stopped:
+
+1. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. It takes the inbox lock (it fails while a daemon runs), clears the stream in one transaction, keeps the bookmark as a skip floor (nothing at or below it is written again), and prints `{"highWater": N}`. On a host still on a version 1 daemon, read `SELECT MAX(sequence) FROM inbox_messages` instead.
+2. Run `node deploy/restore-coordinator.ts --sequence-floor N DB-PATH` with N at least the largest `highWater`. In one FULL transaction it raises the message id watermark to N and gives the log a new `stream_id`.
+3. Start the coordinator, then the daemons. Each resumes at the restored `C`; ids at or below the backup tail come back with the same bytes and deduplicate.
+
+A dedup hash conflict after a restore means the floor was too low or a host was not counted; the daemon stays fail-closed and reports the session and message id.
+`--reset-bookmark` alone is also the remedy for "Bookmark is behind the receipted position".
+
+### Rollback of one host
+
+With the host's daemon stopped: `node deploy/rollback-host-v2.ts --host HOST-ID DB-PATH` sets each of the host's cursors to `MAX(cursor, C)` and deletes the `hosts` row, and `node deploy/rollback-inbox.ts --stream-clients-stopped INBOX-PATH` returns the inbox to version 3.
+An older coordinator binary requires every host to be rolled back first.
+
+### Tests
+
+`test/acceptance/v2-*.test.ts` run the real coordinator and real daemons: delivery and window, broadcast fan-out, crash and restore, migration and rollback, presence, and a seeded randomised model.
+`npm run test:perf` runs the performance gates in `test/perf/` through a TCP proxy that adds 30 ms each way; it is not part of `npm test`.
+
 ## Local inbox and Pi ACK
 
 ### Local inbox
@@ -424,13 +532,16 @@ It then reconnects with the capped exponential backoff.
 The daemon uses one durable local SQLite database per host.
 `src/host/client.ts` implements the runtime-facing inbox methods through local IPC.
 Only the daemon opens the database and performs schema work.
-The current inbox schema is version 3.
+The current inbox schema is version 4.
+Version 4 adds `inbox_stream`, the host stream v2 bookmark (`stream_id`, `bookmark`), both NULL until the first v2 hello commits; `--reset-bookmark` clears only `stream_id`.
+The daemon hashes any row stored without a hash (by a daemon older than packet hashes, after a rollback) when it opens the inbox.
+`node deploy/rollback-inbox.ts --stream-clients-stopped INBOX-PATH` returns a stopped inbox to version 3; the other rollback flags also accept version 4.
 Version 3 renames the evidence columns to `evidence_record_id` and `evidence_location`.
 It also rewrites queued registration JSON from `piSessionId` to `sessionId`.
 Session keys, messages, cursors, and stored evidence values do not change.
 The legacy `messages` view keeps its old column names.
 The migration runs in one transaction when a daemon first opens a version 0 or version 2 file.
-An older daemon fails closed on a version 3 file with `Unsupported inbox schema version: 3`.
+An older daemon fails closed on a newer file, for example `Unsupported inbox schema version: 4`.
 `node deploy/rollback-inbox.ts --contract-clients-stopped INBOX-PATH` returns a stopped inbox to version 2.
 
 ### Delivery evidence
@@ -475,7 +586,7 @@ The wait returns at once, without a queue write or a coordinator request, when t
 A registration for the session that is still queued or in flight disables this shortcut: the request joins that registration and waits for its attempt.
 Every request for a session queues the same bytes, so a new request never supersedes a waiting one.
 A row queued by a version 1 daemon can carry `displayName`; the daemon posts it without the name, and the next enqueue replaces it.
-A queued heartbeat always posts, and its result replaces the remembered one.
+On v1 a queued heartbeat always posts, and its result replaces the remembered one. On v2, once presence runs, a heartbeat that the remembered result answers completes locally, with no row and no POST.
 A coordinator refusal withdraws the remembered result; an unreachable coordinator does not.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
@@ -485,7 +596,7 @@ Identical queued registrations do not generate another write or wake.
 A known failed request receives a bounded retry delay.
 An empty queue has no scan timer.
 
-The host removes local message rows seven days after their Pi ACK.
+The host removes local message rows seven days after their Pi ACK, and on v2 only at or below the bookmark.
 It never expires an unacknowledged local message.
 Legacy acknowledged rows receive a full seven-day window after migration.
 Cleanup runs at startup and once per minute during daemon activity.
@@ -617,7 +728,7 @@ If the recovery turn also aborts, the original stays pending for later input or 
 
 ### Lane A
 
-`src/server/store.ts` exports `createCoordinatorStore(dbPath: string, namespace: string): CoordinatorStore`.
+`src/server/store.ts` exports `createCoordinatorStore(dbPath: string, namespace: string, options?: {retentionMs?: number}): CoordinatorStore`.
 Tests live in `test/store/`.
 Lane A is the one schema owner.
 It uses WAL, parameterized `node:sqlite`, and synchronous transactions.
@@ -625,7 +736,7 @@ It has no release-watcher tables and no feed tables.
 
 ### Lane B
 
-`src/server/control/index.ts` exports `createControlHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler`.
+`src/server/control/index.ts` exports `createControlHandler(store: CoordinatorStore, auth: HostAuthenticator, settings?: Settings): ControlHandler`.
 Tests live in `test/control/`.
 The bin composes this handler with lane C.
 This lane does not edit the schema.
@@ -633,12 +744,12 @@ It serves the fixed HTTP control routes.
 
 ### Lane C
 
-`src/server/delivery/index.ts` exports `createStreamHandler(store: CoordinatorStore, auth: HostAuthenticator): ControlHandler`.
+`src/server/delivery/index.ts` exports `createStreamHandler(store: CoordinatorStore, auth: HostAuthenticator, settings?: Settings): ControlHandler`.
 Tests live in `test/delivery/`.
-It serves the stream route and the receipt route.
+It serves the v1 and v2 stream and receipt routes from one map of live connections keyed by host.
 One host stream covers all subscribed sessions.
 Store commits and receipts trigger durable replay reads.
-Keepalive writes do not query pending messages.
+v1 keepalive writes do not query pending messages and stay at a fixed 15 seconds; the `keepalive` setting applies to v2 only. The v2 keepalive tick runs one batch when the window has room, then sends `through`.
 This lane does not edit the schema.
 
 ### Lane D
