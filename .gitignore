@@ -8,5 +8,5 @@ coverage/
 rust/target/
 reports/
 deploy/package-lock.json
-npmjs.env
+*.env
 .ci/
