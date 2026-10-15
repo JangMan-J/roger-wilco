@@ -45,9 +45,9 @@ export interface ClaudeAdapter {
   /** Bind the session lease, queue registration, and start heartbeat/lease recovery. */
   start(): Promise<void>;
   stop(): Promise<void>;
-  /** The bound session address; fails while unbound. */
+  /** The bound session address; fails while unbound or after the harness session changed. */
   bound(): Promise<BoundSession | Failure>;
-  /** One coordinator call as the bound session. */
+  /** One coordinator call as the bound session; refused once the harness session changed. */
   call(route: string, method: 'GET' | 'POST', body?: unknown): Promise<Outcome<unknown>>;
   /** Dispatch one roger_* tool by name. */
   tool(name: string, params?: Record<string, unknown>): Promise<Outcome<unknown>>;
@@ -55,7 +55,8 @@ export interface ClaudeAdapter {
    * One delivery pass: acknowledge whatever the transcript already proves, then hand
    * each remaining pending message to the harness once. Returns the messages handed
    * over in this pass; they stay unacknowledged until a later pass finds transcript
-   * evidence for them.
+   * evidence for them. Rejects, delivering and acknowledging nothing further, once
+   * the harness session no longer matches the bound session.
    */
   receive(): Promise<Message[]>;
   /** True while this runtime holds its lease. */
@@ -76,8 +77,23 @@ export function createClaudeAdapter(harness: ClaudeHarness, options: ClaudeAdapt
   const valid = (rt: Runtime, token: string | undefined) =>
     !rt.stopped && rt.bound && token !== undefined && token === rt.inbox.authority();
 
+  /** Why the harness no longer runs this runtime's session, or undefined while it still does. */
+  function sessionChange(rt: Runtime): string | undefined {
+    const own = sessionKey(rt.session);
+    let current: string;
+    try { current = sessionKey(claudeSessionAddress(harness.sessionId(), rt.session.namespace)); }
+    catch (cause) { return `Session changed: ${(cause as Error).message}; bound session is ${own}`; }
+    return current === own ? undefined : `Session changed: harness session ${current} is not bound session ${own}`;
+  }
+  /** Fail closed: nothing is delivered or acknowledged once the harness session differs from the bound one. */
+  function assertSession(rt: Runtime): void {
+    const reason = sessionChange(rt);
+    if (reason) throw new Error(reason);
+  }
+
   async function pass(rt: Runtime): Promise<Message[]> {
     const delivered: Message[] = [];
+    assertSession(rt);
     const token = rt.inbox.authority();
     if (!valid(rt, token)) return delivered;
     const pending = await rt.inbox.pending(rt.session, rt.runtimeId);
@@ -90,17 +106,20 @@ export function createClaudeAdapter(harness: ClaudeHarness, options: ClaudeAdapt
       catch { continue; } // Indeterminate store: retry on a later pass, never acknowledge.
       if (found.state === 'persisted') {
         if (!rt.evidence.locatedAt(found.evidence, location!)) continue;
+        assertSession(rt);
         const result = await rt.evidence.acknowledge(found.evidence);
         if (result.ok) submitted.delete(message.id);
         continue;
       }
       if (submitted.has(message.id)) continue;
+      assertSession(rt);
       submitted.add(message.id);
       try { await harness.deliver(message); }
       catch { submitted.delete(message.id); continue; }
       delivered.push(message);
       // A harness may persist synchronously (tests, file-backed hosts); if the
       // transcript already proves this delivery, acknowledge it in the same pass.
+      assertSession(rt);
       try {
         const again = await rt.evidence.lookup(rt.evidence.location(), message.id, message);
         if (again.state === 'persisted' && rt.evidence.locatedAt(again.evidence, rt.evidence.location()!)) {
@@ -116,15 +135,21 @@ export function createClaudeAdapter(harness: ClaudeHarness, options: ClaudeAdapt
     async bound() {
       const rt = runtime;
       if (!rt || rt.stopped || !rt.bound) return error('Roger-Wilco session is not bound');
+      const changed = sessionChange(rt);
+      if (changed) return error(changed);
       return { actor: rt.session, hostId: rt.config.hostId };
     },
     async call(route, method, body) {
       const rt = runtime;
       if (!rt || rt.stopped || !rt.bound) return error('Roger-Wilco session is not bound');
+      let changed = sessionChange(rt);
+      if (changed) return error(changed);
       const registration = route === ROUTES.register && isRegistration(body) ? body : { session: rt.session };
       const registered = await rt.inbox.awaitRegistration(registration);
       if (!registered.ok) return registered;
       if (runtime !== rt || rt.stopped) return error('Session changed');
+      changed = sessionChange(rt);
+      if (changed) return error(changed);
       if (route === ROUTES.register) return registered;
       return options.request(rt.config, route, method, body);
     },
@@ -135,7 +160,7 @@ export function createClaudeAdapter(harness: ClaudeHarness, options: ClaudeAdapt
     tool,
     bound: core.bound,
     call: core.call,
-    isBound: () => !!runtime && !runtime.stopped && runtime.bound,
+    isBound: () => !!runtime && !runtime.stopped && runtime.bound && !sessionChange(runtime),
     async start() {
       if (runtime) return;
       const config = await options.loadConfig();

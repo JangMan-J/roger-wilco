@@ -242,3 +242,64 @@ test('Muse entry imports no Pi module', async () => {
   assert.ok([...seen].some(file => file.endsWith(join('src', 'evidence.ts'))));
   assert.equal([...seen].some(file => file.includes(join('src', 'pi'))), false);
 });
+
+test('a harness session change fails closed: no call, no delivery, no acknowledgement', async t => {
+  const h = await stack(t);
+  const session = museSessionAddress(museSessionId, namespace);
+  const otherSessionId = '01a13d1b-8a0a-7ee0-8d8e-52d312288315';
+  let current = museSessionId;
+  let switchAfterDeliver = false;
+  const delivered: Message[] = [];
+  const harness: MuseHarness = {
+    sessionId: () => current,
+    transcriptPath: () => h.transcript,
+    deliver: async message => {
+      delivered.push(message);
+      await appendFile(h.transcript, `${JSON.stringify({ output: JSON.stringify({ event: 'delivered', message }) })}\n`);
+      if (switchAfterDeliver) current = otherSessionId;
+    },
+  };
+  const requests: string[] = [];
+  const adapter = createMuseAdapter(harness, {
+    loadConfig: async () => h.config,
+    connectHost,
+    request: (config, route, method, body) => { requests.push(route); return requestCoordinator(config, route, method, body); },
+  });
+  t.after(() => adapter.stop());
+  await adapter.start();
+  assert.equal((await adapter.tool('roger_identity', {})).ok, true);
+  const first = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'one' });
+  const second = h.store.send({ hostId }, peer, { recipient: sessionKey(session), body: 'two' });
+  assert.ok(first.ok && second.ok);
+  await until(() => receipt(h.inboxPath, second.value.id) !== undefined, 'both messages reach the local inbox');
+
+  // The harness now runs another session; the runtime still holds the old lease.
+  current = otherSessionId;
+  const reason = new RegExp(`Session changed: harness session fleet:${otherSessionId} is not bound session fleet:${museSessionId}`);
+  assert.equal(adapter.isBound(), false);
+  const identity = await adapter.bound();
+  assert.ok('ok' in identity && !identity.ok);
+  assert.match(identity.message, reason);
+  const sent = await adapter.tool('roger_send', { recipient: sessionKey(peer), body: 'stale' });
+  assert.equal(sent.ok, false);
+  assert.match(!sent.ok ? sent.message : '', reason);
+  assert.deepEqual(requests, [], 'no coordinator call as the stale session');
+  await assert.rejects(adapter.receive(), reason);
+  assert.equal(delivered.length, 0, 'nothing delivered to the other session');
+
+  // The session changes during a delivery: the delivered message is not acknowledged, the next is not delivered.
+  current = museSessionId;
+  switchAfterDeliver = true;
+  await assert.rejects(adapter.receive(), reason);
+  assert.deepEqual(delivered.map(message => message.body), ['one']);
+  assert.equal(receipt(h.inboxPath, first.value.id).evidence_record_id, null, 'transcript evidence is not acknowledged after the change');
+  assert.equal(receipt(h.inboxPath, second.value.id).evidence_record_id, null);
+
+  // Back on the bound session, the next pass acknowledges the first and delivers the second.
+  current = museSessionId;
+  switchAfterDeliver = false;
+  await adapter.receive();
+  assert.deepEqual(delivered.map(message => message.body), ['one', 'two']);
+  assert.match(receipt(h.inboxPath, first.value.id).evidence_record_id ?? '', /^line-\d+$/);
+  assert.match(receipt(h.inboxPath, second.value.id).evidence_record_id ?? '', /^line-\d+$/);
+});
