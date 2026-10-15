@@ -110,7 +110,9 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
     if (!valid(token) || !path || file() !== path || submitted.has(message.id)) return;
     submitted.add(message.id);
     try {
-      pi.sendMessage(deliveryEntry(message), { deliverAs: 'followUp', triggerTurn: true });
+      // A directed message wakes the session; a broadcast is recorded without
+      // starting a turn, and the model sees it on its next turn.
+      pi.sendMessage(deliveryEntry(message), { deliverAs: 'followUp', triggerTurn: message.recipient !== '*' });
     } catch (e) { submitted.delete(message.id); report(`Pi submission failed: ${String(e)}`); retry(); }
   }
 
@@ -165,7 +167,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
         // runtime was unbound; only wake IDs still pending in this inbox.
         const pending = await inbox.pending(session, runtimeId);
         if (!valid(token) || file() !== path ||
-            !pending.some(message => submitted.has(message.id)) || !(await ownsLease(token)) ||
+            !pending.some(message => submitted.has(message.id) && message.recipient !== '*') || !(await ownsLease(token)) ||
             !valid(token) || file() !== path || !submitted.size) {
           recoveringAbort = false;
           return;

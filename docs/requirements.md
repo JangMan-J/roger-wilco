@@ -82,9 +82,12 @@ harness. Each adapter declares one wake level:
 - `mailbox-only`: the adapter can only store the message in the mailbox.
 
 The mailbox contents, the delivery rule, and the acknowledgement rule are
-the same at all three levels. A directed send wakes only the host that
-holds the recipient session. A broadcast message (recipient `*`) wakes
-all hosts. There is no separate wake-only signal type.
+the same at all three levels. A directed send wakes only the recipient
+session. A broadcast message (recipient `*`) reaches every mailbox and
+wakes no session; each session sees it the next time it reads its mailbox
+or takes a turn. The coordinator still notifies every host of a broadcast
+so that each host stores it; that notification is transport, not a wake.
+There is no separate wake-only signal type.
 
 ## Out of scope
 

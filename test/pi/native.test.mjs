@@ -117,6 +117,18 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   await until(async () => (await entries(file)).some(e => e.type === 'custom_message' && e.details?.deliveryId === 'fleet:msg:1'));
   assert.equal((await entries(file)).find(e => e.details?.deliveryId === 'fleet:msg:1').content, JSON.stringify(idle.message),
     'native custom messages preserve the envelope without Roger warning boilerplate');
+  // A broadcast is recorded in the idle session and acknowledged, but starts no model turn.
+  await external.receive({ type: 'message', subscriptionId: `fleet:${a}`, message: {
+    version: 1, id: 'fleet:msg:100', sequence: 100, timestamp: Date.now(), sender: `fleet:${b}`,
+    recipient: '*', body: 'Broadcast update', data: null, visibility: 'public' } });
+  await until(async () => (await entries(file)).some(e => e.type === 'custom_message' && e.details?.deliveryId === 'fleet:msg:100'));
+  await until(async () => {
+    const db = new DatabaseSync(inboxPath, { readOnly: true });
+    try { return !!db.prepare('SELECT evidence_record_id FROM inbox_messages WHERE message_id = ?').get('fleet:msg:100')?.evidence_record_id; }
+    finally { db.close(); }
+  });
+  await delay(300);
+  assert.equal(requests.length, 1, 'a broadcast must not start a model turn');
   hold = true;
   const work = session.prompt('Original user work');
   await until(() => requests.length === 2);

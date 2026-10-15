@@ -35,8 +35,9 @@ _Confirmed_: 2026-10-15, user clarification that names are opt-in and not part o
 _Avoid_: Display name, session name
 
 **Wake**:
-A request, made when a message is sent, for the receiving session to attend
-to its mailbox. A wake is not a message type and it is not an acknowledgement.
+A request, made when a directed message is sent, for the receiving session to attend
+to its mailbox. A broadcast makes no wake request.
+A wake is not a message type and it is not an acknowledgement.
 _Example_: A message sent to an idle Pi session causes a new turn in that session.
 _Confirmed_: 2026-10-15, user requirement that sending must be able to wake an agent.
 _Avoid_: Signal, ping, notification
@@ -45,7 +46,7 @@ _Avoid_: Signal, ping, notification
 The strongest wake an adapter can perform, declared by the adapter. One of:
 `forceful` (start a turn in an idle live session), `next-turn` (queue for
 the next turn boundary), or `mailbox-only` (store only).
-_Example_: The Pi adapter is `forceful`; the Muse CLI adapter is `mailbox-only`.
+_Example_: The Pi adapter is `forceful`; the Muse and Claude Code CLI adapters are `mailbox-only`.
 _Confirmed_: 2026-10-15, harness surface study across twenty harnesses.
 _Avoid_: Wake capability tier, wake mode
 

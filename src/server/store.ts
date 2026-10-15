@@ -378,8 +378,9 @@ class Store implements CoordinatorStore {
       return { ok: true, value };
     });
     if (outcome.ok) {
-      // Broadcast wakes every host; a directed send wakes only the recipient's
-      // host, and an unregistered recipient wakes none.
+      // Transport notification, not a session wake: a broadcast notifies every
+      // host so each stores it; a directed send notifies only the recipient's
+      // host, and an unregistered recipient notifies none.
       if (input.recipient === '*') this.notify(undefined);
       else if (recipientHost) this.notify(recipientHost);
     }
