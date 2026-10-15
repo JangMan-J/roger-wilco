@@ -96,7 +96,7 @@ The core does not provide the following, and consumers must not require it:
 - Starting, stopping, supervising, or rendering agent processes or
   terminals.
 - Inferring session state from terminal or model output. Presence is the
-  registration and heartbeat record; no other state is inferred.
+  registration and host presence record; no other state is inferred.
 - Conversation operations: no request/response pairing, steering,
   handover, or structured interview in the protocol. Consumers can build
   these from message bodies and the `data` field.

@@ -50,6 +50,12 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
   const requests = [];
   const server = createServer(async (req, res) => {
+    // A version 1 coordinator: the daemon's /v2 stream request gets 404 and falls back to /v1.
+    if (req.url.startsWith('/v2/')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found', message: 'Unknown route' }));
+      return;
+    }
     if (req.url === '/v1/hosts/stream') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(': idle\n\n');
@@ -176,6 +182,12 @@ test('native slash commands show the board without a model turn and report unava
   let savedRank = 1;
   let rankUnavailable = false;
   const server = createServer(async (req, res) => {
+    // A version 1 coordinator: the daemon's /v2 stream request gets 404 and falls back to /v1.
+    if (req.url.startsWith('/v2/')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found', message: 'Unknown route' }));
+      return;
+    }
     if (req.url === '/v1/hosts/stream') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(': idle\n\n');

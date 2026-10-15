@@ -402,12 +402,12 @@ The `send` and `claim` transactions commit at `synchronous=FULL`. A message inse
 A FULL commit also syncs every earlier WAL frame, so a registration that a later message depends on reaches stable storage with that message.
 The offered mark is connection state.
 Lost cursor updates replay messages: after an OS crash the cursor can roll back over several acknowledged messages, the stream offers each again in order, the daemon deduplicates them by message ID, and the daemon sends each receipt again, which the coordinator accepts.
-Registrations, ranks, and claim releases commit at NORMAL. The host daemon repeats registration on its heartbeat, and a lost release only keeps the claim until it expires.
+Registrations, ranks, and claim releases commit at NORMAL. A v1 host daemon repeats registration on its heartbeat; a v2 host daemon registers again on a presence `unknown` and after a `leave`. A lost release only keeps the claim until it expires.
 
 ### Host stream deadlines
 
 The host stream client uses a 10-second deadline for response headers.
-After the response headers arrive, the idle deadline is 45 seconds.
+After the response headers arrive, the idle deadline is 45 seconds on v1, and `3 × keepaliveMs` from `hello` on v2.
 A nonempty read resets that idle deadline.
 SSE comments are nonempty reads.
 Keepalive comments therefore reset the idle deadline.
@@ -424,13 +424,15 @@ It then reconnects with the capped exponential backoff.
 The daemon uses one durable local SQLite database per host.
 `src/host/client.ts` implements the runtime-facing inbox methods through local IPC.
 Only the daemon opens the database and performs schema work.
-The current inbox schema is version 3.
+The current inbox schema is version 4.
+Version 4 adds `inbox_stream`, the host stream v2 bookmark (`stream_id`, `bookmark`), both NULL until the first v2 hello commits.
+`node deploy/rollback-inbox.ts --stream-clients-stopped INBOX-PATH` returns a stopped inbox to version 3; the other rollback flags also accept version 4.
 Version 3 renames the evidence columns to `evidence_record_id` and `evidence_location`.
 It also rewrites queued registration JSON from `piSessionId` to `sessionId`.
 Session keys, messages, cursors, and stored evidence values do not change.
 The legacy `messages` view keeps its old column names.
 The migration runs in one transaction when a daemon first opens a version 0 or version 2 file.
-An older daemon fails closed on a version 3 file with `Unsupported inbox schema version: 3`.
+An older daemon fails closed on a newer file, for example `Unsupported inbox schema version: 4`.
 `node deploy/rollback-inbox.ts --contract-clients-stopped INBOX-PATH` returns a stopped inbox to version 2.
 
 ### Delivery evidence
@@ -475,7 +477,7 @@ The wait returns at once, without a queue write or a coordinator request, when t
 A registration for the session that is still queued or in flight disables this shortcut: the request joins that registration and waits for its attempt.
 Every request for a session queues the same bytes, so a new request never supersedes a waiting one.
 A row queued by a version 1 daemon can carry `displayName`; the daemon posts it without the name, and the next enqueue replaces it.
-A queued heartbeat always posts, and its result replaces the remembered one.
+On v1 a queued heartbeat always posts, and its result replaces the remembered one. On v2, once presence runs, a heartbeat that the remembered result answers completes locally, with no row and no POST.
 A coordinator refusal withdraws the remembered result; an unreachable coordinator does not.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
@@ -485,7 +487,7 @@ Identical queued registrations do not generate another write or wake.
 A known failed request receives a bounded retry delay.
 An empty queue has no scan timer.
 
-The host removes local message rows seven days after their Pi ACK.
+The host removes local message rows seven days after their Pi ACK, and on v2 only at or below the bookmark.
 It never expires an unacknowledged local message.
 Legacy acknowledged rows receive a full seven-day window after migration.
 Cleanup runs at startup and once per minute during daemon activity.

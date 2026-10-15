@@ -300,7 +300,7 @@ test('a failing first registration does not starve a later session in the same p
   await inbox.enqueueRegistration({ session: b });
   const posts: string[] = [];
   const results: Array<{ key: string; ok: boolean; error?: string }> = [];
-  inbox.onRegistrationResult((key, _json, _generation, result) => results.push({ key, ok: result.ok, ...(result.ok ? {} : { error: result.error }) }));
+  inbox.onRegistrationResult((key, result) => results.push({ key, ok: result.ok, ...(result.ok ? {} : { error: result.error }) }));
   const server = createServer(async (req, res) => {
     if (req.url === ROUTES.register) {
       let payload = '';
@@ -348,7 +348,7 @@ test('a version 1 displayName is dropped at enqueue, an older daemon\'s queued n
   t.after(() => reopened.close());
   const bodies: unknown[] = [];
   const results: RegistrationResult[] = [];
-  reopened.onRegistrationResult((_key, _json, _generation, result) => { if (result.ok) results.push(result.value); });
+  reopened.onRegistrationResult((_key, result) => { if (result.ok) results.push(result.value); });
   const server = createServer(async (req, res) => {
     if (req.url === ROUTES.register) {
       let payload = '';
