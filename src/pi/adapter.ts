@@ -134,6 +134,11 @@ export function createPiAdapter(pi: ExtensionAPI, options: PiAdapterOptions): vo
       if (route === ROUTES.register) return registered;
       return options.request(owner.config, route, method, body);
     },
+    async health() {
+      const owner = runtime;
+      if (!owner || owner.stopped) return error('Roger-Wilco session is not bound');
+      return options.request(owner.config, ROUTES.health, 'GET');
+    },
   };
   registerPiSurface(pi, core);
 }

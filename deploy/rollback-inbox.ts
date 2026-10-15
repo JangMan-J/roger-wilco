@@ -30,6 +30,11 @@ function downgradeSchema3(db: DatabaseSync): void {
   db.exec('PRAGMA user_version = 2');
 }
 
+/** Schema 4 -> 3 inside an open transaction: drop the host stream v2 bookmark. */
+function downgradeSchema4(db: DatabaseSync): void {
+  db.exec('DROP TABLE inbox_stream; PRAGMA user_version = 3');
+}
+
 function withInbox(path: string, work: (db: DatabaseSync, version: number) => void): void {
   const lock = new DatabaseSync(`${path}.lock`);
   let db: DatabaseSync | undefined;
@@ -47,8 +52,9 @@ function withInbox(path: string, work: (db: DatabaseSync, version: number) => vo
 /** Requires all legacy runtimes to be stopped. Preserves post-cutover rows in place. */
 export function rollbackInbox(path: string) {
   withInbox(path, (db, version) => {
-    if (version !== 2 && version !== 3) throw new Error('Expected inbox schema version 2 or 3');
-    if (version === 3) downgradeSchema3(db);
+    if (version !== 2 && version !== 3 && version !== 4) throw new Error('Expected inbox schema version 2, 3 or 4');
+    if (version === 4) downgradeSchema4(db);
+    if (version >= 3) downgradeSchema3(db);
     db.exec(`
       DROP VIEW messages;
       DROP VIEW leases;
@@ -69,17 +75,28 @@ export function rollbackInbox(path: string) {
 /** Schema 3 -> 2, for a daemon package from before the agent-neutral contract. Requires that daemon and its clients to be stopped. */
 export function rollbackInboxContract(path: string) {
   withInbox(path, (db, version) => {
-    if (version !== 3) throw new Error('Expected inbox schema version 3');
+    if (version !== 3 && version !== 4) throw new Error('Expected inbox schema version 3 or 4');
+    if (version === 4) downgradeSchema4(db);
     downgradeSchema3(db);
     db.exec('DELETE FROM inbox_leases');
   });
 }
 
+/** Schema 4 -> 3, for a daemon package from before host stream v2. Requires that daemon and its clients to be stopped. */
+export function rollbackInboxStream(path: string) {
+  withInbox(path, (db, version) => {
+    if (version !== 4) throw new Error('Expected inbox schema version 4');
+    downgradeSchema4(db);
+  });
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [flag, path] = process.argv.slice(2);
-  if (process.argv.length !== 4 || !path || (flag !== '--legacy-clients-stopped' && flag !== '--contract-clients-stopped'))
-    throw new Error('Usage: node deploy/rollback-inbox.ts --legacy-clients-stopped|--contract-clients-stopped inbox-path');
-  if (flag === '--legacy-clients-stopped') rollbackInbox(resolve(path));
-  else rollbackInboxContract(resolve(path));
+  const rollbacks: Record<string, (path: string) => void> = {
+    '--legacy-clients-stopped': rollbackInbox, '--contract-clients-stopped': rollbackInboxContract, '--stream-clients-stopped': rollbackInboxStream,
+  };
+  if (process.argv.length !== 4 || !path || !flag || !Object.hasOwn(rollbacks, flag))
+    throw new Error('Usage: node deploy/rollback-inbox.ts --legacy-clients-stopped|--contract-clients-stopped|--stream-clients-stopped inbox-path');
+  rollbacks[flag]!(resolve(path));
   console.log('Inbox rollback preserved messages, receipts, and queued registrations.');
 }

@@ -1,10 +1,22 @@
 /** Claude Code tool surface. It sees the core only through CoreAccess; it never touches the lease, delivery, or Claude Code session IDs. */
 import {
-  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, sessionKey,
+  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, isSettingValue, sessionKey,
   type Claim, type Outcome, type RegistrationResult, type SessionAddress,
 } from '../protocol/index.ts';
 
-const PRESENCE_MS = 90_000;
+/** Board "present" window when `/health` has no presenceWindowMs (a version 1 coordinator). */
+const PRESENCE_FALLBACK_MS = 90_000;
+/** The board's "present" window from `/health`, read once per process once it succeeds; the fallback otherwise. */
+function presenceWindow(health: () => Promise<Outcome<unknown>>): () => Promise<number> {
+  let known: number | undefined;
+  return async () => {
+    if (known !== undefined) return known;
+    const result = await health();
+    if (!result.ok) return PRESENCE_FALLBACK_MS;
+    const value = result.value !== null && typeof result.value === 'object' ? (result.value as { presenceWindowMs?: unknown }).presenceWindowMs : undefined;
+    return known = isSettingValue('presenceWindowMs', value) ? value : PRESENCE_FALLBACK_MS;
+  };
+}
 
 export type Failure = Extract<Outcome<never>, { ok: false }>;
 /** The invoking session, resolved while this runtime holds its lease. */
@@ -16,21 +28,25 @@ export interface CoreAccess {
   bound(): Promise<BoundSession | Failure>;
   /** Register the invoking session, then make one coordinator call as it. A register route returns the registration. */
   call(route: string, method: 'GET' | 'POST', body?: unknown): Promise<Outcome<unknown>>;
+  /** `GET /health`, without registering. */
+  health(): Promise<Outcome<unknown>>;
 }
 
 const failure = (message: string): Failure => ({ ok: false, error: 'temporarily_unavailable', message });
 
 /** Dispatch one roger_* tool by name. Any Claude Code tool host (CLI, MCP, plugin) registers this same dispatcher. */
 export function createClaudeTools(core: CoreAccess): (name: string, params?: Record<string, unknown>) => Promise<Outcome<unknown>> {
+  const window = presenceWindow(() => core.health());
   async function board(all = false): Promise<Outcome<unknown>> {
     const first = await core.call(ROUTES.sessions, 'GET') as Outcome<RegistrationResult[]>;
     if (!first.ok) return first;
     const second = await core.call(ROUTES.claims, 'GET');
+    const present = await window();
     const now = Date.now();
     // A version 1 coordinator can still list displayName and session entities.
     const rows = first.value.map(ownRegistrationResult);
     const visible = all ? rows : rows.filter(row =>
-      typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= PRESENCE_MS);
+      typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= present);
     return second.ok ? { ok: true, value: { sessions: visible, claims: (second.value as Claim[]) } } : second;
   }
 

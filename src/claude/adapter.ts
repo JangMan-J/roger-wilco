@@ -152,6 +152,11 @@ export function createClaudeAdapter(harness: ClaudeHarness, options: ClaudeAdapt
       if (route === ROUTES.register) return registered;
       return options.request(rt.config, route, method, body);
     },
+    async health() {
+      const rt = runtime;
+      if (!rt || rt.stopped) return error('Roger-Wilco session is not bound');
+      return options.request(rt.config, ROUTES.health, 'GET');
+    },
   };
   const tool = createClaudeTools(core);
 

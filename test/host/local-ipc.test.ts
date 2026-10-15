@@ -364,14 +364,14 @@ test('a version 1 waiter that sends displayName is an ordinary waiter: a later n
   const enqueued = readResult(raw, 2);
   writeFrame(raw, 2, 'enqueueRegistration', { registration: { session: a, displayName: 'New name' } });
   assert.deepEqual(await enqueued, { ok: true, value: null });
-  assert.deepEqual(inbox.registrations(), [queued], 'the same canonical row and generation');
+  assert.deepEqual(inbox.registrations(), [queued], 'the same canonical row');
   const value: RegistrationResult = { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 1 };
   inbox.completeRegistration(queued!);
-  inbox.reportRegistration(sessionKey(a), queued!.registration_json, queued!.generation, { ok: true, value });
+  inbox.reportRegistration(sessionKey(a), { ok: true, value });
   assert.deepEqual(await waiting, { ok: true, value });
 });
 
-test('a waiter follows a newer generation of its session row and ignores the older result', async t => {
+test('a waiter settles on the next result for its own session only', async t => {
   const { path, inbox, config } = rig(t);
   const ipc = await listenLocal(config, inbox);
   t.after(() => ipc.close());
@@ -381,19 +381,20 @@ test('a waiter follows a newer generation of its session row and ignores the old
   const waiting = client.awaitRegistration({ session: a });
   void waiting.then(() => { settled = true; }, () => { settled = true; });
   await waitFor(async () => await count(path, registrationSql) === 1);
-  const older = inbox.registrations()[0]!;
-  inbox.completeRegistration(older); // consumed before its result is reported
+  const [row] = inbox.registrations();
+  // A repeated request queues the same bytes: no new row and no new announcement.
+  let announced = 0;
+  inbox.onRegistration(() => { announced++; });
   await client.enqueueRegistration({ session: a });
-  const newer = inbox.registrations()[0]!;
-  assert.ok(newer.generation > older.generation);
-  inbox.reportRegistration(sessionKey(a), older.registration_json, older.generation, { ok: false, error: 'owner_conflict', message: 'older' });
+  assert.deepEqual(inbox.registrations(), [row]);
+  assert.equal(announced, 0);
+  inbox.reportRegistration(sessionKey(b), { ok: false, error: 'owner_conflict', message: 'other session' });
   await delay(100);
-  assert.equal(settled, false, 'the waiter follows the newer generation');
+  assert.equal(settled, false, 'another session\'s result does not settle the waiter');
   // A version 1 daemon could add displayName and session entities; the client drops them.
   const value: RegistrationResult = { subscription: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt: 2 };
-  inbox.completeRegistration(newer);
-  inbox.reportRegistration(sessionKey(a), newer.registration_json, newer.generation,
-    { ok: true, value: { ...value, displayName: 'Old name', entities: [] } as RegistrationResult });
+  inbox.completeRegistration(row!);
+  inbox.reportRegistration(sessionKey(a), { ok: true, value: { ...value, displayName: 'Old name', entities: [] } as RegistrationResult });
   assert.deepEqual(await waiting, { ok: true, value });
 });
 
@@ -404,7 +405,7 @@ test('registered event preserves the coordinator failure code to the client', as
   const client = clientFor(t, path);
   assert.equal((await client.bind(a, 'rt-a')).ok, true);
   const seen = new Promise<unknown>(resolve => client.onRegistrationResult!(result => resolve(result)));
-  inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 1,
+  inbox.reportRegistration(sessionKey(a),
     { ok: false, error: 'owner_conflict', message: 'Session belongs to another host' });
   assert.deepEqual(await seen, { ok: false, error: 'owner_conflict', message: 'Session belongs to another host' });
 });
@@ -619,9 +620,9 @@ test('awaitRegistration for a session registered in this daemon lifetime makes n
     assert.equal(posts.length, 2);
     assert.equal(await count(path, registrationSql), 0);
     // A coordinator refusal withdraws the result; an outage keeps it.
-    inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'temporarily_unavailable', message: 'offline' });
+    inbox.reportRegistration(sessionKey(a), { ok: false, error: 'temporarily_unavailable', message: 'offline' });
     assert.deepEqual(await client.awaitRegistration({ session: a }), second);
-    inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'owner_conflict', message: 'moved' });
+    inbox.reportRegistration(sessionKey(a), { ok: false, error: 'owner_conflict', message: 'moved' });
     assert.equal((await client.awaitRegistration({ session: a })).ok, true);
     assert.equal(posts.length, 3);
     assert.ok(posts.every(body => JSON.stringify(body) === JSON.stringify({ session: a })), 'every POST carries the session only');
@@ -694,7 +695,7 @@ test('a queued registration keeps awaitRegistration off the remembered result, i
   const json = JSON.stringify({ session: a });
   const result = (lastSeenAt: number): Outcome<RegistrationResult> => ({ ok: true, value: { subscription: { id: key, session: a, hostId: 'host-a', cursor: 0 }, rank: 1, lastSeenAt } });
   const seenOf = (outcome: Outcome<unknown>) => outcome.ok ? (outcome.value as RegistrationResult).lastSeenAt : undefined;
-  inbox.reportRegistration(key, json, 0, result(1));
+  inbox.reportRegistration(key, result(1));
   assert.equal(seenOf(await client.awaitRegistration({ session: a })), 1, 'nothing pending: answered from memory');
   // An await behind a queued heartbeat waits for that heartbeat.
   await client.enqueueRegistration({ session: a });
@@ -705,7 +706,7 @@ test('a queued registration keeps awaitRegistration off the remembered result, i
   assert.equal(settled, false, 'an await does not return the old result while a heartbeat is queued');
   let row = inbox.registrations()[0]!;
   inbox.completeRegistration(row);
-  inbox.reportRegistration(key, row.registration_json, row.generation, result(2));
+  inbox.reportRegistration(key, result(2));
   assert.equal(seenOf(await behind), 2);
   // An outage leaves the heartbeat queued and keeps the remembered result in
   // memory; an await joins the queued row and reports its last attempt, not
@@ -713,10 +714,10 @@ test('a queued registration keeps awaitRegistration off the remembered result, i
   await client.enqueueRegistration({ session: a });
   row = inbox.registrations()[0]!;
   const offline: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'offline' };
-  inbox.reportRegistration(key, row.registration_json, row.generation, offline);
+  inbox.reportRegistration(key, offline);
   assert.deepEqual(await client.awaitRegistration({ session: a }), offline);
   assert.deepEqual(inbox.registrations(), [row], 'the row stays queued for the retry');
   inbox.completeRegistration(row);
-  inbox.reportRegistration(key, row.registration_json, row.generation, result(3));
+  inbox.reportRegistration(key, result(3));
   assert.equal(seenOf(await client.awaitRegistration({ session: a })), 3, 'nothing pending again: answered from memory');
 });

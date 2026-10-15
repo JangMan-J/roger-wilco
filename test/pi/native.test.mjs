@@ -38,6 +38,12 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     const body = req.method === 'POST' ? JSON.parse(await new Promise(resolve => {
       let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value));
     })) : undefined;
+    // A version 1 coordinator: the daemon's /v2 stream request gets 404 and falls back to /v1.
+    if (req.url.startsWith('/v2/')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found', message: 'Unknown route' }));
+      return;
+    }
     if (req.url === '/v1/hosts/stream') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(': idle\n\n');

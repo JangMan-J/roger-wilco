@@ -23,8 +23,22 @@ export async function runHost(configPath?: string) {
   try { await daemon.start(abort.signal); }
   finally { await stop(); }
 }
+/**
+ * Clear the inbox bookmark so the next connect resumes at the coordinator's
+ * receipted position. Takes the inbox singleton lock, so it fails while a
+ * daemon runs. Prints the highest position this inbox has seen.
+ */
+export async function resetBookmark(configPath?: string): Promise<{ highWater: number }> {
+  const config = await readHostConfig(configPath);
+  const inbox = createDaemonInbox(config.inboxPath);
+  try { return inbox.resetBookmark(); }
+  finally { await inbox.close(); }
+}
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  if (process.argv.includes('--help')) {
-    console.log('Usage: roger-wilco-host [config.json]\nDefault: $ROGER_WILCO_CONFIG or ~/.config/roger-wilco/host.json');
-  } else { await runHost(process.argv[2]); }
+  const args = process.argv.slice(2);
+  if (args.includes('--help')) {
+    console.log('Usage: roger-wilco-host [config.json]\n       roger-wilco-host --reset-bookmark [config.json]\nDefault: $ROGER_WILCO_CONFIG or ~/.config/roger-wilco/host.json');
+  } else if (args[0] === '--reset-bookmark') {
+    console.log(JSON.stringify(await resetBookmark(args[1])));
+  } else { await runHost(args[0]); }
 }
