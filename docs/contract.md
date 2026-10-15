@@ -116,7 +116,9 @@ The extension retries a conflicting binding every second.
 
 A stop or a switch releases the old runtime.
 The daemon supplies lease time and binds a fresh random grant to each socket connection.
+The daemon keeps leases in memory only.
 Disconnect and daemon restart invalidate the grant.
+The `inbox_leases` table remains for the legacy fence views; the daemon does not write leases to it.
 Another connection cannot reuse a live grant, even with the same runtime ID.
 Only the addressed session is permitted to consume its own inbox.
 
@@ -365,7 +367,12 @@ The host reconnects with capped exponential backoff.
 It authenticates on each connection.
 `Last-Event-ID` is ignored for durable resume.
 The host calls the receipt POST **only after** the local inbox `receive` transaction commits.
-That transaction deduplicates the message.
+That transaction deduplicates the message and commits at `synchronous=FULL`.
+The SSE parser validates each frame once; the stream path does not validate it again.
+A direct `receive` call still validates its frame.
+Receipts are posted in order on one chain per subscription, and the stream keeps reading while they are in flight.
+A failed or invalid receipt response leaves the coordinator cursor unmoved.
+The next connection replays that message, and the host posts its receipt again.
 
 The host skips malformed or unsupported message events without a receipt.
 The affected subscription stays pending while other subscriptions continue on that connection.
@@ -430,6 +437,9 @@ The socket method is `ack` with `{token, evidence}`.
 The host checks the lease, the session id, and the message namespace.
 A repeated acknowledgement must present the same record and location.
 Other evidence is rejected as `Conflicting delivery evidence`.
+An acknowledgement commits at `synchronous=NORMAL`.
+Power loss can drop only that acknowledgement, which leaves the message pending.
+The message is then delivered again, and the adapter acknowledges it again from its own evidence.
 A stored message carries a SHA-256 hash of its verified JSON, computed by the
 coordinator at write and by the host daemon at ingest.
 After that, reads check hash equality only.
@@ -454,6 +464,10 @@ The local registration queue survives a coordinator outage.
 Startup binding enqueues registration and returns without a wait for HTTP.
 The host daemon is the only writer of `POST /v1/sessions/register`.
 A tool that needs the result waits for that attempt. Startup does not.
+The wait returns at once, without a queue write or a coordinator request, when the session registered successfully during the current daemon process and the request names no display name other than the registered one.
+A registration for the session that is still queued or in flight disables this shortcut: the request enqueues and waits, so the coordinator ends on the latest request.
+A queued heartbeat always posts, and its result replaces the remembered one.
+A coordinator refusal withdraws the remembered result; an unreachable coordinator does not.
 The host daemon drains and retries registrations.
 It does not reset subscription cursors.
 The socket closes from the daemon lease expiry. It does not keep a second clock.

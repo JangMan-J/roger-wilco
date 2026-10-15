@@ -94,8 +94,9 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   await tool('roger_identity', { displayName: '[[0:FLEET]]' });
   assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', sessionId: id }, displayName: '[[0:FLEET]]' });
   assert.equal(requests.at(-1).path, '/v1/sessions/register');
-  await tool('roger_identity', {});
-  assert.deepEqual(requests.at(-1).body, { session: { namespace: 'fleet', sessionId: id } });
+  const registered = requests.length;
+  assert.equal((await tool('roger_identity', {})).ok, true);
+  assert.equal(requests.length, registered, 'a session registered in this daemon lifetime reads its registration without a POST');
   await tool('roger_send', { recipient: '*', body: 'Hello', data: { priority: 2 }, visibility: 'public' });
   await tool('roger_inbox', { since: 2, limit: 20 });
   await tool('roger_claim', { key: 'work', ttlSeconds: 90 });
@@ -109,7 +110,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
     assert.equal(requests.at(-1).path, '/v1/entities?' + new URLSearchParams({ id: entity.id, since: String(since), limit: String(limit) }));
     const registerIndex = requests.findLastIndex(r => r.path === '/v1/sessions/register');
     assert.ok(registerIndex >= 0 && registerIndex < requests.length - 1, 'entity lookup runs only after the bound session is registered');
-    assert.deepEqual(requests.at(registerIndex).body, { session: { namespace: 'fleet', sessionId: id } });
+    assert.deepEqual(requests.at(registerIndex).body.session, { namespace: 'fleet', sessionId: id });
   }
   const beforeInvalid = requests.length;
   for (const params of [{}, { label: 'fix-parser', id: typed.id }, { id: typed.id, type: 0 }, { id: 'invalid' },

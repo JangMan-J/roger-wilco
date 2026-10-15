@@ -21,9 +21,11 @@ const SCHEMA_VERSION = 3;
 /** Session-address field name that schema 2 and older stored in queued registration JSON. Migration input only. */
 const LEGACY_SESSION_FIELD = 'piSessionId';
 
-type LeaseRow = { runtime_id: string; expires_at: number };
 type RegistrationRow = { session_key: string; registration_json: string; generation: number };
 type PendingRow = { message_json: string; hash: string | null };
+/** Insert of a frame the SSE parser already validated. Not exported, so only
+ * the stream path in this module can skip the check that receive() makes. */
+const ingestParsed = Symbol('ingestParsed');
 /** The packet identity: SHA-256 over the exact stored message JSON text. */
 function packetHash(json: string): string {
   return createHash('sha256').update(json).digest('hex');
@@ -42,6 +44,11 @@ export class LocalHostInbox {
   private readonly registrationAttempting = new Map<string, number>();
   private readonly registrationQueued = new Set<(key: string, registrationJson: string, generation: number) => void>();
   private readonly faults = new Set<() => void>();
+  /** Connection grants. A daemon restart drops every grant, so they live only
+   * in memory. The inbox_leases table remains for the legacy fence views. */
+  private readonly leases = new Map<string, { runtimeId: string; expiresAt: number }>();
+  /** Latest successful registration result per session in this daemon process. */
+  private readonly registered = new Map<string, RegistrationResult>();
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -114,7 +121,8 @@ export class LocalHostInbox {
           Array<{ session_key: string; message_id: string; message_json: string }>)
           backfill.run(packetHash(row.message_json), row.message_id, row.session_key);
       }
-      // Connection grants never survive a daemon restart.
+      // Older daemons stored grants here. This daemon keeps them in memory
+      // and never writes this table; clear rows an older daemon left behind.
       this.db.exec('DELETE FROM inbox_leases');
     });
     this.sweep();
@@ -166,8 +174,25 @@ export class LocalHostInbox {
     const done = this.registrationCompletions.get(key);
     return done && done.generation === generation ? done.result : undefined;
   }
+  /** The result that answers an awaitRegistration without a coordinator
+   * POST: the session registered successfully during this daemon's lifetime,
+   * the request names no display name other than the registered one, and no
+   * registration for the session is queued or in flight. A pending row would
+   * land at the coordinator after this answer, so the caller waits for it. */
+  registeredResult(registration: Registration): RegistrationResult | undefined {
+    const key = sessionKey(registration.session);
+    const result = this.registered.get(key);
+    if (!result) return undefined;
+    if (registration.displayName !== undefined && registration.displayName !== result.displayName) return undefined;
+    if (this.registrationAttempting.has(key)) return undefined;
+    if (this.db.prepare('SELECT 1 FROM inbox_registrations WHERE session_key = ?').get(key)) return undefined;
+    return result;
+  }
   reportRegistration(key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>): void {
     this.registrationCompletions.set(key, { generation, result });
+    // An outage keeps the last result; a coordinator refusal withdraws it.
+    if (result.ok) this.registered.set(key, result.value);
+    else if (result.error !== 'temporarily_unavailable') this.registered.delete(key);
     if (this.registrationAttempting.get(key) === generation) this.registrationAttempting.delete(key);
     let fault: unknown;
     for (const listener of this.registrationResults) {
@@ -211,9 +236,15 @@ export class LocalHostInbox {
     if (now < this.nextSweepAt) return;
     this.tx(() => {
       this.db.prepare('DELETE FROM inbox_messages WHERE acknowledged_at < ? AND evidence_record_id IS NOT NULL').run(now - HISTORY_MS);
-      this.db.prepare('DELETE FROM inbox_leases WHERE expires_at <= ?').run(now);
     });
+    for (const [key, lease] of this.leases) if (lease.expiresAt <= now) this.leases.delete(key);
     this.nextSweepAt = now + SWEEP_MS;
+  }
+
+  /** Runs work at synchronous=NORMAL, then restores the connection's FULL default. */
+  private normalSync<T>(work: () => T): T {
+    this.db.exec('PRAGMA synchronous = NORMAL');
+    try { return work(); } finally { this.db.exec('PRAGMA synchronous = FULL'); }
   }
 
   private tx<T>(work: () => T): T {
@@ -230,6 +261,12 @@ export class LocalHostInbox {
 
   async receive(frame: StreamFrame): Promise<{ inserted: boolean }> {
     if (!isStreamFrame(frame)) throw new TypeError('Invalid stream frame');
+    return this[ingestParsed](frame);
+  }
+
+  /** Commits at synchronous=FULL before it returns, so the coordinator
+   * receipt that follows never covers a message a power loss could drop. */
+  [ingestParsed](frame: StreamFrame): { inserted: boolean } {
     const messageJson = JSON.stringify(frame.message);
     const result = this.db.prepare(`INSERT OR IGNORE INTO inbox_messages
       (session_key, message_id, sequence, message_json, hash) VALUES (?, ?, ?, ?, ?)`).run(
@@ -248,29 +285,30 @@ export class LocalHostInbox {
 
   private setLease(session: SessionAddress, runtimeId: string, now: number, renew: boolean): Outcome<{ leaseExpiresAt: number }> {
     if (!isSessionAddress(session) || !runtimeId || !Number.isSafeInteger(now) || now < 0) return failure('invalid_request', 'Invalid lease input');
-    return this.tx(() => {
-      const key = sessionKey(session);
-      const row = this.db.prepare('SELECT runtime_id, expires_at FROM inbox_leases WHERE session_key = ?').get(key) as LeaseRow | undefined;
-      if (renew && (!row || row.runtime_id !== runtimeId || row.expires_at <= now)) return failure('owner_conflict', 'Lease no longer owned');
-      if (!renew && row && row.expires_at > now && row.runtime_id !== runtimeId) return failure('owner_conflict', 'Session already active');
-      // A lease is always bounded by the current clock, even on a repeated bind.
-      const expires = now + LEASE_MS;
-      this.db.prepare(`INSERT INTO inbox_leases (session_key, runtime_id, expires_at) VALUES (?, ?, ?)
-        ON CONFLICT(session_key) DO UPDATE SET runtime_id = excluded.runtime_id, expires_at = excluded.expires_at`)
-        .run(key, runtimeId, expires);
-      return { ok: true, value: { leaseExpiresAt: expires } };
-    });
+    const key = sessionKey(session);
+    const lease = this.leases.get(key);
+    if (renew && (!lease || lease.runtimeId !== runtimeId || lease.expiresAt <= now)) return failure('owner_conflict', 'Lease no longer owned');
+    if (!renew && lease && lease.expiresAt > now && lease.runtimeId !== runtimeId) return failure('owner_conflict', 'Session already active');
+    // A lease is always bounded by the current clock, even on a repeated bind.
+    const expiresAt = now + LEASE_MS;
+    this.leases.set(key, { runtimeId, expiresAt });
+    return { ok: true, value: { leaseExpiresAt: expiresAt } };
   }
 
   async release(session: SessionAddress, runtimeId: string): Promise<void> {
     if (!isSessionAddress(session) || !runtimeId) return;
-    this.db.prepare('DELETE FROM inbox_leases WHERE session_key = ? AND runtime_id = ?').run(sessionKey(session), runtimeId);
+    const key = sessionKey(session);
+    if (this.leases.get(key)?.runtimeId === runtimeId) this.leases.delete(key);
+  }
+
+  /** The runtime holding the live lease for a session, if any. */
+  leaseHolder(session: SessionAddress): string | undefined {
+    const lease = this.leases.get(sessionKey(session));
+    return lease && lease.expiresAt > Date.now() ? lease.runtimeId : undefined;
   }
 
   private owns(session: SessionAddress, runtimeId: string): boolean {
-    const row = this.db.prepare('SELECT runtime_id, expires_at FROM inbox_leases WHERE session_key = ?')
-      .get(sessionKey(session)) as LeaseRow | undefined;
-    return !!row && row.runtime_id === runtimeId && row.expires_at > Date.now();
+    return this.leaseHolder(session) === runtimeId;
   }
 
   async pending(session: SessionAddress, runtimeId: string): Promise<Message[]> {
@@ -302,7 +340,12 @@ export class LocalHostInbox {
     if (!isSessionAddress(session) || !runtimeId || !isDeliveryEvidence(evidence) || evidence.sessionId !== session.sessionId ||
       !evidence.messageId.startsWith(`${session.namespace}:msg:`)) return failure('invalid_request', 'Invalid delivery evidence');
     let changed = false;
-    const result: Outcome<null> = this.tx(() => {
+    // An acknowledgement commits at synchronous=NORMAL. Power loss can drop
+    // only the latest NORMAL commits, and a dropped acknowledgement leaves the
+    // message pending: it is redelivered, and the adapter acknowledges it
+    // again from the evidence in its own session store. The next FULL commit
+    // (an inbox insert from receive) syncs these WAL frames too.
+    const result: Outcome<null> = this.normalSync(() => this.tx(() => {
       if (!this.owns(session, runtimeId)) return failure('owner_conflict', 'Session lease is not owned');
       const row = this.db.prepare(`SELECT message_json, evidence_record_id, evidence_location FROM inbox_messages
         WHERE session_key = ? AND message_id = ?`).get(sessionKey(session), evidence.messageId) as
@@ -316,7 +359,7 @@ export class LocalHostInbox {
         WHERE session_key = ? AND message_id = ?`).run(evidence.recordId, evidence.location, Date.now(), sessionKey(session), evidence.messageId);
       changed = true;
       return { ok: true, value: null };
-    });
+    }));
     if (changed) this.changed(sessionKey(session));
     return result;
   }
@@ -374,7 +417,7 @@ export class LocalHostInbox {
   }
 
   async close(): Promise<void> {
-    if (!this.closed) { this.closed = true; this.changes.clear(); this.registrationChanges.clear(); this.registrationResults.clear(); this.registrationAttempts.clear(); this.registrationQueued.clear(); this.registrationGenerations.clear(); this.registrationAttempting.clear(); this.faults.clear(); this.db.close(); this.lock.close(); }
+    if (!this.closed) { this.closed = true; this.changes.clear(); this.registrationChanges.clear(); this.registrationResults.clear(); this.registrationAttempts.clear(); this.registrationQueued.clear(); this.registrationGenerations.clear(); this.registrationAttempting.clear(); this.faults.clear(); this.leases.clear(); this.registered.clear(); this.db.close(); this.lock.close(); }
   }
 }
 
@@ -543,12 +586,6 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
   let unsubscribeRegistration: (() => void) | undefined;
   let registrationDirty = true;
   let registrationWake: (() => void) | undefined;
-  /** Last successful registration per session. An identical re-enqueue inside
-   * the window is answered from this cache instead of another coordinator
-   * POST. The window stays well under the 30 s heartbeat and the 90 s board
-   * presence window, so coordinator last-seen times remain fresh. */
-  const REGISTRATION_CACHE_MS = 20_000;
-  const registrationCache = new Map<string, { json: string; value: RegistrationResult; at: number }>();
   const kickRegistrations = () => { registrationDirty = true; registrationWake?.(); };
   const onAbort = () => controller?.abort();
   let lastError = '';
@@ -584,18 +621,11 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
           // generation is picked up by the next pass its enqueue triggered.
           if (!inbox.isCurrentRegistration(row)) continue;
           try {
-            const cached = registrationCache.get(row.session_key);
-            if (cached && cached.json === row.registration_json && Date.now() - cached.at < REGISTRATION_CACHE_MS) {
-              inbox.completeRegistration(row);
-              inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value: cached.value });
-              continue;
-            }
             const registration = storedRegistration(row.registration_json);
             inbox.reportRegistrationAttempt(row.session_key, row.registration_json, row.generation);
             const value = outcomeValue(await jsonPost(base, ROUTES.register, config.credential, registration, signal), isRegistrationResult);
             if (!value || value.subscription.id !== row.session_key || value.subscription.hostId !== config.hostId)
               throw new Error('Invalid registration response');
-            registrationCache.set(row.session_key, { json: row.registration_json, value, at: Date.now() });
             inbox.completeRegistration(row);
             inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value });
           } catch (error) {
@@ -646,7 +676,8 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
         // failed post leaves the cursor unmoved so replay reposts it.
         const receiptChains = new Map<string, Promise<void>>();
         for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'), report)) {
-          await inbox.receive(frame); // transaction commits before receipt is sent
+          // frames() validated this frame; the insert commits before the receipt is sent.
+          inbox[ingestParsed](frame);
           const receipt = { subscriptionId: frame.subscriptionId, messageId: frame.message.id };
           const prior = receiptChains.get(frame.subscriptionId) ?? Promise.resolve();
           receiptChains.set(frame.subscriptionId, prior.then(async () => {
