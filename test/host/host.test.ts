@@ -409,3 +409,174 @@ test('a non-UUID session has its own lease and inbox; a Pi UUID lease stays on t
   assert.equal((await inbox.bind({ namespace: 'fleet', sessionId: 'a'.repeat(129) }, 'x', now)).ok, false);
   assert.equal((await inbox.bind({ namespace: 'fleet', sessionId: 'bad\nid' }, 'x', now)).ok, false);
 });
+
+test('leases live in memory: bind, renew, release and expiry never write inbox_leases', async t => {
+  const { inbox, path } = fixture(t);
+  const rows = () => {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { return db.prepare('SELECT count(*) AS n FROM inbox_leases').get()!.n; } finally { db.close(); }
+  };
+  const now = Date.now();
+  assert.equal((await inbox.bind(a, 'first', now)).ok, true);
+  assert.equal((await inbox.renew(a, 'first', now + 1)).ok, true);
+  assert.equal(rows(), 0, 'bind and renew leave inbox_leases empty');
+  assert.deepEqual(await inbox.bind(a, 'second', now + 2), { ok: false, error: 'owner_conflict', message: 'Session already active' });
+  assert.equal(inbox.leaseHolder(a), 'first');
+  await inbox.release(a, 'second');
+  assert.equal(inbox.leaseHolder(a), 'first', 'only the holder releases');
+  await inbox.release(a, 'first');
+  assert.equal(inbox.leaseHolder(a), undefined);
+  assert.equal((await inbox.renew(a, 'first', now + 3)).ok, false);
+  assert.equal((await inbox.bind(a, 'second', now + 3)).ok, true);
+  // Expiry is by clock: a lease granted 30 s ago is no longer live.
+  assert.equal((await inbox.bind(b, 'stale', now - 30_001)).ok, true);
+  assert.equal(inbox.leaseHolder(b), undefined);
+  assert.equal((await inbox.renew(b, 'stale', Date.now())).ok, false);
+  assert.equal((await inbox.bind(b, 'fresh', Date.now())).ok, true);
+  assert.equal(rows(), 0);
+});
+
+test('an acknowledgement commits at synchronous NORMAL while inbox inserts stay FULL', async t => {
+  const { inbox } = fixture(t);
+  const seen: Array<[string, number]> = [];
+  const level = (db: DatabaseSync) => originalPrepare.call(db, 'PRAGMA synchronous').get()!.synchronous as number;
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  DatabaseSync.prototype.exec = function (this: DatabaseSync, sql: string) {
+    if (sql === 'COMMIT') seen.push(['commit', level(this)]);
+    return originalExec.call(this, sql);
+  };
+  DatabaseSync.prototype.prepare = function (this: DatabaseSync, sql: string) {
+    if (/^INSERT OR IGNORE INTO inbox_messages/.test(sql)) seen.push(['insert', level(this)]);
+    return originalPrepare.call(this, sql);
+  } as typeof DatabaseSync.prototype.prepare;
+  try {
+    assert.equal((await inbox.bind(a, 'owner', Date.now())).ok, true);
+    await inbox.receive(frame(1));
+    assert.equal((await inbox.acknowledgeDelivery(a, 'owner', {
+      messageId: 'fleet:msg:1', sessionId: a.sessionId, recordId: 'entry-1', location: 'session.jsonl',
+    })).ok, true);
+    assert.equal((await inbox.acknowledgeDelivery(a, 'intruder', {
+      messageId: 'fleet:msg:1', sessionId: a.sessionId, recordId: 'entry-1', location: 'session.jsonl',
+    })).ok, false);
+    await inbox.receive(frame(2));
+  } finally {
+    DatabaseSync.prototype.exec = originalExec;
+    DatabaseSync.prototype.prepare = originalPrepare;
+  }
+  // 1 is NORMAL, 2 is FULL. A refused acknowledgement still restores FULL.
+  assert.deepEqual(seen, [['insert', 2], ['commit', 1], ['commit', 1], ['insert', 2]]);
+});
+
+test('a stream frame is validated once, by the parser; direct receive() still validates', async t => {
+  const { inbox, path } = fixture(t);
+  let direct = 0;
+  const receive = inbox.receive.bind(inbox);
+  inbox.receive = async (value: StreamFrame) => { direct++; return receive(value); };
+  let receipts = 0;
+  let committed = false;
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message\ndata: {"invalid":true}\n\n');
+      res.write(`event: message\ndata: ${JSON.stringify(frame(1))}\n\n`);
+      return;
+    }
+    if (req.url === ROUTES.receipt) {
+      for await (const _ of req) { /* drain */ }
+      const db = new DatabaseSync(path, { readOnly: true });
+      committed = db.prepare('SELECT count(*) AS n FROM inbox_messages WHERE message_id = ?').get('fleet:msg:1')!.n === 1;
+      db.close();
+      receipts++;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, value: { id: sessionKey(a), session: a, hostId: 'host-a', cursor: 1 } }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const daemon = createHostDaemon({ coordinatorUrl: `http://127.0.0.1:${address.port}`,
+    hostId: 'host-a', credential: 'secret', inboxPath: path }, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try { await waitFor(() => receipts === 1); }
+  finally { await daemon.stop(); await run; }
+  assert.equal(committed, true, 'the insert commits before the receipt');
+  assert.equal(direct, 0, 'the stream path does not validate the frame a second time');
+  await assert.rejects(() => inbox.receive({ ...frame(2), subscriptionId: sessionKey(b) }), /Invalid stream frame/);
+  assert.equal(direct, 1);
+});
+
+test('an invalid receipt response does not stop the stream; the cursor stays and replay reposts the receipt', { timeout: 15_000 }, async t => {
+  const { inbox, path } = fixture(t);
+  // The fake coordinator advances a cursor only when it answers a receipt
+  // validly, and each connection offers every frame past the cursor.
+  const cursor = new Map<string, number>();
+  const log: Array<{ messageId: string; connection: number; answer: 'valid' | 'invalid' }> = [];
+  const offered = [frame(1, a), frame(2, b)];
+  let connections = 0;
+  let aPosted = () => {};
+  const aReceipt = new Promise<void>(resolve => { aPosted = resolve; });
+  let bDone = () => {};
+  const bAnswered = new Promise<void>(resolve => { bDone = resolve; });
+  let aDone = () => {};
+  const aAnswered = new Promise<void>(resolve => { aDone = resolve; });
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.stream) {
+      const connection = ++connections;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const write = (item: StreamFrame) => res.write(`event: message\ndata: ${JSON.stringify(item)}\n\n`);
+      if (connection === 1) {
+        write(offered[0]!);
+        await aReceipt; // a's receipt is in flight and unanswered
+        write(offered[1]!);
+        await aAnswered;
+        res.end();
+      } else {
+        for (const item of offered) if ((cursor.get(item.subscriptionId) ?? 0) < item.message.sequence) write(item);
+      }
+      return;
+    }
+    if (req.url === ROUTES.receipt) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const receipt = JSON.parse(body) as { subscriptionId: string; messageId: string };
+      const connection = connections;
+      res.setHeader('content-type', 'application/json');
+      if (receipt.subscriptionId === sessionKey(a) && connection === 1) {
+        aPosted();
+        await bAnswered;
+        log.push({ messageId: receipt.messageId, connection, answer: 'invalid' });
+        res.end(JSON.stringify({ unexpected: true }));
+        aDone();
+        return;
+      }
+      const item = offered.find(entry => entry.message.id === receipt.messageId)!;
+      cursor.set(receipt.subscriptionId, item.message.sequence);
+      log.push({ messageId: receipt.messageId, connection, answer: 'valid' });
+      const session = receipt.subscriptionId === sessionKey(a) ? a : b;
+      res.end(JSON.stringify({ ok: true, value: { id: receipt.subscriptionId, session, hostId: 'host-a', cursor: item.message.sequence } }));
+      if (session === b) bDone();
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const daemon = createHostDaemon({ coordinatorUrl: `http://127.0.0.1:${address.port}`,
+    hostId: 'host-a', credential: 'secret', inboxPath: path }, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try { await waitFor(() => log.length === 3, 10_000); }
+  finally { await daemon.stop(); await run; }
+  assert.deepEqual(log, [
+    { messageId: 'fleet:msg:2', connection: 1, answer: 'valid' },
+    { messageId: 'fleet:msg:1', connection: 1, answer: 'invalid' },
+    { messageId: 'fleet:msg:1', connection: 2, answer: 'valid' },
+  ], 'b is read and receipted while a is unanswered; a is reposted only on replay');
+  assert.equal(connections, 2);
+  assert.deepEqual([...cursor.entries()].sort(), [[sessionKey(a), 1], [sessionKey(b), 2]]);
+  assert.equal((await inbox.bind(a, 'owner', Date.now())).ok, true);
+  assert.deepEqual((await inbox.pending(a, 'owner')).map(item => item.id), ['fleet:msg:1'], 'replay stored no second row');
+});

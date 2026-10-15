@@ -29,13 +29,6 @@ function receiptState(inboxPath, address, id) {
 function receiptEntry(inboxPath, address, id) {
   return receiptState(inboxPath, address, id)?.evidence_record_id;
 }
-function leaseOwner(inboxPath, address) {
-  const db = new DatabaseSync(inboxPath, { readOnly: true });
-  try {
-    return db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?')
-      .get(`${address.namespace}:${address.sessionId}`)?.runtime_id;
-  } finally { db.close(); }
-}
 async function until(check, attempts = 300) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (await check()) return;
@@ -112,7 +105,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
     void (async () => {
       assert.equal(readyFile, undefined, 'one ready barrier');
       readyFile = state.file;
-      assert.ok(leaseOwner(inboxPath, address), 'Pi bound through the daemon before receive');
+      assert.ok(inbox.leaseHolder(address), 'Pi bound through the daemon before receive');
       assert.deepEqual(await inbox.receive({
         type: 'message', subscriptionId: `fleet:${sessionId}`,
         message: { version: 1, id, sequence: 1, timestamp: Date.now(),
@@ -129,13 +122,13 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
   ]).finally(() => clearTimeout(deadline));
   assert.equal(state.stage, stage);
   assert.equal(state.file, readyFile);
-  const killedOwner = leaseOwner(inboxPath, address);
+  const killedOwner = inbox.leaseHolder(address);
   assert.ok(killedOwner);
   child.kill('SIGKILL');
   assert.equal((await exited).signal, 'SIGKILL');
   resumeAck?.();
   inbox.acknowledgeDelivery = originalAck;
-  await until(() => leaseOwner(inboxPath, address) === undefined);
+  await until(() => inbox.leaseHolder(address) === undefined);
 
   const file = state.file;
   const initial = pi.SessionManager.open(file);
@@ -186,7 +179,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
     try {
       await session.bindExtensions({});
       await until(() => {
-        const owner = leaseOwner(inboxPath, address);
+        const owner = inbox.leaseHolder(address);
         return owner !== undefined && owner !== killedOwner;
       });
       await until(() => typeof receiptEntry(inboxPath, address, id) === 'string');
@@ -205,7 +198,7 @@ for (const stage of stages) test(`SIGKILL ${stage}: actual Pi extension resumes 
       await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
       session.dispose();
     }
-    await until(() => leaseOwner(inboxPath, address) === undefined);
+    await until(() => inbox.leaseHolder(address) === undefined);
     await local.close();
     await inbox.close();
     const reopened = createHostInbox(inboxPath);

@@ -119,6 +119,11 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
           await inbox.enqueueRegistration(registration);
           return ok(null);
         }
+        // Registered during this daemon's lifetime: answer without a queue
+        // write or a coordinator POST. Heartbeat enqueues still post, and
+        // their results replace this one, so presence stays fresh.
+        const known = inbox.registeredResult(registration);
+        if (known) return ok(known);
         const timedOut: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration timed out' };
         const superseded: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' };
         // The inbox owns correlation: enqueue returns the effective queued
@@ -153,9 +158,9 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
           if (waiter.bare) waiter.generation = current.generation;
           else settleWaiter(waiter, superseded);
         }
-        // A fast completion (for example a daemon cache hit) may already have
-        // been reported while this enqueue was in flight, before the waiter's
-        // generation was assigned and its result listener could match it.
+        // A fast completion may already have been reported while this enqueue
+        // was in flight, before the waiter's generation was assigned and its
+        // result listener could match it.
         const completed = waiter.generation === undefined ? undefined : inbox.registrationCompletion(key, waiter.generation);
         if (completed && regWaiters.has(id)) settleWaiter(waiter, completed);
         // An attempt for this generation may already be in flight.

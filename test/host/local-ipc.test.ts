@@ -23,7 +23,6 @@ const b: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a
 const c: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440002' };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const registrationSql = 'SELECT count(*) AS n FROM inbox_registrations';
-const leaseSql = 'SELECT count(*) AS n FROM inbox_leases';
 
 function message(sequence: number, recipient: string, body = `m${sequence}`): Message {
   return { version: 1, id: `fleet:msg:${sequence}`, sequence, timestamp: 1_700_000_000_000, sender: sessionKey(c), recipient, body, data: null, visibility: 'private' };
@@ -167,7 +166,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   const closing = first.close();
   assert.equal(first.authority!(), undefined);
   await closing;
-  await waitFor(async () => await count(path, leaseSql) === 0);
+  await waitFor(() => inbox.leaseHolder(a) === undefined);
   const raw = await sock(path);
   const calls: Array<[number, string, object]> = [
     [1, 'renew', { token }], [2, 'pending', { token }], [3, 'ack', { token, evidence: proof(1, a) }],
@@ -184,7 +183,7 @@ test('stale grants fail after disconnect and restart; client time does not set t
   assert.ok(retired && retired !== token);
   await ipc.close();
   await waitFor(() => second.authority!() === undefined);
-  await waitFor(async () => await count(path, leaseSql) === 0);
+  await waitFor(() => inbox.leaseHolder(a) === undefined);
   await inbox.close();
   reopened = new LocalHostInbox(path);
   ipc = await listenLocal(config, reopened);
@@ -434,9 +433,10 @@ test('lost registration reply leaves a committed row, then the same enqueue drai
     await waitFor(async () => posts === 1 && await count(path, registrationSql) === 0);
     const again = await sock(path);
     writeFrame(again, 1, 'enqueueRegistration', { registration: { session: a } });
-    // The identical re-enqueue drains from the daemon's registration cache:
-    // the row completes and waiters settle without a second coordinator POST.
-    await waitFor(async () => posts === 1 && await count(path, registrationSql) === 0);
+    // A heartbeat enqueue always posts, so coordinator presence stays fresh.
+    await waitFor(async () => await count(path, registrationSql) === 1);
+    gates.shift()?.();
+    await waitFor(async () => posts === 2 && await count(path, registrationSql) === 0);
     again.destroy();
   } finally {
     for (const release of gates) release();
@@ -478,7 +478,7 @@ test('invalid frames close only their socket, and a slow reader stays bounded', 
   await inbox.receive(frame(4, b));
   assert.deepEqual((await healthy.pending(b, 'rt-b')).map(item => item.id), ['fleet:msg:4']);
   assert.equal((await healthy.acknowledgeDelivery(b, 'rt-b', proof(4, b))).ok, true);
-  await waitFor(async () => await count(path, `SELECT count(*) AS n FROM inbox_leases WHERE session_key = '${sessionKey(a)}'`) === 0, 8_000);
+  await waitFor(() => inbox.leaseHolder(a) === undefined, 8_000);
   slow.destroy();
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 8_000);
@@ -544,4 +544,73 @@ test('SIGKILL after inbox commit before hint survives stale-socket recovery with
   client = createHostClient(path);
   assert.equal((await client.bind(a, 'after-crash')).ok, true);
   assert.deepEqual((await client.pending(a, 'after-crash')).map(item => item.id), ['fleet:msg:1']);
+});
+
+test('awaitRegistration for a session registered in this daemon lifetime makes no coordinator POST', { timeout: 20_000 }, async t => {
+  const { path, inbox, config } = rig(t);
+  const posts: Array<string | undefined> = [];
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      posts.push(registration.displayName);
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 },
+        rank: 1, lastSeenAt: posts.length, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  config.coordinatorUrl = `http://127.0.0.1:${address.port}`;
+  const lastSeen = (result: Outcome<unknown>) => result.ok ? (result.value as { lastSeenAt?: number }).lastSeenAt : undefined;
+  let daemon = createHostDaemon(config, inbox);
+  let run = daemon.start(new AbortController().signal);
+  let reopened: LocalHostInbox | undefined;
+  t.after(() => reopened?.close());
+  try {
+    await modeReady(path);
+    const client = clientFor(t, path);
+    const first = await client.awaitRegistration({ session: a });
+    assert.equal(lastSeen(first), 1);
+    assert.equal(posts.length, 1, 'the first registration posts');
+    // Well past any short-lived cache window.
+    const now = Date.now();
+    t.mock.method(Date, 'now', () => now + 120_000);
+    assert.deepEqual(await client.awaitRegistration({ session: a }), first);
+    assert.equal(posts.length, 1, 'a registered session resolves without a POST');
+    assert.equal(await count(path, registrationSql), 0, 'and without a queue write');
+    // A heartbeat still posts, and its result answers later waits.
+    await client.enqueueRegistration({ session: a });
+    await waitFor(async () => posts.length === 2 && await count(path, registrationSql) === 0);
+    assert.equal(lastSeen(await client.awaitRegistration({ session: a })), 2);
+    assert.equal(posts.length, 2);
+    // A new explicit display name posts; the registered name does not.
+    const named = await client.awaitRegistration({ session: a, displayName: 'Named' });
+    assert.equal(named.ok && named.value.displayName, 'Named');
+    assert.equal(posts.length, 3);
+    assert.deepEqual(await client.awaitRegistration({ session: a, displayName: 'Named' }), named);
+    assert.deepEqual(await client.awaitRegistration({ session: a }), named);
+    assert.equal(posts.length, 3);
+    // A coordinator refusal withdraws the result; an outage keeps it.
+    inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'temporarily_unavailable', message: 'offline' });
+    assert.deepEqual(await client.awaitRegistration({ session: a }), named);
+    inbox.reportRegistration(sessionKey(a), JSON.stringify({ session: a }), 0, { ok: false, error: 'owner_conflict', message: 'moved' });
+    assert.equal((await client.awaitRegistration({ session: a })).ok, true);
+    assert.equal(posts.length, 4);
+    // A new daemon lifetime registers again.
+    await daemon.stop(); await run;
+    await inbox.close();
+    reopened = new LocalHostInbox(path);
+    daemon = createHostDaemon(config, reopened);
+    run = daemon.start(new AbortController().signal);
+    await modeReady(path);
+    assert.equal((await clientFor(t, path).awaitRegistration({ session: a })).ok, true);
+    assert.equal(posts.length, 5);
+  } finally { await daemon.stop(); await run; }
 });

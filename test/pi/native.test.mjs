@@ -94,13 +94,9 @@ test('native Pi extension binds automatically, routes only its session, wakes id
     return client;
   }
   async function retireLiveLease() {
-    const db = new DatabaseSync(inboxPath, { readOnly: true });
-    try {
-      db.exec('PRAGMA busy_timeout = 5000');
-      const token = db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?').get(`fleet:${a}`)?.runtime_id;
-      assert.equal(typeof token, 'string');
-      await external.release({ namespace: 'fleet', sessionId: a }, token);
-    } finally { db.close(); }
+    const token = external.leaseHolder({ namespace: 'fleet', sessionId: a });
+    assert.equal(typeof token, 'string');
+    await external.release({ namespace: 'fleet', sessionId: a }, token);
   }
   await session.bindExtensions({});
   await until(() => calls.some(call => call.path === '/v1/sessions/register'));
@@ -232,8 +228,8 @@ test('native Pi extension binds automatically, routes only its session, wakes id
   resumed.agent.streamFunction = () => { resumedCalls++; throw new Error('Acknowledged message replayed on resume'); };
   t.after(async () => { await resumed.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); resumed.dispose(); });
   await resumed.bindExtensions({});
-  // Binding may be served by the daemon's registration cache, so no fresh
-  // coordinator POST is required here; the assertion below is the signal.
+  // Binding may be answered from the registration this daemon already made,
+  // so no fresh coordinator POST is required here; the assertion below is the signal.
   await delay(600); // Two inbox poll cycles after binding: persisted IDs are ACKed, not resubmitted.
   assert.equal(resumedCalls, 0);
   await resumed.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });

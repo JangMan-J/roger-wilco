@@ -4,7 +4,6 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { promises as fsPromises } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { DatabaseSync } from 'node:sqlite';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -67,12 +66,11 @@ test('a stalled startup bind has at most one scheduled retry', { timeout: 8000 }
   }
 });
 
-function expireLease(path, key) {
-  const db = new DatabaseSync(path);
-  try {
-    db.exec('PRAGMA busy_timeout = 5000');
-    assert.equal(db.prepare('UPDATE inbox_leases SET expires_at = ? WHERE session_key = ?').run(Date.now() - 1, key).changes, 1);
-  } finally { db.close(); }
+/** Ends the live lease in the daemon without telling its socket, as an expiry would. */
+async function expireLease(inbox, session) {
+  const holder = inbox.leaseHolder(session);
+  assert.equal(typeof holder, 'string');
+  await inbox.release(session, holder);
 }
 
 test('~/ host configuration gives Pi and host daemon the same durable inbox', async t => {
@@ -166,7 +164,7 @@ test('a delayed JSONL read cannot submit after another runtime takes the lease',
       body: 'takeover', data: null, visibility: 'private',
     } });
     await reading;
-    expireLease(inboxPath, `fleet:${session.sessionId}`);
+    await expireLease(inbox, session);
     assert.equal(old.authority(), grant);
     assert.equal((await fresh.bind(session, 'new-runtime', Date.now())).ok, true);
     assert.equal(old.authority(), grant);
@@ -201,7 +199,6 @@ test('a rebound runtime does not wake an ID acknowledged by the takeover owner',
   const sent = [];
   const ctx = { sessionManager: { getSessionId: () => session.sessionId, getSessionFile: () => file } };
   const delivery = createPiDelivery({ sendMessage: message => sent.push(message) }, ctx, old, session, 'old-runtime');
-  const key = `fleet:${session.sessionId}`;
   try {
     assert.equal((await delivery.bind(session, 'old-runtime')).ok, true);
     const grant = old.authority();
@@ -212,7 +209,7 @@ test('a rebound runtime does not wake an ID acknowledged by the takeover owner',
     await inbox.receive({ type: 'message', subscriptionId: `fleet:${session.sessionId}`, message });
     for (let i = 0; i < 100 && !sent.length; i++) await delay(10);
     assert.equal(sent.filter(m => m.details?.deliveryId === message.id).length, 1);
-    expireLease(inboxPath, key);
+    await expireLease(inbox, session);
     assert.equal(old.authority(), grant);
     assert.equal((await fresh.bind(session, 'new-runtime', Date.now())).ok, true);
     assert.equal(old.authority(), grant);
@@ -230,11 +227,7 @@ test('a rebound runtime does not wake an ID acknowledged by the takeover owner',
     assert.equal((await delivery.bind(session, 'old-runtime')).ok, true);
     const rebound = old.authority();
     assert.notEqual(rebound, grant);
-    const db = new DatabaseSync(inboxPath);
-    try {
-      db.exec('PRAGMA busy_timeout = 5000');
-      assert.equal(db.prepare('SELECT runtime_id FROM inbox_leases WHERE session_key = ?').get(key).runtime_id, rebound);
-    } finally { db.close(); }
+    assert.equal(inbox.leaseHolder(session), rebound);
     await delivery.resumeAfterAbort();
     assert.equal(sent.filter(m => m.customType === 'roger-wilco-wake').length, 0);
     assert.equal(sent.filter(m => m.details?.deliveryId === message.id).length, 1);
