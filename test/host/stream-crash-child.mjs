@@ -1,11 +1,12 @@
 // Host daemon child for the v2 crash tests: it kills itself with SIGKILL at a
 // named point. `before-commit`: at the COMMIT of the first batch that inserts
 // a message. `before-receipt`: when the first v2 receipt POST starts, after its
-// batch committed. `hello`: at the hello COMMIT.
+// batch committed. `hello`: at the hello COMMIT. HOST and CREDENTIAL default to the
+// fake coordinator's `host-a` and `secret`.
 import { DatabaseSync } from 'node:sqlite';
 import { createDaemonInbox, createHostDaemon } from '../../src/host/index.ts';
 
-const [inboxPath, coordinatorUrl, at] = process.argv.slice(2);
+const [inboxPath, coordinatorUrl, at, hostId = 'host-a', credential = 'secret'] = process.argv.slice(2);
 const die = () => process.kill(process.pid, 'SIGKILL');
 let armed = false;
 const prepare = DatabaseSync.prototype.prepare;
@@ -25,4 +26,4 @@ globalThis.fetch = (input, init) => {
   return fetch(input, init);
 };
 const inbox = createDaemonInbox(inboxPath);
-await createHostDaemon({ coordinatorUrl, hostId: 'host-a', credential: 'secret', inboxPath }, inbox).start(new AbortController().signal);
+await createHostDaemon({ coordinatorUrl, hostId, credential, inboxPath }, inbox).start(new AbortController().signal);

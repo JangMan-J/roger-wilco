@@ -212,7 +212,7 @@ The coordinator and host have no third-party runtime dependencies.
 
 Pi exposes `roger_identity`, `roger_send`, `roger_inbox`, `roger_board`, `roger_claim`, `roger_release`, and `roger_entity`.
 These tools derive their actor from the invoking Pi session.
-The board defaults to sessions seen within 90 seconds and includes active claims.
+The board defaults to sessions seen within `presenceWindowMs`, read once per process from `/health` (default 90 seconds; 90 seconds when a version 1 coordinator omits the field), and includes active claims.
 The model tool accepts `{all:true}` to include stale, retained registrations.
 The user commands `/roger` and `/roger_board` display the board without a model turn.
 They offer a session picker followed by a rank picker.
@@ -223,7 +223,7 @@ Session rows show rank, presence age, and `lastSeenAt`.
 ### Retention
 
 The coordinator removes registrations unseen for longer than `retention` (settings file, default seven days).
-The 90-second board filter does not stop delivery.
+The board's presence filter does not stop delivery.
 Until registration expiry, offline sessions retain direct and broadcast delivery through their host.
 After expiry, registration starts at the durable message sequence watermark.
 It does not replay messages from the expired subscription.
@@ -421,6 +421,109 @@ The parser does not emit a comment as a message.
 Host JSON posts also use a 10-second deadline.
 When a stream deadline expires, the host aborts that stream read.
 It then reconnects with the capped exponential backoff.
+
+## Host stream v2
+
+The full design is in [protocol-v2.md](protocol-v2.md). This section states the contract.
+
+### Version selection
+
+The route selects the version; there is no handshake field.
+A host with a `hosts` row is on version 2.
+For that host, `GET /v1/hosts/stream` and `POST /v1/hosts/receipts` return 409 `owner_conflict` "Host uses protocol 2".
+The stream route answers before it supersedes any live connection, so a stale version 1 daemon cannot end a version 2 stream.
+A version 2 open supersedes any live version 1 or version 2 connection for the host.
+A daemon with no bookmark sends `GET /v2/hosts/stream` with no query.
+A version 1 coordinator answers that request with 404 `not_found`; the daemon then runs one version 1 stream request and tries `/v2` again after the normal backoff.
+A daemon with a bookmark sends `?stream=<stream_id>&after=<bookmark>` and never falls back; it reports 400, 404 and 409, backs off and retries.
+
+### Open
+
+`stream` and `after` appear together or not at all, each once. `stream` is 32 lowercase hexadecimal characters; `after` is a decimal safe integer of at least 0. Anything else is 400 `invalid_request`.
+The open runs before any SSE header, so a refused open is a JSON outcome:
+
+- `stream` differs from the coordinator log identity: 409 "Bookmark belongs to another coordinator log".
+- `after` is above the message tail: 409 "Bookmark is ahead of the coordinator tail".
+- `after` is below the receipted position `C` of an existing `hosts` row: 409 "Bookmark is behind the receipted position".
+
+The first open creates the `hosts` row (the cut-over) with `C = MIN(cursor)` over the host's sessions, or the tail when it has none, lowered to `after` when `after` is given.
+From that commit on the host's session cursors are frozen as start points.
+The stream resumes at `resume = max(C, MIN(start))`, or the tail when the host has no sessions.
+The coordinator never sets `C` from the daemon's `after`.
+
+### Frames
+
+Every event is `event: v2` with one `data:` line of JSON and no `id:` line. Keepalive is the comment `: keepalive`.
+
+- `hello {stream, host, conn, resume, keepaliveMs, presenceWindowMs}` comes first and once.
+- `member {session, start}` adds a member or replaces its start; `leave {session}` removes it. Membership is read in the same snapshot as the messages it governs and is diffed against what the connection last sent.
+- `msg {seq, message}` carries a message owed to this host; `seq` equals `message.sequence`. The message bytes and SHA-256 are the version 1 bytes.
+- `through {seq}` states that nothing else is owed up to `seq`.
+
+`msg` and `through` are position frames. Their `seq` strictly increases, and the first is above `resume`.
+A message is owed to a host when it is directed to a member whose start is below its `seq`, or when it is a broadcast and some member other than its sender has a start below its `seq`.
+A broadcast crosses the wire once per host; the daemon copies it to every eligible member, with `recipient` kept as `*`.
+The daemon aborts the connection on any frame it cannot accept: an invalid or oversized event, an unknown type, a position out of order, a directed message for a non-member, a message outside the stream namespace, a message id already stored with a different hash, or a `hello` for another host or log. The batch is not committed and no receipt is sent.
+
+### Window and receipts
+
+At most `window` (W) `msg` frames, and at most 16 MiB of them, are unreceipted on one connection; the frame that crosses the byte cap is still sent.
+The daemon commits each read of frames in one transaction at `synchronous=FULL`, with the bookmark `D` in the same transaction, and only then posts a receipt.
+`POST /v2/hosts/receipts {conn, through}` means "this inbox has stored every message owed to this host up to `through`". The coordinator answers:
+
+1. 400 for a body that is not an exact `HostReceipt`.
+2. 409 "Host is not on protocol 2" for a host with no `hosts` row.
+3. 200 with the current `C` when `through ≤ C`, from any connection, with no change.
+4. 409 "Superseded connection" when `conn` is not the host's live version 2 connection. Every `conn` is unknown after a coordinator restart.
+5. 400 "Receipt is ahead of the sent position" when `through` is above the highest position sent on the connection.
+6. Otherwise `C := through` at NORMAL, the covered frames leave the window, and the reply is 200 with `through`.
+
+The daemon keeps at most one receipt in flight per connection and coalesces to the latest committed position. It retries a transport error or 503, aborts the connection on 400 or 409, and ignores a reply that arrives after its connection ended.
+`C ≤ D` holds whenever the inbox has a bookmark.
+On the keepalive tick (`keepaliveMs`) the stream runs one batch if the window has room and sends `through` for traffic that never woke the host, so an idle host's `C` advances.
+
+### Presence
+
+While the daemon runs version 2 it sends one `POST /v2/hosts/presence {sessions}` every `presenceWindowMs / 3`, listing the sessions that hold a live lease (at most 4096, in key order).
+The coordinator refreshes `last_seen_at` of the listed sessions registered to that host and returns every other listed key in `unknown`. It creates nothing, wakes nothing and changes no start.
+The daemon registers each `unknown` key again; a `leave` also clears the remembered registration, so the next heartbeat posts.
+
+### Sync classes
+
+| Transaction | Class |
+|---|---|
+| `send`, `claim`, the `openHost` that creates the `hosts` row | FULL |
+| `register`, rank, claim release, version 2 receipt, presence, maintenance, a non-creating `openHost` | NORMAL |
+| Daemon hello commit and batch commit | FULL |
+| Daemon acknowledgement | NORMAL |
+
+The coordinator connection default stays NORMAL; FULL is set before `BEGIN` and restored after `COMMIT`.
+
+### Settings
+
+The coordinator reads `$ROGER_WILCO_SETTINGS` or `~/.config/roger-wilco/roger-wilco.conf`: `window` (default 32, 1-256), `retention` (7d, 1d-90d), `keepalive` (15s, 5s-60s) and `presence_window` (90s, 15s-15m). An unknown key or a value out of bounds fails startup; an absent file gives the defaults.
+The daemon takes `keepaliveMs` and `presenceWindowMs` from `hello`: its idle deadline is `3 × keepaliveMs` and its presence interval `presenceWindowMs / 3`.
+
+### Coordinator restore
+
+A restored coordinator database would issue again ids above its backup tail. With the coordinator stopped:
+
+1. On every host, stop the daemon and run `roger-wilco-host --reset-bookmark [config.json]`. It takes the inbox lock (it fails while a daemon runs), clears the bookmark in one transaction and prints `{"highWater": N}`. On a host still on a version 1 daemon, read `SELECT MAX(sequence) FROM inbox_messages` instead.
+2. Run `node deploy/restore-coordinator.ts --sequence-floor N DB-PATH` with N at least the largest `highWater`. In one FULL transaction it raises the message id watermark to N and gives the log a new `stream_id`.
+3. Start the coordinator, then the daemons. Each resumes at the restored `C`; ids at or below the backup tail come back with the same bytes and deduplicate.
+
+A dedup hash conflict after a restore means the floor was too low or a host was not counted; the daemon stays fail-closed and reports the session and message id.
+`--reset-bookmark` alone is also the remedy for "Bookmark is behind the receipted position".
+
+### Rollback of one host
+
+With the host's daemon stopped: `node deploy/rollback-host-v2.ts --host HOST-ID DB-PATH` sets each of the host's cursors to `MAX(cursor, C)` and deletes the `hosts` row, and `node deploy/rollback-inbox.ts --stream-clients-stopped INBOX-PATH` returns the inbox to version 3.
+An older coordinator binary requires every host to be rolled back first.
+
+### Tests
+
+`test/acceptance/v2-*.test.ts` run the real coordinator and real daemons: delivery and window, broadcast fan-out, crash and restore, migration and rollback, presence, and a seeded randomised model.
+`npm run test:perf` runs the performance gates in `test/perf/` through a TCP proxy that adds 30 ms each way; it is not part of `npm test`.
 
 ## Local inbox and Pi ACK
 
