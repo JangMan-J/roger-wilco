@@ -26,7 +26,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # Full history: test/host/fencing reads the pre-contract protocol from
+      # an old commit with git show.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # The coexistence test loads the real pi-webtasks extension beside this
       # package. It is a public repo; no token needed.
@@ -59,12 +63,18 @@ jobs:
           (cd .ci/sdk/ai && npm install --omit=dev --ignore-scripts --silent)
           (cd .ci/sdk/coding-agent && npm install --omit=dev --ignore-scripts --silent)
 
+      # The Rust interop test runs cargo build --offline inside npm test;
+      # fetch the crates first so the offline build finds them.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fetch --locked --manifest-path rust/Cargo.toml
+
       - name: Install, link SDK, typecheck, test
         env:
           PI_PACKAGE_DIR: ${{ github.workspace }}/.ci/sdk/coding-agent
           WEBTASKS_PACKAGE_DIR: ${{ github.workspace }}/.ci/pi-webtasks
         run: |
           npm ci --ignore-scripts
+          (cd .ci/pi-webtasks && npm ci --ignore-scripts)
           npm run setup:sdk
           npm run typecheck
           npm test
