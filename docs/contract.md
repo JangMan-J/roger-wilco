@@ -424,6 +424,9 @@ The Muse adapter uses a line in the Muse session transcript (`session.jsonl` und
 That line must record the adapter's own delivered record, `{event:'delivered', message:{id, sender, body, ...}}`, possibly nested inside transcript frames or JSON-encoded tool output.
 A bare mention of a message ID in the transcript is never evidence.
 The Muse adapter never writes to the transcript; the Muse runtime owns it.
+The Claude Code adapter uses one line of the Claude Code session transcript (`<projects>/<encoded-cwd>/<sessionId>.jsonl`); its `recordId` is that line's `uuid`.
+The line must be a main-chain `user` line whose `sessionId` is the session's own and whose `tool_result` content carries the delivered record as one whole output line.
+A human prompt, assistant text, a subagent (`isSidechain`) line, or another session's line never counts, even when it holds the exact record.
 No adapter imports another adapter, and the core imports no harness.
 Every adapter supplies exactly three harness-specific pieces: one session-identity mapping module, one `EvidenceSource` implementation, and one tool surface over its lease-bound core access.
 Everything else — coordinator store, host daemon, socket client, wire validators — is shared core.
@@ -629,6 +632,15 @@ A later receive pass acknowledges from transcript evidence.
 Tests live in `test/muse/`.
 The Muse adapter is a sibling of the Pi adapter; it shares the core and imports no Pi module.
 Its fragile surface is the Muse transcript layout and the delivered-record shape, not the wire protocol.
+
+### Lane C
+
+`src/claude/index.ts` exports the Claude Code adapter factory and its harness interface.
+`src/bin/claude.ts` is the CLI harness, run from the Claude Code Bash tool: it takes the session ID from `CLAUDE_CODE_SESSION_ID`, prints each delivered message as one JSON line, and never acknowledges on print alone.
+A later receive pass acknowledges from the tool result that Claude Code recorded in the transcript.
+Tests live in `test/claude/`.
+The Claude Code adapter is a sibling of the Pi and Muse adapters; it imports neither.
+Its fragile surface is the Claude Code transcript line shape (`type`, `isSidechain`, `sessionId`, `uuid`, `message.content[].tool_result`), not the wire protocol.
 
 ### Lane F
 

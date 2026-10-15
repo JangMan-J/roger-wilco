@@ -17,7 +17,8 @@
     "roger-wilco-coordinator": "src/bin/coordinator.ts",
     "roger-wilco-host": "src/bin/host.ts",
     "roger-wilco-agent": "src/bin/agent.ts",
-    "roger-wilco-muse": "src/bin/muse.ts"
+    "roger-wilco-muse": "src/bin/muse.ts",
+    "roger-wilco-claude": "src/bin/claude.ts"
   },
   "engines": { "node": ">=24" },
   "keywords": ["pi-package"],
