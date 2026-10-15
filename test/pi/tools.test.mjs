@@ -44,6 +44,8 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   const stale = { subscription: { id: `fleet:${randomUUID()}` }, rank: 3, lastSeenAt: now - 90_001 };
   const unknown = { subscription: { id: `fleet:${randomUUID()}` }, rank: 1 };
   const typed = entityReference('fleet', 'fix-parser', 255);
+  // A version 1 coordinator still lists displayName and session entities; roger_board drops them.
+  const recentV1 = { ...recent, displayName: 'Alice', entities: [entityReference('fleet', 'FLEET', 0)] };
   const mention = { version: 1, id: 'fleet:msg:3', sequence: 3, timestamp: now, sender: `fleet:${id}`,
     recipient: '*', body: 'Review [[fix-parser]] and [[255:fix-parser]]', data: null, visibility: 'private' };
   const requests = [];
@@ -67,7 +69,7 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
       return;
     }
     const url = new URL(req.url, 'http://localhost');
-    const value = req.url === '/v1/sessions' ? [recent, stale, unknown] :
+    const value = req.url === '/v1/sessions' ? [recentV1, stale, unknown] :
       req.url === '/v1/claims' ? [{ key: 'work', owner: `fleet:${id}` }] :
       url.pathname === '/v1/entities' ? { entity: typed, messages: [mention] } : { accepted: true };
     res.end(JSON.stringify({ ok: true, value }));

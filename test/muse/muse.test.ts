@@ -14,7 +14,8 @@ import { museTranscriptEvidence } from '../../src/muse/transcript.ts';
 import { createHostClient } from '../../src/host/client.ts';
 import { connectHost, requestCoordinator } from '../../src/host/http.ts';
 import { createDaemonInbox, createHostDaemon } from '../../src/host/index.ts';
-import { ROUTES, sessionKey, type Message, type SessionAddress } from '../../src/protocol/index.ts';
+import { createMuseTools } from '../../src/muse/tools.ts';
+import { ROUTES, entityReference, sessionKey, type Message, type SessionAddress } from '../../src/protocol/index.ts';
 import { createControlHandler, createHostAuthenticator } from '../../src/server/control/index.ts';
 import { createStreamHandler } from '../../src/server/delivery/index.ts';
 import { createCoordinatorStore } from '../../src/server/store.ts';
@@ -341,4 +342,18 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
 test('the Muse CLI register and identity commands take no name', async () => {
   for (const command of ['register', 'identity'])
     await assert.rejects(runMuseCli([command, 'Alice']), /takes no name; a call sign is an entity/);
+});
+
+test('Muse roger_board drops a version 1 coordinator\'s displayName and session entities', async t => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const row = { subscription: { id: sessionKey(peer), session: peer, hostId, cursor: 0 }, rank: 2, lastSeenAt: now };
+  const v1 = { ...row, displayName: 'Alice', entities: [entityReference(namespace, 'FLEET')] };
+  const claims = [{ key: 'work', owner: sessionKey(peer) }];
+  const tools = createMuseTools({
+    bound: async () => ({ actor: peer, hostId }),
+    call: async route => ({ ok: true, value: route === ROUTES.sessions ? [v1] : claims }),
+  });
+  for (const params of [{}, { all: true }])
+    assert.deepEqual(await tools('roger_board', params), { ok: true, value: { sessions: [row], claims } }, JSON.stringify(params));
 });
