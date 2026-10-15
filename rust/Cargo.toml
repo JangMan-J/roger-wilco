@@ -3,7 +3,7 @@ name = "roger-wilco-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Second-language Roger-Wilco client and evidence conformance kit, written from docs/contract.md"
-license = "UNLICENSED"
+license = "MIT"
 
 [dependencies]
 serde_json = "1.0"

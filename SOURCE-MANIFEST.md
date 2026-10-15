@@ -17,8 +17,7 @@ The initial Roger-Wilco implementation is commit `5282762`.
 | Same pi-webtasks commit | Same | `src/index.ts`, `tests/agent-bus.test.ts`, `tests/helpers/test-host.ts` | Pi lifecycle, native SDK fixtures, and acceptance tests |
 
 The agent-bus portions retain the Pinax Network MIT notice in `THIRD-PARTY-NOTICES`.
-The pi-webtasks commit has no tracked license file.
-The package remains private, with no public distribution license for those portions.
+The pi-webtasks commit has no tracked license file; pi-webtasks is the author's own project, and the portions adapted here are licensed MIT by the copyright holder.
 `LICENSE` records these terms.
 
 Research-provider code, webhook signatures, public feeds, and release watchers are excluded.

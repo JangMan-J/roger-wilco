@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, realpath } from 'node:fs/promises';
+import { access, readFile, realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -9,7 +9,12 @@ const root = await realpath(resolve(process.env.PI_PACKAGE_DIR ??
   fileURLToPath(new URL('../../node_modules/@earendil-works/pi-coding-agent/', import.meta.url))));
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 assert.equal(manifest.name, '@earendil-works/pi-coding-agent');
-await import(pathToFileURL(join(root, 'src/experimental/source-resolver.ts')).href);
+// The probe drives Pi's own test harness, which exists only in a Pi source
+// checkout. With a built npm SDK (CI) there is nothing to probe; skip.
+const sourceResolver = join(root, 'src/experimental/source-resolver.ts');
+const hasSource = await access(sourceResolver).then(() => true, () => false);
+if (!hasSource) process.exit(0); // no Pi source checkout (built SDK only, e.g. CI): nothing to probe
+await import(pathToFileURL(sourceResolver).href);
 const { createHarness } = await import(pathToFileURL(join(root, 'test/suite/harness.ts')).href);
 const { fauxAssistantMessage } = await import('@earendil-works/pi-ai/compat');
 

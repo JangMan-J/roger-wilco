@@ -1,6 +1,30 @@
-Roger-Wilco is private software maintained by JangMan-J.
-No public distribution license is granted for original Roger-Wilco code
-or adaptations of the private pi-webtasks project.
+MIT License
 
-The agent-bus portions remain under the MIT license in THIRD-PARTY-NOTICES.
-That notice does not change the license terms of other code.
+Copyright (c) 2026 JangMan-J
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Third-party code
+----------------
+
+Portions of this software are adapted from Pinax Network's agent-bus and
+remain under the MIT license recorded in THIRD-PARTY-NOTICES. Portions
+adapted from the author's pi-webtasks project are original work of the
+copyright holder above and are licensed under the MIT terms in this file.
+See SOURCE-MANIFEST.md for the full provenance table.

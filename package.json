@@ -1,15 +1,23 @@
 {
   "name": "roger-wilco",
   "version": "0.1.0",
-  "private": true,
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
+  "author": "JangMan-J",
   "description": "Durable session messaging and coordination for Pi over SSE and HTTP.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JangMan-J/roger-wilco.git"
+  },
+  "homepage": "https://github.com/JangMan-J/roger-wilco#readme",
+  "bugs": { "url": "https://github.com/JangMan-J/roger-wilco/issues" },
+  "publishConfig": { "access": "public" },
   "type": "module",
   "files": ["src", "deploy", "docs", "scripts", ".node-version", "README.md", "CONTEXT.md", "LICENSE", "THIRD-PARTY-NOTICES", "SOURCE-MANIFEST.md"],
   "bin": {
-    "roger-wilco-coordinator": "./src/bin/coordinator.ts",
-    "roger-wilco-host": "./src/bin/host.ts",
-    "roger-wilco-muse": "./src/bin/muse.ts"
+    "roger-wilco-coordinator": "src/bin/coordinator.ts",
+    "roger-wilco-host": "src/bin/host.ts",
+    "roger-wilco-agent": "src/bin/agent.ts",
+    "roger-wilco-muse": "src/bin/muse.ts"
   },
   "engines": { "node": ">=24" },
   "keywords": ["pi-package"],
@@ -22,7 +30,8 @@
     "coordinator": "node src/bin/coordinator.ts",
     "host": "node src/bin/host.ts",
     "setup:sdk": "node scripts/link-sdk.mjs",
-    "prepack": "node scripts/pack-lock.mjs"
+    "prepack": "node scripts/pack-lock.mjs",
+    "prepublishOnly": "npm run typecheck"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

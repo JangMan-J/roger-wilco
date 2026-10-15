@@ -1,0 +1,73 @@
+# Release: tag v<version> -> CI gate -> npm publish -> GitHub Release.
+#
+# Publish auth (pick one, in this order of preference):
+#   1. npm Trusted Publishing (OIDC): after the first publish, open
+#      npmjs.com -> roger-wilco -> Settings -> Trusted Publisher and add this
+#      repository + workflow (release.yml). No secret needed afterwards.
+#   2. NPM_TOKEN secret: a granular *automation* token (bypasses 2FA) with
+#      read/write on this package. Needed at least for the first publish.
+# The workflow passes the secret if present; with no secret npm falls back
+# to OIDC trusted publishing automatically (npm CLI >= 11.5).
+#
+# Provenance (--provenance) needs a *public* source repository, so it is
+# only requested when this repository is public.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write   # create the GitHub Release
+  id-token: write   # npm provenance / trusted publishing
+
+jobs:
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+
+      # npm's trusted-publishing support lives in npm >= 11.5, which does not
+      # ship with Node 24 yet. Upgrade the CLI only; runtime stays pinned.
+      - name: Upgrade npm CLI
+        run: npm install -g npm@^11.5
+
+      - name: Tag matches package version
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          [ "$version" = "${{ github.ref_name }}" ] || {
+            echo "tag ${{ github.ref_name }} != package.json $version" >&2; exit 1; }
+
+      - run: npm ci --ignore-scripts
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args="--access public"
+          if [ "$(gh api "repos/${{ github.repository }}" -q .visibility)" = "public" ]; then
+            args="$args --provenance"
+          fi
+          echo "npm publish $args"
+          npm publish $args
+
+      - name: GitHub Release with the published tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="$(npm pack | tail -1)"
+          gh release create "${{ github.ref_name }}" "$file" \
+            --title "Roger-Wilco ${{ github.ref_name }}" \
+            --generate-notes --verify-tag
