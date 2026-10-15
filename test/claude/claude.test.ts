@@ -265,9 +265,21 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
     },
   };
   const requests: string[] = [];
+  let switchDuringRegistration = false;
+  let registrations = 0;
   const adapter = createClaudeAdapter(harness, {
     loadConfig: async () => h.config,
-    connectHost,
+    connectHost: async config => {
+      const inbox = await connectHost(config);
+      const awaitRegistration = inbox.awaitRegistration.bind(inbox);
+      inbox.awaitRegistration = async registration => {
+        registrations += 1;
+        const result = await awaitRegistration(registration);
+        if (switchDuringRegistration) current = otherSessionId;
+        return result;
+      };
+      return inbox;
+    },
     request: (config, route, method, body) => { requests.push(route); return requestCoordinator(config, route, method, body); },
   });
   t.after(() => adapter.stop());
@@ -279,6 +291,7 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
   await until(() => receipt(h.inboxPath, second.value.id) !== undefined, 'both messages reach the local inbox');
 
   // The harness now runs another session; the runtime still holds the old lease.
+  const before = registrations;
   current = otherSessionId;
   const reason = new RegExp(`Session changed: harness session fleet:${otherSessionId} is not bound session fleet:${claudeSessionId}`);
   assert.equal(adapter.isBound(), false);
@@ -288,7 +301,23 @@ test('a harness session change fails closed: no call, no delivery, no acknowledg
   const sent = await adapter.tool('roger_send', { recipient: sessionKey(peer), body: 'stale' });
   assert.equal(sent.ok, false);
   assert.match(!sent.ok ? sent.message : '', reason);
+  const board = await adapter.tool('roger_board', {});
+  assert.equal(board.ok, false);
+  assert.match(!board.ok ? board.message : '', reason);
+  const direct = await adapter.call(ROUTES.sessions, 'GET');
+  assert.equal(direct.ok, false);
+  assert.match(!direct.ok ? direct.message : '', reason);
   assert.deepEqual(requests, [], 'no coordinator call as the stale session');
+  assert.equal(registrations, before, 'no registration wait as the stale session');
+
+  // The session changes while call() waits for registration: the request is still refused.
+  current = claudeSessionId;
+  switchDuringRegistration = true;
+  const raced = await adapter.call(ROUTES.sessions, 'GET');
+  switchDuringRegistration = false;
+  assert.equal(raced.ok, false);
+  assert.match(!raced.ok ? raced.message : '', reason);
+  assert.deepEqual(requests, [], 'no coordinator call after a change during registration');
   await assert.rejects(adapter.receive(), reason);
   assert.equal(delivered.length, 0, 'nothing delivered to the other session');
 
