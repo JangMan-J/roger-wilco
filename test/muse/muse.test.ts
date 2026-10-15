@@ -353,7 +353,30 @@ test('Muse roger_board drops a version 1 coordinator\'s displayName and session 
   const tools = createMuseTools({
     bound: async () => ({ actor: peer, hostId }),
     call: async route => ({ ok: true, value: route === ROUTES.sessions ? [v1] : claims }),
+    health: async () => ({ ok: true, value: { service: 'roger-wilco', version: 1 } }),
   });
   for (const params of [{}, { all: true }])
     assert.deepEqual(await tools('roger_board', params), { ok: true, value: { sessions: [row], claims } }, JSON.stringify(params));
+});
+
+test('Muse roger_board filters by /health presenceWindowMs, read once, and falls back to 90 s without it', async t => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const row = (sessionId: string, age: number) => ({ subscription: { id: `${namespace}:${sessionId}`, session: { namespace, sessionId }, hostId, cursor: 0 },
+    rank: 2, lastSeenAt: now - age });
+  const fresh = row('fresh', 20_000), recent = row('recent', 60_000), stale = row('stale', 90_001);
+  const board = async (value: unknown) => {
+    let reads = 0;
+    const tools = createMuseTools({
+      bound: async () => ({ actor: peer, hostId }),
+      call: async route => ({ ok: true, value: route === ROUTES.sessions ? [fresh, recent, stale] : [] }),
+      health: async () => { reads++; return { ok: true, value }; },
+    });
+    const first = await tools('roger_board', {});
+    const second = await tools('roger_board', {});
+    assert.deepEqual(second, first);
+    return { sessions: first.ok ? (first.value as { sessions: unknown[] }).sessions : first, reads };
+  };
+  assert.deepEqual(await board({ service: 'roger-wilco', version: 1, presenceWindowMs: 30_000 }), { sessions: [fresh], reads: 1 });
+  assert.deepEqual(await board({ service: 'roger-wilco', version: 1 }), { sessions: [fresh, recent], reads: 1 });
 });

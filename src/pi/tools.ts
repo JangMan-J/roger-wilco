@@ -2,11 +2,23 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import {
-  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, sessionKey,
+  ROUTES, ownRegistrationResult, entityReference, isEntityId, isMessageInput, isSettingValue, sessionKey,
   type Claim, type Outcome, type RegistrationResult, type SessionAddress,
 } from '../protocol/index.ts';
 
-const PRESENCE_MS = 90_000;
+/** Board "present" window when `/health` has no presenceWindowMs (a version 1 coordinator). */
+const PRESENCE_FALLBACK_MS = 90_000;
+/** The board's "present" window from `/health`, read once per process once it succeeds; the fallback otherwise. */
+function presenceWindow(health: () => Promise<Outcome<unknown>>): () => Promise<number> {
+  let known: number | undefined;
+  return async () => {
+    if (known !== undefined) return known;
+    const result = await health();
+    if (!result.ok) return PRESENCE_FALLBACK_MS;
+    const value = result.value !== null && typeof result.value === 'object' ? (result.value as { presenceWindowMs?: unknown }).presenceWindowMs : undefined;
+    return known = isSettingValue('presenceWindowMs', value) ? value : PRESENCE_FALLBACK_MS;
+  };
+}
 
 export type Failure = Extract<Outcome<never>, { ok: false }>;
 /** The invoking session, resolved while this runtime holds its lease. */
@@ -18,6 +30,8 @@ export interface CoreAccess {
   bound(ctx: ExtensionContext): Promise<BoundSession | Failure>;
   /** Register the invoking session, then make one coordinator call as it. A register route returns the registration. */
   call(ctx: ExtensionContext, route: string, method: 'GET' | 'POST', body?: unknown): Promise<Outcome<unknown>>;
+  /** `GET /health`, without registering. */
+  health(): Promise<Outcome<unknown>>;
 }
 
 const text = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }], details: value });
@@ -28,15 +42,17 @@ const IDENTITY_DESCRIPTION = 'Register this session and return its address, host
 const rankLabel = (rank: number) => rank === 1 ? 'fleet (rank 1)' : `Rank ${rank}`;
 
 export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
+  const window = presenceWindow(() => core.health());
   async function board(ctx: ExtensionContext, all = false): Promise<Outcome<unknown>> {
     const first = await core.call(ctx, ROUTES.sessions, 'GET') as Outcome<RegistrationResult[]>;
     if (!first.ok) return first;
     const second = await core.call(ctx, ROUTES.claims, 'GET');
+    const present = await window();
     const now = Date.now();
     // A version 1 coordinator can still list displayName and session entities.
     const rows = first.value.map(ownRegistrationResult);
     const visible = all ? rows : rows.filter(row =>
-      typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= PRESENCE_MS);
+      typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt) && now - row.lastSeenAt <= present);
     return second.ok ? { ok: true, value: { sessions: visible, claims: second.value } } : second;
   }
   const boardCommand = {
@@ -57,7 +73,7 @@ export function registerPiSurface(pi: ExtensionAPI, core: CoreAccess): void {
         `Your address: ${address}`,
         `Your host: ${JSON.stringify(identity.hostId)}`,
         '',
-        `${all ? 'All registered sessions' : 'Recent sessions (presence within 90s)'} (${result.value.sessions.length}):`,
+        `${all ? 'All registered sessions' : `Recent sessions (presence within ${Math.round(await window() / 1000)}s)`} (${result.value.sessions.length}):`,
         ...result.value.sessions.map((row, index) => labels[index] +
           (typeof row.lastSeenAt === 'number' && Number.isFinite(row.lastSeenAt)
             ? ` — last seen ${new Date(row.lastSeenAt).toISOString()} (${Math.max(0, Math.floor((Date.now() - row.lastSeenAt) / 1000))}s ago)`
