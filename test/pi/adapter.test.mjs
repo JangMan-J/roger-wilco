@@ -58,7 +58,8 @@ test('the adapter reaches the host only through the injected HostInbox and the c
     connectHost: async received => { assert.equal(received, config); return inbox; },
     request: async (received, route, method, body) => { requests.push({ received, route, method, body }); return { ok: true, value: 'sent' }; },
   });
-  assert.deepEqual([...commands.keys()], ['roger', 'roger_board']);
+  assert.deepEqual([...commands.keys()], ['roger']);
+  assert.deepEqual(commands.get('roger').getArgumentCompletions('s'), [{ value: 'send ', label: 'send ' }]);
   assert.deepEqual([...tools.keys()], ['roger_identity', 'roger_send', 'roger_inbox', 'roger_entity', 'roger_board', 'roger_claim', 'roger_release']);
   const ctx = ctxFor(id.toUpperCase(), join(dir, 'session.jsonl'));
   await handlers.get('session_start')({ reason: 'startup' }, ctx);

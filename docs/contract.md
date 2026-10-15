@@ -210,9 +210,13 @@ Pi exposes `roger_identity`, `roger_send`, `roger_inbox`, `roger_board`, `roger_
 These tools derive their actor from the invoking Pi session.
 The board defaults to sessions seen within 90 seconds and includes active claims.
 The model tool accepts `{all:true}` to include stale, retained registrations.
-The user commands `/roger` and `/roger_board` display the board without a model turn.
-They offer a session picker followed by a rank picker.
-Cancellation leaves all ranks unchanged.
+The user command `/roger` displays the board without a model turn; there is no `/roger_board` user command.
+Its picker can broadcast a message, message the selected session, or assign that session a rank.
+The command also accepts a direct target and optional inline message, for example `/roger @FLEET hello` or `/roger * hello`.
+Targets resolve by exact session address or by a unique display name, session ID, or prefix among registered sessions.
+An omitted message opens the editor when the Pi UI is available.
+Directed command messages default to private visibility, broadcasts to public visibility, and `--public` makes a directed command message public.
+Cancellation sends no message and leaves all ranks unchanged.
 `/roger all` includes stale, retained sessions.
 Session rows show rank, presence age, and `lastSeenAt`.
 
