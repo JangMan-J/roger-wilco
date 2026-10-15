@@ -18,6 +18,22 @@ _Example_: A consumer interprets a change from 0 to 153 as a status change for t
 _Confirmed_: 2026-10-13, user clarification that the integer is metadata.
 _Avoid_: Entity type, authority, rank
 
+**Session address**:
+The core identity of a session: a namespace and an opaque session identifier.
+Routing, leases, mailboxes, and claims use the address only.
+Two sessions may share a call sign; their addresses still tell them apart.
+_Example_: `fleet:550e8400-e29b-41d4-a716-446655440000` identifies one session whatever it is called.
+_Confirmed_: 2026-10-15, disambiguation of address, entity label, and call sign.
+_Avoid_: Display name, session name, user ID
+
+**Call sign**:
+An optional label a consumer associates with a session address, through an entity.
+The core tracks the entity; the association and its meaning belong to the consumer.
+A session needs no call sign, and the core routes only by address.
+_Example_: A consumer associates the entity label FLEET with one session address as its call sign.
+_Confirmed_: 2026-10-15, user clarification that names are opt-in and not part of this project.
+_Avoid_: Display name, session name
+
 **Wake**:
 A request, made when a message is sent, for the receiving session to attend
 to its mailbox. A wake is not a message type and it is not an acknowledgement.

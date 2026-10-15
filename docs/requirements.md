@@ -57,8 +57,15 @@ functions require a change to this document.
   optional expiry time. Claims coordinate work; they grant no permission.
 - Ranks. A session has a rank from 1 to 5, set by a user. Rank is display
   metadata. It does not change routing or permissions.
-- Display names. A session may set a display name. The name does not change
-  its address.
+- Addresses, entity labels, and call signs are three different things.
+  An address is the core identity of a session: opaque, stable, and the
+  only routing key (a UUID in Pi's case). An entity label is the text of
+  a named subject the core tracks, with stable identity and opaque
+  metadata, whether or not the subject is a session. A call sign is a
+  consumer's optional association between a session address and an
+  entity label; the association and its meaning belong to the consumer.
+  The core provides no display-name function, and session registration
+  carries no name field.
 - The board. The board lists registered sessions, their last-seen times,
   and active claims.
 - The wire contract. A client written in another language, from the
