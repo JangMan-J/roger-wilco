@@ -1,17 +1,19 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
-  deliveryId, entityReference, extractEntities, isEntityId, isMessage, isMessageInput, isNamespace, isReceipt, isRegistration,
-  isSessionAddress, isSessionKey, sessionKey, PROTOCOL_VERSION,
-  type Claim, type CoordinatorStore, type EntityHistory, type EntityRef, type HostPrincipal, type Message,
-  type JsonValue, type MessageInput, type Outcome, type Receipt, type Registration,
-  type RegistrationResult, type SessionAddress, type StreamFrame, type Subscription,
+  deliveryId, entityReference, extractEntities, isEntityId, isMessage, isMessageInput, isNamespace, isPresence, isReceipt,
+  isRegistration, isSessionAddress, isSessionKey, isSettingValue, sessionKey, DEFAULT_SETTINGS, PROTOCOL_VERSION,
+  type Claim, type CoordinatorStore, type EntityHistory, type EntityRef, type HostBatch, type HostPrincipal, type HostStart,
+  type Message, type JsonValue, type MessageInput, type Outcome, type Presence, type PresenceResult, type Receipt,
+  type Registration, type RegistrationResult, type SessionAddress, type StreamFrame, type Subscription,
 } from '../protocol/index.ts';
 
-const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAINTENANCE_MS = 60_000;
+/** Message ids one hostBatch call examines at most, however far behind the host is. */
+export const SCAN_SPAN = 4096;
+const STREAM_ID = /^[0-9a-f]{32}$/;
 const COLLECTION_LIMIT = 5000;
 const VERIFIED_CACHE_LIMIT = 4096;
 // The verified-message cache is also bounded by stored text (body plus data JSON, in
@@ -68,6 +70,8 @@ function messageHash(message: Message): string {
 }
 type ClaimRow = { key: string; owner: string; note: string | null; claimed_at: number; expires_at: number | null };
 const failure = <T>(error: 'invalid_request' | 'not_found' | 'owner_conflict', message: string): Outcome<T> => ({ ok: false, error, message });
+/** A new random coordinator log id: 32 lowercase hex digits. */
+export const newStreamId = (): string => randomBytes(16).toString('hex');
 const validHost = (host: HostPrincipal): boolean => !!host && typeof host.hostId === 'string' && host.hostId.length > 0;
 const validLimit = (limit: number): boolean => Number.isSafeInteger(limit) && limit > 0 && limit <= 500;
 const validCursor = (cursor: number): boolean => Number.isSafeInteger(cursor) && cursor >= 0;
@@ -87,6 +91,7 @@ const addressOf = (key: string): SessionAddress => {
 class Store implements CoordinatorStore {
   private readonly db: DatabaseSync;
   private readonly namespace: string;
+  private readonly retentionMs: number;
   private readonly rotation = new Map<string, string>();
   private readonly listeners = new Set<(hostId: string | undefined) => void>();
   /**
@@ -106,19 +111,26 @@ class Store implements CoordinatorStore {
   private readonly entityRow: StatementSync;
   private readonly insertEntity: StatementSync;
   private readonly insertMention: StatementSync;
+  private readonly hostRow: StatementSync;
+  private readonly hostMembers: StatementSync;
+  private readonly hostRows: StatementSync;
 
-  constructor(path: string, namespace: string) {
+  constructor(path: string, namespace: string, retentionMs: number) {
     if (!isNamespace(namespace)) throw new TypeError('Invalid namespace');
+    if (!isSettingValue('retentionMs', retentionMs)) throw new RangeError('Invalid retention');
     this.namespace = namespace;
+    this.retentionMs = retentionMs;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     try {
       // Durability classes. Commits run at synchronous=NORMAL: in WAL mode they survive a
       // process crash, and an OS crash or power loss can roll back the most recent ones.
       // send() commits at FULL, because a message insert lost after a success response is
-      // a lost message; a FULL commit also syncs every earlier WAL frame. The offered mark
-      // is connection state. A lost cursor update replays one message, which the daemon
-      // deduplicates by message ID (INSERT OR IGNORE) and receipts again.
+      // a lost message; a FULL commit also syncs every earlier WAL frame. claim() and the
+      // openHost() that creates a hosts row (the v2 cut-over) also commit at FULL. The offered
+      // mark is connection state. A lost cursor update replays one message, which the daemon
+      // deduplicates by message ID (INSERT OR IGNORE) and receipts again. A lost v2 receipt
+      // only lowers C, which replays frames the daemon skips.
       this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;
         PRAGMA busy_timeout = 5000; PRAGMA journal_size_limit = 16777216;`);
       this.db.exec(schema);
@@ -142,6 +154,15 @@ class Store implements CoordinatorStore {
         if (!row) this.db.prepare('INSERT INTO store_config (namespace) VALUES (?)').run(namespace);
         // Pre-presence databases get one retention window, not immediate data loss.
         this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE last_seen_at = 0').run(Date.now());
+      });
+      // Host stream v2 delta. A hosts row means that host is on protocol 2; acked is C(h).
+      // stream_id names this coordinator log; it is set once and kept on every later open.
+      this.transaction(() => {
+        this.db.exec('CREATE TABLE IF NOT EXISTS hosts (host_id TEXT PRIMARY KEY, acked INTEGER NOT NULL)');
+        const configColumns = this.db.prepare('PRAGMA table_info(store_config)').all() as { name: string }[];
+        if (!configColumns.some(column => column.name === 'stream_id'))
+          this.db.exec('ALTER TABLE store_config ADD COLUMN stream_id TEXT');
+        this.db.prepare('UPDATE store_config SET stream_id = ? WHERE stream_id IS NULL').run(newStreamId());
       });
       this.migrateEntityMetadata();
       // Only registration display names created session entity sources. Those names
@@ -173,6 +194,17 @@ class Store implements CoordinatorStore {
         ) WHERE s.host_id = ? AND s.id NOT IN (SELECT value FROM json_each(?))
         ORDER BY (s.id <= ?), s.id LIMIT ?`);
       this.offer = this.db.prepare('UPDATE sessions SET offered = ? WHERE id = ?');
+      this.hostRow = this.db.prepare('SELECT acked FROM hosts WHERE host_id = ?');
+      this.hostMembers = this.db.prepare('SELECT id, cursor FROM sessions WHERE host_id = ? ORDER BY id');
+      // Directed rows above the recipient's start, plus each broadcast once when some member
+      // other than its sender has a start below it. Both branches seek the recipient index.
+      this.hostRows = this.db.prepare(`SELECT m.* FROM sessions s JOIN messages m ON m.recipient = s.id
+          WHERE s.host_id = :host AND m.id > :from AND m.id <= :upto AND m.id > s.cursor
+        UNION ALL
+        SELECT m.* FROM messages m
+          WHERE m.recipient = '*' AND m.id > :from AND m.id <= :upto
+            AND EXISTS (SELECT 1 FROM sessions s WHERE s.host_id = :host AND s.cursor < m.id AND s.id <> m.sender)
+        ORDER BY id LIMIT :limit`);
       this.maintain();
     } catch (error) { this.db.close(); throw error; }
   }
@@ -188,6 +220,23 @@ class Store implements CoordinatorStore {
         return result;
       } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     } finally { if (full) this.db.exec('PRAGMA synchronous = NORMAL'); }
+  }
+  /** A read snapshot: every statement inside sees the same committed state. */
+  private snapshot<T>(action: () => T): T {
+    this.db.exec('BEGIN DEFERRED');
+    try {
+      const result = action();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  /** The durable message watermark; AUTOINCREMENT never reissues an id at or below it. */
+  private tail(): number {
+    return (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS tail")
+      .get() as { tail: number }).tail;
+  }
+  private acked(hostId: string): number | undefined {
+    return (this.hostRow.get(hostId) as { acked: number } | undefined)?.acked;
   }
   private migrateEntityMetadata(): void {
     this.transaction(() => {
@@ -234,21 +283,24 @@ class Store implements CoordinatorStore {
     const now = Date.now();
     if (now < this.nextMaintenance) return;
     this.transaction(() => {
-      this.db.prepare('DELETE FROM sessions WHERE last_seen_at < ?').run(now - RETENTION_MS);
+      const cutoff = now - this.retentionMs;
+      this.db.prepare('DELETE FROM sessions WHERE last_seen_at < ?').run(cutoff);
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
       this.db.exec("DELETE FROM entity_sources WHERE kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key)");
-      // A sender or unrelated low cursor must not pin history. Broadcasts remain
-      // until every retained recipient has acknowledged, or its registration expires.
+      // A sender or unrelated low cursor must not pin history. A message stays while a retained
+      // session it is owed to has a start (cursor) below it and its host has not receipted it.
+      // A v1 host has no hosts row (acked -1), which leaves the per-session cursor rule.
       this.db.prepare(`DELETE FROM messages WHERE id IN (
-        SELECT id FROM messages WHERE timestamp < ?
-          AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = messages.recipient AND cursor < messages.id)
-          AND (recipient != '*' OR NOT EXISTS (
-            SELECT 1 FROM sessions WHERE id != messages.sender AND cursor < messages.id
-          )) ORDER BY timestamp LIMIT ?
-      )`).run(now - RETENTION_MS, COLLECTION_LIMIT);
+        SELECT m.id FROM messages m WHERE m.timestamp < ?
+          AND NOT EXISTS (SELECT 1 FROM sessions s LEFT JOIN hosts h ON h.host_id = s.host_id
+            WHERE s.id = m.recipient AND s.cursor < m.id AND COALESCE(h.acked, -1) < m.id)
+          AND (m.recipient <> '*' OR NOT EXISTS (SELECT 1 FROM sessions s LEFT JOIN hosts h ON h.host_id = s.host_id
+            WHERE s.id <> m.sender AND s.cursor < m.id AND COALESCE(h.acked, -1) < m.id))
+          ORDER BY m.timestamp LIMIT ?
+      )`).run(cutoff, COLLECTION_LIMIT);
       this.db.prepare(`DELETE FROM entities WHERE last_seen_at < ? AND NOT EXISTS (
         SELECT 1 FROM message_entities WHERE entity_id = entities.id
-      ) AND NOT EXISTS (SELECT 1 FROM entity_sources WHERE entity_id = entities.id)`).run(now - RETENTION_MS);
+      ) AND NOT EXISTS (SELECT 1 FROM entity_sources WHERE entity_id = entities.id)`).run(cutoff);
     });
     this.nextMaintenance = now + MAINTENANCE_MS;
   }
@@ -362,8 +414,7 @@ class Store implements CoordinatorStore {
       const now = Date.now();
       if (!row) {
         // AUTOINCREMENT's durable watermark survives collection of the entire history.
-        const tail = (this.db.prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) AS tail")
-          .get() as { tail: number }).tail;
+        const tail = this.tail();
         this.db.prepare('INSERT INTO sessions (id, host_id, last_seen_at, initial_cursor, cursor) VALUES (?, ?, ?, ?, ?)')
           .run(id, host.hostId, now, tail, tail);
       } else {
@@ -485,6 +536,9 @@ class Store implements CoordinatorStore {
       const row = this.session(receipt.subscriptionId);
       if (!row) return failure('not_found', 'Subscription does not exist');
       if (row.host_id !== host.hostId) return failure('owner_conflict', 'Subscription belongs to another host');
+      // Serialised with openHost by BEGIN IMMEDIATE: a v1 receipt either counts in the
+      // cut-over's MIN(cursor) or is refused after it.
+      if (this.acked(host.hostId) !== undefined) return failure('owner_conflict', 'Host uses protocol 2');
       const sequence = Number(receipt.messageId.slice(`${this.namespace}:msg:`.length));
       if (sequence <= row.cursor) {
         // The cursor itself proves the latest ACK even after message collection.
@@ -543,9 +597,74 @@ class Store implements CoordinatorStore {
       return { ok: true, value: released };
     });
   }
+  openHost(host: HostPrincipal, bookmark: { stream?: string; after?: number } = {}): Outcome<HostStart> {
+    const { stream, after } = bookmark;
+    if (!validHost(host) || (stream !== undefined && (typeof stream !== 'string' || !STREAM_ID.test(stream))) ||
+        (after !== undefined && !validCursor(after))) return failure('invalid_request', 'Invalid host stream bookmark');
+    this.maintain();
+    // Creating the row is the cut-over: it freezes cursors as starts and refuses v1
+    // receipts, so it commits at FULL. The check and BEGIN run with no await between them.
+    const creating = this.acked(host.hostId) === undefined;
+    return this.transaction((): Outcome<HostStart> => {
+      const tail = this.tail();
+      const id = (this.db.prepare('SELECT stream_id FROM store_config').get() as { stream_id: string }).stream_id;
+      if (stream !== undefined && stream !== id) return failure('owner_conflict', 'Bookmark belongs to another coordinator log');
+      if (after !== undefined && after > tail) return failure('owner_conflict', 'Bookmark is ahead of the coordinator tail');
+      const minStart = (this.db.prepare('SELECT MIN(cursor) AS start FROM sessions WHERE host_id = ?')
+        .get(host.hostId) as { start: number | null }).start;
+      let acked = this.acked(host.hostId);
+      if (acked === undefined) {
+        // A lower C only replays more; it never loses a message.
+        acked = Math.min(minStart ?? tail, after ?? Number.MAX_SAFE_INTEGER);
+        this.db.prepare('INSERT INTO hosts (host_id, acked) VALUES (?, ?)').run(host.hostId, acked);
+      } else if (after !== undefined && after < acked) {
+        return failure('owner_conflict', 'Bookmark is behind the receipted position');
+      }
+      // The coordinator's own knowledge, never the daemon's `after`, and never written to C.
+      return { ok: true, value: { acked, resume: Math.max(acked, minStart ?? tail), stream: id } };
+    }, creating);
+  }
+  hostBatch(host: HostPrincipal, from: number, limit: number): HostBatch {
+    if (!validHost(host) || !validCursor(from) || !Number.isSafeInteger(limit) || limit < 1)
+      throw new TypeError('Invalid host batch');
+    this.maintain();
+    return this.snapshot(() => {
+      const tail = this.tail();
+      const members = (this.hostMembers.all(host.hostId) as { id: string; cursor: number }[])
+        .map(row => ({ session: row.id, start: row.cursor }));
+      const upto = Math.max(from, Math.min(tail, from + SCAN_SPAN));
+      const rows = this.hostRows.all({ host: host.hostId, from, upto, limit }) as MessageRow[];
+      const scanned = rows.length === limit ? rows.at(-1)!.id : upto;
+      return { members, messages: rows.map(row => this.message(row)), scanned, tail };
+    });
+  }
+  advanceHost(host: HostPrincipal, through: number): number | undefined {
+    if (!validHost(host) || !validCursor(through)) throw new TypeError('Invalid host receipt');
+    return this.transaction(() => {
+      this.db.prepare('UPDATE hosts SET acked = ? WHERE host_id = ? AND acked < ?').run(through, host.hostId, through);
+      return this.acked(host.hostId);
+    });
+  }
+  hostAcked(host: HostPrincipal): number | undefined {
+    return validHost(host) ? this.acked(host.hostId) : undefined;
+  }
+  presence(host: HostPrincipal, request: Presence): Outcome<PresenceResult> {
+    if (!validHost(host) || !isPresence(request)) return failure('invalid_request', 'Invalid presence');
+    this.maintain();
+    // No notify: presence makes nothing deliverable and never changes a start.
+    return this.transaction((): Outcome<PresenceResult> => {
+      if (this.acked(host.hostId) === undefined) return failure('owner_conflict', 'Host is not on protocol 2');
+      const now = Date.now();
+      const refresh = this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ? AND host_id = ?');
+      const unknown = request.sessions.filter(key => Number(refresh.run(now, key, host.hostId).changes) === 0);
+      return { ok: true, value: { unknown } };
+    });
+  }
   close(): void { this.db.close(); }
 }
 
-export function createCoordinatorStore(dbPath: string, namespace: string): CoordinatorStore {
-  return new Store(dbPath, namespace);
+/** `retentionMs` is the registration expiry and collection age, from settings. */
+export function createCoordinatorStore(dbPath: string, namespace: string,
+  options: { retentionMs?: number } = {}): CoordinatorStore {
+  return new Store(dbPath, namespace, options.retentionMs ?? DEFAULT_SETTINGS.retentionMs);
 }
