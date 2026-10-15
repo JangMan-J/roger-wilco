@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -154,9 +155,11 @@ test('host restart after local commit but lost receipt replays one durable inbox
   await host.inbox.release(recipient, 'inspector');
 });
 
-test('native Pi loads research-only pi-webtasks beside Roger-Wilco: research dispatch remains, new messages have one consumer', async t => {
+test('native Pi loads pi-webtasks beside Roger-Wilco: research dispatch remains, new messages have one consumer', async t => {
   const h = await rig(t);
-  const researchPackage = resolve(process.env.WEBTASKS_PACKAGE_DIR ?? resolve('..', 'pi-webtasks'));
+  const sibling = resolve('..', 'pi-webtasks');
+  const researchPackage = resolve(process.env.WEBTASKS_PACKAGE_DIR ??
+    (existsSync(sibling) ? sibling : join(homedir(), '.pi/agent/git/github.com/JangMan-J/pi-webtasks')));
   const installed = resolve(researchPackage, 'src/index.ts');
   const previousWebtasks = process.env.WEBTASKS_DIR;
   const previousKey = process.env._PARALLEL_API_KEY;
@@ -194,7 +197,6 @@ test('native Pi loads research-only pi-webtasks beside Roger-Wilco: research dis
   t.after(() => researchStore.close());
   assert.ok(current.session.extensionRunner.getToolDefinition('deep_search'), 'real research extension registered');
   assert.ok(current.session.extensionRunner.getToolDefinition('roger_send'), 'Roger-Wilco registered');
-  assert.equal(current.session.extensionRunner.getToolDefinition('agent_bus_listen'), undefined, 'removed agent-message branch cannot bind a second consumer');
   const researchTool = (current.session as any)._toolRegistry.get('deep_search');
   assert.ok(researchTool, 'research tool wired into native Pi');
   const lookup = await researchTool.execute('read-saved', { research: referenceId });

@@ -13,7 +13,7 @@ import rogerWilco from '../../src/pi/index.ts';
 import { persistedReceipt } from '../../src/pi/delivery.ts';
 
 const childFile = fileURLToPath(new URL('./crash-child.mjs', import.meta.url));
-const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
 const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
 const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
 const stages = ['before-write', 'after-write-before-fsync', 'after-fsync-before-ack', 'after-ack'];

@@ -647,7 +647,7 @@ Later shared changes return to the integrator.
 
 `node --test test/protocol/*.test.mjs test/protocol/*.test.ts` has **no skips**.
 `PI_PACKAGE_DIR` can override the selected installed Pi package for the native probe.
-The default package is `~/pi-main/packages/coding-agent` with sibling `../ai`.
+The default package is `~/pi/packages/coding-agent` with sibling `../ai`.
 No external provider calls are made.
 
 The Node SQLite probe tests named parameters, positional parameters, numeric ID type, WAL, and reopen.

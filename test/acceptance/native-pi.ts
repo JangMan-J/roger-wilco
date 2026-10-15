@@ -7,7 +7,7 @@ import type { TestContext } from 'node:test';
 
 /** Real persistent Pi runtime. Only provider streaming is synthetic; no network model calls. */
 export async function nativePi(t: TestContext, dir: string, options: { sessionFile?: string; extensions?: string[] } = {}) {
-  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
   const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
   const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
   assert.equal(typeof pi.SessionManager.create, 'function', `Installed Pi at ${root} must support persistent sessions`);
@@ -61,7 +61,7 @@ function installSyntheticModel(session: any, ai: any, model: any, calls: unknown
 
 /** Real Pi AgentSessionRuntime performs fork/switch teardown and session_start; no manual event simulation. */
 export async function nativePiRuntime(t: TestContext, dir: string) {
-  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
   const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
   const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
   const agentDir = join(dir, 'agent');

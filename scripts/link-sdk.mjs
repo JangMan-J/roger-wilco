@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const coding = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+const coding = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
 for (const [name, target] of [['pi-coding-agent', coding], ['pi-ai', resolve(coding, '../ai')]]) {
   const manifest = JSON.parse(await readFile(join(target, 'package.json'), 'utf8'));
   if (manifest.name !== `@earendil-works/${name}`) throw new Error(`Unexpected SDK package: ${manifest.name}`);

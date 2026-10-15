@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 // Test the selected installed/build Pi, never silently substitute an npm version.
-const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
 const piVersion = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).version;
 const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
 const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);

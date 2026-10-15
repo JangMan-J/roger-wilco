@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 const [dir, sessionId, stage] = process.argv.slice(2);
-const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
 const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
 const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
 const id = 'fleet:msg:1';

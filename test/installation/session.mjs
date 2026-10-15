@@ -2,7 +2,7 @@
 /**
  * Native Pi subprocess fixture for a provisioned host. Start with:
  *   RW_SESSION_DIR=<directory> ROGER_WILCO_CONFIG=<host.json> node test/installation/session.mjs
- * Optional: PI_PACKAGE_DIR (default ~/pi-main/packages/coding-agent), RW_PACKAGE_DIR (default repo root).
+ * Optional: PI_PACKAGE_DIR (default ~/pi/packages/coding-agent), RW_PACKAGE_DIR (default repo root).
  * Commands: send {recipient,body,id?}, entity {label,type?,id?}, busy, wait-queued {deliveryId}, release, stop.
  * Stdout is exclusively NDJSON: ready, send, entity, received, turn, busy, released.
  * `received` is emitted only for a complete custom_message in this session's JSONL.
@@ -24,7 +24,7 @@ const withTimeout = (promise, ms) => Promise.race([
 async function main() {
   // Pi and extensions must not put diagnostic chatter on the machine-readable channel.
   for (const method of ['log', 'info', 'warn']) console[method] = (...args) => console.error(...args);
-  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+  const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
   const packageDir = resolve(process.env.RW_PACKAGE_DIR ?? fileURLToPath(new URL('../..', import.meta.url)));
   const dir = process.env.RW_SESSION_DIR;
   assert.ok(dir, 'RW_SESSION_DIR is required');

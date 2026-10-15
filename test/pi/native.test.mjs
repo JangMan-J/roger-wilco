@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createDaemonInbox as createHostInbox, createHostDaemon } from '../../src/host/index.ts';
 import { createHostClient } from '../../src/host/client.ts';
 
-const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi-main/packages/coding-agent'));
+const root = resolve(process.env.PI_PACKAGE_DIR ?? join(homedir(), 'pi/packages/coding-agent'));
 const pi = await import(pathToFileURL(join(root, 'dist/index.js')).href);
 const ai = await import(pathToFileURL(resolve(root, '../ai/dist/compat.js')).href);
 const extension = fileURLToPath(new URL('../../src/pi/index.ts', import.meta.url));
