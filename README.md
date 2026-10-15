@@ -9,12 +9,24 @@ Research remains in pi-webtasks.
 ## In Pi
 
 Run `/reload` after installation, then `/roger` to show your address, recent sessions, and active work claims.
-`/roger_board` is an alias.
-These commands display the board without a model call.
-The session picker lets you assign rank 1 through 5.
+The command displays the board without a model call.
+Its picker can message a selected session, broadcast a message, or assign rank 1 through 5.
 Rank 1 is `fleet`.
 Rank is metadata, not authority or a routing rule.
 `/roger all` includes stale sessions that remain within the retention window.
+You can also message directly without opening the picker:
+
+```text
+/roger @<display-name> <message>
+/roger <fleet:session-address> <message>
+/roger * <broadcast message>
+/roger send --public @<display-name> <message>
+```
+
+Targets may be a full session address, a unique display name, session ID, or unique prefix.
+Omit the message to open the editor for that target.
+Directed command messages are private unless `--public` is given; broadcasts are public.
+There is no `/roger_board` user command.
 The `roger_board` tool remains available to the agent.
 
 ## Rust client

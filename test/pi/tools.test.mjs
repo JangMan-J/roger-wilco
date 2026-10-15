@@ -161,6 +161,7 @@ test('native slash commands show the board without a model turn and report unava
   const staleId = `fleet:${staleSession.sessionId}`;
   const unknownId = `fleet:${randomUUID()}`;
   const rankRequests = [];
+  const messageRequests = [];
   let savedRank = 1;
   let rankUnavailable = false;
   const server = createServer(async (req, res) => {
@@ -192,6 +193,15 @@ test('native slash commands show the board without a model turn and report unava
       }
       return;
     }
+    if (req.url === '/v1/messages' && !unavailable) {
+      messageRequests.push({ body, authorization: req.headers.authorization });
+      res.end(JSON.stringify({ ok: true, value: {
+        version: 1, id: `fleet:msg:${messageRequests.length}`, sequence: messageRequests.length, timestamp: now,
+        sender: `${body.sender.namespace}:${body.sender.sessionId}`, recipient: body.message.recipient,
+        body: body.message.body, data: null, visibility: body.message.visibility ?? 'private',
+      } }));
+      return;
+    }
     if (unavailable) {
       res.writeHead(503);
       res.end(JSON.stringify({ ok: false, error: 'temporarily_unavailable', message: 'Coordinator is offline' }));
@@ -215,14 +225,16 @@ test('native slash commands show the board without a model turn and report unava
   const native = await nativePi(t, dir, {
     extensions: [resolve(process.env.RW_PACKAGE_DIR ?? '.', 'src/pi/index.ts')],
   });
-  const notices = [], pickers = [];
+  const notices = [], pickers = [], editors = [];
   let choose = async (_title, _options) => undefined;
+  let draft = 'Interactive hello';
   native.session.extensionRunner.setUIContext({
     setStatus() {},
     notify: (message, type) => notices.push({ message, type }),
     select: async (title, options) => { pickers.push({ title, options }); return choose(title, options); },
+    editor: async title => { editors.push(title); return draft; },
   });
-  for (const command of ['/roger', '/roger_board']) {
+  for (const command of ['/roger']) {
     await native.session.prompt(command);
     const notice = notices.at(-1);
     assert.equal(notice.type, 'info');
@@ -239,19 +251,42 @@ test('native slash commands show the board without a model turn and report unava
     assert.ok(pickers.at(-1).options.some(option => option.includes(native.id) && option.includes('fleet (rank 1)')));
     assert.ok(!pickers.at(-1).options.some(option => option.includes(staleId)));
   }
-  assert.equal(notices.length, 2);
+  assert.equal(notices.length, 1);
   await native.session.prompt('/roger all');
   assert.ok(notices.at(-1).message.includes(staleId));
   assert.ok(notices.at(-1).message.includes(`${unknownId} — host "host-b" — fleet (rank 1) — last seen unknown`));
   assert.ok(notices.at(-1).message.includes(`last seen ${new Date(now - 120_000).toISOString()}`));
   assert.deepEqual(rankRequests, [], 'Escape at the session picker does not mutate ranks');
+  await native.session.prompt(`/roger ${staleId} Direct hello`);
+  assert.ok(notices.at(-1).message.includes(`Sent to ${staleId}: fleet:msg:1`));
+  assert.equal(messageRequests.length, 1);
+  assert.equal(messageRequests[0].body.message.recipient, staleId);
+  assert.equal(messageRequests[0].body.message.body, 'Direct hello');
+  assert.equal(messageRequests[0].body.message.visibility, 'private');
+  await native.session.prompt('/roger --public * Broadcast hello');
+  assert.equal(messageRequests.length, 2);
+  assert.equal(messageRequests[1].body.message.recipient, '*');
+  assert.equal(messageRequests[1].body.message.visibility, 'public');
+  choose = async (title, options) => title.startsWith('Choose a Roger session')
+    ? options.find(option => option.includes(staleId))
+    : options.find(option => option.startsWith('Message '));
+  await native.session.prompt('/roger all');
+  assert.equal(editors.length, 1);
+  assert.ok(editors[0].includes(staleId));
+  assert.equal(messageRequests.length, 3);
+  assert.equal(messageRequests[2].body.message.body, draft);
+  assert.equal(messageRequests[2].body.message.visibility, 'private');
   choose = async () => 'View only (no changes)';
   await native.session.prompt('/roger');
-  choose = async (_title, options) => options.find(option => option.includes(staleId));
+  choose = async (title, options) => title.startsWith('Choose a Roger session')
+    ? options.find(option => option.includes(staleId))
+    : title.startsWith('Action for') ? options.find(option => option.startsWith('Assign rank')) : undefined;
   await native.session.prompt('/roger all');
   assert.deepEqual(pickers.at(-1).options, ['fleet (rank 1)', 'Rank 2', 'Rank 3', 'Rank 4', 'Rank 5']);
   assert.deepEqual(rankRequests, [], 'view-only and cancelling the rank picker do not mutate ranks');
-  choose = async (_title, options) => options.find(option => option.includes(staleId)) ?? 'Rank 4';
+  choose = async (title, options) => title.startsWith('Choose a Roger session')
+    ? options.find(option => option.includes(staleId))
+    : title.startsWith('Action for') ? options.find(option => option.startsWith('Assign rank')) : 'Rank 4';
   await native.session.prompt('/roger all');
   assert.deepEqual(rankRequests, [{ body: { session: staleSession, rank: 4 }, authorization: 'Bearer offline-secret' }]);
   assert.deepEqual(notices.at(-1), { message: `${staleId}: Rank 4`, type: 'info' });
@@ -259,7 +294,9 @@ test('native slash commands show the board without a model turn and report unava
   await native.session.prompt('/roger all');
   assert.ok(notices.at(-1).message.includes(`${staleId} — host "host-b" — Rank 4`));
   rankUnavailable = true;
-  choose = async (_title, options) => options.find(option => option.includes(staleId)) ?? 'Rank 5';
+  choose = async (title, options) => title.startsWith('Choose a Roger session')
+    ? options.find(option => option.includes(staleId))
+    : title.startsWith('Action for') ? options.find(option => option.startsWith('Assign rank')) : 'Rank 5';
   await native.session.prompt('/roger all');
   assert.deepEqual(notices.at(-1), { message: 'Rank update unavailable', type: 'error' });
   assert.equal(savedRank, 4);
@@ -297,7 +334,9 @@ test('native rank picker persists another host’s session metadata through the 
   const notices = [];
   native.session.extensionRunner.setUIContext({
     setStatus() {}, notify: (message, type) => notices.push({ message, type }),
-    select: async (_title, options) => options.find(option => option.includes(target.sessionId)) ?? 'Rank 5',
+    select: async (title, options) => title.startsWith('Choose a Roger session')
+      ? options.find(option => option.includes(target.sessionId))
+      : title.startsWith('Action for') ? options.find(option => option.startsWith('Assign rank')) : 'Rank 5',
   });
   await native.session.prompt('/roger');
   assert.deepEqual(notices.at(-1), { message: `fleet:${target.sessionId}: Rank 5`, type: 'info' });
