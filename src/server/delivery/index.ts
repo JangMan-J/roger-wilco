@@ -94,10 +94,11 @@ export function createStreamHandler(store: CoordinatorStore, auth: HostAuthentic
         while (!signal.aborted) {
           if (connection.dirty) {
             connection.dirty = false;
-            const frames: StreamFrame[] = store.pending(identity.value, 500);
+            const frames: StreamFrame[] = store.pending(identity.value, 500, connection.inFlight.keys());
             let wrote = false;
             for (const frame of frames) {
               if (signal.aborted) break;
+              // The store already skips these; the check keeps a store that ignores `inFlight` correct.
               if (connection.inFlight.has(frame.subscriptionId)) continue;
               connection.inFlight.set(frame.subscriptionId, frame.message.id);
               const payload = `id: ${frame.message.id}\nevent: message\ndata: ${JSON.stringify(frame)}\n\n`;

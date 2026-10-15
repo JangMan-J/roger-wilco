@@ -171,14 +171,14 @@ The coordinator HTTP entry handles these fixed paths.
 
 | Request | Body or query | Success value or rule |
 |---|---|---|
-| `POST /v1/sessions/register` | `Registration` | `RegistrationResult`. The initial cursor is the current message tail, set atomically. A retry from the same host returns the existing subscription and the **unchanged** cursor. Another host receives HTTP 409. Registration is durable before the response. |
+| `POST /v1/sessions/register` | `Registration` | `RegistrationResult`. The initial cursor is the current message tail, set atomically. A retry from the same host returns the existing subscription and the **unchanged** cursor. Another host receives HTTP 409. Registration is committed before the response; see Coordinator durability. A registration does not wake the host stream, because it makes no message deliverable. |
 | `POST /v1/sessions/rank` | `{session: SessionAddress, rank: number}` | Updated `RegistrationResult`. Rank must be an integer from 1 through 5. Any authenticated host can change this metadata. |
 | `GET /v1/sessions` | none | Registered sessions and host assignment. No active Pi session is required. |
 | `GET /v1/claims` | none | Active work claims. Expired claims are removed. |
 | `POST /v1/messages` | `{sender: SessionAddress, message: MessageInput}` | `Message`. The server checks the sender host assignment and the same namespace. It checks the envelope. It rejects an invalid envelope. It persists the message before success. Broadcast recipient `*` excludes the sender at delivery. |
 | `GET /v1/inbox?namespace=...&sessionId=...&since=0&limit=100` | explicit historical query | Ordered messages for the session. The host assignment is checked. A caller can query messages from before registration. Those messages do not generate historical automatic wake-ups. |
 | `GET /v1/entities?id=...&since=0&limit=100` | entity ID and message pagination | `{entity:{id,type,label},messages:Message[]}`. Retained mentions in sequence order. Unknown IDs return 404. |
-| `POST /v1/claims` | `{key,owner:SessionAddress,ttlSeconds,note?}` | `{claim,acquired}`. A positive `ttlSeconds` value expires after that many seconds. Zero means no expiry. Acquire, renew, and takeover of an expired claim are atomic. Release is owner-only. |
+| `POST /v1/claims` | `{key,owner:SessionAddress,ttlSeconds,note?}` | `{claim,acquired}`. The key is 1–256 UTF-16 code units and not whitespace only; the store enforces this for every caller, not only HTTP. A positive `ttlSeconds` value expires after that many seconds. Zero means no expiry. Acquire, renew, and takeover of an expired claim are atomic. Release is owner-only. |
 | `POST /v1/claims/release` | `{key,owner:SessionAddress}` | A boolean. Release is owner-only. |
 | `GET /v1/hosts/stream` | `Accept: text/event-stream` | One authenticated stream per host. Each `event: message` carries a JSON `StreamFrame`. The `id` field is permitted to be the message ID for diagnostics. It **never** drives the durable resume position. Keepalives are comments. A new connection supersedes the earlier stream for that host. Disconnection or shutdown cancels the stream promptly. |
 | `POST /v1/hosts/receipts` | `Receipt` | `Subscription`. The coordinator accepts a receipt only for a delivered message on that authenticated host's own subscription. The per-subscription cursor advances monotonically and contiguously. A repeated receipt is idempotent. A forged ID is rejected. An undelivered future ID is rejected. |
@@ -342,8 +342,15 @@ SSE frame:
 
 ### Replay and cursors
 
-`CoordinatorStore.pending(host,limit)` is the SQLite replay source for catch-up sends and live sends.
+`CoordinatorStore.pending(host,limit,inFlight)` is the SQLite replay source for catch-up sends and live sends.
 Frames are ordered by global sequence per subscription.
+The stream passes the subscription IDs it holds in flight on its connection.
+The store skips those subscriptions before it reads or verifies any row, and they do not count toward the limit.
+A new connection holds nothing in flight, so it receives every unacknowledged offer again from SQLite.
+The store keeps a cache of verified messages by row ID, so it checks each row hash once per process.
+The cache is bounded by entry count (4096) and by stored text (4 MiB of body and data JSON).
+A row with more than 64 KiB of stored text is not cached; its hash is checked on each read.
+The cache holds no delivery state; cursors and offers always come from SQLite.
 The stream checks that result first.
 It then waits for database changes.
 The wait uses a race-free subscribe/recheck loop.
@@ -372,6 +379,16 @@ Cursor progress is independent for each subscription.
 A later global ID cannot skip an earlier unacknowledged message for that subscription.
 SQLite storage transactions initialize the first cursor atomically with registration.
 Only lane A changes coordinator schemas.
+
+### Coordinator durability
+
+The coordinator database runs in WAL mode at `synchronous=NORMAL`.
+A NORMAL commit survives a coordinator process crash; an OS crash or power loss can roll back the most recent NORMAL commits.
+The `send` transaction commits at `synchronous=FULL`, because a message insert lost after a success response is a lost message.
+A FULL commit also syncs every earlier WAL frame, so a registration that a later message depends on reaches stable storage with that message.
+The offered mark is connection state.
+A lost cursor update replays one message: the stream offers it again, the daemon deduplicates it by message ID, and the daemon sends its receipt again, which the coordinator accepts.
+Registrations, ranks, and claims also commit at NORMAL; the host daemon repeats registration on its heartbeat, and a claim lost to power loss can be acquired again by another owner.
 
 ### Host stream deadlines
 

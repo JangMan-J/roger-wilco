@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
+import crypto, { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { createCoordinatorStore } from '../../src/server/store.ts';
 import { sessionKey, type CoordinatorStore, type Receipt, type SessionAddress } from '../../src/protocol/index.ts';
 
@@ -691,5 +693,207 @@ test('a non-UUID session registers beside Pi UUIDs; namespace and host checks st
     }
     assert.deepEqual(store.listSessions().map(row => row.subscription.id).sort(), [sessionKey(a), sessionKey(agent), sessionKey(lower)].sort());
     assert.equal(store.listClaims()[0]?.owner, sessionKey(agent));
+  } finally { store.close(); }
+});
+
+test('send commits at synchronous=FULL; every other commit, including after a send, runs at NORMAL', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  const levels: number[] = [];
+  const exec = DatabaseSync.prototype.exec;
+  t.mock.method(DatabaseSync.prototype, 'exec', function (this: DatabaseSync, sql: string) {
+    if (sql === 'COMMIT') levels.push((this.prepare('PRAGMA synchronous').get() as { synchronous: number }).synchronous);
+    return exec.call(this, sql);
+  });
+  const commits = (action: () => unknown): number[] => { levels.length = 0; action(); return [...levels]; };
+  const NORMAL = 1, FULL = 2;
+  assert.deepEqual(commits(() => register(store)), [NORMAL, NORMAL, NORMAL]);
+  let sent!: { id: string };
+  assert.deepEqual(commits(() => { sent = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'durable' })); }), [FULL]);
+  assert.deepEqual(commits(() => store.pending(hostA, 10)), [NORMAL]);
+  assert.deepEqual(commits(() => ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: sent.id }))), [NORMAL]);
+  assert.deepEqual(commits(() => ok(store.claim(hostA, 'work', sessionKey(a), 60))), [NORMAL]);
+  // A send that rolls back still restores NORMAL for the next commit.
+  ok(store.send(hostA, a, { recipient: '*', body: '[[shared]]' }));
+  const db = new DatabaseSync(path);
+  db.exec("UPDATE entities SET label = 'different label'");
+  db.close();
+  assert.throws(() => store.send(hostA, a, { recipient: '*', body: '[[shared]]' }), /collision/i);
+  assert.deepEqual(commits(() => ok(store.releaseClaim(hostA, 'work', sessionKey(a)))), [NORMAL]);
+});
+
+test('a cursor update lost after commit replays the next message, which is re-offered and re-accepted cleanly', async t => {
+  const path = await fileStore(t);
+  // Persisted states a lost receipt commit can leave: the offer survived, or the offer was lost too.
+  for (const lostOffer of [false, true]) {
+    let store = createCoordinatorStore(path, 'fleet');
+    try {
+      ok(store.register(hostA, { session: a }));
+      ok(store.register(hostA, { session: b }));
+      const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'first' }));
+      const second = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'second' }));
+      const receipt = (id: string) => ({ subscriptionId: sessionKey(b), messageId: id });
+      assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [first.id]);
+      ok(store.acknowledge(hostA, receipt(first.id)));
+      assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [second.id]);
+      assert.equal(ok(store.acknowledge(hostA, receipt(second.id))).cursor, second.sequence);
+      store.close();
+      const db = new DatabaseSync(path);
+      db.prepare('UPDATE sessions SET cursor = ?, offered = ? WHERE id = ?')
+        .run(first.sequence, lostOffer ? null : second.sequence, sessionKey(b));
+      db.close();
+      store = createCoordinatorStore(path, 'fleet');
+      // A pipelined receipt that beats the re-offer is rejected only when the offer itself was lost.
+      if (lostOffer) assert.equal(store.acknowledge(hostA, receipt(second.id)).ok, false);
+      assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [second.id]);
+      assert.equal(ok(store.acknowledge(hostA, receipt(second.id))).cursor, second.sequence);
+      assert.equal(ok(store.acknowledge(hostA, receipt(second.id))).cursor, second.sequence);
+      assert.equal(ok(store.acknowledge(hostA, receipt(first.id))).cursor, second.sequence);
+      assert.deepEqual(store.pending(hostA, 10), []);
+      const third = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'third' }));
+      assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id), [third.id]);
+      assert.equal(ok(store.acknowledge(hostA, receipt(third.id))).cursor, third.sequence);
+      // Reset for the next variant.
+      store.close();
+      const reset = new DatabaseSync(path);
+      reset.exec('DELETE FROM sessions');
+      reset.close();
+    } finally { try { store.close(); } catch {} }
+  }
+});
+
+test('registration, heartbeat, and renaming do not wake store subscribers', () => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  try {
+    const woken: Array<string | undefined> = [];
+    store.subscribe(hostId => { woken.push(hostId); });
+    ok(store.register(hostA, { session: a }));
+    ok(store.register(hostA, { session: a }));
+    ok(store.register(hostA, { session: a, displayName: 'Ay' }));
+    ok(store.register(hostB, { session: c }));
+    assert.deepEqual(woken, []);
+    ok(store.send(hostA, a, { recipient: sessionKey(c), body: 'still wakes' }));
+    assert.deepEqual(woken, ['host-b']);
+  } finally { store.close(); }
+});
+
+test('pending skips in-flight subscriptions before reading rows; a new connection re-offers the earlier offer', async t => {
+  const path = await fileStore(t);
+  let store = createCoordinatorStore(path, 'fleet');
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const toB = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'to b' }));
+  const toA = ok(store.send(hostA, b, { recipient: sessionKey(a), body: 'to a' }));
+  // Connection one offers both; with b in flight, only a is offered again.
+  assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id).sort(), [toA.id, toB.id].sort());
+  assert.deepEqual(store.pending(hostA, 10, [sessionKey(b)]).map(frame => frame.message.id), [toA.id]);
+  assert.deepEqual(store.pending(hostA, 10, [sessionKey(a), sessionKey(b)]), []);
+  // An in-flight subscription does not consume the limit.
+  assert.deepEqual(store.pending(hostA, 1, [sessionKey(a)]).map(frame => frame.message.id), [toB.id]);
+  // A new connection holds nothing in flight and re-offers both earlier offers.
+  assert.deepEqual(store.pending(hostA, 10).map(frame => frame.message.id).sort(), [toA.id, toB.id].sort());
+  store.close();
+  const db = new DatabaseSync(path);
+  db.prepare("UPDATE messages SET body = 'tampered' WHERE id = ?").run(toB.sequence);
+  db.close();
+  store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  // The skipped row is never materialized or verified, so its corruption cannot surface here.
+  assert.deepEqual(store.pending(hostA, 10, new Set([sessionKey(b)])).map(frame => frame.message.id), [toA.id]);
+  assert.throws(() => store.pending(hostA, 10), /Message hash mismatch/);
+});
+
+test('each stored row hash is verified once into a bounded, frozen message cache', t => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const first = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'cached', data: { nested: { list: [1] } } }));
+  const digest = t.mock.method(crypto.Hash.prototype, 'digest');
+  const hashes = (action: () => unknown): number => { digest.mock.resetCalls(); action(); return digest.mock.callCount(); };
+  let read!: { id: string }[];
+  assert.equal(hashes(() => { read = ok(store.inbox(hostA, b, 0, 10)); }), 1);
+  assert.deepEqual(read, [first]);
+  const data = read[0] as unknown as { data: { nested: { list: number[] } } };
+  assert.ok(Object.isFrozen(data) && Object.isFrozen(data.data.nested) && Object.isFrozen(data.data.nested.list));
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, 0, 10))), 0);
+  assert.equal(hashes(() => store.pending(hostA, 10)), 0);
+  // Delivery state still comes from SQLite: after the receipt, the cached row is no longer pending.
+  ok(store.acknowledge(hostA, { subscriptionId: sessionKey(b), messageId: first.id }));
+  assert.deepEqual(store.pending(hostA, 10), []);
+  // The cache is bounded: reading 4096 newer rows evicts the first, which is then verified again.
+  digest.mock.restore();
+  for (let index = 0; index < 4096; index++) ok(store.send(hostA, a, { recipient: sessionKey(b), body: `filler ${index}` }));
+  for (let since = first.sequence; ;) {
+    const page = ok(store.inbox(hostA, b, since, 500));
+    if (!page.length) break;
+    since = page.at(-1)!.sequence;
+  }
+  const again = t.mock.method(crypto.Hash.prototype, 'digest');
+  ok(store.inbox(hostA, b, 0, 1));
+  assert.equal(again.mock.callCount(), 1);
+});
+
+test('the verified-message cache is bounded by stored text, and a large row is verified on every read', t => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const send = (size: number) => ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'sized', data: { pad: 'x'.repeat(size) } }));
+  const digest = t.mock.method(crypto.Hash.prototype, 'digest');
+  const hashes = (action: () => unknown): number => { digest.mock.resetCalls(); action(); return digest.mock.callCount(); };
+  // A row above the 64 KiB entry limit is not cached.
+  const large = send(70_000);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, large.sequence - 1, 1))), 1);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, large.sequence - 1, 1))), 1);
+  // 80 rows of 60 KB stay far below the 4096-entry limit but exceed 4 MiB of text,
+  // so reading them all evicts the oldest cached row.
+  const first = send(60_000);
+  for (let index = 1; index < 80; index++) send(60_000);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 1);
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 0);
+  ok(store.inbox(hostA, b, first.sequence, 500));
+  assert.equal(hashes(() => ok(store.inbox(hostA, b, first.sequence - 1, 1))), 1);
+});
+
+test('reading many large messages does not retain them in the coordinator heap', t => {
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc') as () => void;
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  t.after(() => store.close());
+  ok(store.register(hostA, { session: a }));
+  ok(store.register(hostA, { session: b }));
+  const pad = 'x'.repeat(1_000_000);
+  for (let index = 0; index < 100; index++) ok(store.send(hostA, a, { recipient: sessionKey(b), body: `large ${index}`, data: { pad } }));
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  for (let since = 0; ;) {
+    const page = ok(store.inbox(hostA, b, since, 10));
+    if (!page.length) break;
+    since = page.at(-1)!.sequence;
+  }
+  store.pending(hostA, 500);
+  gc();
+  const retained = process.memoryUsage().heapUsed - before;
+  // 100 MB of message text was read; an unbounded cache would keep all of it.
+  assert.ok(retained < 32 * 1024 * 1024, `retained ${Math.round(retained / 1024 / 1024)} MB`);
+});
+
+test('claim and release reject whitespace-only keys in the store itself', () => {
+  const store = createCoordinatorStore(':memory:', 'fleet');
+  try {
+    ok(store.register(hostA, { session: a }));
+    for (const key of [' ', '   ', '\t', '\n \r\n', '\u00a0', '\u3000']) {
+      const claimed = store.claim(hostA, key, sessionKey(a), 60);
+      assert.equal(claimed.ok, false, JSON.stringify(key));
+      assert.equal(!claimed.ok && claimed.error, 'invalid_request');
+      const released = store.releaseClaim(hostA, key, sessionKey(a));
+      assert.equal(released.ok, false, JSON.stringify(key));
+      assert.equal(!released.ok && released.error, 'invalid_request');
+    }
+    assert.deepEqual(store.listClaims(), []);
+    assert.equal(ok(store.claim(hostA, ' padded ', sessionKey(a), 60)).acquired, true);
+    assert.equal(ok(store.releaseClaim(hostA, ' padded ', sessionKey(a))), true);
   } finally { store.close(); }
 });

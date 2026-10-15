@@ -70,8 +70,12 @@ export interface CoordinatorStore {
   send(host: HostPrincipal, sender: SessionAddress, input: MessageInput): Outcome<Message>;
   inbox(host: HostPrincipal, session: SessionAddress, since: number, limit: number): Outcome<Message[]>;
   entity(id: string, since: number, limit: number): Outcome<EntityHistory>;
-  /** Atomic tail snapshot on first registration; retry MUST return unchanged cursor. */
-  pending(host: HostPrincipal, limit: number): StreamFrame[];
+  /**
+   * Atomic tail snapshot on first registration; retry MUST return unchanged cursor.
+   * `inFlight` lists subscription IDs the caller's connection already holds an offer for;
+   * they are skipped before any row is read.
+   */
+  pending(host: HostPrincipal, limit: number, inFlight?: Iterable<string>): StreamFrame[];
   /** Only this host's subscription, and only a delivered contiguous item, advances its cursor. */
   acknowledge(host: HostPrincipal, receipt: Receipt): Outcome<Subscription>;
   claim(host: HostPrincipal, key: string, owner: SessionKey, ttlSeconds: number, note?: string): Outcome<{ claim: Claim; acquired: boolean }>;
