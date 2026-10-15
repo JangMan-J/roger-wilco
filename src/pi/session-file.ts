@@ -21,6 +21,20 @@ export function deliveryEntry(message: Message) {
   return { customType: DELIVERY_TYPE, content: JSON.stringify(message), display: true, details: { deliveryId: message.id } };
 }
 
+/**
+ * An entry without content is matched on its details alone. An entry that carries
+ * content is evidence only when that content is the delivered message itself, with
+ * the same message ID as the delivery ID in its details.
+ */
+function contentMatches(content: unknown, deliveryId: string): boolean {
+  if (content === undefined) return true;
+  if (typeof content !== 'string') return false;
+  try {
+    const message = JSON.parse(content) as { id?: unknown } | null;
+    return !!message && typeof message === 'object' && message.id === deliveryId;
+  } catch { return false; }
+}
+
 function sameSnapshot(a: BigIntStats, b: BigIntStats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 }
@@ -41,9 +55,10 @@ function receiptReader() {
         const entries = new Map<string, string>();
         if (header?.type === 'session' && header.id != null && piSessionId(header.id) === session.sessionId) {
           for (const line of lines) {
-            const entry = JSON.parse(line) as { type?: string; id?: string; customType?: string; details?: { deliveryId?: string } };
+            const entry = JSON.parse(line) as { type?: string; id?: string; customType?: string; content?: unknown; details?: { deliveryId?: string } };
             if (entry.type === 'custom_message' && entry.customType === DELIVERY_TYPE &&
                 typeof entry.details?.deliveryId === 'string' && typeof entry.id === 'string' && entry.id.length &&
+                contentMatches(entry.content, entry.details.deliveryId) &&
                 !entries.has(entry.details.deliveryId)) entries.set(entry.details.deliveryId, entry.id);
           }
         }
