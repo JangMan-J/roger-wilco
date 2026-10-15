@@ -15,7 +15,7 @@ import { createHostDaemon, createDaemonInbox as createHostInbox, LocalHostInbox 
 import { listenLocal } from '../../src/host/ipc.ts';
 import {
   MAX_JSON_BYTES, ROUTES, sessionKey,
-  type HostConfig, type HostInbox, type Message, type Outcome, type DeliveryEvidence, type SessionAddress, type StreamFrame,
+  type HostConfig, type HostInbox, type Message, type Outcome, type RegistrationResult, type DeliveryEvidence, type SessionAddress, type StreamFrame,
 } from '../../src/protocol/index.ts';
 
 const a: SessionAddress = { namespace: 'fleet', sessionId: '550e8400-e29b-41d4-a716-446655440000' };
@@ -613,4 +613,96 @@ test('awaitRegistration for a session registered in this daemon lifetime makes n
     assert.equal((await clientFor(t, path).awaitRegistration({ session: a })).ok, true);
     assert.equal(posts.length, 5);
   } finally { await daemon.stop(); await run; }
+});
+
+test('a rename back to the registered name while a rename is in flight posts again and wins', { timeout: 20_000 }, async t => {
+  const { path, inbox, config } = rig(t);
+  const posts: Array<string | undefined> = [];
+  let applied: string | undefined;
+  let releaseTwo = () => {};
+  const gateTwo = new Promise<void>(resolve => { releaseTwo = resolve; });
+  let twoStarted = () => {};
+  const twoPosted = new Promise<void>(resolve => { twoStarted = resolve; });
+  const server = createServer(async (req, res) => {
+    if (req.url === ROUTES.register) {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const registration = JSON.parse(body) as { session: SessionAddress; displayName?: string };
+      posts.push(registration.displayName);
+      if (registration.displayName === 'Two') { twoStarted(); await gateTwo; }
+      applied = registration.displayName;
+      res.end(JSON.stringify({ ok: true, value: { subscription: { id: sessionKey(registration.session), session: registration.session, hostId: 'host-a', cursor: 0 },
+        rank: 1, ...(registration.displayName ? { displayName: registration.displayName } : {}) } }));
+      return;
+    }
+    if (req.url === ROUTES.stream) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': idle\n\n'); return; }
+    res.writeHead(404).end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  config.coordinatorUrl = `http://127.0.0.1:${address.port}`;
+  const daemon = createHostDaemon(config, inbox);
+  const run = daemon.start(new AbortController().signal);
+  try {
+    await modeReady(path);
+    const client = clientFor(t, path);
+    const one = await client.awaitRegistration({ session: a, displayName: 'One' });
+    assert.equal(one.ok && one.value.displayName, 'One');
+    const two = client.awaitRegistration({ session: a, displayName: 'Two' });
+    void two.catch(() => {});
+    await twoPosted; // 'Two' is in flight at the coordinator
+    let revertSettled = false;
+    const revert = client.awaitRegistration({ session: a, displayName: 'One' });
+    void revert.then(() => { revertSettled = true; }, () => { revertSettled = true; });
+    await waitFor(() => revertSettled || inbox.registrations().some(row => row.registration_json.includes('"One"')));
+    assert.equal(revertSettled, false, 'the revert is not answered from the remembered result while Two is in flight');
+    releaseTwo();
+    assert.deepEqual(await two, { ok: false, error: 'temporarily_unavailable', message: 'Registration superseded by a newer registration' });
+    const reverted = await revert;
+    assert.equal(reverted.ok && reverted.value.displayName, 'One');
+    assert.deepEqual(posts, ['One', 'Two', 'One']);
+    assert.equal(applied, 'One', 'the coordinator ends on the name the caller was told succeeded');
+  } finally { releaseTwo(); await daemon.stop(); await run; }
+});
+
+test('a queued registration keeps awaitRegistration off the remembered result, including during an outage', async t => {
+  const { path, inbox, config } = rig(t);
+  const ipc = await listenLocal(config, inbox);
+  t.after(() => ipc.close());
+  const client = clientFor(t, path);
+  assert.equal((await client.bind(a, 'rt-a')).ok, true);
+  const key = sessionKey(a);
+  const result = (displayName: string): Outcome<RegistrationResult> => ({ ok: true, value: { subscription: { id: key, session: a, hostId: 'host-a', cursor: 0 }, rank: 1, displayName } });
+  const nameOf = (outcome: Outcome<unknown>) => outcome.ok ? (outcome.value as RegistrationResult).displayName : undefined;
+  inbox.reportRegistration(key, JSON.stringify({ session: a, displayName: 'One' }), 0, result('One'));
+  assert.equal(nameOf(await client.awaitRegistration({ session: a })), 'One', 'nothing pending: answered from memory');
+  // A bare await behind a queued rename waits for that rename.
+  await client.enqueueRegistration({ session: a, displayName: 'Two' });
+  let bareSettled = false;
+  const bare = client.awaitRegistration({ session: a });
+  void bare.then(() => { bareSettled = true; }, () => { bareSettled = true; });
+  await delay(150);
+  assert.equal(bareSettled, false, 'a bare await does not return the old name while a rename is queued');
+  let row = inbox.registrations()[0]!;
+  inbox.completeRegistration(row);
+  inbox.reportRegistration(key, row.registration_json, row.generation, result('Two'));
+  assert.equal(nameOf(await bare), 'Two');
+  // An outage leaves 'Three' queued and keeps the remembered 'Two'; a revert
+  // to 'Two' replaces the queued row instead of answering from memory.
+  await client.enqueueRegistration({ session: a, displayName: 'Three' });
+  row = inbox.registrations()[0]!;
+  inbox.reportRegistration(key, row.registration_json, row.generation, { ok: false, error: 'temporarily_unavailable', message: 'offline' });
+  let revertSettled = false;
+  const revert = client.awaitRegistration({ session: a, displayName: 'Two' });
+  void revert.then(() => { revertSettled = true; }, () => { revertSettled = true; });
+  await waitFor(() => revertSettled || inbox.registrations().some(r => r.registration_json.includes('"Two"')));
+  assert.equal(revertSettled, false, 'the revert is queued, not answered from memory');
+  row = inbox.registrations()[0]!;
+  assert.ok(row.registration_json.includes('"Two"'), 'the revert replaced the queued Three');
+  inbox.completeRegistration(row);
+  inbox.reportRegistration(key, row.registration_json, row.generation, result('Two'));
+  assert.equal(nameOf(await revert), 'Two');
 });

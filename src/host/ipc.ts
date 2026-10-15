@@ -119,9 +119,10 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
           await inbox.enqueueRegistration(registration);
           return ok(null);
         }
-        // Registered during this daemon's lifetime: answer without a queue
-        // write or a coordinator POST. Heartbeat enqueues still post, and
-        // their results replace this one, so presence stays fresh.
+        // Registered during this daemon's lifetime with nothing pending for
+        // the session: answer without a queue write or a coordinator POST.
+        // Heartbeat enqueues still post, and their results replace this one,
+        // so presence stays fresh.
         const known = inbox.registeredResult(registration);
         if (known) return ok(known);
         const timedOut: Outcome<RegistrationResult> = { ok: false, error: 'temporarily_unavailable', message: 'Registration timed out' };

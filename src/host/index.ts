@@ -175,12 +175,18 @@ export class LocalHostInbox {
     return done && done.generation === generation ? done.result : undefined;
   }
   /** The result that answers an awaitRegistration without a coordinator
-   * POST: the session registered successfully during this daemon's lifetime
-   * and the request names no display name other than the registered one. */
+   * POST: the session registered successfully during this daemon's lifetime,
+   * the request names no display name other than the registered one, and no
+   * registration for the session is queued or in flight. A pending row would
+   * land at the coordinator after this answer, so the caller waits for it. */
   registeredResult(registration: Registration): RegistrationResult | undefined {
-    const result = this.registered.get(sessionKey(registration.session));
+    const key = sessionKey(registration.session);
+    const result = this.registered.get(key);
     if (!result) return undefined;
-    return registration.displayName === undefined || registration.displayName === result.displayName ? result : undefined;
+    if (registration.displayName !== undefined && registration.displayName !== result.displayName) return undefined;
+    if (this.registrationAttempting.has(key)) return undefined;
+    if (this.db.prepare('SELECT 1 FROM inbox_registrations WHERE session_key = ?').get(key)) return undefined;
+    return result;
   }
   reportRegistration(key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>): void {
     this.registrationCompletions.set(key, { generation, result });

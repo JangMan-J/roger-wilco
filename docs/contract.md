@@ -448,6 +448,7 @@ Startup binding enqueues registration and returns without a wait for HTTP.
 The host daemon is the only writer of `POST /v1/sessions/register`.
 A tool that needs the result waits for that attempt. Startup does not.
 The wait returns at once, without a queue write or a coordinator request, when the session registered successfully during the current daemon process and the request names no display name other than the registered one.
+A registration for the session that is still queued or in flight disables this shortcut: the request enqueues and waits, so the coordinator ends on the latest request.
 A queued heartbeat always posts, and its result replaces the remembered one.
 A coordinator refusal withdraws the remembered result; an unreachable coordinator does not.
 The host daemon drains and retries registrations.
