@@ -153,6 +153,11 @@ export async function listenLocal(config: HostConfig, inbox: LocalHostInbox): Pr
           if (waiter.bare) waiter.generation = current.generation;
           else settleWaiter(waiter, superseded);
         }
+        // A fast completion (for example a daemon cache hit) may already have
+        // been reported while this enqueue was in flight, before the waiter's
+        // generation was assigned and its result listener could match it.
+        const completed = waiter.generation === undefined ? undefined : inbox.registrationCompletion(key, waiter.generation);
+        if (completed && regWaiters.has(id)) settleWaiter(waiter, completed);
         // An attempt for this generation may already be in flight.
         if (!socket.destroyed && regWaiters.has(id) && inbox.registrationAttemptGeneration(key) === waiter.generation && !waiter.attempted) {
           waiter.attempted = true;

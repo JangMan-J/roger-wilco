@@ -68,7 +68,7 @@ Release, expiry, disconnect, and shutdown retire the token.
 Every bound command compares its connection token before touching storage.
 The database mutation checks the same owner and lease inside its transaction.
 
-Pending returns at most one message and indicates whether another page exists.
+Pending returns at most 32 messages (at most 256 KiB of message JSON, always including the first) and indicates whether another page exists.
 The client can accumulate at most 32 messages per reconciliation batch.
 Every new reconciliation starts from the oldest unacknowledged row.
 Page cursors never authorize acknowledgment.

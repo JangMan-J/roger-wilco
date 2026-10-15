@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -22,7 +23,11 @@ const LEGACY_SESSION_FIELD = 'piSessionId';
 
 type LeaseRow = { runtime_id: string; expires_at: number };
 type RegistrationRow = { session_key: string; registration_json: string; generation: number };
-type PendingRow = { message_json: string };
+type PendingRow = { message_json: string; hash: string | null };
+/** The packet identity: SHA-256 over the exact stored message JSON text. */
+function packetHash(json: string): string {
+  return createHash('sha256').update(json).digest('hex');
+}
 
 export class LocalHostInbox {
   private readonly db: DatabaseSync;
@@ -99,6 +104,16 @@ export class LocalHostInbox {
         version = 2;
       }
       if (version === 2) migrateNeutralEvidence(this.db);
+      const inboxColumns = this.db.prepare('PRAGMA table_info(inbox_messages)').all() as Array<{ name: string }>;
+      if (!inboxColumns.some(column => column.name === 'hash')) {
+        this.db.exec('ALTER TABLE inbox_messages ADD COLUMN hash TEXT');
+        // Rows already stored were verified when their frames were ingested;
+        // hash them once here so later reads are equality checks.
+        const backfill = this.db.prepare('UPDATE inbox_messages SET hash = ? WHERE message_id = ? AND session_key = ?');
+        for (const row of this.db.prepare('SELECT session_key, message_id, message_json FROM inbox_messages').all() as
+          Array<{ session_key: string; message_id: string; message_json: string }>)
+          backfill.run(packetHash(row.message_json), row.message_id, row.session_key);
+      }
       // Connection grants never survive a daemon restart.
       this.db.exec('DELETE FROM inbox_leases');
     });
@@ -145,7 +160,14 @@ export class LocalHostInbox {
       throw fault;
     }
   }
+  /** The last completed registration result per session, for waiters that subscribed mid-flight. */
+  private readonly registrationCompletions = new Map<string, { generation: number; result: Outcome<RegistrationResult> }>();
+  registrationCompletion(key: string, generation: number): Outcome<RegistrationResult> | undefined {
+    const done = this.registrationCompletions.get(key);
+    return done && done.generation === generation ? done.result : undefined;
+  }
   reportRegistration(key: string, registrationJson: string, generation: number, result: Outcome<RegistrationResult>): void {
+    this.registrationCompletions.set(key, { generation, result });
     if (this.registrationAttempting.get(key) === generation) this.registrationAttempting.delete(key);
     let fault: unknown;
     for (const listener of this.registrationResults) {
@@ -208,9 +230,10 @@ export class LocalHostInbox {
 
   async receive(frame: StreamFrame): Promise<{ inserted: boolean }> {
     if (!isStreamFrame(frame)) throw new TypeError('Invalid stream frame');
+    const messageJson = JSON.stringify(frame.message);
     const result = this.db.prepare(`INSERT OR IGNORE INTO inbox_messages
-      (session_key, message_id, sequence, message_json) VALUES (?, ?, ?, ?)`).run(
-      frame.subscriptionId, frame.message.id, frame.message.sequence, JSON.stringify(frame.message));
+      (session_key, message_id, sequence, message_json, hash) VALUES (?, ?, ?, ?, ?)`).run(
+      frame.subscriptionId, frame.message.id, frame.message.sequence, messageJson, packetHash(messageJson));
     if (result.changes === 1) this.changed(frame.subscriptionId);
     return { inserted: result.changes === 1 };
   }
@@ -252,18 +275,27 @@ export class LocalHostInbox {
 
   async pending(session: SessionAddress, runtimeId: string): Promise<Message[]> {
     if (!isSessionAddress(session) || !runtimeId || !this.owns(session, runtimeId)) return [];
-    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages WHERE session_key = ? AND evidence_record_id IS NULL
+    const rows = this.db.prepare(`SELECT message_json, hash FROM inbox_messages WHERE session_key = ? AND evidence_record_id IS NULL
       ORDER BY sequence ASC`).all(sessionKey(session)) as PendingRow[];
-    return rows.map(row => storedMessage(row.message_json));
+    return rows.map(row => storedMessage(row.message_json, row.hash));
   }
 
   pendingPage(session: SessionAddress, owner: string, afterSequence = 0): Outcome<{ messages: Message[]; more: boolean }> {
     if (!this.owns(session, owner)) return failure('owner_conflict', 'Session lease is not owned');
-    const rows = this.db.prepare(`SELECT message_json FROM inbox_messages
-      WHERE session_key = ? AND evidence_record_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 2`)
+    const rows = this.db.prepare(`SELECT message_json, hash FROM inbox_messages
+      WHERE session_key = ? AND evidence_record_id IS NULL AND sequence > ? ORDER BY sequence LIMIT 33`)
       .all(sessionKey(session), afterSequence) as PendingRow[];
-    const message = rows[0] ? storedMessage(rows[0].message_json) : undefined;
-    return { ok: true, value: { messages: message ? [message] : [], more: rows.length > 1 } };
+    // A page is bounded by count and by bytes, so a few large messages cost
+    // one exchange each and many small messages share one. At least the
+    // first message is always included, whatever its size.
+    const messages: Message[] = [];
+    let bytes = 0;
+    for (const row of rows) {
+      bytes += Buffer.byteLength(row.message_json);
+      if (messages.length && (messages.length >= 32 || bytes > 256 * 1024)) break;
+      messages.push(storedMessage(row.message_json, row.hash));
+    }
+    return { ok: true, value: { messages, more: rows.length > messages.length } };
   }
 
   async acknowledgeDelivery(session: SessionAddress, runtimeId: string, evidence: DeliveryEvidence): Promise<Outcome<null>> {
@@ -349,7 +381,14 @@ export class LocalHostInbox {
 function failure(code: 'invalid_request' | 'owner_conflict' | 'not_found', message: string): Outcome<never> {
   return { ok: false, error: code, message };
 }
-function storedMessage(json: string): Message {
+function storedMessage(json: string, hash?: string | null): Message {
+  // A hashed row was fully verified when its frame was ingested. The
+  // equality check is the whole verification here: bytes that are not the
+  // verified bytes are rejected, not re-validated.
+  if (hash) {
+    if (packetHash(json) !== hash) throw new Error('Message hash mismatch');
+    return JSON.parse(json) as Message;
+  }
   const value: unknown = JSON.parse(json);
   if (!isMessage(value)) throw new TypeError('Invalid stored message');
   return value;
@@ -504,6 +543,12 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
   let unsubscribeRegistration: (() => void) | undefined;
   let registrationDirty = true;
   let registrationWake: (() => void) | undefined;
+  /** Last successful registration per session. An identical re-enqueue inside
+   * the window is answered from this cache instead of another coordinator
+   * POST. The window stays well under the 30 s heartbeat and the 90 s board
+   * presence window, so coordinator last-seen times remain fresh. */
+  const REGISTRATION_CACHE_MS = 20_000;
+  const registrationCache = new Map<string, { json: string; value: RegistrationResult; at: number }>();
   const kickRegistrations = () => { registrationDirty = true; registrationWake?.(); };
   const onAbort = () => controller?.abort();
   let lastError = '';
@@ -539,11 +584,18 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
           // generation is picked up by the next pass its enqueue triggered.
           if (!inbox.isCurrentRegistration(row)) continue;
           try {
+            const cached = registrationCache.get(row.session_key);
+            if (cached && cached.json === row.registration_json && Date.now() - cached.at < REGISTRATION_CACHE_MS) {
+              inbox.completeRegistration(row);
+              inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value: cached.value });
+              continue;
+            }
             const registration = storedRegistration(row.registration_json);
             inbox.reportRegistrationAttempt(row.session_key, row.registration_json, row.generation);
             const value = outcomeValue(await jsonPost(base, ROUTES.register, config.credential, registration, signal), isRegistrationResult);
             if (!value || value.subscription.id !== row.session_key || value.subscription.hostId !== config.hostId)
               throw new Error('Invalid registration response');
+            registrationCache.set(row.session_key, { json: row.registration_json, value, at: Date.now() });
             inbox.completeRegistration(row);
             inbox.reportRegistration(row.session_key, row.registration_json, row.generation, { ok: true, value });
           } catch (error) {
@@ -588,12 +640,21 @@ export function createHostDaemon(config: HostConfig, inbox: LocalHostInbox): { s
         armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out');
         kickRegistrations();
         backoff = RETRY_MIN_MS;
+        // Receipts are posted on a per-subscription chain: the stream keeps
+        // reading while posts are in flight, order per subscription is
+        // preserved for the coordinator's contiguous-cursor check, and a
+        // failed post leaves the cursor unmoved so replay reposts it.
+        const receiptChains = new Map<string, Promise<void>>();
         for await (const frame of frames(response.body, streamSignal, () => armDeadline(STREAM_IDLE_MS, 'Host stream idle timed out'), report)) {
           await inbox.receive(frame); // transaction commits before receipt is sent
           const receipt = { subscriptionId: frame.subscriptionId, messageId: frame.message.id };
-          const ack = outcomeValue(await jsonPost(base, ROUTES.receipt, config.credential, receipt, signal), isSubscription);
-          if (!ack || ack.id !== receipt.subscriptionId || ack.hostId !== config.hostId) throw new Error('Invalid receipt response');
+          const prior = receiptChains.get(frame.subscriptionId) ?? Promise.resolve();
+          receiptChains.set(frame.subscriptionId, prior.then(async () => {
+            const ack = outcomeValue(await jsonPost(base, ROUTES.receipt, config.credential, receipt, signal), isSubscription);
+            if (!ack || ack.id !== receipt.subscriptionId || ack.hostId !== config.hostId) throw new Error('Invalid receipt response');
+          }).catch(error => { if (!signal.aborted) report(error); }));
         }
+        await Promise.all(receiptChains.values());
         if (!signal.aborted) throw new Error('Host stream ended');
       } catch (error) {
         if (!signal.aborted) report(connection.signal.aborted ? connection.signal.reason : error);

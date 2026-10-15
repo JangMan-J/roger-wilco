@@ -107,8 +107,9 @@ test('session-bound tools use the invoking UUID; board includes sessions and cla
   ]) {
     assert.deepEqual(await tool('roger_entity', params), { ok: true, value: { entity, messages: [mention] } });
     assert.equal(requests.at(-1).path, '/v1/entities?' + new URLSearchParams({ id: entity.id, since: String(since), limit: String(limit) }));
-    assert.deepEqual(requests.at(-2).body, { session: { namespace: 'fleet', sessionId: id } }, 'entity lookup registers the bound session first');
-    assert.equal(requests.at(-2).path, '/v1/sessions/register');
+    const registerIndex = requests.findLastIndex(r => r.path === '/v1/sessions/register');
+    assert.ok(registerIndex >= 0 && registerIndex < requests.length - 1, 'entity lookup runs only after the bound session is registered');
+    assert.deepEqual(requests.at(registerIndex).body, { session: { namespace: 'fleet', sessionId: id } });
   }
   const beforeInvalid = requests.length;
   for (const params of [{}, { label: 'fix-parser', id: typed.id }, { id: typed.id, type: 0 }, { id: 'invalid' },

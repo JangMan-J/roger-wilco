@@ -53,7 +53,11 @@ CREATE TABLE IF NOT EXISTS claims (
 );`;
 
 type SessionRow = { id: string; host_id: string; display_name: string | null; last_seen_at: number; rank: number; cursor: number; initial_cursor: number; offered: number | null };
-type MessageRow = { id: number; timestamp: number; sender: string; recipient: string; body: string; data: string; visibility: 'private' | 'public' };
+type MessageRow = { id: number; timestamp: number; sender: string; recipient: string; body: string; data: string; visibility: 'private' | 'public'; hash: string | null };
+/** The packet identity: SHA-256 over the exact JSON text of the verified message. */
+function messageHash(message: Message): string {
+  return createHash('sha256').update(JSON.stringify(message)).digest('hex');
+}
 type ClaimRow = { key: string; owner: string; note: string | null; claimed_at: number; expires_at: number | null };
 const failure = <T>(error: 'invalid_request' | 'not_found' | 'owner_conflict', message: string): Outcome<T> => ({ ok: false, error, message });
 const validHost = (host: HostPrincipal): boolean => !!host && typeof host.hostId === 'string' && host.hostId.length > 0;
@@ -90,6 +94,9 @@ class Store implements CoordinatorStore {
       const entityColumns = this.db.prepare('PRAGMA table_info(entities)').all() as { name: string }[];
       if (!entityColumns.some(column => column.name === 'last_seen_at'))
         this.db.exec('ALTER TABLE entities ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0');
+      const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
+      if (!messageColumns.some(column => column.name === 'hash'))
+        this.db.exec('ALTER TABLE messages ADD COLUMN hash TEXT');
       const columns = this.db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
       if (!columns.some(column => column.name === 'last_seen_at'))
         this.db.exec('ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0');
@@ -106,6 +113,13 @@ class Store implements CoordinatorStore {
         this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE last_seen_at = 0').run(Date.now());
       });
       this.migrateEntityMetadata();
+      // Rows written before packet hashes existed are verified once, here,
+      // and hashed; after this pass every read is an equality check.
+      this.transaction(() => {
+        const update = this.db.prepare('UPDATE messages SET hash = ? WHERE id = ?');
+        for (const row of this.db.prepare('SELECT * FROM messages WHERE hash IS NULL').all() as MessageRow[])
+          update.run(messageHash(this.message(row)), row.id);
+      });
       this.sessionRow = this.db.prepare('SELECT * FROM sessions WHERE id = ?');
       this.messageRow = this.db.prepare('SELECT * FROM messages WHERE id = ?');
       this.claimRow = this.db.prepare('SELECT * FROM claims WHERE key = ?');
@@ -222,21 +236,46 @@ class Store implements CoordinatorStore {
     }
     return entities.map(entity => entity.id);
   }
-  private registration(row: SessionRow): RegistrationResult {
+  /** All entities for one source kind in a single joined query, grouped by source key. */
+  private sourceEntitiesByKey(kind: 'session' | 'claim'): Map<string, EntityRef[]> {
+    const rows = this.db.prepare(`SELECT s.source_key AS source_key, e.id, e.type, e.label FROM entities e
+      JOIN entity_sources s ON s.entity_id = e.id WHERE s.kind = ? ORDER BY s.source_key, e.id`)
+      .all(kind) as Array<EntityRef & { source_key: string }>;
+    const byKey = new Map<string, EntityRef[]>();
+    for (const row of rows) {
+      const list = byKey.get(row.source_key) ?? [];
+      list.push({ id: row.id, type: row.type, label: row.label });
+      byKey.set(row.source_key, list);
+    }
+    return byKey;
+  }
+  private registration(row: SessionRow, entities?: EntityRef[]): RegistrationResult {
+    const found = entities ?? this.sourceEntities('session', row.id).entities;
     return { subscription: this.subscription(row), ...(row.display_name === null ? {} : { displayName: row.display_name }),
-      lastSeenAt: row.last_seen_at, rank: row.rank, ...this.sourceEntities('session', row.id) };
+      lastSeenAt: row.last_seen_at, rank: row.rank, ...(found?.length ? { entities: found } : {}) };
   }
   private message(row: MessageRow): Message {
-    const data: unknown = JSON.parse(row.data);
+    let data: unknown;
+    try { data = JSON.parse(row.data); }
+    catch { throw new Error(row.hash ? 'Message hash mismatch' : 'Invalid stored message'); }
     const message = { version: PROTOCOL_VERSION, id: deliveryId(this.namespace, row.id), sequence: row.id,
       timestamp: row.timestamp, sender: row.sender, recipient: row.recipient, body: row.body,
       data, visibility: row.visibility };
+    // A hashed row was fully verified at write time by this store and at
+    // input time by the sending adapter. The equality check below is the
+    // whole read-path verification: bytes that are not the verified bytes
+    // are rejected, not re-validated.
+    if (row.hash) {
+      if (messageHash(message as Message) !== row.hash) throw new Error('Message hash mismatch');
+      return message as Message;
+    }
     if (!isMessage(message)) throw new TypeError('Invalid stored message');
     return message;
   }
-  private claimValue(row: ClaimRow): Claim {
+  private claimValue(row: ClaimRow, entities?: EntityRef[]): Claim {
+    const found = entities ?? this.sourceEntities('claim', row.key).entities;
     return { key: row.key, owner: row.owner, note: row.note, claimedAt: row.claimed_at, expiresAt: row.expires_at,
-      ...this.sourceEntities('claim', row.key) };
+      ...(found?.length ? { entities: found } : {}) };
   }
   private assigned(host: HostPrincipal, session: SessionAddress): Outcome<SessionRow> {
     if (!validHost(host) || !isSessionAddress(session) || session.namespace !== this.namespace)
@@ -303,8 +342,9 @@ class Store implements CoordinatorStore {
   }
   listSessions(): RegistrationResult[] {
     this.maintain();
+    const entities = this.sourceEntitiesByKey('session');
     return (this.db.prepare('SELECT * FROM sessions ORDER BY id').all() as SessionRow[])
-      .map(row => this.registration(row));
+      .map(row => this.registration(row, entities.get(row.id)));
   }
   listClaims(): Claim[] {
     this.maintain();
@@ -312,8 +352,9 @@ class Store implements CoordinatorStore {
       const now = Date.now();
       this.db.prepare('DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
       this.db.exec("DELETE FROM entity_sources WHERE kind = 'claim' AND NOT EXISTS (SELECT 1 FROM claims WHERE key = source_key)");
+      const entities = this.sourceEntitiesByKey('claim');
       return (this.db.prepare('SELECT * FROM claims ORDER BY key').all() as ClaimRow[])
-        .map(row => this.claimValue(row));
+        .map(row => this.claimValue(row, entities.get(row.key)));
     });
   }
   send(host: HostPrincipal, sender: SessionAddress, input: MessageInput): Outcome<Message> {
@@ -321,6 +362,7 @@ class Store implements CoordinatorStore {
     if (!assignment.ok) return assignment;
     if (!isMessageInput(input) || (input.recipient !== '*' && !input.recipient.startsWith(`${this.namespace}:`)))
       return failure('invalid_request', 'Invalid message');
+    let recipientHost: string | undefined;
     const outcome: Outcome<Message> = this.transaction(() => {
       const result = this.db.prepare('INSERT INTO messages (timestamp, sender, recipient, body, data, visibility) VALUES (?, ?, ?, ?, ?, ?)')
         .run(Date.now(), sessionKey(sender), input.recipient, input.body, JSON.stringify(input.data ?? null), input.visibility ?? 'private');
@@ -328,9 +370,19 @@ class Store implements CoordinatorStore {
       for (const id of this.trackEntities([input.body, input.data ?? null])) {
         this.insertMention.run(id, result.lastInsertRowid);
       }
-      return { ok: true, value: this.message(this.messageRow.get(result.lastInsertRowid) as MessageRow) };
+      // A directed message can only be delivered on the recipient's host.
+      recipientHost = input.recipient === '*' ? undefined : this.session(input.recipient)?.host_id;
+      const row = this.messageRow.get(result.lastInsertRowid) as MessageRow;
+      const value = this.message(row);
+      this.db.prepare('UPDATE messages SET hash = ? WHERE id = ?').run(messageHash(value), row.id);
+      return { ok: true, value };
     });
-    if (outcome.ok) this.notify(undefined);
+    if (outcome.ok) {
+      // Broadcast wakes every host; a directed send wakes only the recipient's
+      // host, and an unregistered recipient wakes none.
+      if (input.recipient === '*') this.notify(undefined);
+      else if (recipientHost) this.notify(recipientHost);
+    }
     return outcome;
   }
   entity(id: string, since: number, limit: number): Outcome<EntityHistory> {

@@ -17,6 +17,32 @@ Rank is metadata, not authority or a routing rule.
 `/roger all` includes stale sessions that remain within the retention window.
 The `roger_board` tool remains available to the agent.
 
+## Rust client
+
+`rust/` contains a second-language client written from the contract, plus the
+evidence-rejection conformance kit (`cargo test --offline` in `rust/`).
+It speaks the coordinator HTTP API and the host socket protocol, and registers,
+sends, and reads the board against the TypeScript coordinator and daemon.
+The interoperability test is `test/rust/client.test.ts`.
+
+## In Muse
+
+The Muse adapter is a sibling of the Pi adapter over the same core interfaces; neither adapter depends on the other.
+Run it from a Muse session, where `MUSE_SESSION_ID` identifies the session:
+
+```sh
+node src/bin/muse.ts address
+node src/bin/muse.ts board
+node src/bin/muse.ts send <session-address> <body>
+node src/bin/muse.ts receive
+```
+
+It reads the same host configuration as the Pi extension (`ROGER_WILCO_CONFIG` or `~/.config/roger-wilco/host.json`).
+`receive` prints each delivered message as one JSON line.
+Muse records that output in the session transcript, and a later `receive` acknowledges the message from that transcript evidence.
+A delivery is never acknowledged on print alone, so run `receive` again after Muse has persisted the output.
+`serve` repeats the receive pass for as long as it runs.
+
 ## Entity references
 
 Mark a word or phrase with `[[Meteor Shower]]`.

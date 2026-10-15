@@ -35,6 +35,18 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeout = 4000):
   assert.fail('Timed out waiting for observable state');
 }
 
+test('an inbox row whose bytes change after ingest is rejected by hash, not re-validated', async t => {
+  const { inbox, path } = fixture(t);
+  assert.deepEqual(await inbox.receive(frame(1, a)), { inserted: true });
+  const now = Date.now();
+  assert.equal((await inbox.bind(a, 'owner', now)).ok, true);
+  assert.deepEqual((await inbox.pending(a, 'owner')).map(m => m.id), ['fleet:msg:1']);
+  const db = new DatabaseSync(path);
+  db.prepare("UPDATE inbox_messages SET message_json = replace(message_json, 'message 1', 'tampered 1')").run();
+  db.close();
+  await assert.rejects(() => inbox.pending(a, 'owner'), /Message hash mismatch/);
+});
+
 test('durable per-recipient dedup, ownership, expiration and delivery evidence guards across reopen', async t => {
   const { inbox, path } = fixture(t);
   assert.deepEqual(await inbox.receive(frame(1, a, '*')), { inserted: true });

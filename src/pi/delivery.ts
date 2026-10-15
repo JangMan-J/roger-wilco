@@ -21,6 +21,8 @@ export interface PiDelivery {
 }
 
 const RENEW_MS = 1000;
+/** The daemon lease lasts 30 s; renewing at this interval keeps two retries in hand. */
+const LEASE_RENEW_MS = 10_000;
 const error = (message: string): Extract<Outcome<never>, { ok: false }> => ({ ok: false, error: 'temporarily_unavailable', message });
 
 /** The caller owns the inbox and releases its lease after stop(). */
@@ -37,6 +39,7 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
   let retryDelay = 250;
   let retryAbort = false;
   const submitted = new Set<string>();
+  let lastRenewAt = 0;
   const evidence = sessionFileEvidence(ctx, inbox, session, runtimeId);
   let recoveringAbort = false;
   let missingFileReported = false;
@@ -89,7 +92,11 @@ export function createPiDelivery(pi: ExtensionAPI, ctx: ExtensionContext, inbox:
 
   async function ownsLease(token = authority()): Promise<boolean> {
     if (!valid(token)) return false;
+    // Delivery passes call this before every submission; the socket renewal
+    // itself is throttled, the in-memory authority check is not.
+    if (Date.now() - lastRenewAt < LEASE_RENEW_MS) return valid(token);
     const result = await inbox.renew(session, runtimeId);
+    if (result.ok) lastRenewAt = Date.now();
     if (!valid(token)) return false;
     if (!result.ok) {
       bound = false;

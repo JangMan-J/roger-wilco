@@ -1,5 +1,10 @@
 # Roger-Wilco protocol contract v1
 
+Requirements are defined in [requirements.md](requirements.md).
+This contract describes the implementation of those requirements. If the
+two documents differ, [requirements.md](requirements.md) is correct and
+this contract is in error.
+
 ## Scope and runtime
 
 This contract describes the current implementation.
@@ -408,8 +413,20 @@ The socket method is `ack` with `{token, evidence}`.
 The host checks the lease, the session id, and the message namespace.
 A repeated acknowledgement must present the same record and location.
 Other evidence is rejected as `Conflicting delivery evidence`.
+A stored message carries a SHA-256 hash of its verified JSON, computed by the
+coordinator at write and by the host daemon at ingest.
+After that, reads check hash equality only.
+Bytes that do not match the recorded hash are rejected, not re-validated.
+
 The Pi adapter uses a session JSONL entry and its file.
 The tracer agent uses a record ID in its own append-only evidence file.
+The Muse adapter uses a line in the Muse session transcript (`session.jsonl` under the Muse sessions root).
+That line must record the adapter's own delivered record, `{event:'delivered', message:{id, sender, body, ...}}`, possibly nested inside transcript frames or JSON-encoded tool output.
+A bare mention of a message ID in the transcript is never evidence.
+The Muse adapter never writes to the transcript; the Muse runtime owns it.
+No adapter imports another adapter, and the core imports no harness.
+Every adapter supplies exactly three harness-specific pieces: one session-identity mapping module, one `EvidenceSource` implementation, and one tool surface over its lease-bound core access.
+Everything else — coordinator store, host daemon, socket client, wire validators — is shared core.
 The `receive(frame)` transaction deduplicates by the immutable namespaced message ID.
 It records the addressed session.
 
@@ -439,7 +456,7 @@ Active transactions or readers can keep the WAL above those limits.
 `pending` is restricted to the active connection grant and session.
 Bind installs the subscriber before its response.
 The runtime catches up after bind and after committed change notifications.
-Pending pages contain at most one message, with at most 32 messages per client batch.
+Pending pages contain at most 32 messages and at most 256 KiB of message JSON, always including the first pending message, with at most 32 messages per client batch.
 Each reconciliation starts from the oldest unacknowledged row.
 The [local contract](migration/local-contract.md) defines framing, bounds, and grant checks.
 When Pi is closed, the host daemon continues to receive.
@@ -603,6 +620,15 @@ On session shutdown it closes that connection and relinquishes the lease.
 Tests live in `test/pi/`.
 There is no second local database writer.
 The sender and the claim owner come from the current session context.
+
+### Lane H
+
+`src/muse/index.ts` exports the Muse adapter factory and its harness interface.
+`src/bin/muse.ts` is the CLI harness: it takes the session ID from `MUSE_SESSION_ID`, prints each delivered message as one JSON line, and never acknowledges on print alone.
+A later receive pass acknowledges from transcript evidence.
+Tests live in `test/muse/`.
+The Muse adapter is a sibling of the Pi adapter; it shares the core and imports no Pi module.
+Its fragile surface is the Muse transcript layout and the delivered-record shape, not the wire protocol.
 
 ### Lane F
 

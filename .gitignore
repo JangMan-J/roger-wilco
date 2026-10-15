@@ -5,4 +5,6 @@ reference/
 *.sqlite*
 .runtime/
 coverage/
+rust/target/
+reports/
 deploy/package-lock.json

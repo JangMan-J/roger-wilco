@@ -1,0 +1,17 @@
+[package]
+name = "roger-wilco-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Second-language Roger-Wilco client and evidence conformance kit, written from docs/contract.md"
+license = "UNLICENSED"
+
+[dependencies]
+serde_json = "1.0"
+
+[[bin]]
+name = "roger-wilco-rs"
+path = "src/main.rs"
+
+[lib]
+name = "roger_wilco_rs"
+path = "src/lib.rs"

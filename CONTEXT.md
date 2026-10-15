@@ -18,6 +18,21 @@ _Example_: A consumer interprets a change from 0 to 153 as a status change for t
 _Confirmed_: 2026-10-13, user clarification that the integer is metadata.
 _Avoid_: Entity type, authority, rank
 
+**Wake**:
+A request, made when a message is sent, for the receiving session to attend
+to its mailbox. A wake is not a message type and it is not an acknowledgement.
+_Example_: A message sent to an idle Pi session causes a new turn in that session.
+_Confirmed_: 2026-10-15, user requirement that sending must be able to wake an agent.
+_Avoid_: Signal, ping, notification
+
+**Wake level**:
+The strongest wake an adapter can perform, declared by the adapter. One of:
+`forceful` (start a turn in an idle live session), `next-turn` (queue for
+the next turn boundary), or `mailbox-only` (store only).
+_Example_: The Pi adapter is `forceful`; the Muse CLI adapter is `mailbox-only`.
+_Confirmed_: 2026-10-15, harness surface study across twenty harnesses.
+_Avoid_: Wake capability tier, wake mode
+
 ## Unresolved
 
 - Meanings of metadata values belong to consumers.

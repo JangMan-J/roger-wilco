@@ -36,7 +36,7 @@ function parseOutcome(method: string, value: unknown): Outcome<unknown> | undefi
       : method === 'awaitRegistration' ? isRegistrationResult(body)
       : rec(body) && (method === 'bind' ? exact(body, ['token', 'leaseExpiresAt']) && validToken(body.token) && safeTime(body.leaseExpiresAt)
         : method === 'renew' ? exact(body, ['leaseExpiresAt']) && safeTime(body.leaseExpiresAt)
-          : method === 'pending' && exact(body, ['messages', 'more']) && Array.isArray(body.messages) && body.messages.length <= 1 && typeof body.more === 'boolean');
+          : method === 'pending' && exact(body, ['messages', 'more']) && Array.isArray(body.messages) && body.messages.length <= 32 && typeof body.more === 'boolean');
     return ok ? { ok: true, value: body } : undefined;
   }
   if (value.ok === false && exact(value, ['ok', 'error', 'message']) && isFailure(value.error) && typeof value.message === 'string')
@@ -150,12 +150,13 @@ class HostClient implements HostInbox {
         throw new Error(`${result.error}: ${result.message}`);
       }
       const page = result.value as { messages: Message[]; more: boolean };
-      const message = page.messages[0];
-      if (!message) break;
-      if (afterSequence !== undefined && message.sequence <= afterSequence) {
-        this.disconnect(new Error('Malformed pending cursor')); throw new Error('Malformed pending cursor');
+      if (!page.messages.length) break;
+      for (const message of page.messages) {
+        if (afterSequence !== undefined && message.sequence <= afterSequence) {
+          this.disconnect(new Error('Malformed pending cursor')); throw new Error('Malformed pending cursor');
+        }
+        messages.push(message); afterSequence = message.sequence;
       }
-      messages.push(message); afterSequence = message.sequence;
       if (!page.more) break;
     }
     return messages;

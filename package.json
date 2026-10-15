@@ -8,7 +8,8 @@
   "files": ["src", "deploy", "docs", "scripts", ".node-version", "README.md", "CONTEXT.md", "LICENSE", "THIRD-PARTY-NOTICES", "SOURCE-MANIFEST.md"],
   "bin": {
     "roger-wilco-coordinator": "./src/bin/coordinator.ts",
-    "roger-wilco-host": "./src/bin/host.ts"
+    "roger-wilco-host": "./src/bin/host.ts",
+    "roger-wilco-muse": "./src/bin/muse.ts"
   },
   "engines": { "node": ">=24" },
   "keywords": ["pi-package"],

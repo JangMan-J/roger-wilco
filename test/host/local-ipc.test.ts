@@ -434,10 +434,10 @@ test('lost registration reply leaves a committed row, then the same enqueue drai
     await waitFor(async () => posts === 1 && await count(path, registrationSql) === 0);
     const again = await sock(path);
     writeFrame(again, 1, 'enqueueRegistration', { registration: { session: a } });
-    await waitFor(async () => await count(path, registrationSql) === 1);
+    // The identical re-enqueue drains from the daemon's registration cache:
+    // the row completes and waiters settle without a second coordinator POST.
+    await waitFor(async () => posts === 1 && await count(path, registrationSql) === 0);
     again.destroy();
-    gates.shift()?.();
-    await waitFor(async () => posts === 2 && await count(path, registrationSql) === 0);
   } finally {
     for (const release of gates) release();
     await daemon.stop();

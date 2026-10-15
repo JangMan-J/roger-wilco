@@ -29,6 +29,39 @@ function register(store: CoordinatorStore) {
   ok(store.register(hostB, { session: c }));
 }
 
+test('a directed send wakes only the recipient host; broadcast wakes all; unknown recipient wakes none', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  t.after(() => store.close());
+  register(store);
+  const woken: Array<string | undefined> = [];
+  const unsubscribe = store.subscribe(hostId => { woken.push(hostId); });
+  t.after(unsubscribe);
+  ok(store.send(hostA, a, { recipient: sessionKey(c), body: 'directed to host-b' }));
+  assert.deepEqual(woken, ['host-b']);
+  woken.length = 0;
+  ok(store.send(hostA, a, { recipient: '*', body: 'broadcast' }));
+  assert.deepEqual(woken, [undefined]);
+  woken.length = 0;
+  ok(store.send(hostA, a, { recipient: 'fleet:ghost', body: 'no such session' }));
+  assert.deepEqual(woken, []);
+});
+
+test('a stored message whose bytes change after write is rejected by hash, not re-validated', async t => {
+  const path = await fileStore(t);
+  const store = createCoordinatorStore(path, 'fleet');
+  register(store);
+  const sent = ok(store.send(hostA, a, { recipient: sessionKey(b), body: 'verified packet' }));
+  store.close();
+  const db = new DatabaseSync(path);
+  db.prepare("UPDATE messages SET body = 'tampered packet' WHERE id = ?").run(sent.sequence);
+  db.close();
+  const reopened = createCoordinatorStore(path, 'fleet');
+  t.after(() => reopened.close());
+  assert.throws(() => reopened.inbox(hostA, b, 0, 10), /Message hash mismatch/);
+  assert.throws(() => reopened.pending(hostA, 10), /Message hash mismatch/);
+});
+
 test('registration snapshots the current tail atomically; retry and reopen preserve progress and host assignment', async t => {
   const path = await fileStore(t);
   let store = createCoordinatorStore(path, 'fleet');
