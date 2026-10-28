@@ -32,6 +32,8 @@ export type Backoff = {
 	/** An adapter that ran this long before exiting starts the delay over. */
 	stableMs: number;
 };
+/** Consecutive failed adapters reported on stderr before the shim goes quiet. */
+const LOGGED_FAILURES = 6;
 export const BACKOFF: Backoff = { initialMs: 250, maxMs: 30_000, stableMs: 10_000 };
 
 /** The core's wording when another process holds the Store: the adapter exits and says so. */
@@ -123,7 +125,9 @@ export function superviseAdapter(opts: Options): Supervisor {
 			}
 			const wait = delayMs(backoff, failures++);
 			why = `${e.message}; reconnecting in ${wait} ms`;
-			log(why);
+			// A long outage must not fill the harness's stderr: six reports, then one notice.
+			if (failures <= LOGGED_FAILURES) log(why);
+			else if (failures === LOGGED_FAILURES + 1) log(`${why} (later attempts are not logged; a send reports the reason)`);
 			// no-poll: a reconnect backoff after the adapter exited, not a scan; mail and receipts follow the core's events.
 			timer = setTimeout(() => {
 				timer = undefined;
