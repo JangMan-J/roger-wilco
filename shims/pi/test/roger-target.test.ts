@@ -142,5 +142,5 @@ test("a bare UUID or UUID prefix resolves to the one Board session whose Address
 });
 
 test("completions offer a composite Address whole", () => {
-	assert.ok(completions([row(COMP)], "[[3").includes(`${COMP} `));
+	assert.ok(completions([row(COMP)], "[[1").includes(`${COMP} `));
 });
