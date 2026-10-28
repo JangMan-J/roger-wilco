@@ -82,9 +82,9 @@ environment, never from argv, which `ps` shows to every user.
 | `board` | `--socket [--from <address>]` | one Board read; `--from` counts as that session's activity |
 
 A session's Address is `--id`, or a fresh UUID. An Address is an opaque string: a UUID, or the
-whole composite `[[<integer>:<label>:<integer>]]<uuid>` (the label may hold spaces). Every
+whole composite `[[<token>:<label>:<token>]]<uuid>` (the label may hold spaces; a token is lowercase base 36, `0-9a-z`, no leading zeros). Every
 command takes it whole and every record keeps it byte-identical; the core never splits it, and
-the integers inside mean something only to the consumer that chose them. A relabel changes the
+the tokens inside mean something only to the consumer that composed them. A relabel changes the
 Board's display label and never the Address, inner label included. The Tracer prints `READY session=<address>`
 after it registers, `STORED mail= record= wake=` after each Store write, and
 `DELIVERED mail= record=` when its Ack is recorded.
@@ -194,7 +194,7 @@ scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a
 scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance wake           # proof 5: directed mail wakes an idle session; busy queues to the turn boundary
-scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
+scripts/acceptance references     # proof 6: references keep both tokens verbatim; relabel keeps the Address
 ```
 
 `cross-host`, `broadcast` and `claims` run on two hosts. Set `ROGER_REMOTE_HOST` to the

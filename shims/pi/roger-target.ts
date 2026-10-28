@@ -1,7 +1,9 @@
 // Pure helpers for /roger: who a typed target names, and who counts as
 // present. No Pi and no I/O, so `node --test shims/pi/test/roger-target.test.ts`
 // covers them. Labels are compared as whole opaque text (case-folded); nothing
-// here reads the integers inside a Reference.
+// here reads the tokens inside a Reference.
+
+import { TOKEN } from "./roger-env.ts";
 
 export type Row = { session: string; host: string; label: string; connected: boolean; last_seen_ms: number };
 
@@ -9,12 +11,15 @@ export const BROADCAST = "*";
 export const DEFAULT_WINDOW_MS = 10 * 60_000;
 
 const ADDRESS = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** An Address may begin with a Reference: `[[<integer>:<label>:<integer>]]<uuid>`; the label may hold spaces. */
-const COMPOSITE = /^\[\[-?\d+:[^\[\]\n]{1,64}:-?\d+\]\][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+/**
+ * An Address may begin with a Reference: `[[<token>:<label>:<token>]]<uuid>`; the label may hold spaces. A token is
+ * lowercase base 36 and is matched case-sensitively: nothing folds the Reference, and a composite routes exactly as typed.
+ */
+const COMPOSITE = new RegExp(`^\\[\\[${TOKEN}:[^\\[\\]\\n]{1,64}:${TOKEN}\\]\\](?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`);
 /** The UUID an Address ends in: the whole text when it has no Reference. */
 const uuidOf = (session: string) => session.replace(/^\[\[[^\]]*\]\]/, "");
 /** Address-shaped text always routes as an Address, never as a label. */
-export const isAddress = (text: string) => ADDRESS.test(text) || new RegExp(`${COMPOSITE.source}$`, "i").test(text);
+export const isAddress = (text: string) => ADDRESS.test(text) || new RegExp(`${COMPOSITE.source}$`).test(text);
 
 const fold = (s: string) => s.normalize("NFC").toLocaleLowerCase();
 

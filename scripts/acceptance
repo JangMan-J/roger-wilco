@@ -594,9 +594,9 @@ claims() {
   echo "PASS claims: unregistered owner refused, second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from both hosts showed one holder"
 }
 
-# Proof 6: references keep both integers verbatim through send, Store,
+# Proof 6: references keep both tokens verbatim through send, Store,
 # delivery, and Board; a label change moves a session's display and never its
-# Address or mailbox. Invariant 3: no code in src branches on those integers.
+# Address or mailbox. Invariant 3: no code in src branches on those tokens.
 references() {
   local meteor='[[153:Meteor Shower:7]]' fleet='[[0:FLEET:0]]'
   local body="start $meteor then $fleet"
@@ -604,7 +604,7 @@ references() {
 
   # Invariant 3 source search: nothing in src parses a Reference or inspects a
   # label beyond carrying it. The patterns are the ways code would read an
-  # integer out of either. Unit-test modules (`#[cfg(test)]` to end of file)
+  # token out of either. Unit-test modules (`#[cfg(test)]` to end of file)
   # are fixtures, not core, and are skipped.
   local hits f
   hits="$(for f in "$ROOT"/src/*.rs; do
@@ -673,11 +673,11 @@ references() {
     || fail "mail to the same Address after relabel must land in the same Store"
   [[ "$(wc -l <"$work/tracer.store")" == 2 ]] || fail "recipient Store should hold exactly two records"
 
-  # A composite Address, `[[<integer>:<label>:<integer>]]<uuid>`, is the session's
+  # A composite Address, `[[<token>:<label>:<token>]]<uuid>`, is the session's
   # whole routing identity: it registers, routes, stores, replies and shows on the
   # Board as one string, and a relabel never changes it.
-  local agent='[[1:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-  local director='[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  local agent='[[1a:Meteor Shower:zz]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  local director='[[2:FLEET:10]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
   "$bin" session --socket "$work/a.sock" --id "$agent" --store "$work/agent.store" \
     >"$work/agent.out" 2>&1 &
   pids+=("$!")

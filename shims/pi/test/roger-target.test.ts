@@ -144,3 +144,19 @@ test("a bare UUID or UUID prefix resolves to the one Board session whose Address
 test("completions offer a composite Address whole", () => {
 	assert.ok(completions([row(COMP)], "[[1").includes(`${COMP} `));
 });
+
+test("a composite with base-36 tokens routes verbatim: lowercase letters, several characters, label case kept", () => {
+	for (const prefix of ["[[1a:FLEET:zz]]", "[[10:Meteor Shower:100]]", "[[a:ABC:z]]", "[[3:FLEET:0]]"]) {
+		const composite = `${prefix}${A}`;
+		const t = to([row(composite)], `${composite} hello`);
+		assert.deepEqual([t.to, t.row?.session, t.rest], [composite, composite, "hello"], prefix);
+		const absent = `${prefix}${ABSENT}`;
+		assert.equal(to([], `${absent} hi`).to, absent, "kept as typed even when not on the Board");
+	}
+});
+
+test("a Reference whose token is not canonical base 36 is not an Address", () => {
+	for (const bad of ["[[A:FLEET:1]]", "[[1:FLEET:Z]]", "[[01:FLEET:1]]", "[[1:FLEET:00]]", "[[-1:FLEET:1]]"]) {
+		refused([row(A)], `${bad}${A} hi`, /no session matches/);
+	}
+});

@@ -66,6 +66,13 @@ test("ROGER_ADDRESS_PREFIX makes the Address the whole composite: Reference, the
 
 test("an explicit ROGER_SESSION wins over the prefix, and a malformed prefix is refused", () => {
 	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: "[[1:A:1]]", ROGER_SESSION: "[[2:B:2]]x" }, PI_ID, "/h", never).session, "[[2:B:2]]x");
-	for (const bad of ["[[1:A]]", "1:A:1", "[[a:A:1]]", "[[1:A:1]]x", "[[1:A\n:1]]"])
+	for (const bad of ["[[1:A]]", "1:A:1", "[[-1:A:1]]", "[[01:A:1]]", "[[A:A:1]]", "[[1:A:Z]]", "[[1:A:00]]", "[[1:A:1]]x", "[[1:A\n:1]]"])
 		assert.throws(() => settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: bad }, PI_ID, "/h", never), /ROGER_ADDRESS_PREFIX/, bad);
+});
+
+test("ROGER_ADDRESS_PREFIX tokens are base 36 of any length: letters and several characters pass, carried verbatim", () => {
+	for (const prefix of ["[[a:A:z]]", "[[1a:FLEET:10]]", "[[1:FLEET:zz]]", "[[0:JING:0]]", "[[zz:Meteor Shower:100]]"]) {
+		const s = settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: prefix }, PI_ID, "/h", never);
+		assert.equal(s.session, `${prefix}${PI_ID}`, prefix);
+	}
 });

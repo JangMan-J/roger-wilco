@@ -32,8 +32,8 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
    exist only as cleanup that can be disabled without losing or duplicating work.
    `scripts/check-no-poll` is the check; a non-correctness timed wait carries
    `// no-poll: <reason>`.
-3. **Opaque integers stay opaque.** Nothing in `src/` compares, branches on, ranks,
-   looks up by, or names the integers in a Reference or on a session. They pass
+3. **Opaque tokens stay opaque.** Nothing in `src/` compares, branches on, ranks,
+   looks up by, or names the tokens in a Reference or on a session. They pass
    through byte-identical. `scripts/acceptance references` is the check.
 4. **No harness in the core.** The core names no harness or model, reads no harness store,
    and `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
