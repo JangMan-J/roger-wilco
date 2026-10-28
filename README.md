@@ -11,9 +11,12 @@ durable state, one host daemon per machine serves local sessions on a Unix socke
 anything else (a command-line client, a test session, an adapter for a particular agent
 program) sits on top of that socket.
 
-The project's purpose and the properties it must prove are fixed in [KERNEL.md](KERNEL.md)
-and [INVARIANTS.md](INVARIANTS.md); terms such as Mail, Ack, Store and Board are defined in
-[GLOSSARY.md](GLOSSARY.md). Those three files are frozen: read them before changing anything.
+The project's purpose, proofs, invariants and terms (Mail, Ack, Store, Board and the rest) are
+held by its director in sealed records outside this repository; `slice status` shows where. Their
+last copy in this repository is `de73721` (`git show de73721:KERNEL.md`, `INVARIANTS.md`,
+`GLOSSARY.md`), the readable copy for anyone without the records. Work is assigned to workers
+as slices, each in its own worktree with a reduced copy of those documents, and merged by the
+director; the gate is described under Checks.
 
 | Module | Doc |
 | --- | --- |
@@ -188,6 +191,7 @@ rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 scripts/check                     # the core gate
 scripts/check-all                 # the core gate, then each shim's own check
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
+scripts/check-seal                # the director's seal on the sealed documents is intact (quiet where none exists)
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
 scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
@@ -222,8 +226,7 @@ core log grows while nobody asks.
 
 | Path | Role |
 | --- | --- |
-| `KERNEL.md`, `INVARIANTS.md`, `GLOSSARY.md` | the frozen purpose, proofs, invariants and terms |
-| `AGENTS.md` | directives, coding standards and review rules |
+| `AGENTS.md` | the director pointer, directives, coding standards and review rules |
 | `src/main.rs` | subcommand dispatch and flags |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
@@ -235,7 +238,7 @@ core log grows while nobody asks.
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
-| `VECTORS/` | the record of what was tried |
+| `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |
 
 Licensed under the [MIT License](LICENSE).
