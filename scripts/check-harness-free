@@ -5,7 +5,8 @@
 #
 # The core is every file in the checkout (tracked or untracked, minus
 # .gitignore) outside shims/, VECTORS/, and docs/reviews/: source, tests, scripts, deploy
-# units, and docs, README.md and the whole GLOSSARY.md body included. A model
+# units, and docs, README.md included. The sealed documents (purpose, proofs, invariants,
+# terms) live outside the repo and were scanned with this check before they were sealed. A model
 # name counts as a harness name. Exempt:
 #   frontmatter         a leading YAML block (--- ... ---) in a markdown file
 #                       records who wrote the file (agent:, session:), not

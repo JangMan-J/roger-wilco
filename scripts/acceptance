@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Acceptance checks named by KERNEL.md proofs.
+# Acceptance checks named by the project's proofs (README.md, Checks).
 # Usage: scripts/acceptance <cross-host|no-poll|independence|pi-shim|claims|references|broadcast|wake>
 set -euo pipefail
 
