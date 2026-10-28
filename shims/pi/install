@@ -14,7 +14,7 @@ set -euo pipefail
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dir="$HOME/.local/share/roger-shims/pi"
 settings="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json"
-files=(roger.ts roger-command.ts roger-target.ts roger-env.ts package.json)
+files=(roger.ts roger-adapter.ts roger-command.ts roger-target.ts roger-env.ts package.json)
 
 usage() { echo "usage: $0 [--uninstall] (settings: \${PI_CODING_AGENT_DIR:-\$HOME/.pi/agent}/settings.json)"; }
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
