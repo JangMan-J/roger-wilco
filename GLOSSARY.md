@@ -35,9 +35,9 @@ _Not_: a model's reply, an open, a read without a record.
 _Confirmed_: 2026-10-21, Jang, at init
 
 **Address**:
-The routing identity of an agent session: a UUID that a label never changes.
-_Example_: a session keeps its UUID when its label goes from `AGENT` to `BUILDER`.
-_Not_: a label, a display prefix, a call sign.
+The routing identity of an agent session: an opaque string, a UUID with an optional leading Reference (`[[<integer>:<label>:<integer>]]<uuid>`), carried verbatim and never changed by a relabel.
+_Example_: a session registered as `[[3:AGENT:12]]<uuid>` keeps that Address when its display label goes from `AGENT` to `BUILDER`.
+_Not_: a display label, a display prefix, a call sign, the UUID alone when the session registered with a Reference.
 _Confirmed_: 2026-10-21, Jang, at init
 
 **Receipt**:
@@ -109,13 +109,13 @@ _Confirmed_: 2026-10-21, Jang, at init
 **Reference**:
 A label with an opaque integer on each side, written `[[<integer>:<label>:<integer>]]`; it names a subject and carries nothing the core reads.
 _Example_: `[[153:Meteor Shower:7]]` and `[[0:FLEET:0]]`.
-_Not_: an address, a claim key with reserved meaning.
+_Not_: an address by itself (an Address may begin with one), a claim key with reserved meaning.
 _Confirmed_: 2026-10-21, Jang, at init
 
 **Opaque integer**:
-A number attached to a label or a session, stored and returned verbatim and never interpreted.
-_Example_: the `153` and `7` in `[[153:Meteor Shower:7]]`.
-_Not_: a rank, a type, a status.
+A number attached to a label or a session, stored and returned verbatim and never interpreted by the core; a consumer may give it meaning.
+_Example_: the `153` and `7` in `[[153:Meteor Shower:7]]`, or a supervisor's rank and spawn sequence in an Address, which the core never reads.
+_Not_: a rank, a type, or a status to the core.
 _Confirmed_: 2026-10-21, Jang, at init
 
 **Broadcast**:
@@ -185,7 +185,7 @@ _Confirmed_: 2026-10-21, Jang, at init
 **Label**:
 Display text the core stores and returns verbatim and never parses: either an agent session's label, which the session gives at Register or any session sets by relabel and which the Board shows beside its Address, or the text between the two integers of a Reference. A session's label may itself contain References.
 _Example_: a session labelled `[[0:FLEET:0]] builder`; `Meteor Shower` in `[[153:Meteor Shower:7]]`.
-_Not_: an Address (a label never routes in the core; a shim may resolve a typed label to an Address before it sends), a claim key, an Opaque integer.
+_Not_: an Address (a display label never routes in the core, and the label inside an Address is part of its opaque string; a shim may resolve a typed label to an Address before it sends), a claim key, an Opaque integer.
 _Avoid_: name, call sign, rank
 _Confirmed_: 2026-10-22, by Jang (first requested by the director in the roger-command-polish slice, 2026-10-21).
 

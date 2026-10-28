@@ -1,6 +1,6 @@
 # sha256 of the frozen set, checked by scripts/check-frozen.
-# Change this file only when the owner promotes a fork. Pinned from 6c31fb0 (promote: mail-record).
-06606c698afefd0ebd0808724dc362ffbf673afc9318b2b294acb91e0c7270e4 KERNEL.md
+# Change this file only when the owner says so. Re-pinned for the composite Address (2026-10-28, Jang): the Address, Reference and Opaque integer terms and proof 6.
+f73aa72437286ca8ffd1286db3b8e14fc930450856bb3ee39813e696d2bfbba6 KERNEL.md
 14bbcecd231885914b3c2c9878c443180f764d0997104f59bb7946db762701a5 INVARIANTS.md
-f2a7ea979dfcd27e2a9aa17fa19d9011ecf6d50643b1c441b69ccd428976bf7e GLOSSARY.md#kernel
+cf3307f620bfe04c81d958d3a56226cf225553cede866172909c1b0691384cea GLOSSARY.md#kernel
 4f4e82ac4d7a1c13f819057bba80a5f973ac6ac376f7244ccf41ea8116332e44 GLOSSARY.md#invariants

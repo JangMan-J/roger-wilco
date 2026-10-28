@@ -32,14 +32,14 @@ Commands:
   coordinator --bind <address:port> --data <log>
               [--port-file <path>] [--unregister-after-ms <ms>]
   daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
-  session     --socket <path> --store <path> [--id <uuid>] [--label <text>] [--declare <text>]
-  adapter     --socket <path> --store <path> [--id <uuid>] [--label <text>] [--declare <text>]
-  send        --socket <path> --from <uuid> --to <uuid|*> --body <text> [--mail <id>]
-  claim       --socket <path> --owner <uuid> --key <text> --ttl-ms <ms>
-  renew       --socket <path> --owner <uuid> --key <text> --ttl-ms <ms>
-  release     --socket <path> --owner <uuid> --key <text>
-  board       --socket <path> [--from <uuid>]
-  label       --socket <path> --from <uuid> --label <text>
+  session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+  adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+  send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
+  claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
+  renew       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
+  release     --socket <path> --owner <address> --key <text>
+  board       --socket <path> [--from <address>]
+  label       --socket <path> --from <address> --label <text>
   receipt     --socket <path> --mail <id>
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
