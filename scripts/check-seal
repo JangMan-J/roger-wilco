@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Seal guard: the project's sealed documents (purpose, proofs, invariants, terms) are held
+# by its director in records outside this repository. When the `slice` tool is installed
+# and a seal exists for this checkout, the sealed bytes must still match it; on any other
+# machine (a clone, CI) this passes quietly. The seal is checked again at every merge by
+# `slice`. It names no harness.
+# Usage: scripts/check-seal
+set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (verify the director's seal when it is present)"; exit 0; fi
+[[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+command -v slice >/dev/null 2>&1 || { echo "SKIP seal: slice is not installed"; exit 0; }
+slice verify --if-sealed

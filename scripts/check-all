@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The core gate, then every shim's own check (shims/*/check), found by listing:
-# adding or removing a shim needs no edit here.
+# adding or removing a shim needs no edit here; then the seal guard, which passes
+# quietly where no seal exists.
 # Usage: scripts/check-all
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate and all shim checks)"; exit 0; fi
@@ -17,4 +18,6 @@ for c in shims/*/check; do
   "$c"
   n=$((n + 1))
 done
+echo "== scripts/check-seal"
+scripts/check-seal
 echo "PASS check-all (core + $n shim checks)"
