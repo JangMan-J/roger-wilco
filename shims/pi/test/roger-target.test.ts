@@ -120,3 +120,27 @@ test("completions: whole-prefix match, spaced labels, quoting, relabel", () => {
 	// The message after a full target is not completed.
 	assert.deepEqual(completions(rows, "Bob Smith hi"), []);
 });
+
+const COMP = `[[3:Meteor Shower:12]]${A}`;
+
+test("a whole composite Address routes verbatim, label spaces and all, on the Board or not", () => {
+	const t = to([row(COMP)], `${COMP} hello there`);
+	assert.deepEqual([t.to, t.row?.session, t.rest], [COMP, COMP, "hello there"]);
+	const absent = `[[2:FLEET:5]]${ABSENT}`;
+	const u = to([], `${absent} hi`);
+	assert.deepEqual([u.to, u.row, u.rest], [absent, undefined, "hi"], "kept as typed: nothing is folded or stripped");
+});
+
+test("a bare UUID or UUID prefix resolves to the one Board session whose Address ends in it", () => {
+	const rows = [row(COMP, "agent"), row(B)];
+	assert.equal(to(rows, `${A} hi`).to, COMP);
+	assert.equal(to(rows, `aaaaaaaa hi`).to, COMP);
+	assert.equal(to(rows, `${B} hi`).to, B);
+	const twice = [row(COMP), row(`[[2:X:1]]${A}`)];
+	refused(twice, `${A} hi`, /ambiguous/);
+	assert.equal(to([row(COMP)], `${ABSENT} hi`).to, ABSENT, "not on the Board: the bare UUID routes as typed");
+});
+
+test("completions offer a composite Address whole", () => {
+	assert.ok(completions([row(COMP)], "[[3").includes(`${COMP} `));
+});
