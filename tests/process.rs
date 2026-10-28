@@ -837,7 +837,7 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
 /// A relabel changes the Board's display label and never the Address.
 #[test]
 fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel() {
-    const AGENT: &str = "[[3:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const AGENT: &str = "[[1:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const DIRECTOR: &str = "[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let mut rig = Rig::new("composite");
     rig.start_stack();

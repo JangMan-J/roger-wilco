@@ -121,7 +121,7 @@ test("completions: whole-prefix match, spaced labels, quoting, relabel", () => {
 	assert.deepEqual(completions(rows, "Bob Smith hi"), []);
 });
 
-const COMP = `[[3:Meteor Shower:12]]${A}`;
+const COMP = `[[1:Meteor Shower:12]]${A}`;
 
 test("a whole composite Address routes verbatim, label spaces and all, on the Board or not", () => {
 	const t = to([row(COMP)], `${COMP} hello there`);

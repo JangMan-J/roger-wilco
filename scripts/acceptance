@@ -676,7 +676,7 @@ references() {
   # A composite Address, `[[<integer>:<label>:<integer>]]<uuid>`, is the session's
   # whole routing identity: it registers, routes, stores, replies and shows on the
   # Board as one string, and a relabel never changes it.
-  local agent='[[3:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  local agent='[[1:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   local director='[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
   "$bin" session --socket "$work/a.sock" --id "$agent" --store "$work/agent.store" \
     >"$work/agent.out" 2>&1 &

@@ -36,7 +36,7 @@ _Confirmed_: 2026-10-21, Jang, at init
 
 **Address**:
 The routing identity of an agent session: an opaque string, a UUID with an optional leading Reference (`[[<integer>:<label>:<integer>]]<uuid>`), carried verbatim and never changed by a relabel.
-_Example_: a session registered as `[[3:AGENT:12]]<uuid>` keeps that Address when its display label goes from `AGENT` to `BUILDER`.
+_Example_: a session registered as `[[1:AGENT:12]]<uuid>` keeps that Address when its display label goes from `AGENT` to `BUILDER`.
 _Not_: a display label, a display prefix, a call sign, the UUID alone when the session registered with a Reference.
 _Confirmed_: 2026-10-21, Jang, at init
 
