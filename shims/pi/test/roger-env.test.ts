@@ -76,3 +76,45 @@ test("ROGER_ADDRESS_PREFIX tokens are base 36 of any length: letters and several
 		assert.equal(s.session, `${prefix}${PI_ID}`, prefix);
 	}
 });
+
+const UUID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+const FULL = `[[1a:FLEET:zz]]${UUID}`;
+
+test("ROGER_ADDRESS is the Address verbatim, whatever Pi's session id is", () => {
+	const s = settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: FULL }, PI_ID, "/h", never);
+	assert.equal(s.session, FULL);
+	assert.equal(s.store, `/h/.local/state/roger-shims/pi/${FULL.replace(/[^A-Za-z0-9._-]/g, "_")}.store`);
+	// No Pi session id at all (and no fresh uuid): still the same Address.
+	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: FULL }, undefined, "/h", never).session, FULL);
+});
+
+test("ROGER_ADDRESS may be a bare uuid, and tokens of any base-36 length are accepted", () => {
+	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: UUID }, PI_ID, "/h", never).session, UUID);
+	for (const a of [`[[0:FLEET:0]]${UUID}`, `[[153:Meteor Shower:7]]${UUID}`, `[[1a:x:zz]]${UUID}`, `[[zzzzzzzzzzzz:l:10]]${UUID}`])
+		assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: a }, PI_ID, "/h", never).session, a);
+});
+
+test("ROGER_ADDRESS beats the prefix; ROGER_SESSION beats ROGER_ADDRESS", () => {
+	const env = { XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: FULL, ROGER_ADDRESS_PREFIX: "[[7:X:7]]" };
+	assert.equal(settings(env, PI_ID, "/h", never).session, FULL);
+	assert.equal(settings({ ...env, ROGER_SESSION: "explicit" }, PI_ID, "/h", never).session, "explicit");
+});
+
+test("a malformed ROGER_ADDRESS names the variable and is not repaired", () => {
+	for (const bad of [
+		"not-an-address",
+		`[[A:Bad:1]]${UUID}`, // uppercase is not base 36 here
+		`[[01:Bad:1]]${UUID}`, // leading zero
+		`[[1::1]]${UUID}`, // empty label
+		`[[1:l:1]]${UUID}x`,
+		`[[1:l:1]] ${UUID}`,
+		`[[1:l:1]]`,
+		`${UUID}\n`,
+	])
+		assert.throws(() => settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: bad }, PI_ID, "/h", never), /ROGER_ADDRESS must be/, JSON.stringify(bad));
+});
+
+test("ROGER_ADDRESS_PREFIX alone still makes <prefix><uuid>, and an empty ROGER_ADDRESS counts as unset", () => {
+	const env = { XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS: "", ROGER_ADDRESS_PREFIX: "[[7:X:7]]" };
+	assert.equal(settings(env, PI_ID, "/h", never).session, `[[7:X:7]]${PI_ID}`);
+});

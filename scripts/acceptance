@@ -204,14 +204,15 @@ start_tracer() { # the Tracer: a session with no harness, on host-b
 # cases. ROGER_WAKE_LATENCY_MS, when set by the caller, reaches the shim.
 pi_out=""
 pi_pid=""
+pi_env=() # extra VAR=value for the next pi_start (an empty <address> leaves ROGER_SESSION unset)
 pi_start() {
   local tag="$1" addr="$2" rbin="$3" ext="$4"
   shift 4
   pi_out="$work/$tag.out"
   mkfifo "$work/$tag.in"
   exec 3<>"$work/$tag.in" # read-write: Pi's stdin stays open until pi_stop
-  PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$rbin" ROGER_SOCKET="$work/a.sock" \
-    ROGER_SESSION="$addr" ROGER_STORE="$work/$tag.store" \
+  env PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$rbin" ROGER_SOCKET="$work/a.sock" \
+    ROGER_STORE="$work/$tag.store" ${addr:+ROGER_SESSION="$addr"} ${pi_env[@]+"${pi_env[@]}"} \
     pi --mode rpc --no-session --offline --no-extensions --no-skills --no-context-files \
       --no-mcp -e "$ext" "$@" <&3 >"$pi_out" 2>"$work/$tag.err" &
   pi_pid=$!
@@ -503,7 +504,45 @@ pi_shim() {
   grep 'tool result: ' "$work/idle.out" | tail -n1 | grep -qF "$gone" || fail "roger_board all lacks the disconnected session"
   pi_stop
 
-  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label and relabel, board (present and all, in /roger and roger_board; an idle connected session stays present past the window, a closed one drops out), address-prefix, label, absent-Address and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
+  # Last, because the killed session stays on the Board as seen-recently.
+  # The link: ROGER_ADDRESS is the Address verbatim; an adapter killed by exact
+  # pid is replaced; Mail Accepted while it was down arrives once, in the Store
+  # and in Pi's transcript; and no adapter respawns after Pi ends.
+  local full="[[1a:FLEET:zz]]66666666-6666-4666-8666-666666666666"
+  adapter_pid() { # the adapter run for $full, by exact argv
+    local p
+    for p in $(pgrep -f "adapter --socket $work/a.sock" || true); do
+      if tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$full"; then echo "$p"; return; fi
+    done
+  }
+  board_has_full() { "$bin" board --socket "$work/a.sock" | grep -qF "address=$full host=host-a connected=true"; }
+  replaced() { local n; n="$(adapter_pid)"; [[ -n "$n" && "$n" != "$1" ]]; }
+  pi_env=(ROGER_ADDRESS="$full")
+  pi_start link "" "$bin" "$ext"
+  pi_env=()
+  wait_for 15 "ROGER_ADDRESS on the Board verbatim" board_has_full
+  local old
+  old="$(adapter_pid)"; [[ -n "$old" ]] || fail "no adapter for $full"
+  kill -KILL "$old"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$full" --mail down-1 \
+    --body "queued while the adapter was down" | grep -q "^ACCEPTED" || fail "mail to $full not accepted"
+  wait_for 20 "a replacement adapter" replaced "$old"
+  wait_for 15 "Board shows $full connected again" board_has_full
+  wait_for 15 "queued mail in Pi's transcript" pi_transcript_has "queued while the adapter was down"
+  log_count "queued while the adapter was down" 1 "$work/link.store" || fail "link Store must hold the body once"
+  pi_call msgs2 '{"type":"get_messages"}' || fail "get_messages unanswered"
+  [[ "$(grep '"command":"get_messages"' "$work/link.out" | tail -n1 | jq -r '.data.messages[]? | select(.customType == "roger-mail") | .content' | grep -c "queued while the adapter was down")" == 1 ]] \
+    || fail "Pi's transcript must hold the mail exactly once"
+  wait_for 15 "receipt for down-1" grep -q '"ev":"receipt","mail":"down-1"' "$work/coord.log"
+  log_count '"ev":"receipt","mail":"down-1"' 1 "$work/coord.log" || fail "down-1 must have exactly one receipt"
+  # Kill again and end Pi at once: the pending respawn must not outlive the session.
+  old="$(adapter_pid)"
+  kill -KILL "$old"
+  pi_stop
+  sleep 3
+  [[ -z "$(adapter_pid)" ]] || fail "an adapter for $full exists after Pi ended"
+
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; ROGER_ADDRESS is the Address verbatim, a killed adapter is replaced and the Mail queued meanwhile arrives once, none respawns after Pi ends; roger_send tool callback delivered; /roger label and relabel, board (present and all, in /roger and roger_board; an idle connected session stays present past the window, a closed one drops out), address-prefix, label, absent-Address and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
 }
 
 # Proof 4. Two hosts, one coordinator. A local and B remote

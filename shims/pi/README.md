@@ -23,7 +23,7 @@ shims/pi/install              # install or update, from this checkout
 shims/pi/install --uninstall  # remove
 ```
 
-Install copies `roger.ts`, `roger-command.ts`, `roger-target.ts`, `roger-env.ts` and
+Install copies `roger.ts`, `roger-adapter.ts`, `roger-command.ts`, `roger-target.ts`, `roger-env.ts` and
 `package.json` to `~/.local/share/roger-shims/pi/` and lists that directory once in the
 `packages` array of Pi's `settings.json` (`${PI_CODING_AGENT_DIR:-~/.pi/agent}`), keeping
 every other setting. Pi loads it as a local package: nothing is fetched, and Pi itself
@@ -46,7 +46,27 @@ adapter on it: that adapter fails at start naming the Store, and the shim report
 Address, and waits for it to exit (SIGKILL after 3 s) before a new session starts the next
 one.
 
-Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_ADDRESS_PREFIX` (a Reference that makes the Address the whole composite `<prefix><uuid>`), `ROGER_SOCKET`,
+A launcher can name the Address itself with `ROGER_ADDRESS`, a whole Address,
+`[[<token>:<label>:<token>]]<uuid>` or a bare `<uuid>`. The shim uses it verbatim: it checks
+the shape (base-36 tokens) and never reads a token. It does not depend on Pi's session id, so
+the Address and its Store survive `/new` and a restart. Precedence: `ROGER_SESSION`, then
+`ROGER_ADDRESS`, then `ROGER_ADDRESS_PREFIX` plus Pi's session id. A malformed value is
+reported and no adapter starts. If a second live session claims an Address a first one holds,
+its adapter is refused at the Store lock; the shim reports `roger address <address> is already
+held by another live session (store <file>)` and does not retry, so Mail is never split. Do
+not point two sessions at one Address with different `ROGER_STORE` files: the Store lock is
+what refuses the second one.
+
+The shim keeps the link alive. If the adapter exits while the Pi session lives (a crash, a
+kill, a restarted host daemon) the shim starts a new one for the same Address and Store after
+250 ms, doubling to at most 30 s between failed attempts (an adapter that stayed up 10 s starts
+the delay over). Mail Accepted meanwhile stays pending at the core and arrives when the new
+adapter registers, once: a record the Store already holds is not rendered twice. A send in
+flight when the adapter died fails, and a send while it is down fails with the reason; it is
+not queued. A missing binary or a bad setting is reported and not retried. `session_shutdown`
+cancels any pending respawn.
+
+Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_ADDRESS`, `ROGER_ADDRESS_PREFIX` (a Reference that makes the Address the whole composite `<prefix><uuid>`), `ROGER_SOCKET`,
 `ROGER_BIN`, `ROGER_STORE`, `ROGER_WAKE_LATENCY_MS`, `ROGER_PRESENCE_WINDOW_MS`. The header
 of `roger.ts` describes each one except `ROGER_PRESENCE_WINDOW_MS` (which sessions `/roger`
 and `roger_board` show by default: connected, or seen within the window, default 10
