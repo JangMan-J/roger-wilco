@@ -56,10 +56,10 @@ test("no socket and no XDG_RUNTIME_DIR is an error naming both", () => {
 });
 
 test("ROGER_ADDRESS_PREFIX makes the Address the whole composite: Reference, then Pi's session id", () => {
-	const prefix = "[[3:Meteor Shower:12]]";
+	const prefix = "[[1:Meteor Shower:12]]";
 	const s = settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: prefix }, PI_ID, "/h", never);
 	assert.equal(s.session, `${prefix}${PI_ID}`);
-	assert.equal(s.store, `/h/.local/state/roger-shims/pi/__3_Meteor_Shower_12__${PI_ID}.store`, "the Store file name is path-safe and unique per UUID");
+	assert.equal(s.store, `/h/.local/state/roger-shims/pi/__1_Meteor_Shower_12__${PI_ID}.store`, "the Store file name is path-safe and unique per UUID");
 	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: prefix }, undefined, "/h", () => "fresh-1").session, `${prefix}fresh-1`);
 	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: "" }, PI_ID, "/h", never).session, PI_ID, "empty counts as unset");
 });
