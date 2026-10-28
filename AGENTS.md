@@ -1,27 +1,26 @@
-This project has a kernel: read KERNEL.md, INVARIANTS.md, GLOSSARY.md, and the open threads in VECTORS/ before changing anything.
-KERNEL.md, INVARIANTS.md and the frozen `## kernel` and `## invariants` namespaces of GLOSSARY.md name no harness or model; provenance frontmatter (`agent:`, `session:`) may. `scripts/check-frozen` pins the frozen bytes (`scripts/frozen.sha256`). Harness specifics live in shims/ and their tests.
+This project has a director: run `slice status`, then read NEXT.md (`slice path next`), before changing anything. Its purpose, proofs, invariants and terms are sealed in the director's records outside this repo, not here. `VECTORS/` is read-only history; write no new vectors.
+
+The sealed documents name no harness or model; provenance frontmatter (`agent:`, `session:`) may. Harness specifics live in shims/ and their tests. Work is delegated as slices (`slice define`, `slice new`); the director gates each attempt and merges with `slice merge <id> <n> --check scripts/check-all`.
 
 ## Directives
 
 - "just remember, this is a standalone project. meant to be as applicable to a call center as to agents. dont let the harness symantics take it over" (2026-10-22)
 - "my vision is this to be a ruthlessly efficient foundation that any sort of adapter can be placed on top of. modular" (2026-10-22)
-- "if there is a fundamental issue that cant be resolved in the original documents, the rules are simple. fork it-change-it-try again" (2026-10-22)
 - "Wake (proof 5) is landed and is not a focus: do not extend, prototype or queue wake work unless Jang asks." (2026-10-22)
 
 ## Coding standards
 
 The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
-`scripts/check-harness-free`, `scripts/check-frozen` (KERNEL.md, INVARIANTS.md and the
-frozen GLOSSARY.md sections keep the bytes pinned in `scripts/frozen.sha256`), and
-`scripts/check-no-poll`. It names no harness.
-`scripts/check-all` runs it, then every `shims/<name>/check` it finds; a shim brings its own
-check and the core gate never changes for it. Nothing lands on main until `scripts/check-all`
-exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
+`scripts/check-harness-free`, and `scripts/check-no-poll`. It names no harness.
+`scripts/check-all` runs it, then every `shims/<name>/check` it finds, then `scripts/check-seal`
+(the director's seal on the sealed documents is intact; it passes quietly where no seal exists).
+A shim brings its own check and the core gate never changes for it. Nothing lands on main until
+`scripts/check-all` exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
 those warnings into errors.
 
 ### Review rules
 
-These are INVARIANTS.md read as rules for a diff. The frozen files win over this one.
+These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md win over this one.
 
 1. **No loss, no duplicate.** Any path that touches a Mail between Accepted and the
    recipient's Ack keeps the body durable across coordinator restart, daemon restart,
@@ -59,4 +58,4 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
   `## Claims`.
 - Keep `src/main.rs` dispatch flat: add an arm, do not restructure.
 - Test-only hooks live behind the `test-hooks` feature and never reach a deploy build.
-- Vectors, not comments, record what was tried; GLOSSARY.md, not comments, defines terms.
+- The director's records, not comments, record what was tried; GLOSSARY.md, not comments, defines terms.
