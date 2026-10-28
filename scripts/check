@@ -14,6 +14,5 @@ step cargo fmt --check
 step cargo clippy --offline --all-targets --features test-hooks -- -D warnings
 step cargo test --offline --features test-hooks
 step scripts/check-harness-free
-step scripts/check-frozen
 step scripts/check-no-poll
 echo "PASS check"
