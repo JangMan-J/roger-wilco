@@ -22,7 +22,7 @@ Roger-Wilco provides durable mail, presence, and exclusive work claims for any a
 5. **Wake on demand**
    Check: `scripts/acceptance wake` exits 0. Directed mail to an idle live session starts a turn within its declared wake latency; the same mail to a busy session queues and is delivered at the turn boundary.
 6. **References keep both integers verbatim**
-   Check: `scripts/acceptance references` exits 0. `[[153:Meteor Shower:7]]` and `[[0:FLEET:0]]` return byte-identical through send, store, delivery, and board, and a session's label prefix changes its display and never its address or mailbox.
+   Check: `scripts/acceptance references` exits 0. `[[153:Meteor Shower:7]]` and `[[0:FLEET:0]]` return byte-identical through send, store, delivery, and board, and a session's label prefix changes its display and never its address or mailbox. An Address `[[153:Meteor Shower:7]]<uuid>` also returns byte-identical through send, store, delivery, reply, and board, and a relabel changes its display and never that Address or its mailbox.
 
 ## Frozen
 

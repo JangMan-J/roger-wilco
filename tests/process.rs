@@ -831,6 +831,135 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
 }
 
+/// An Address may be the whole composite `[[<integer>:<label>:<integer>]]<uuid>`
+/// (the label may hold spaces). The core carries it as an opaque string:
+/// registration, send, coordinator log, host inbox, Store, reply, Board.
+/// A relabel changes the Board's display label and never the Address.
+#[test]
+fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel() {
+    const AGENT: &str = "[[3:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const DIRECTOR: &str = "[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let mut rig = Rig::new("composite");
+    rig.start_stack();
+    let (_, mut agent_in) = rig.start_adapter("a.sock", AGENT, "agent.store", "agent.out", &[]);
+    let out = "director.out";
+    let store = rig.p("director.store");
+    rig.spawn(
+        &[
+            "session",
+            "--socket",
+            rig.p("b.sock").to_str().unwrap(),
+            "--id",
+            DIRECTOR,
+            "--store",
+            store.to_str().unwrap(),
+            "--label",
+            "builder",
+        ],
+        out,
+    );
+    wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
+
+    // Send: agent (through its shim line) -> director, to the whole composite.
+    let body_out = "question for [[2:FLEET:5]]";
+    let line = format!(
+        "{{\"type\":\"send\",\"to\":\"{DIRECTOR}\",\"mail\":\"c-1\",\"body\":\"{body_out}\"}}"
+    );
+    writeln!(agent_in, "{line}").unwrap();
+    wait_for_text(&rig.p(out), "DELIVERED mail=c-1", Duration::from_secs(10));
+    let stored = read(&store);
+    assert_eq!(
+        count_lines_with(&stored, &format!("\"from\":\"{AGENT}\"")),
+        1,
+        "{stored}"
+    );
+    assert_eq!(count_lines_with(&stored, body_out), 1, "{stored}");
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(
+        count_lines_with(
+            &coord,
+            &format!("\"from\":\"{AGENT}\",\"to\":\"{DIRECTOR}\"")
+        ),
+        1,
+        "coordinator log keeps both Addresses whole: {coord}"
+    );
+
+    // Reply: director -> agent, to the whole composite; the agent's shim is
+    // told the sender Address verbatim and only after its own Store holds it.
+    let reply = |mail: &str, body: &str| {
+        let sent = Command::new(BIN)
+            .args([
+                "send",
+                "--socket",
+                rig.p("b.sock").to_str().unwrap(),
+                "--from",
+                DIRECTOR,
+                "--to",
+                AGENT,
+                "--mail",
+                mail,
+                "--body",
+                body,
+            ])
+            .env("ROGER_TOKEN", TOKEN)
+            .output()
+            .unwrap();
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+    };
+    reply("c-2", "answer");
+    wait_for_text(
+        &rig.p("agent.out"),
+        &format!("\"type\":\"mail\",\"mail\":\"c-2\",\"from\":\"{DIRECTOR}\",\"body\":\"answer\",\"record\":\"r-1\""),
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("coord.log"),
+        "\"ev\":\"receipt\",\"mail\":\"c-2\"",
+        Duration::from_secs(10),
+    );
+    assert_eq!(count_lines_with(&read(&rig.p("agent.store")), "answer"), 1);
+
+    // Relabel: the display label changes; the Address, inner label included,
+    // does not, and its mailbox is the same.
+    let relabeled = Command::new(BIN)
+        .args([
+            "label",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--from",
+            DIRECTOR,
+            "--label",
+            "renamed",
+        ])
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    assert!(
+        relabeled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relabeled.stderr)
+    );
+    let board = Command::new(BIN)
+        .args(["board", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    let board = String::from_utf8_lossy(&board.stdout).to_string();
+    assert!(board.contains(&format!("address={DIRECTOR} ")), "{board}");
+    assert!(board.contains(&format!("address={AGENT} ")), "{board}");
+    assert!(board.contains("label=renamed"), "{board}");
+    writeln!(
+        agent_in,
+        "{{\"type\":\"send\",\"to\":\"{DIRECTOR}\",\"mail\":\"c-3\",\"body\":\"after relabel\"}}"
+    )
+    .unwrap();
+    wait_for_text(&rig.p(out), "DELIVERED mail=c-3", Duration::from_secs(10));
+}
+
 #[test]
 fn adapter_rejects_a_malformed_send_and_keeps_serving() {
     let mut rig = Rig::new("adapter-malformed");

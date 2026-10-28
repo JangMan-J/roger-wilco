@@ -673,6 +673,38 @@ references() {
     || fail "mail to the same Address after relabel must land in the same Store"
   [[ "$(wc -l <"$work/tracer.store")" == 2 ]] || fail "recipient Store should hold exactly two records"
 
+  # A composite Address, `[[<integer>:<label>:<integer>]]<uuid>`, is the session's
+  # whole routing identity: it registers, routes, stores, replies and shows on the
+  # Board as one string, and a relabel never changes it.
+  local agent='[[3:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  local director='[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  "$bin" session --socket "$work/a.sock" --id "$agent" --store "$work/agent.store" \
+    >"$work/agent.out" 2>&1 &
+  pids+=("$!")
+  "$bin" session --socket "$work/b.sock" --id "$director" --store "$work/director.store" \
+    >"$work/director.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "composite agent READY" grep -q READY "$work/agent.out"
+  wait_for 10 "composite director READY" grep -q READY "$work/director.out"
+  "$bin" send --socket "$work/a.sock" --from "$agent" --to "$director" \
+    --mail comp-1 --body "question $meteor" >"$work/comp.out" || fail "send to a composite Address refused"
+  wait_for 10 "comp-1 delivered" grep -q 'DELIVERED mail=comp-1' "$work/director.out"
+  jq -e --arg f "$agent" --arg t "$director" \
+    'select(.ev == "mail" and .mail == "comp-1") | .from == $f and .to == $t' "$work/coord.log" >/dev/null \
+    || fail "coordinator log changed a composite Address"
+  jq -e --arg f "$agent" 'select(.mail == "comp-1") | .from == $f' "$work/director.store" >/dev/null \
+    || fail "recipient Store changed the sender's composite Address"
+  "$bin" send --socket "$work/b.sock" --from "$director" --to "$agent" \
+    --mail comp-2 --body "answer" >>"$work/comp.out" || fail "reply to a composite Address refused"
+  wait_for 10 "comp-2 delivered" grep -q 'DELIVERED mail=comp-2' "$work/agent.out"
+  jq -e --arg f "$director" 'select(.mail == "comp-2") | .from == $f' "$work/agent.store" >/dev/null \
+    || fail "reply Store changed the replier's composite Address"
+  "$bin" label --socket "$work/a.sock" --from "$director" --label "renamed" >/dev/null || fail "relabel of a composite Address refused"
+  [[ "$("$bin" board --socket "$work/b.sock" | grep -cF "SESSION address=$director ")" == 1 ]] \
+    || fail "relabel changed the composite Address on the Board"
+  "$bin" board --socket "$work/b.sock" | grep -F "address=$director " | grep -qF "label=renamed" \
+    || fail "the Board does not show the relabeled display for the composite Address"
+
   # The label survives a coordinator restart with the same bytes.
   kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
   "$bin" coordinator --bind "$coord" --data "$work/coord.log" \
@@ -682,7 +714,7 @@ references() {
   label="$(board_label "$work/b.sock" "$RECIPIENT")"
   [[ "$label" == "$new_label" ]] || fail "board after coordinator restart shows '$label'"
 
-  echo "PASS references: $meteor and $fleet returned byte-identical through send, Store, delivery, and Board; relabel changed display only, same Address, same Store, across a coordinator restart; src inspects no Reference"
+  echo "PASS references: $meteor and $fleet returned byte-identical through send, Store, delivery, and Board; a composite Address round-tripped send, delivery, reply and Board; relabel changed display only, same Address, same Store, across a coordinator restart; src inspects no Reference"
 }
 
 # Proof 3. Two hosts, one coordinator. Three registered sessions: the

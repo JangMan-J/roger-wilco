@@ -81,7 +81,11 @@ environment, never from argv, which `ps` shows to every user.
 | `release` | `--socket --owner <address> --key <text>` | give a Claim up |
 | `board` | `--socket [--from <address>]` | one Board read; `--from` counts as that session's activity |
 
-A session's Address is `--id`, or a fresh UUID. The Tracer prints `READY session=<address>`
+A session's Address is `--id`, or a fresh UUID. An Address is an opaque string: a UUID, or the
+whole composite `[[<integer>:<label>:<integer>]]<uuid>` (the label may hold spaces). Every
+command takes it whole and every record keeps it byte-identical; the core never splits it, and
+the integers inside mean something only to the consumer that chose them. A relabel changes the
+Board's display label and never the Address, inner label included. The Tracer prints `READY session=<address>`
 after it registers, `STORED mail= record= wake=` after each Store write, and
 `DELIVERED mail= record=` when its Ack is recorded.
 
