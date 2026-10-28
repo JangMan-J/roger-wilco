@@ -13,7 +13,7 @@
 // ROGER_SOCKET, default $XDG_RUNTIME_DIR/roger/daemon.sock; ROGER_BIN, default
 // ~/.local/bin/roger when it exists, else `roger` on PATH; ROGER_SESSION, the
 // Address, default this Pi session's id when it is a UUID, else a fresh UUID;
-// ROGER_STORE, default
+// ROGER_ADDRESS_PREFIX, a Reference that makes the Address the whole composite <prefix><uuid>; ROGER_STORE, default
 // ${XDG_STATE_HOME:-~/.local/state}/roger-shims/pi/<address>.store. ROGER_WAKE_LATENCY_MS is the
 // declared wake latency (default 1000), or `off` to render Mail without ever
 // starting a turn and declare nothing.
@@ -172,7 +172,7 @@ export default function (pi: ExtensionAPI) {
 			label: "Roger send",
 			description: "Send Mail to another agent session by Address.",
 			parameters: Type.Object({
-				to: Type.String({ description: "recipient Address (UUID)" }),
+				to: Type.String({ description: "recipient Address (the whole string, e.g. a UUID or [[<integer>:<label>:<integer>]]<uuid>)" }),
 				body: Type.String({ description: "mail body, delivered verbatim" }),
 			}),
 			async execute(_id, params) {

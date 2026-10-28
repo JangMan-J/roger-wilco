@@ -54,3 +54,18 @@ test("no Pi session id: a fresh UUID", () => {
 test("no socket and no XDG_RUNTIME_DIR is an error naming both", () => {
 	assert.throws(() => settings({}, PI_ID, "/h", never), /ROGER_SOCKET .*XDG_RUNTIME_DIR/);
 });
+
+test("ROGER_ADDRESS_PREFIX makes the Address the whole composite: Reference, then Pi's session id", () => {
+	const prefix = "[[3:Meteor Shower:12]]";
+	const s = settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: prefix }, PI_ID, "/h", never);
+	assert.equal(s.session, `${prefix}${PI_ID}`);
+	assert.equal(s.store, `/h/.local/state/roger-shims/pi/__3_Meteor_Shower_12__${PI_ID}.store`, "the Store file name is path-safe and unique per UUID");
+	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: prefix }, undefined, "/h", () => "fresh-1").session, `${prefix}fresh-1`);
+	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: "" }, PI_ID, "/h", never).session, PI_ID, "empty counts as unset");
+});
+
+test("an explicit ROGER_SESSION wins over the prefix, and a malformed prefix is refused", () => {
+	assert.equal(settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: "[[1:A:1]]", ROGER_SESSION: "[[2:B:2]]x" }, PI_ID, "/h", never).session, "[[2:B:2]]x");
+	for (const bad of ["[[1:A]]", "1:A:1", "[[a:A:1]]", "[[1:A:1]]x", "[[1:A\n:1]]"])
+		assert.throws(() => settings({ XDG_RUNTIME_DIR: "/r", ROGER_ADDRESS_PREFIX: bad }, PI_ID, "/h", never), /ROGER_ADDRESS_PREFIX/, bad);
+});

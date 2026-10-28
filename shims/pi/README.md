@@ -46,7 +46,7 @@ adapter on it: that adapter fails at start naming the Store, and the shim report
 Address, and waits for it to exit (SIGKILL after 3 s) before a new session starts the next
 one.
 
-Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_SOCKET`,
+Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_ADDRESS_PREFIX` (a Reference that makes the Address the whole composite `<prefix><uuid>`), `ROGER_SOCKET`,
 `ROGER_BIN`, `ROGER_STORE`, `ROGER_WAKE_LATENCY_MS`, `ROGER_PRESENCE_WINDOW_MS`. The header
 of `roger.ts` describes each one except `ROGER_PRESENCE_WINDOW_MS` (which sessions `/roger`
 and `roger_board` show by default: connected, or seen within the window, default 10

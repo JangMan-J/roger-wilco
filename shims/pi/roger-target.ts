@@ -9,8 +9,12 @@ export const BROADCAST = "*";
 export const DEFAULT_WINDOW_MS = 10 * 60_000;
 
 const ADDRESS = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** An Address may begin with a Reference: `[[<integer>:<label>:<integer>]]<uuid>`; the label may hold spaces. */
+const COMPOSITE = /^\[\[-?\d+:[^\[\]\n]{1,64}:-?\d+\]\][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+/** The UUID an Address ends in: the whole text when it has no Reference. */
+const uuidOf = (session: string) => session.replace(/^\[\[[^\]]*\]\]/, "");
 /** Address-shaped text always routes as an Address, never as a label. */
-export const isAddress = (text: string) => ADDRESS.test(text);
+export const isAddress = (text: string) => ADDRESS.test(text) || new RegExp(`${COMPOSITE.source}$`, "i").test(text);
 
 const fold = (s: string) => s.normalize("NFC").toLocaleLowerCase();
 
@@ -59,9 +63,20 @@ export function resolve(rows: Row[], input: string): Target | string {
 	const restAfter = (n: number) => (quoted !== undefined ? text : text.slice(n)).trim();
 	if (!first) return "no target given";
 	if (first === BROADCAST) return { to: BROADCAST, rest: restAfter(1) };
+	// A composite Address: the whole text through the UUID, kept exactly as typed.
+	const composite = quoted === undefined && text.startsWith("[[") ? COMPOSITE.exec(text)?.[0] : undefined;
+	if (composite) {
+		const row = rows.find((r) => r.session === composite);
+		return { to: composite, row, rest: restAfter(composite.length) };
+	}
 	if (isAddress(first)) {
 		const row = rows.find((r) => fold(r.session) === fold(first));
-		return { to: row?.session ?? first.toLowerCase(), row, rest: restAfter(first.length) };
+		if (row) return { to: row.session, row, rest: restAfter(first.length) };
+		// A bare UUID names the one Board session whose Address ends in it.
+		const ends = rows.filter((r) => fold(uuidOf(r.session)) === fold(first));
+		if (ends.length > 1) return `ambiguous target ${JSON.stringify(first)} (address): ${ends.map((r) => r.session).join(", ")}`;
+		if (ends[0]) return { to: ends[0].session, row: ends[0], rest: restAfter(first.length) };
+		return { to: first.toLowerCase(), row: undefined, rest: restAfter(first.length) };
 	}
 
 	// Labels that fit: the whole target when quoted, else a prefix of the text
@@ -78,7 +93,7 @@ export function resolve(rows: Row[], input: string): Target | string {
 		return `ambiguous target: labels ${fits.map((r) => JSON.stringify(r.label)).join(", ")} all fit; quote one as @"<label>"`;
 
 	const hex = fold(first);
-	const byPrefix = /^[0-9a-f-]{3,}$/.test(hex) ? rows.filter((r) => fold(r.session).startsWith(hex)) : [];
+	const byPrefix = /^[0-9a-f-]{3,}$/.test(hex) ? rows.filter((r) => fold(uuidOf(r.session)).startsWith(hex)) : [];
 	const hits = new Map<string, Row>();
 	for (const r of [...fits, ...byPrefix]) hits.set(r.session, r);
 	if (hits.size > 1) {
