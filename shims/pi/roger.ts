@@ -172,7 +172,7 @@ export default function (pi: ExtensionAPI) {
 			label: "Roger send",
 			description: "Send Mail to another agent session by Address.",
 			parameters: Type.Object({
-				to: Type.String({ description: "recipient Address (the whole string, e.g. a UUID or [[<integer>:<label>:<integer>]]<uuid>)" }),
+				to: Type.String({ description: "recipient Address (the whole string, e.g. a UUID or [[<token>:<label>:<token>]]<uuid>)" }),
 				body: Type.String({ description: "mail body, delivered verbatim" }),
 			}),
 			async execute(_id, params) {

@@ -615,12 +615,12 @@ fn mail_survives_recipient_kill_between_store_and_ack() {
 }
 
 #[test]
-fn references_keep_both_integers_and_relabel_keeps_the_address() {
+fn references_keep_both_tokens_and_relabel_keeps_the_address() {
     let mut rig = Rig::new("references");
     rig.start_stack();
     rig.start_recipient_with("recipient.out", false, Some("[[153:Meteor Shower:7]]"));
 
-    // Send, store, delivery: both integers come back byte-identical.
+    // Send, store, delivery: both tokens come back byte-identical.
     let body = "start [[153:Meteor Shower:7]] then [[0:FLEET:0]]";
     rig.send("m-ref-1", body);
     wait_for_text(
@@ -831,14 +831,14 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
 }
 
-/// An Address may be the whole composite `[[<integer>:<label>:<integer>]]<uuid>`
+/// An Address may be the whole composite `[[<token>:<label>:<token>]]<uuid>`, tokens base 36 and several characters long
 /// (the label may hold spaces). The core carries it as an opaque string:
 /// registration, send, coordinator log, host inbox, Store, reply, Board.
 /// A relabel changes the Board's display label and never the Address.
 #[test]
 fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel() {
-    const AGENT: &str = "[[1:Meteor Shower:12]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const DIRECTOR: &str = "[[2:FLEET:5]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const AGENT: &str = "[[1a:Meteor Shower:zz]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const DIRECTOR: &str = "[[2:FLEET:10]]bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let mut rig = Rig::new("composite");
     rig.start_stack();
     let (_, mut agent_in) = rig.start_adapter("a.sock", AGENT, "agent.store", "agent.out", &[]);
@@ -861,7 +861,7 @@ fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel
     wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
 
     // Send: agent (through its shim line) -> director, to the whole composite.
-    let body_out = "question for [[2:FLEET:5]]";
+    let body_out = "question for [[2:FLEET:10]]";
     let line = format!(
         "{{\"type\":\"send\",\"to\":\"{DIRECTOR}\",\"mail\":\"c-1\",\"body\":\"{body_out}\"}}"
     );

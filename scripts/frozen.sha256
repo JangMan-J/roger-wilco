@@ -1,6 +1,6 @@
 # sha256 of the frozen set, checked by scripts/check-frozen.
-# Change this file only when the owner says so. Re-pinned for the composite Address (2026-10-28, Jang): the Address, Reference and Opaque integer terms and proof 6.
-f73aa72437286ca8ffd1286db3b8e14fc930450856bb3ee39813e696d2bfbba6 KERNEL.md
-14bbcecd231885914b3c2c9878c443180f764d0997104f59bb7946db762701a5 INVARIANTS.md
-86b7379cc89d1b5c2ffd0b05a3c94f25e3d796e64e72560d21c732cb8ef89bde GLOSSARY.md#kernel
+# Change this file only when the owner says so. Re-pinned for the composite Address (2026-10-28, Jang) and again when Reference tokens became opaque base-36 (2026-10-29): the Address, Reference and Opaque token terms, proof 6 and the invariant on tokens.
+4dc6cdfd870aedec40867f94ee8cab36cfc7895a72bb0d33d51ebec2ffef5ad4 KERNEL.md
+93aca1568fd7e6bcaf77da9ab3ab38f76e7d085be517cce96a936ba6f15be80a INVARIANTS.md
+9faa603865383364c0acd0b26a7d893bd0e69f56631d8df2d0598aff78cd089d GLOSSARY.md#kernel
 4f4e82ac4d7a1c13f819057bba80a5f973ac6ac376f7244ccf41ea8116332e44 GLOSSARY.md#invariants
