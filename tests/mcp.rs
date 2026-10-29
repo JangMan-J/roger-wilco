@@ -879,7 +879,12 @@ fn the_board_lists_only_present_sessions_unless_all() {
 fn address_precedence_flag_then_named_variable_then_default_variable() {
     let rig = Rig::new("address");
     let store = |n: &str| rig.p(n).to_str().unwrap().to_string();
-    let me = |m: &mut Mcp| s(&m.ok("roger_board", "{}"), "me");
+    let me = |m: &mut Mcp| {
+        // A Board read needs the coordinator to hold the Register.
+        let r = m.ok("roger_registered", r#"{"wait_seconds":20}"#);
+        assert_eq!(r.get("registered"), Some(&Value::Bool(true)), "{r:?}");
+        s(&m.ok("roger_board", "{}"), "me")
+    };
 
     let (s1, s2, s3, s4) = (
         store("1.store"),
