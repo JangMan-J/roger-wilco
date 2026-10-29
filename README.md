@@ -2,7 +2,7 @@
 
 Roger-Wilco gives a set of long-running sessions on your own machines three things: durable
 mail between them, a shared Board of who is registered, and exclusive, expiring claims on
-keys. A session can be an AI agent, a script, or a person behind some front end; the core
+keys. A session can be an application, a script, or a person behind some front end; the core
 knows sessions, not the programs behind them. It routes and stores. It does not schedule work,
 assign tasks, or interpret what it carries.
 
@@ -22,7 +22,7 @@ director; the gate is described under Checks.
 | --- | --- |
 | Core contract: commands, delivery, claims, checks | this file |
 | Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
-| Shims: one adapter per agent program, each installed separately | `shims/<name>/README.md` |
+| A legacy client awaiting removal | `legacy/<name>/README.md` |
 | The gate and the review rules | [AGENTS.md § Coding standards](AGENTS.md#coding-standards) |
 
 ## Requirements
@@ -76,7 +76,7 @@ environment, never from argv, which `ps` shows to every user.
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0) |
 | `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session` | the same session, fronted by a stdin/stdout line stream for a shim |
+| `adapter` | same as `session` | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
@@ -185,20 +185,20 @@ address already in use.
 
 ## Adapters
 
-Anything that fronts an agent program sits on top of the core as an adapter-fronted shim
-under `shims/<name>/`, each with its own README, install script and `check`. A shim starts
+A client written for a program connects through a face, in its own project; the core ships
+none. A client that wants a line stream starts
 `roger adapter` and talks to it in JSON lines (the request and reply shapes are documented at
 `adapter` in `src/session.rs`); the core never learns which program is there. When the
-adapter's stdin reaches EOF it unregisters its Address (see Registration) and exits; a shim
+adapter's stdin reaches EOF it unregisters its Address (see Registration) and exits; a client
 ends its adapter by closing that stdin.
 
-A delivery reaches the shim after the adapter has written it to its Store, as one `mail` line
-that carries the Mail's `kind` and `headers`. What a shim does when a delivery arrives is the
-shim's own: the core carries no state about it, and the Store write and the Ack wait for
-nothing the shim does. The adapter writes the Mail to its Store (durable), then tells the shim,
-then sends the Ack; the Ack stays the adapter's responsibility and a shim never sends it. What
-a shim has shown its program is not durable. If the adapter died before its Ack, the core
-redelivers and the Store reuses the same record, so a restarted shim is told again; Mail
+A delivery reaches the client after the adapter has written it to its Store, as one `mail` line
+that carries the Mail's `kind` and `headers`. What a client does when a delivery arrives is the
+client's own: the core carries no state about it, and the Store write and the Ack wait for
+nothing the client does. The adapter writes the Mail to its Store (durable), then tells the client,
+then sends the Ack; the Ack stays the adapter's responsibility and a client never sends it. What
+a client has shown its program is not durable. If the adapter died before its Ack, the core
+redelivers and the Store reuses the same record, so a restarted client is told again; Mail
 already acked is not replayed.
 
 `--declare` is opaque text a session states about itself at Register; the core stores it and
@@ -214,9 +214,9 @@ that speaks one needs no adapter of its own.
   `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`
   Tracer and the one-shot subcommands above are clients of it.
 - **The `roger adapter` stream.** The same session fronted by one JSON line stream on stdin and
-  stdout, for a shim (see Adapters).
+  stdout, for a client (see Adapters).
 - **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
-  that can register an MCP server needs no shim.
+  that can register an MCP server needs no client code.
 
 ### `roger mcp`
 
@@ -232,7 +232,7 @@ closing its stdin.
 
 | Setting | Order |
 | --- | --- |
-| Address | `--id`; else the variable named by `--id-env NAME` (so a client's own registration can hand the server a stable per-conversation id; unset or empty falls through); else `ROGER_ADDRESS`; else a fresh UUID. Used verbatim, never parsed. |
+| Address | `--id`; else the variable named by `--id-env NAME` (so a client's own registration can hand the server a stable per-session id; unset or empty falls through); else `ROGER_ADDRESS`; else a fresh UUID. Used verbatim, never parsed. |
 | Socket | `--socket`; else `ROGER_SOCKET`; else `$XDG_RUNTIME_DIR/roger/daemon.sock`. A missing socket, or none of these set, is an error naming what was expected and what was seen. |
 | Store | `--store`; else `ROGER_STORE`; else `${XDG_STATE_HOME:-~/.local/state}/roger/mcp/<address>.store`. |
 
@@ -286,12 +286,12 @@ rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 ```sh
 scripts/check                     # the core gate
-scripts/check-all                 # the core gate, then each shim's own check
+scripts/check-all                 # the core gate, then each legacy client's own check
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
 scripts/check-seal                # the director's seal on the sealed documents is intact (quiet where none exists)
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
-scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
+scripts/acceptance independence   # proof 2: a real outside program on `roger mcp` and a Tracer exchange mail both ways; one real model call; loopback
 scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, kind broadcast
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance references     # proof 6: references keep both tokens verbatim; relabel keeps the Address
@@ -307,7 +307,7 @@ and one on the remote host, reached with `ssh` and `scp`. For example:
 `ROGER_REMOTE_HOST=<ssh-destination> ROGER_ACCEPT_BIND=<local-ipv4> scripts/acceptance cross-host`.
 They build a
 binary with the test hooks and remove every process and directory they created. The other
-checks run on loopback and need `jq`; what a proof needs from a harness is in that shim's
+checks run on loopback and need `jq`; what a legacy client's acceptance needs is in its
 README.
 
 What `scripts/check-harness-free` counts as the core, and what it exempts, is review rule 4
@@ -330,7 +330,7 @@ core log grows while nobody asks.
 | `src/coordinator.rs` | central durable store; pushes committed mail |
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
-| `src/session.rs` | contract-shaped agent session (Tracer), adapter, and the clients |
+| `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing and message helpers |
@@ -339,7 +339,7 @@ core log grows while nobody asks.
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
-| `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
+| `legacy/<name>/` | a client awaiting removal: README, install, check, acceptance |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |
 

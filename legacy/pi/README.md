@@ -1,4 +1,8 @@
-# Pi shim
+# Pi client (legacy)
+
+> **Legacy.** This is a legacy client, not part of the core. It stays only because live Pi
+> sessions load its installed copy (`~/.local/share/roger-shims/pi`), and is to be removed once
+> its replacement passes the same acceptance.
 
 Connects each Pi session to Roger-Wilco, so it can send and receive Mail, read the Board and
 hold claims, and wakes an idle Pi when directed Mail arrives. The shim is a Pi extension
@@ -19,8 +23,8 @@ installs. It needs, per host:
 Installing or removing it changes nothing in the core or in any other shim.
 
 ```sh
-shims/pi/install              # install or update, from this checkout
-shims/pi/install --uninstall  # remove
+legacy/pi/install              # install or update, from this checkout
+legacy/pi/install --uninstall  # remove
 ```
 
 Install copies `roger.ts`, `roger-adapter.ts`, `roger-command.ts`, `roger-target.ts`, `roger-env.ts` and
@@ -87,13 +91,13 @@ core's `wake: false`) queues no turn and is rendered with `triggerTurn: false`.
 ## Checks
 
 ```sh
-shims/pi/check                    # unit tests under test/; no pi binary needed
-shims/pi/acceptance pi-shim        # lifecycle and the roger_send tool callback in a real Pi; no model
-shims/pi/acceptance wake           # proof 5: directed mail wakes an idle Pi; busy queues to the turn boundary
-scripts/acceptance independence   # proof 2: this shim is one of the two harnesses
+legacy/pi/check                    # unit tests under test/; no pi binary needed
+legacy/pi/acceptance pi-shim      # lifecycle and the roger_send tool callback in a real Pi; no model
+legacy/pi/acceptance wake           # proof 5: directed mail wakes an idle Pi; busy queues to the turn boundary
+legacy/pi/acceptance independence # Pi and Claude Code exchange Mail both ways, then the Tracer and Pi
 ```
 
 The three acceptance checks run on loopback and need `pi` and `jq`.
-`shims/pi/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
-`scripts/acceptance independence` Pi runs in RPC mode with wake off and makes no model
+`legacy/pi/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
+`legacy/pi/acceptance independence` Pi runs in RPC mode with wake off and makes no model
 call; that check also needs `claude` (logged in), `pi`, `jq`.

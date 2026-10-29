@@ -1,4 +1,4 @@
-// Unit tests for the shim defaults: node --test shims/pi/test/roger-env.test.ts
+// Unit tests for the shim defaults: node --test legacy/pi/test/roger-env.test.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { settings } from "../roger-env.ts";

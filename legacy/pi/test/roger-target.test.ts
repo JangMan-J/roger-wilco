@@ -1,4 +1,4 @@
-// Unit tests for /roger target resolution and presence: node --test shims/pi/test/roger-target.test.ts
+// Unit tests for /roger target resolution and presence: node --test legacy/pi/test/roger-target.test.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { completions, DEFAULT_WINDOW_MS, present, resolve, windowMs, type Row, type Target } from "../roger-target.ts";

@@ -1,5 +1,5 @@
 // Pure helpers for /roger: who a typed target names, and who counts as
-// present. No Pi and no I/O, so `node --test shims/pi/test/roger-target.test.ts`
+// present. No Pi and no I/O, so `node --test legacy/pi/test/roger-target.test.ts`
 // covers them. Labels are compared as whole opaque text (case-folded); nothing
 // here reads the tokens inside a Reference.
 

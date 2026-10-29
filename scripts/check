@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The core gate: every change on main passes this before it lands. It names no
-# harness; scripts/check-all adds each shim's own check on top.
+# harness; scripts/check-all adds each client's own check on top.
 # Usage: scripts/check
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate)"; exit 0; fi

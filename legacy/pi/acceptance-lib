@@ -1,4 +1,4 @@
-# Pi helpers shared by shims/pi/acceptance and scripts/acceptance (independence): sourced, never run.
+# Pi helpers for legacy/pi/acceptance: sourced, never run.
 # Needs scripts/acceptance-lib first.
 # Pi in RPC mode on host-a, driven through fd 3. pi_start <tag> <address>
 # <roger-binary> <extension> [pi-args...]; output lands in $work/<tag>.out. A

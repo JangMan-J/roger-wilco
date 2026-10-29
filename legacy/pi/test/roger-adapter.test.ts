@@ -1,4 +1,4 @@
-// Process tests for the adapter supervisor: node --test shims/pi/test/roger-adapter.test.ts
+// Process tests for the adapter supervisor: node --test legacy/pi/test/roger-adapter.test.ts
 // A real coordinator, host daemon and `roger adapter` on loopback; no Pi. Every
 // process is killed by the exact pid this file started or the supervisor reports.
 import assert from "node:assert/strict";

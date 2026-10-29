@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Install the Pi shim for this user, on top of an installed roger core.
 #
-#   shims/pi/install              copy the shim from this checkout to
+#   legacy/pi/install              copy the shim from this checkout to
 #                                 ~/.local/share/roger-shims/pi/ and list that
 #                                 directory once in the `packages` array of Pi's
 #                                 settings.json (${PI_CODING_AGENT_DIR:-~/.pi/agent})
-#   shims/pi/install --uninstall  remove that entry and that directory; Stores stay
+#   legacy/pi/install --uninstall  remove that entry and that directory; Stores stay
 #
 # Idempotent: rerunning replaces the copy and leaves one entry. Touches nothing
 # outside its own directory and its own entry in Pi's settings. See README.md.

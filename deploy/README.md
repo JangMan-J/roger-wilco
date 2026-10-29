@@ -2,8 +2,8 @@
 
 How the core is installed and run on your hosts: one coordinator host, and a host daemon on
 every host including that one. What the core guarantees is in the
-[top-level README](../README.md); a shim installs on top of a deployed core per its own
-`shims/<name>/README.md`.
+[top-level README](../README.md); a legacy client installs on top of a deployed core per its own
+`legacy/<name>/README.md`.
 
 ## Before you start
 
@@ -43,7 +43,7 @@ On `<host>` it writes:
 | `~/.local/share/roger/deployed` | `commit=` and `sha256=` of the installed binary |
 
 The units come from this directory (`deploy/`). At run time the host daemon serves
-`$XDG_RUNTIME_DIR/roger/daemon.sock`, the socket every client, Tracer and shim on that host
+`$XDG_RUNTIME_DIR/roger/daemon.sock`, the socket every client, Tracer and client on that host
 uses.
 
 ## Host config
@@ -96,7 +96,7 @@ cp -rp ~/.local/share/roger "$b/share/"
 cp -p ~/.config/systemd/user/roger-*.service "$b/units/"
 ```
 
-A shim keeps its own state (its Stores); back that up per its README.
+A client keeps its own state (its Stores); back that up per its README.
 
 ## Procedure
 
