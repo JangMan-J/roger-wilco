@@ -6,12 +6,13 @@ The sealed documents name no harness or model; provenance frontmatter (`agent:`,
 
 - "just remember, this is a standalone project. meant to be as applicable to a call center as to agents. dont let the harness symantics take it over" (2026-10-22)
 - "my vision is this to be a ruthlessly efficient foundation that any sort of adapter can be placed on top of. modular" (2026-10-22)
-- "Wake (proof 5) is landed and is not a focus: do not extend, prototype or queue wake work unless Jang asks." (2026-10-22)
+- "It was never a goal to turn delivery into turns, 'turns and wakes' shouldn't actually be present in roger-wilco's vocabulary... its foundational layer should be as suitable to use for an office call center as for an autonomous agent team. However, on our side of things, turns and wakes are important - it's just a matter of separating boundaries and what transports implement them/the shape of the wire information." (2026-10-29; supersedes the 2026-10-22 directive "Wake (proof 5) is landed and is not a focus": wake leaves Roger, and its behavior belongs to the consumer's side)
+- "I think MCP alongside socket connections is fine... It's just the decisions of what to place where that matter most and how to reduce the amount of adapters that other potential clients 'need' in order to use the service. Redundancy is not inefficiency." (2026-10-29)
 
 ## Coding standards
 
 The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
-`scripts/check-harness-free`, and `scripts/check-no-poll`. It names no harness.
+`scripts/check-harness-free`, `scripts/check-vocabulary`, and `scripts/check-no-poll`. It names no harness.
 `scripts/check-all` runs it, then every `shims/<name>/check` it finds, then `scripts/check-seal`
 (the director's seal on the sealed documents is intact; it passes quietly where no seal exists).
 A shim brings its own check and the core gate never changes for it. Nothing lands on main until
@@ -44,6 +45,18 @@ These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md wi
    list of names. `scripts/check-harness-free` is the check.
 5. **No workflow.** The core stores and routes; it never decides what work exists or
    who takes it.
+6. **No vocabulary of what a session does with its Mail.** No turn, wake, idle, or busy
+   state, request, field, flag, flag name, or doc exists in the core; a delivery carries
+   its `kind` (`directed` or `broadcast`) and the sender's opaque `headers`, and what a
+   consumer does on arrival is the consumer's. A shim may have such words; the core may
+   not. `scripts/check-vocabulary` is the check; the one line allowed to say it carries
+   `legacy-wire:` and a reason, and a release that drops its reader drops the line.
+7. **Opaque headers stay opaque.** Nothing in `src/` compares, branches on, ranks, or
+   names a header key or value; they pass through byte-identical, bounded, with a refusal
+   that names what was expected and what was seen.
+8. **Faces are equal and additive.** The socket protocol, the `roger adapter` stream, and
+   `roger mcp` give a session the same Mail, Store, Ack, Board, claim and receipt
+   semantics. A new face adds no semantics of its own and no crate.
 
 ### Code
 
