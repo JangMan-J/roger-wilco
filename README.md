@@ -208,7 +208,7 @@ returns it on the Board, and reads none of it.
 
 A Face is one complete way a client reaches the core as a session. All three give a session the
 same Mail, Store, Ack, Board, Claim and Receipt semantics and add none of their own; a client
-that speaks one needs no adapter of its own.
+that speaks one needs nothing more from the core.
 
 - **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket: `register`,
   `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`

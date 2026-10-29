@@ -43,7 +43,7 @@ On `<host>` it writes:
 | `~/.local/share/roger/deployed` | `commit=` and `sha256=` of the installed binary |
 
 The units come from this directory (`deploy/`). At run time the host daemon serves
-`$XDG_RUNTIME_DIR/roger/daemon.sock`, the socket every client, Tracer and client on that host
+`$XDG_RUNTIME_DIR/roger/daemon.sock`, the socket every client and Tracer on that host
 uses.
 
 ## Host config
