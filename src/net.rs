@@ -17,24 +17,57 @@ pub fn ack_msg(mail: &str, session: &str, record: &str) -> Value {
     ])
 }
 
+/// The Kind of a Mail sent to one Address.
+pub const DIRECTED: &str = "directed";
+/// The Kind of a copy of a Broadcast.
+pub const BROADCAST: &str = "broadcast";
+
 /// The one shape both the coordinator and a host daemon use to hand a Mail
-/// to the next hop. `wake` is false only for a Broadcast copy, which makes
-/// no wake request.
-pub fn deliver_msg(mail: &str, from: &str, to: &str, body: &str, wake: bool) -> Value {
+/// to the next hop: its Kind and the sender's headers, carried as given.
+pub fn deliver_msg(
+    mail: &str,
+    from: &str,
+    to: &str,
+    body: &str,
+    kind: &str,
+    headers: &Value,
+) -> Value {
     obj(vec![
         ("type", s("deliver")),
         ("mail", s(mail)),
         ("from", s(from)),
         ("to", s(to)),
         ("body", s(body)),
-        ("wake", Value::Bool(wake)),
+        ("kind", s(kind)),
+        ("headers", headers.clone()),
+        legacy_field(kind), // legacy-wire: emit for the previous release's readers
     ])
 }
 
-/// A deliver line's wake request; a line without one (written before the
-/// field existed) is directed mail, which requests a wake.
-pub fn wake_of(v: &Value) -> bool {
-    !matches!(v.get("wake"), Some(Value::Bool(false)))
+/// The one field an earlier release's readers still look for on a delivery,
+/// computed from the Kind. The release after this one deletes it, and every
+/// caller of it.
+pub fn legacy_field(kind: &str) -> (&'static str, Value) {
+    ("wake", Value::Bool(kind != BROADCAST)) // legacy-wire: emit for the previous release's readers
+}
+
+/// A delivery's Kind. A line written before Kind existed says it in the
+/// older field: false marks a Broadcast copy, anything else is directed.
+pub fn kind_of(v: &Value) -> String {
+    if let Some(kind) = v.get("kind").and_then(|x| x.as_str()) {
+        return kind.to_string();
+    }
+    let older = v.get("wake"); // legacy-wire: read a log or peer from before Kind
+    match older {
+        Some(Value::Bool(false)) => BROADCAST.to_string(),
+        _ => DIRECTED.to_string(),
+    }
+}
+
+/// A delivery's headers, as the sender set them; the empty set when the line
+/// has none (written before headers existed, or sent without any).
+pub fn headers_of(v: &Value) -> Value {
+    v.get("headers").cloned().unwrap_or(Value::Obj(Vec::new()))
 }
 
 /// A Register's declared text: opaque text a session states about itself,
