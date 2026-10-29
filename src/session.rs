@@ -1,4 +1,4 @@
-//! A contract-shaped agent session: registers with its host daemon,
+//! A contract-shaped session: registers with its host daemon,
 //! writes delivered mail to its own durable Store, and acks naming the
 //! Store record. It knows nothing about the core beyond the socket.
 
@@ -30,7 +30,7 @@ pub struct McpHooks {
 }
 
 /// How a client reaches this session: the Tracer's own stdout, the adapter's
-/// shim stream, or the MCP server's hooks.
+/// client stream, or the MCP server's hooks.
 pub enum Face {
     Tracer,
     Adapter(net::Writer),
@@ -49,17 +49,17 @@ pub fn run(
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
-/// on stdin/stdout for a shim. The shim sends `{"type":"send","to","body"}`
+/// on stdin/stdout for a client. The client sends `{"type":"send","to","body"}`
 /// (optional `"mail"` and `"headers"`, an object of string values), `{"type":"board"}` (read as this session),
 /// `{"type":"relabel","label"}` (optional `"session"`, default this one), or
 /// `{"type":"claim","op","key"}` (optional `"ttl_ms"`, owned by this session),
 /// and is answered in order with `accepted`, `board`, `relabeled`,
 /// `claim_result`, or `error`; it is also told `ready` once and `mail` per delivery,
 /// which carries the delivery's `kind` and `headers`. A `mail`
-/// line follows the Store write and never gates the ack: the shim renders
+/// line follows the Store write and never gates the ack: the client renders
 /// what the adapter already holds and acknowledges nothing.
-/// `declared` is the shim's opaque self-description, sent with Register.
-/// When the shim's stdin closes, the session unregisters and the process exits.
+/// `declared` is the client's opaque self-description, sent with Register.
+/// When the client's stdin closes, the session unregisters and the process exits.
 pub fn adapter(
     socket: PathBuf,
     id: String,
@@ -71,18 +71,18 @@ pub fn adapter(
     serve(socket, id, label, store_path, declared, Face::Adapter(out))
 }
 
-/// The adapter's shim side, started once the session has registered.
-fn shim_io(socket: PathBuf, me: String, to_shim: net::Writer, daemon: net::Writer) {
+/// The adapter's client side, started once the session has registered.
+fn client_io(socket: PathBuf, me: String, to_client: net::Writer, daemon: net::Writer) {
     // A send blocks until the core answers, so sends run on a worker, one at a
-    // time and in order (a shim pairs replies to sends by order). The reader
-    // below only reads stdin, so the shim's EOF ends this process at once even
+    // time and in order (a client pairs replies to sends by order). The reader
+    // below only reads stdin, so the client's EOF ends this process at once even
     // while a send waits.
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Value>>();
     std::thread::spawn(move || {
         for line in rx {
-            let reply = line.and_then(|v| shim_request(&socket, &me, &v));
+            let reply = line.and_then(|v| client_request(&socket, &me, &v));
             let _ = net::send(
-                &to_shim,
+                &to_client,
                 &reply.unwrap_or_else(|e| {
                     obj(vec![("type", s("error")), ("error", s(&e.to_string()))])
                 }),
@@ -95,7 +95,7 @@ fn shim_io(socket: PathBuf, me: String, to_shim: net::Writer, daemon: net::Write
                 break;
             }
         }
-        // The shim's stdin closed: its harness is gone, so this session is
+        // The client's stdin closed: its harness is gone, so this session is
         // too. It leaves the Board and every later Broadcast now; Mail already
         // accepted for its Address stays pending at the coordinator.
         let _ = net::send(&daemon, &obj(vec![("type", s("unregister"))]));
@@ -103,9 +103,9 @@ fn shim_io(socket: PathBuf, me: String, to_shim: net::Writer, daemon: net::Write
     });
 }
 
-fn shim_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
+fn client_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
     match net::field(v, "type")? {
-        "send" => shim_send(socket, me, v),
+        "send" => client_send(socket, me, v),
         "board" => request(
             socket,
             &obj(vec![
@@ -147,7 +147,7 @@ fn shim_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
     }
 }
 
-fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
+fn client_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
     // A missing mail id is generated; a present one of the wrong type is a
     // malformed send, not a request to pick another id.
     let mail = match v.get("mail") {
@@ -179,12 +179,12 @@ pub fn serve(
     declared: Option<String>,
     face: Face,
 ) -> io::Result<()> {
-    let (shim, mut mcp) = match face {
+    let (client, mut mcp) = match face {
         Face::Tracer => (None, None),
         Face::Adapter(w) => (Some(w), None),
         Face::Mcp(h) => (None, Some(h)),
     };
-    let tracer = shim.is_none() && mcp.is_none();
+    let tracer = client.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
     let mut records: HashMap<String, String> = HashMap::new(); // mail -> record
     for line in &prior {
@@ -212,10 +212,10 @@ pub fn serve(
         register.push(("declared", s(d)));
     }
     net::send(&writer, &obj(register))?;
-    match &shim {
+    match &client {
         Some(w) => {
             net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?;
-            shim_io(socket, id.clone(), w.clone(), writer.clone());
+            client_io(socket, id.clone(), w.clone(), writer.clone());
         }
         None if tracer => {
             println!("READY session={id}");
@@ -273,7 +273,7 @@ pub fn serve(
                         record
                     }
                 };
-                if let Some(w) = &shim {
+                if let Some(w) = &client {
                     let kind = net::kind_of(&v);
                     net::send(
                         w,

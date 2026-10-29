@@ -104,7 +104,7 @@ impl Rig {
     }
 
     /// Start `roger adapter` on a host's daemon socket. Returns its stdin, the
-    /// only way a shim speaks to it; its stdout is the file `out`.
+    /// only way a client speaks to it; its stdout is the file `out`.
     fn start_adapter(
         &mut self,
         sock: &str,
@@ -768,13 +768,13 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     rig.start_stack();
     rig.start_recipient("tracer.out", false);
     let adapter_id = SENDER;
-    let (_, mut shim_in) =
+    let (_, mut client_in) =
         rig.start_adapter("a.sock", adapter_id, "adapter.store", "adapter.out", &[]);
 
-    // Shim -> Tracer: the shim forwards a send tool call as one line.
-    let body_out = "from the shim [[153:Meteor Shower:7]]";
+    // Client -> Tracer: the client forwards a send tool call as one line.
+    let body_out = "from the client [[153:Meteor Shower:7]]";
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"s-1\",\"body\":\"{body_out}\"}}"
     )
     .unwrap();
@@ -795,9 +795,9 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
         "{tracer_store}"
     );
 
-    // Tracer's host -> adapter: the shim is told the body, but only after
+    // Tracer's host -> adapter: the client is told the body, but only after
     // the adapter's own Store holds it, and the receipt names that record.
-    let body_in = "to the shim [[0:FLEET:0]]";
+    let body_in = "to the client [[0:FLEET:0]]";
     let sent = Command::new(BIN)
         .args([
             "send",
@@ -860,7 +860,7 @@ fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel
     );
     wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
 
-    // Send: agent (through its shim line) -> director, to the whole composite.
+    // Send: agent (through its client line) -> director, to the whole composite.
     let body_out = "question for [[2:FLEET:10]]";
     let line = format!(
         "{{\"type\":\"send\",\"to\":\"{DIRECTOR}\",\"mail\":\"c-1\",\"body\":\"{body_out}\"}}"
@@ -884,7 +884,7 @@ fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel
         "coordinator log keeps both Addresses whole: {coord}"
     );
 
-    // Reply: director -> agent, to the whole composite; the agent's shim is
+    // Reply: director -> agent, to the whole composite; the agent's client is
     // told the sender Address verbatim and only after its own Store holds it.
     let reply = |mail: &str, body: &str| {
         let sent = Command::new(BIN)
@@ -965,18 +965,19 @@ fn adapter_rejects_a_malformed_send_and_keeps_serving() {
     let mut rig = Rig::new("adapter-malformed");
     rig.start_stack();
     rig.start_recipient("tracer.out", false);
-    let (_, mut shim_in) = rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
+    let (_, mut client_in) =
+        rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
 
     // Not JSON, then a mail id of the wrong type: each is an error reply and
     // neither reaches the core (a wrong-typed id must not become a fresh UUID).
-    writeln!(shim_in, "not json").unwrap();
+    writeln!(client_in, "not json").unwrap();
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":5,\"body\":\"x\"}}"
     )
     .unwrap();
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ok-1\",\"body\":\"fine\"}}"
     )
     .unwrap();
@@ -995,7 +996,7 @@ fn adapter_rejects_a_malformed_send_and_keeps_serving() {
 fn adapter_exits_on_stdin_eof_while_a_send_waits_on_a_silent_core() {
     let mut rig = Rig::new("adapter-eof");
     rig.start_stack();
-    let (idx, mut shim_in) =
+    let (idx, mut client_in) =
         rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
     // Freeze the coordinator: its sockets stay open and it never answers, so
     // the daemon holds the send for its full upstream wait (10 s).
@@ -1006,17 +1007,17 @@ fn adapter_exits_on_stdin_eof_while_a_send_waits_on_a_silent_core() {
         .unwrap()
         .success());
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"body\":\"stuck\"}}"
     )
     .unwrap();
-    drop(shim_in); // the harness is gone
+    drop(client_in); // the harness is gone
 
     let start = Instant::now();
     while rig.children[idx].try_wait().unwrap().is_none() {
         assert!(
             start.elapsed() < Duration::from_secs(3),
-            "adapter outlived its shim's stdin while a send waited"
+            "adapter outlived its client's stdin while a send waited"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1727,7 +1728,7 @@ fn broadcast_from_sender(rig: &Rig, mail: &str) -> String {
         .to_string()
 }
 
-/// A shim closing the adapter's stdin ends the session on purpose: it leaves
+/// A client closing the adapter's stdin ends the session on purpose: it leaves
 /// the Board and every later Broadcast at once, and Mail sent to its Address
 /// afterwards is still kept for it.
 #[test]
@@ -2612,9 +2613,10 @@ fn the_adapter_carries_kind_and_headers_both_ways() {
     let mut rig = Rig::new("adapter-headers");
     rig.start_stack();
     rig.start_recipient("tracer.out", false);
-    let (_, mut shim_in) = rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
+    let (_, mut client_in) =
+        rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ah-1\",\"body\":\"x\",\"headers\":{{\"t\":\"1\\n2\"}}}}"
     )
     .unwrap();
@@ -2624,7 +2626,7 @@ fn the_adapter_carries_kind_and_headers_both_ways() {
         Duration::from_secs(10),
     );
     writeln!(
-        shim_in,
+        client_in,
         "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ah-2\",\"body\":\"x\",\"headers\":[]}}"
     )
     .unwrap();

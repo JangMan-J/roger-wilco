@@ -5,17 +5,20 @@
 # does when Mail arrives is the consumer's.
 #
 # The core is every file in the checkout (tracked or untracked, minus .gitignore)
-# outside shims/, VECTORS/, and docs/reviews/, as for scripts/check-harness-free.
+# outside legacy/, VECTORS/, and docs/reviews/, as for scripts/check-harness-free.
 # Exempt:
 #   frontmatter         a leading YAML block in a markdown file
-#   shims/              adapters on top of the core; each may have its own vocabulary
-#   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
+#   legacy/             a client awaiting removal; it may have its own vocabulary
+#   .slice/, .accept/, accept, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence
 #   AGENTS.md           the director's file; it quotes dated directives verbatim
 #   scripts/check-vocabulary  this list of words
 #   a line carrying `legacy-wire:` and a reason, for the one transition field an
 #                       earlier release's reader still needs; the final release has none
+#
+# The same files may not use the retired terms `shim`, `shims`, or `agent session(s)`:
+# session and client are the words.
 #
 # Usage: scripts/check-vocabulary [path ...]   (default: the whole core)
 set -euo pipefail
@@ -26,6 +29,8 @@ cd "$ROOT"
 
 # Whole words: "return" and "returns" are not "turn".
 WORDS='wake|wakes|woke|woken|waking|turn|turns|idle|busy'
+# Retired terms, whole words; the phrase may be split by any whitespace and any case.
+RETIRED='shims?|agent[[:space:]]+sessions?'
 
 # A checkout lists its files through git; a plain export (no .git) lists the tree minus target/.
 list_files() {
@@ -36,24 +41,36 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(shims|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+  grep -vE '^(legacy|VECTORS|\.slice|\.accept)/|^accept$|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
-hits="$(for f in "${files[@]}"; do
-  if [[ "$f" == *.md ]]; then
-    awk 'NR == 1 && /^---[[:space:]]*$/ { fm = 1 }
-         fm { buf[++n] = $0; if (NR > 1 && /^---[[:space:]]*$/) { for (i = 1; i <= n; i++) print ""; fm = n = 0 }; next }
-         { print }
-         END { for (i = 1; i <= n; i++) print buf[i] }' "$f" |
-      grep -HniIE --label="$f" "\b($WORDS)\b" || true
-  else
-    grep -HniIE "\b($WORDS)\b" -- "$f" || true
-  fi
-done | grep -v 'legacy-wire:' || true)"
+# scan <regex>: every line of every core file that matches, frontmatter blanked.
+scan() {
+  local f
+  for f in "${files[@]}"; do
+    if [[ "$f" == *.md ]]; then
+      awk 'NR == 1 && /^---[[:space:]]*$/ { fm = 1 }
+           fm { buf[++n] = $0; if (NR > 1 && /^---[[:space:]]*$/) { for (i = 1; i <= n; i++) print ""; fm = n = 0 }; next }
+           { print }
+           END { for (i = 1; i <= n; i++) print buf[i] }' "$f" |
+        grep -HniIE --label="$f" "\b($1)\b" || true
+    else
+      grep -HniIE "\b($1)\b" -- "$f" || true
+    fi
+  done
+}
+
+hits="$(scan "$WORDS" | grep -v 'legacy-wire:' || true)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: turn, wake, idle, or busy vocabulary in the core (only shims/ may use it):" >&2
+  echo "FAIL: turn, wake, idle, or busy vocabulary in the core (only legacy/ may use it):" >&2
   echo "$hits" >&2
   exit 1
 fi
-echo "PASS vocabulary: no turn, wake, idle, or busy vocabulary in ${#files[@]} core files under ${*:-.}"
+hits="$(scan "$RETIRED")"
+if [[ -n "$hits" ]]; then
+  echo "FAIL: retired terms: session and client are the words (only legacy/ may use them):" >&2
+  echo "$hits" >&2
+  exit 1
+fi
+echo "PASS vocabulary: no turn, wake, idle, busy, or retired vocabulary in ${#files[@]} core files under ${*:-.}"

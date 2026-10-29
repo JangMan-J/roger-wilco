@@ -1,4 +1,4 @@
-# Shared by scripts/acceptance and each shim's acceptance script: sourced, never run.
+# Shared by scripts/acceptance and each client's acceptance script: sourced, never run.
 # It names no harness. The caller sets `set -euo pipefail` and, for the cleanup trap,
 # the globals below.
 

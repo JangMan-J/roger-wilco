@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# The core gate, then every shim's own check (shims/*/check), found by listing:
-# adding or removing a shim needs no edit here; then the seal guard, which passes
+# The core gate, then every legacy client's own check (legacy/*/check), found by listing:
+# adding or removing a legacy client needs no edit here; then the seal guard, which passes
 # quietly where no seal exists.
 # Usage: scripts/check-all
 set -euo pipefail
-if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate and all shim checks)"; exit 0; fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate and all legacy checks)"; exit 0; fi
 [[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -12,7 +12,7 @@ cd "$ROOT"
 echo "== scripts/check"
 scripts/check
 n=0
-for c in shims/*/check; do
+for c in legacy/*/check; do
   [[ -x "$c" ]] || continue
   echo "== $c"
   "$c"
@@ -20,4 +20,4 @@ for c in shims/*/check; do
 done
 echo "== scripts/check-seal"
 scripts/check-seal
-echo "PASS check-all (core + $n shim checks)"
+echo "PASS check-all (core + $n legacy checks)"

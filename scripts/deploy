@@ -7,7 +7,7 @@
 #           roger-coordinator.service (coordinator host only)
 #   record  ~/.local/share/roger/deployed (commit and sha256 of the binary)
 #   socket  $XDG_RUNTIME_DIR/roger/daemon.sock, served by the host daemon
-# Anything that sits on top of the core (an adapter, a shim, a plain client)
+# Anything that sits on top of the core (an adapter, a client, a plain client)
 # installs separately and uses only the binary and the socket.
 #
 # Usage: scripts/deploy <host> [commit]     commit defaults to HEAD

@@ -1,4 +1,4 @@
-// Shim defaults for the Pi shim. Pure, so node --test shims/pi/test/roger-env.test.ts
+// Shim defaults for the Pi shim. Pure, so node --test legacy/pi/test/roger-env.test.ts
 // covers it without Pi.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
