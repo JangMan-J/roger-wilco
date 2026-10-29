@@ -3,8 +3,10 @@
 // transcript, and forwards send calls as lines. It never acknowledges a
 // delivery: the adapter acks from its own Store.
 //
-// Wake: a delivered Mail that carries a wake request (every directed Mail;
-// a Broadcast sets `wake: false`) starts a turn when Pi is idle, and when Pi
+// Wake: Pi maps the core's delivery `kind: directed` to its wake behavior: such
+// a Mail starts a turn when Pi is idle. A `broadcast` kind queues no turn. An
+// older core sends no `kind`; its `wake` field (false on a broadcast) is read
+// then. Headers are carried by the core and ignored here. When Pi
 // is busy it is queued as a follow-up that Pi hands the model at the turn
 // boundary. Pi decides idle or busy; the core never learns either. The shim
 // declares its wake latency to the Board as `wake-latency-ms=<n>`.
@@ -39,7 +41,7 @@ import { homedir } from "node:os";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerRogerCommand } from "./roger-command.ts";
-import { superviseAdapter } from "./roger-adapter.ts";
+import { startsTurn, superviseAdapter } from "./roger-adapter.ts";
 
 /** The declared wake latency in ms, or undefined when wake is off. */
 export function wakeLatency(env: string | undefined): number | undefined {
@@ -58,7 +60,7 @@ export default function (pi: ExtensionAPI) {
 		fresh: randomUUID,
 		wakeMs,
 		onMail: (ev) => {
-			const wake = wakeMs !== undefined && ev.wake !== false;
+			const wake = startsTurn(ev, wakeMs);
 			// Idle: triggerTurn starts a turn now. Busy: followUp waits for the
 			// current turn to end, then Pi continues with this Mail.
 			pi.sendMessage(
