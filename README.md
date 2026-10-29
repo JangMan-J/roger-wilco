@@ -22,7 +22,6 @@ director; the gate is described under Checks.
 | --- | --- |
 | Core contract: commands, delivery, claims, checks | this file |
 | Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
-| A legacy client awaiting removal | `legacy/<name>/README.md` |
 | The gate and the review rules | [AGENTS.md § Coding standards](AGENTS.md#coding-standards) |
 
 ## Requirements
@@ -298,7 +297,7 @@ rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 ```sh
 scripts/check                     # the core gate
-scripts/check-all                 # the core gate, then each legacy client's own check
+scripts/check-all                 # the core gate, then the seal guard
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
 scripts/check-seal                # the director's seal on the sealed documents is intact (quiet where none exists)
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
@@ -319,8 +318,7 @@ and one on the remote host, reached with `ssh` and `scp`. For example:
 `ROGER_REMOTE_HOST=<ssh-destination> ROGER_ACCEPT_BIND=<local-ipv4> scripts/acceptance cross-host`.
 They build a
 binary with the test hooks and remove every process and directory they created. The other
-checks run on loopback and need `jq`; what a legacy client's acceptance needs is in its
-README.
+checks run on loopback and need `jq`.
 
 What `scripts/check-harness-free` counts as the core, and what it exempts, is review rule 4
 in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
@@ -351,7 +349,6 @@ core log grows while nobody asks.
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
-| `legacy/<name>/` | a client awaiting removal: README, install, check, acceptance |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |
 

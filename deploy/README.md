@@ -2,8 +2,7 @@
 
 How the core is installed and run on your hosts: one coordinator host, and a host daemon on
 every host including that one. What the core guarantees is in the
-[top-level README](../README.md); a legacy client installs on top of a deployed core per its own
-`legacy/<name>/README.md`.
+[top-level README](../README.md); a client of the core installs separately, from its own project.
 
 ## Before you start
 
