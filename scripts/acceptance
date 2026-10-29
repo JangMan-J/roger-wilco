@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by the project's proofs (README.md, Checks).
-# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast>
+# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers>
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/acceptance-lib"
@@ -111,7 +111,7 @@ cross_host() {
   # Both stamps are on the coordinator's clock; the latency spans the kill.
   local rcpt re
   rcpt="$("$bin" receipt --socket "$work/a.sock" --mail accept-1)" || fail "roger receipt accept-1"
-  re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+\$"
+  re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+ kind=directed\$"
   [[ "$rcpt" =~ $re ]] || fail "receipt lacks a stamp: $rcpt"
 
   echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1 ($rcpt)"
@@ -164,7 +164,7 @@ independence() {
   wait_for 15 "Pi Store holds the tracer's body" grep -qF "$in_body" "$work/pi.store"
   log_count "$in_body" 1 "$work/pi.store" || fail "Pi Store must hold the tracer's body exactly once"
   wait_for 15 "Pi transcript shows the mail" pi_transcript_has "$in_body"
-  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started the agent loop"
 
   # Pi -> Claude Code: sent while Claude is not running; the Mail stays
   # pending in the core until Claude's adapter registers.
@@ -202,7 +202,7 @@ independence() {
   wait_for 15 "Pi Store holds Claude's body" grep -qF "$claude_to_pi" "$work/pi.store"
   log_count "$claude_to_pi" 1 "$work/pi.store" || fail "Pi Store must hold Claude's body exactly once"
   wait_for 15 "Pi transcript shows Claude's mail" pi_transcript_has "$claude_to_pi"
-  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn in Pi"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started the agent loop in Pi"
 
   # Receipts follow the acks; wait for the observable count, not a delay.
   wait_for 15 "four receipts at the coordinator" log_count '"ev":"receipt"' 4 "$work/coord.log"
@@ -282,7 +282,7 @@ claims() {
 
   # Past the first deadline: the renewal holds the key.
   sleep "$(awk -v ms=$(( t1 + 4500 - $(now_ms) )) 'BEGIN { print (ms > 0 ? ms / 1000 : 0) }')"
-  (( $(now_ms) >= t1 + 4000 )) || fail "woke before the first deadline"
+  (( $(now_ms) >= t1 + 4000 )) || fail "sleep ended before the first deadline"
   expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
   board_one_holder "$a"
 
@@ -425,12 +425,11 @@ references() {
 }
 
 # Proof 3. Two hosts, one coordinator. Three registered sessions: the
-# sender's own locally, an idle one remotely, and one remotely
+# sender's own locally, a quiet one remotely, and one remotely
 # that is SIGKILLed between its Store write and its Ack. One
-# broadcast must land in every Store exactly once. "Starts no turn": a session
-# starts a turn only on a wake request, and each session reports the wake
-# request its delivery carried; every broadcast copy must report wake=false.
-IDLE="44444444-4444-4444-8444-444444444444"
+# broadcast must land in every Store exactly once, and each session reports
+# the kind its delivery carried: every broadcast copy must report kind=broadcast.
+THIRD="44444444-4444-4444-8444-444444444444"
 broadcast() {
   local mail="bcast-1" body="fleet notice [[0:FLEET:0]] to every session"
   two_host_stack
@@ -439,9 +438,9 @@ broadcast() {
     >"$work/sender.out" 2>&1 &
   pids+=("$!")
   wait_for 10 "sender READY" grep -q READY "$work/sender.out"
-  remote_spawn idle.pid idle.out \
-    "./roger session --socket $remote_work/b.sock --id $IDLE --store $remote_work/idle.store" \
-    || fail "start remote idle session"
+  remote_spawn third.pid third.out \
+    "./roger session --socket $remote_work/b.sock --id $THIRD --store $remote_work/third.store" \
+    || fail "start remote third session"
   remote_spawn recipient.pid recipient1.out \
     "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
     || fail "start remote recipient"
@@ -471,29 +470,29 @@ broadcast() {
   log_count '"ev":"mail"' 0 "$work/coord.log" || fail "a broadcast must not be stored as directed mail"
 
   local addr
-  for addr in "$SENDER" "$IDLE" "$RECIPIENT"; do
+  for addr in "$SENDER" "$THIRD" "$RECIPIENT"; do
     log_count "\"ev\":\"receipt\",\"mail\":\"$mail/$addr\"" 1 "$work/coord.log" \
       || fail "coordinator must hold exactly one receipt for $addr"
   done
 
   local spec store out where
-  for spec in "local sender" "remote idle" "remote recipient"; do
+  for spec in "local sender" "remote third" "remote recipient"; do
     read -r where store <<<"$spec"
     out="${store}.out"; [[ "$store" == recipient ]] && out=recipient1.out
     if [[ "$where" == local ]]; then
       log_count "$body" 1 "$work/$store.store" || fail "$store Store must hold the body once"
       [[ "$(wc -l <"$work/$store.store")" == 1 ]] || fail "$store Store holds extra records"
-      grep -q "^STORED mail=$mail/.* record=r-1 wake=false$" "$work/$out" || fail "$store: delivery carried a wake request"
+      grep -q "^STORED mail=$mail/.* record=r-1 kind=broadcast$" "$work/$out" || fail "$store: delivery lacked kind=broadcast"
     else
       ssh -n "$REMOTE_HOST" "test \"\$(grep -cF '$body' $remote_work/$store.store)\" = 1 && test \"\$(wc -l <$remote_work/$store.store)\" = 1" \
         || fail "$store Store on $REMOTE_HOST must hold the body exactly once"
-      ssh -n "$REMOTE_HOST" "grep -q '^STORED mail=$mail/.* record=r-1 wake=false\$' $remote_work/$out" \
-        || fail "$store: delivery carried a wake request"
+      ssh -n "$REMOTE_HOST" "grep -q '^STORED mail=$mail/.* record=r-1 kind=broadcast\$' $remote_work/$out" \
+        || fail "$store: delivery lacked kind=broadcast"
     fi
   done
 
   "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
-  echo "PASS broadcast: one broadcast reached all three registered sessions on both hosts, including an idle one and one SIGKILLed between Store and Ack, exactly once each, every copy without a wake request"
+  echo "PASS broadcast: one broadcast reached all three registered sessions on both hosts, including one SIGKILLed between Store and Ack, exactly once each, every copy of kind broadcast"
 }
 
 # Invariant 2: no fixed-interval scan on the correctness path. Mail, receipts,
@@ -501,8 +500,8 @@ broadcast() {
 # disabled. The core has no sweep to disable: nothing in src runs on a timer
 # (scripts/check-no-poll finds only the daemon's reconnect backoff, the
 # daemon's bounded wait for one upstream reply, and the Store lock's single
-# try). A sweep added later must take a switch that this check turns off; the
-# idle windows below fail while one runs, since they require that nothing is
+# try). A sweep added later must take a switch that this check switches off; the
+# quiet windows below fail while one runs, since they require that nothing is
 # committed while nobody asks.
 #
 # Each phase isolates event triggers, so removing any one of them fails it:
@@ -562,8 +561,8 @@ no_poll() {
     "$bin" send --socket "$work/$1.sock" --from "$SENDER" --to "$2" --mail "$3" --body "$4" \
       | grep -q "ACCEPTED mail=$3" || fail "send $3 not accepted"
   }
-  # idle <ms> <why>: nobody asks for <ms>; no log in the core may grow.
-  idle() {
+  # quiet <ms> <why>: nobody asks for <ms>; no log in the core may grow.
+  quiet() {
     local before after
     before="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
     sleep "$(awk -v ms="$1" 'BEGIN { print ms / 1000 }')"
@@ -586,7 +585,7 @@ no_poll() {
 
   # broadcast: the committed copy is pushed to the connected session.
   send a '*' np-b1 "broadcast [[0:FLEET:0]]"
-  wait_for 10 "broadcast: copy stored without wake" grep -q "STORED mail=np-b1/$r record=r-2 wake=false" "$work/r.out"
+  wait_for 10 "broadcast: copy stored with kind broadcast" grep -q "STORED mail=np-b1/$r record=r-2 kind=broadcast" "$work/r.out"
   wait_for 10 "broadcast: receipt for the copy" receipt "np-b1/$r"
 
   # register: mail for an Address no host daemon has seen waits at the
@@ -614,7 +613,7 @@ no_poll() {
     || fail "claims: L's acquire refused: $out"
   out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
     && fail "claims: a second owner took a held key: $out"
-  idle 2000 "claims: past the deadline"
+  quiet 2000 "claims: past the deadline"
   out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
     || fail "claims: the key was not free at the first request after its deadline: $out"
   [[ "$out" == "CLAIMED op=acquire holder=$r "* ]] || fail "claims: expected R to hold the key, saw: $out"
@@ -640,7 +639,7 @@ no_poll() {
     tracer b "$d" "d$i"; pid=$tracer_pid
     wait_for 10 "leave: D$i registered" registered "$d"
     kill -9 "$pid"; wait "$pid" 2>/dev/null || true
-    idle $((NP_GRACE_MS + 700)) "leave: D$i past its grace"
+    quiet $((NP_GRACE_MS + 700)) "leave: D$i past its grace"
     unregistered "$d" && fail "leave: D$i unregistered with no read"
     case "$reader" in
       broadcast) send a '*' np-b2 "after a grace"
@@ -669,7 +668,7 @@ no_poll() {
   wait_for 10 "leave: E registered" registered "$e"
   daemon_stop c
   wait "$pid" 2>/dev/null || true
-  idle $((NP_GRACE_MS + 700)) "leave: E past its grace"
+  quiet $((NP_GRACE_MS + 700)) "leave: E past its grace"
   "$bin" board --socket "$work/a.sock" >"$work/board.out" || fail "leave: board read failed"
   unregistered "$e" || fail "leave: E not unregistered after its host daemon's link dropped"
 
@@ -713,8 +712,161 @@ no_poll() {
   echo "PASS no-poll: with no sweep in the core, directed mail, a broadcast, mail pending at Register and at a host daemon's hello, and mail held in a host daemon's inbox while the coordinator was down were each delivered and acked once; receipts reached the coordinator on the ack and on replay; a claim expired at the first request past its deadline; sessions were unregistered on stdin EOF and, after their grace, by the first Broadcast, claim, relabel and Board read (after a closed connection and a dropped host link); and no log grew while nobody asked"
 }
 
+# Proof K7. Kind and headers arrive verbatim. Loopback: a throwaway coordinator and
+# two host daemons (acceptance-lib), a Tracer, and a real `roger send`. Kinds and headers
+# (non-ASCII text, an empty value, quotes, backslashes, newlines, key order, and the largest
+# set the bounds allow) must reach the Store and the receipt byte-identical across a SIGKILL
+# of the recipient between its Store write and its Ack and a restart of the coordinator and
+# the host daemon; a refused set commits nothing; logs and a Store written before kind and
+# headers existed replay. The expected JSON is built with jq, not by the core.
+json_obj() { # json_obj key=value...: the headers as one JSON object, keys in the order given
+  local out="" k v
+  for kv in "$@"; do
+    k="$(jq -n --arg v "${kv%%=*}" '$v')"; v="$(jq -n --arg v "${kv#*=}" '$v')"
+    out+="${out:+,}$k:$v"
+  done
+  printf '{%s}' "$out"
+}
+
+headers() {
+  command -v jq >/dev/null || fail "jq required to build the expected headers"
+  loopback_stack
+  local daemon_b_pid="${pids[1]}" out held="$work/held.marker"
+
+  tracer1() { # the recipient, parked between its Store write and its Ack
+    "$bin" session --socket "$work/b.sock" --id "$RECIPIENT" --store "$work/tracer.store" \
+      --hold-before-ack "$held" >>"$work/tracer.out" 2>&1 &
+    pids+=("$!"); tracer_pid=$!
+  }
+  tracer_pid=""
+  tracer1
+  wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+
+  # Directed mail with headers that stress the encoding, in an order that is not sorted.
+  local hdrs=("z-last=4417" $'note=héllo wörld ✓ 日本語' "empty=" 'q=say "hi" \back\\slash'
+              $'nl=line1\nline2\ttab\rend' "a-first=[[153:Meteor Shower:7]]")
+  local want; want="$(json_obj "${hdrs[@]}")"
+  local args=() h
+  for h in "${hdrs[@]}"; do args+=(--header "$h"); done
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" --mail k7-1 --body "directed" \
+    "${args[@]}" | grep -q "ACCEPTED mail=k7-1" || fail "directed send with headers not accepted"
+  wait_for 15 "recipient stored and holding before ack" test -f "$held"
+  grep -qx "STORED mail=k7-1 record=r-1 kind=directed" "$work/tracer.out" || fail "STORED line lacks kind=directed: $(cat "$work/tracer.out")"
+  [[ "$(grep '^HEADERS mail=k7-1 ' "$work/tracer.out")" == "HEADERS mail=k7-1 $want" ]] \
+    || fail "recipient HEADERS differ from the sent set: $(grep '^HEADERS' "$work/tracer.out")"
+  kill -9 "$tracer_pid"; wait "$tracer_pid" 2>/dev/null || true
+  log_count '"ev":"receipt"' 0 "$work/coord.log" || fail "receipt exists before the recipient acked"
+
+  # Restart the coordinator and the recipient's host daemon, then the recipient.
+  kill "$coord_pid" "$daemon_b_pid"; wait "$coord_pid" "$daemon_b_pid" 2>/dev/null || true
+  "$bin" coordinator --bind "$coord" --data "$work/coord.log" >"$work/coord2.out" 2>&1 &
+  coord_pid=$!
+  "$bin" daemon --coordinator "$coord" --host-id host-b --socket "$work/b.sock" --data "$work/b.log" \
+    >"$work/daemon-b2.out" 2>&1 &
+  pids+=("$!")
+  wait_for 15 "daemon b socket" test -S "$work/b.sock"
+  tracer1
+  wait_for 15 "DELIVERED after restart" grep -q "DELIVERED mail=k7-1 record=r-1" "$work/tracer.out"
+  [[ "$(wc -l <"$work/tracer.store")" == 1 ]] || fail "Store must hold the Mail once"
+  grep -qF "\"kind\":\"directed\",\"headers\":$want}" "$work/tracer.store" || fail "Store entry lacks kind and the exact headers: $(cat "$work/tracer.store")"
+  grep -qF "\"headers\":$want" "$work/coord.log" || fail "coordinator log lacks the exact headers"
+  grep -qF "\"headers\":$want" "$work/b.log" || fail "host daemon log lacks the exact headers"
+  local rc re
+  wait_for 15 "receipt after the restarts" "$bin" receipt --socket "$work/a.sock" --mail k7-1
+  rc="$("$bin" receipt --socket "$work/a.sock" --mail k7-1)"
+  re="^RECEIPT mail=k7-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+ kind=directed\$"
+  [[ "$(head -n1 <<<"$rc")" =~ $re ]] || fail "RECEIPT line: $rc"
+  [[ "$(sed -n 2p <<<"$rc")" == "HEADERS mail=k7-1 $want" ]] || fail "receipt HEADERS differ: $rc"
+
+  # A Broadcast with the largest set the bounds allow: every copy carries kind and the set.
+  local pad i k max=() margs=()
+  pad="$(printf 'é%.0s' $(seq 2047))"
+  for i in $(seq 32 -1 1); do max+=("$(printf '%0128d' "$i")=$(printf '%02d' "$i")$pad"); done
+  for h in "${max[@]}"; do margs+=(--header "$h"); done
+  local wantmax; wantmax="$(json_obj "${max[@]}")"
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail k7-b --body "all" \
+    "${margs[@]}" | grep -q "ACCEPTED mail=k7-b" || fail "largest set refused"
+  wait_for 15 "broadcast copy acked" grep -q "DELIVERED mail=k7-b/$RECIPIENT" "$work/tracer.out"
+  grep -qx "STORED mail=k7-b/$RECIPIENT record=r-2 kind=broadcast" "$work/tracer.out" || fail "copy STORED line lacks kind=broadcast"
+  [[ "$(grep "^HEADERS mail=k7-b/" "$work/tracer.out")" == "HEADERS mail=k7-b/$RECIPIENT $wantmax" ]] \
+    || fail "the largest set changed on the way"
+  # Compared in the shell: the set is too large for one grep argument.
+  [[ "$(tail -n1 "$work/tracer.store")" == *"\"kind\":\"broadcast\",\"headers\":$wantmax}" ]] || fail "Store entry lacks the largest set"
+  wait_for 15 "receipt for the copy" "$bin" receipt --socket "$work/a.sock" --mail "k7-b/$RECIPIENT"
+  rc="$("$bin" receipt --socket "$work/a.sock" --mail "k7-b/$RECIPIENT")"
+  [[ "$(head -n1 <<<"$rc")" == *" kind=broadcast" ]] || fail "copy RECEIPT line lacks kind=broadcast: $(head -n1 <<<"$rc")"
+  [[ "$(sed -n 2p <<<"$rc")" == "HEADERS mail=k7-b/$RECIPIENT $wantmax" ]] || fail "copy receipt HEADERS differ"
+
+  # Refused sets commit nothing: no Mail, no log line, unknown to the receipt.
+  local mails_before bcast_before n=0 refused reason
+  mails_before="$(grep -c '"ev":"mail"' "$work/coord.log")"; bcast_before="$(grep -c '"ev":"broadcast"' "$work/coord.log")"
+  refuse() { # refuse <to> <expected reason substring> <header args...>
+    local to="$1" want_reason="$2"; shift 2
+    n=$((n + 1))
+    if "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$to" --mail "k7-r$n" --body x "$@" >"$work/refused.out" 2>&1; then
+      fail "refused set accepted: $want_reason"
+    fi
+    grep -qF -- "$want_reason" "$work/refused.out" || fail "refusal lacks '$want_reason': $(cat "$work/refused.out")"
+    if "$bin" receipt --socket "$work/a.sock" --mail "k7-r$n" >/dev/null 2>&1; then fail "refused k7-r$n exists"; fi
+  }
+  local over=(); for i in $(seq 1 33); do over+=(--header "k$i=v"); done
+  local big; big="$(head -c 4097 /dev/zero | tr '\0' x)"
+  for to in "$RECIPIENT" '*'; do
+    refuse "$to" "headers: expected at most 32 headers, saw 33" "${over[@]}"
+    refuse "$to" 'expected a value of at most 4096 bytes, saw 4097' --header "k=$big"
+    refuse "$to" "expected a key of 1 to 128 bytes, saw a key of 129 bytes" --header "$(head -c 129 /dev/zero | tr '\0' k)=v"
+    refuse "$to" "expected a key of 1 to 128 bytes, saw a key of 0 bytes" --header "=v"
+    refuse "$to" 'headers: duplicate key' --header a=1 --header a=2
+  done
+  [[ "$(grep -c '"ev":"mail"' "$work/coord.log")" == "$mails_before" ]] || fail "a refused set committed a Mail"
+  [[ "$(grep -c '"ev":"broadcast"' "$work/coord.log")" == "$bcast_before" ]] || fail "a refused set committed a Broadcast"
+  ! grep -q 'k7-r' "$work/coord.log" "$work/a.log" "$work/b.log" || fail "a refused Mail left a log line"
+
+  # Replay: a coordinator log, a host daemon log and a Store written before kind and headers.
+  local to="$RECIPIENT" old="$work/old"
+  mkdir -p "$old"
+  {
+    printf '%s\n' '{"ev":"session","session":"'"$to"'","host":"host-old"}'
+    printf '%s\n' '{"ev":"mail","mail":"old-c1","from":"'"$SENDER"'","to":"'"$to"'","body":"stored","accepted_at_ms":1}'
+    printf '%s\n' '{"ev":"mail","mail":"old-c2","from":"'"$SENDER"'","to":"'"$to"'","body":"new","accepted_at_ms":2}'
+    printf '%s\n' '{"ev":"broadcast","mail":"old-b","from":"'"$SENDER"'","body":"all","to":["'"$to"'"],"accepted_at_ms":3}'
+  } >"$old/coord.log"
+  printf '%s\n' '{"record":"r-1","mail":"old-c1","from":"'"$SENDER"'","body":"stored"}' >"$old/tracer.store"
+  local dl='{"ev":"deliver","mail":"%s","from":"'"$SENDER"'","to":"'"$to"'","body":"d"%s}\n'
+  {
+    printf "$dl" old-d1 ',"wake":false' # legacy-wire: read shape, a Broadcast copy
+    printf "$dl" old-d2 ',"wake":true'  # legacy-wire: read shape, directed
+    printf "$dl" old-d3 ''
+  } >"$old/daemon.log"
+  "$bin" coordinator --bind 127.0.0.1:0 --port-file "$old/port" --data "$old/coord.log" >"$old/coord.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "old coordinator port" test -s "$old/port"
+  "$bin" daemon --coordinator "127.0.0.1:$(cat "$old/port")" --host-id host-old --socket "$old/d.sock" \
+    --data "$old/daemon.log" >"$old/daemon.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "old daemon socket" test -S "$old/d.sock"
+  "$bin" session --socket "$old/d.sock" --id "$to" --store "$old/tracer.store" >"$old/tracer.out" 2>&1 &
+  pids+=("$!")
+  wait_for 15 "old Mail delivered" grep -q "DELIVERED mail=old-c2" "$old/tracer.out"
+  wait_for 15 "old Broadcast copy delivered" grep -q "DELIVERED mail=old-b/$to" "$old/tracer.out"
+  wait_for 15 "old daemon inbox delivered" grep -q "DELIVERED mail=old-d3" "$old/tracer.out"
+  grep -q "^STORED mail=old-c2 record=r-[0-9]* kind=directed$" "$old/tracer.out" || fail "old mail event is not directed"
+  grep -q "^STORED mail=old-b/$to record=r-[0-9]* kind=broadcast$" "$old/tracer.out" || fail "old broadcast event is not kind broadcast"
+  grep -q "^STORED mail=old-d1 record=r-[0-9]* kind=broadcast$" "$old/tracer.out" || fail "old daemon event with the older flag false is not kind broadcast"
+  grep -q "^STORED mail=old-d2 record=r-[0-9]* kind=directed$" "$old/tracer.out" || fail "old daemon event with the older flag true is not directed"
+  grep -q "^STORED mail=old-d3 record=r-[0-9]* kind=directed$" "$old/tracer.out" || fail "old daemon event with no flag is not directed"
+  grep -q "^DELIVERED mail=old-c1 record=r-1$" "$old/tracer.out" || fail "stored old Mail did not reuse its record"
+  ! grep -q "STORED mail=old-c1" "$old/tracer.out" || fail "stored old Mail was written again"
+  [[ "$(grep -c '"mail":"old-c1"' "$old/tracer.store")" == 1 ]] || fail "old Store holds old-c1 other than once"
+  ! grep -q HEADERS "$old/tracer.out" || fail "a Mail with no headers printed a HEADERS line"
+  rc="$("$bin" receipt --socket "$old/d.sock" --mail old-c2)"
+  [[ "$rc" == RECEIPT*" kind=directed" ]] || fail "old coordinator mail receipt: $rc"
+
+  echo "PASS headers: kinds and headers (non-ASCII, empty, quotes, backslashes, newlines, order, the largest set) arrived byte-identical in the Store and the receipt across a recipient SIGKILL between Store and Ack and a restart of the coordinator and host daemon; every refused set committed nothing; old coordinator and host daemon logs and an old Store replayed with the right kinds"
+}
+
 usage() {
-  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast>"
+  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers>"
   echo "cross-host, claims, broadcast require ROGER_REMOTE_HOST (SSH destination) and"
   echo "ROGER_ACCEPT_BIND (local IPv4 reachable from that host). Other suites use loopback."
 }
@@ -727,5 +879,6 @@ case "$1" in
   claims) claims ;;
   references) references ;;
   broadcast) broadcast ;;
+  headers) headers ;;
   *) usage >&2; exit 2 ;;
 esac
