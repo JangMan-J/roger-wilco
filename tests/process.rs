@@ -1560,6 +1560,9 @@ fn presence_is_the_open_session_connection_then_own_activity() {
     let mut rig = Rig::new("presence");
     rig.start_stack();
     let recipient = rig.start_recipient("recipient.out", false);
+    // READY means the Register left for the host daemon, not that the
+    // coordinator holds it: read the Board only once its row is there.
+    wait_board_lists(&rig, "a.sock", RECIPIENT, true);
 
     // Connected and quiet: last seen is the moment of each read.
     let (connected, first) = presence(&rig, "a.sock", None);
@@ -2350,6 +2353,9 @@ fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
     rig.start_stack();
     rig.register("a.sock", SENDER);
     let recipient = rig.start_recipient("recipient1.out", false);
+    // A Claim needs a registered owner at the coordinator, and READY only
+    // says the Register left for the host daemon.
+    wait_board_lists(&rig, "a.sock", RECIPIENT, true);
     assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000).0, 0);
     rig.send("m-before", "before the rename");
     wait_for_text(
