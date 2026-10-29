@@ -57,6 +57,9 @@ struct Rig {
     children: Vec<Child>,
     coord_port: String,
     coord_idx: usize,
+    /// The test has killed or frozen the coordinator: a session started now is
+    /// told READY and cannot yet be told REGISTERED.
+    coord_unreachable: bool,
     /// Extra coordinator flags, applied to the first start and every restart.
     coord_extra: Vec<String>,
 }
@@ -80,6 +83,7 @@ impl Rig {
             children: Vec::new(),
             coord_port: String::new(),
             coord_idx: 0,
+            coord_unreachable: false,
             coord_extra: Vec::new(),
         }
     }
@@ -189,6 +193,15 @@ impl Rig {
         wait_until_board_reaches_both(self);
     }
 
+    /// READY says the Register left for the host daemon; REGISTERED says the
+    /// coordinator holds it. A test that goes on to claim, relabel or read
+    /// the Board waits for the second, unless the coordinator is out of reach.
+    fn await_registered(&self, out: &str) {
+        if !self.coord_unreachable {
+            wait_for_text(&self.p(out), "REGISTERED", Duration::from_secs(10));
+        }
+    }
+
     fn start_recipient(&mut self, out: &str, hold: bool) -> usize {
         self.start_recipient_with(out, hold, None)
     }
@@ -216,6 +229,7 @@ impl Rig {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let idx = self.spawn(&arg_refs, out);
         wait_for_text(&self.p(out), "READY", Duration::from_secs(10));
+        self.await_registered(out);
         idx
     }
 
@@ -238,6 +252,7 @@ impl Rig {
             &out,
         );
         wait_for_text(&self.p(&out), "READY", Duration::from_secs(10));
+        self.await_registered(&out);
         idx
     }
 
@@ -268,6 +283,9 @@ impl Rig {
     }
 
     fn kill(&mut self, idx: usize) {
+        if idx == self.coord_idx {
+            self.coord_unreachable = true;
+        }
         self.children[idx].kill().unwrap(); // SIGKILL on Unix
         self.children[idx].wait().unwrap();
     }
@@ -300,6 +318,7 @@ impl Rig {
             while Instant::now() < deadline {
                 if port_file.exists() {
                     self.coord_idx = idx;
+                    self.coord_unreachable = false;
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -1300,6 +1319,7 @@ fn start_session(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str) ->
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let idx = rig.spawn(&refs, out);
     wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
+    rig.await_registered(out);
     idx
 }
 
@@ -2313,6 +2333,7 @@ fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resum
             .success());
     };
     signal("-STOP");
+    rig.coord_unreachable = true;
     rig.kill(recipient);
     rig.start_recipient("recipient2.out", true);
     // The daemon's 10 s wait ran out with the link still up.
