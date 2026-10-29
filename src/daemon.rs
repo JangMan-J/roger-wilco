@@ -332,7 +332,6 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
                 ("body", s(&m.body)),
                 ("kind", s(&m.kind)),
                 ("headers", m.headers.clone()),
-                net::legacy_field(&m.kind), // legacy-wire: emit so a rollback replays its inbox
             ]);
             st.log.append(&json::stringify(&ev))?;
             st.order.push(mail_id.clone());
