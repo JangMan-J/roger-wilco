@@ -9,7 +9,7 @@
 # Exempt:
 #   frontmatter         a leading YAML block in a markdown file
 #   legacy/             a client awaiting removal; it may have its own vocabulary
-#   .slice/, .accept/, accept, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
+#   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence
 #   AGENTS.md           the director's file; it quotes dated directives verbatim
@@ -41,7 +41,7 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(legacy|VECTORS|\.slice|\.accept)/|^accept$|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+  grep -vE '^(legacy|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
