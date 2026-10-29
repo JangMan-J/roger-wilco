@@ -46,11 +46,12 @@ These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md wi
 5. **No workflow.** The core stores and routes; it never decides what work exists or
    who takes it.
 6. **No vocabulary of what a session does with its Mail.** No turn, wake, idle, or busy
-   state, request, field, flag, flag name, or doc exists in the core; a delivery carries
+   state, request, field, flag, or doc exists in the core; a delivery carries
    its `kind` (`directed` or `broadcast`) and the sender's opaque `headers`, and what a
    consumer does on arrival is the consumer's. A shim may have such words; the core may
-   not. `scripts/check-vocabulary` is the check; the one line allowed to say it carries
-   `legacy-wire:` and a reason, and a release that drops its reader drops the line.
+   not. `scripts/check-vocabulary` is the check. A line that must name the old wire field for
+   one transition release carries `legacy-wire:` and a reason; the release that drops the
+   field drops the line.
 7. **Opaque headers stay opaque.** Nothing in `src/` compares, branches on, ranks, or
    names a header key or value; they pass through byte-identical, bounded, with a refusal
    that names what was expected and what was seen.
