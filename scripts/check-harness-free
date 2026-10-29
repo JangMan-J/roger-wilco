@@ -24,8 +24,10 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Whole-word matches only: "pipe" and "copy" must not trip on "pi".
-HARNESSES='pi|claude|claude-code|codex|gemini|cursor|aider|copilot|herdr|zellij|opencode|goose|cline|roo|amp|letta|windsurf'
+# Whole-word matches only: "pipe" and "copy" must not trip on "pi". `cursor` is not
+# listed: Cursor is a term of the core (a session's read position, GLOSSARY), and a word
+# match cannot tell it from the editor of that name.
+HARNESSES='pi|claude|claude-code|codex|gemini|aider|copilot|herdr|zellij|opencode|goose|cline|roo|amp|letta|windsurf'
 MODELS='anthropic|openai|fireworks|opus|sonnet|haiku|gpt|deepseek|llama|qwen|mistral|grok|kimi|glm'
 
 # A checkout lists its files through git; a plain export (no .git) lists the tree minus target/.
