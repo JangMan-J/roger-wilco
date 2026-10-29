@@ -4,6 +4,7 @@ mod daemon;
 mod durlog;
 mod headers;
 mod json;
+mod mcp;
 mod net;
 mod session;
 
@@ -51,6 +52,8 @@ Commands:
   daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+  mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
+              [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
               [--header <key=value>]...
   claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
@@ -119,6 +122,7 @@ fn main() -> io::Result<()> {
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--declare"),
         ),
+        "mcp" => mcp::run(&args),
         "send" => session::send(
             PathBuf::from(need(&args, "--socket")?),
             need(&args, "--from")?,

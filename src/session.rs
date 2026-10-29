@@ -10,12 +10,32 @@ use std::collections::HashMap;
 use std::io::{self, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Test hook (feature `test-hooks` only): when set, the first delivery is
 /// written to the Store, the marker file is created, and the session parks
 /// before its ack until killed. On restart the marker exists and it acks.
 #[cfg(feature = "test-hooks")]
 pub static HOLD_BEFORE_ACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// What the MCP face hooks into the session loop; the loop itself is shared.
+pub struct McpHooks {
+    /// Called once after Register is sent, with the writer to the host daemon.
+    pub registered: Option<Box<dyn FnOnce(net::Writer) + Send>>,
+    /// Called after each delivery has reached the Store, never before.
+    pub stored: Box<dyn Fn() + Send>,
+    /// Held across a Store write; true once the face is closing, after which
+    /// a delivery is left unstored and unacked so it stays pending.
+    pub gate: Arc<Mutex<bool>>,
+}
+
+/// How a client reaches this session: the Tracer's own stdout, the adapter's
+/// shim stream, or the MCP server's hooks.
+pub enum Face {
+    Tracer,
+    Adapter(net::Writer),
+    Mcp(McpHooks),
+}
 
 /// The Tracer: a session with no harness, reporting on its own stdout.
 pub fn run(
@@ -25,7 +45,7 @@ pub fn run(
     store_path: PathBuf,
     declared: Option<String>,
 ) -> io::Result<()> {
-    serve(socket, id, label, store_path, declared, None)
+    serve(socket, id, label, store_path, declared, Face::Tracer)
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
@@ -48,7 +68,7 @@ pub fn adapter(
     declared: Option<String>,
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
-    serve(socket, id, label, store_path, declared, Some(out))
+    serve(socket, id, label, store_path, declared, Face::Adapter(out))
 }
 
 /// The adapter's shim side, started once the session has registered.
@@ -148,14 +168,23 @@ fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
     Ok(obj(vec![("type", s("accepted")), ("mail", s(&mail))]))
 }
 
-fn serve(
+/// The session loop all three faces share: register, write each delivery to
+/// the Store, then ack naming its Record id. Returns when the host daemon
+/// connection ends.
+pub fn serve(
     socket: PathBuf,
     id: String,
     label: Option<String>,
     store_path: PathBuf,
     declared: Option<String>,
-    shim: Option<net::Writer>,
+    face: Face,
 ) -> io::Result<()> {
+    let (shim, mut mcp) = match face {
+        Face::Tracer => (None, None),
+        Face::Adapter(w) => (Some(w), None),
+        Face::Mcp(h) => (None, Some(h)),
+    };
+    let tracer = shim.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
     let mut records: HashMap<String, String> = HashMap::new(); // mail -> record
     for line in &prior {
@@ -167,7 +196,12 @@ fn serve(
     }
     let mut next_record = records.len() as u64 + 1;
 
-    let conn = UnixStream::connect(&socket)?;
+    let conn = UnixStream::connect(&socket).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("expected a host daemon at {}, saw {e}", socket.display()),
+        )
+    })?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     let lines = net::lines(Box::new(conn));
     let mut register = vec![("type", s("register")), ("session", s(&id))];
@@ -183,10 +217,14 @@ fn serve(
             net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?;
             shim_io(socket, id.clone(), w.clone(), writer.clone());
         }
-        None => {
+        None if tracer => {
             println!("READY session={id}");
             io::stdout().flush()?;
         }
+        None => {}
+    }
+    if let Some(registered) = mcp.as_mut().and_then(|h| h.registered.take()) {
+        registered(writer.clone());
     }
 
     let mut req = 0i64;
@@ -198,6 +236,16 @@ fn serve(
                 let record = match records.get(&mail) {
                     Some(existing) => existing.clone(),
                     None => {
+                        let held = match &mcp {
+                            Some(h) => {
+                                let closing = h.gate.lock().unwrap();
+                                if *closing {
+                                    continue;
+                                }
+                                Some(closing)
+                            }
+                            None => None,
+                        };
                         let record = format!("r-{next_record}");
                         next_record += 1;
                         let entry = obj(vec![
@@ -210,7 +258,11 @@ fn serve(
                         ]);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
-                        if shim.is_none() {
+                        drop(held);
+                        if let Some(h) = &mcp {
+                            (h.stored)();
+                        }
+                        if tracer {
                             println!(
                                 "STORED mail={mail} record={record} kind={}",
                                 net::kind_of(&v)
@@ -257,7 +309,7 @@ fn serve(
                     ]),
                 )?;
             }
-            "acked" if shim.is_none() => {
+            "acked" if tracer => {
                 println!(
                     "DELIVERED mail={} record={}",
                     net::field(&v, "mail")?,
@@ -300,7 +352,7 @@ pub fn relabel(socket: PathBuf, session: String, label: String) -> io::Result<()
     Ok(())
 }
 
-fn send_mail(
+pub fn send_mail(
     socket: &PathBuf,
     from: &str,
     to: &str,
@@ -351,7 +403,7 @@ fn print_headers(mail: &str, headers: &Value) {
 }
 
 /// One request to the host daemon, answered by exactly one line.
-fn request(socket: &PathBuf, v: &Value) -> io::Result<Value> {
+pub fn request(socket: &PathBuf, v: &Value) -> io::Result<Value> {
     let conn = UnixStream::connect(socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     net::send(&writer, v)?;

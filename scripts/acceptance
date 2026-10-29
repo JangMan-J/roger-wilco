@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by the project's proofs (README.md, Checks).
-# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers>
+# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp>
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/acceptance-lib"
@@ -865,8 +865,178 @@ headers() {
   echo "PASS headers: kinds and headers (non-ASCII, empty, quotes, backslashes, newlines, order, the largest set) arrived byte-identical in the Store and the receipt across a recipient SIGKILL between Store and Ack and a restart of the coordinator and host daemon; every refused set committed nothing; old coordinator and host daemon logs and an old Store replayed with the right kinds"
 }
 
+# Proof K8 (loopback, no model): `roger mcp` is a session. A small MCP client in bash + jq
+# drives it over stdio. Each client keeps its request counter in a file, since every call runs
+# in a subshell; each server's stdin is a fifo held open by a numbered descriptor.
+mcp() {
+  loopback_stack
+  local A1="11111111-1111-4111-8111-111111111111"
+  local COMPOSITE="[[1a:FLEET:zz]]$RECIPIENT"
+  local sock="$work/a.sock" r
+
+  declare -A MFD MPID
+  mcp_start() { # mcp_start <name> <roger mcp args...>   (env passes through)
+    local n="$1" fd; shift
+    if [[ -n "${MFD[$n]:-}" ]]; then eval "exec ${MFD[$n]}>&-"; MFD[$n]=""; fi
+    rm -f "$work/$n.in" "$work/$n.id"; mkfifo "$work/$n.in"
+    "$bin" mcp --socket "$sock" "$@" <"$work/$n.in" >"$work/$n.out" 2>"$work/$n.err" &
+    MPID[$n]=$!; pids+=("${MPID[$n]}")
+    exec {fd}>"$work/$n.in"; MFD[$n]=$fd
+  }
+  mcp_close() { eval "exec ${MFD[$1]}>&-"; MFD[$1]=""; }
+  mcp_send() { printf '%s\n' "$2" >&"${MFD[$1]}"; }
+  mcp_wait_id() { # mcp_wait_id <name> <id> [seconds]: print the response line with that id
+    local n="$1" id="$2" d=$(( $(date +%s) + ${3:-20} )) l
+    while (( $(date +%s) < d )); do
+      l="$(jq -c --argjson id "$id" 'select(.id == $id)' "$work/$n.out" 2>/dev/null | head -n1 || true)"
+      [[ -n "$l" ]] && { printf '%s' "$l"; return 0; }
+      sleep 0.05
+    done
+    echo "no response id $id from $n: $(tail -3 "$work/$n.out") / $(tail -3 "$work/$n.err")" >&2; return 1
+  }
+  mcp_rpc() { # mcp_rpc <name> <method> <params-json> [seconds] -> the response line
+    local n="$1" id
+    id=$(( $(cat "$work/$n.id" 2>/dev/null || echo 0) + 1 )); echo "$id" >"$work/$n.id"
+    mcp_send "$n" "$(jq -cn --argjson id "$id" --arg m "$2" --argjson p "${3:-{\}}" '{jsonrpc:"2.0",id:$id,method:$m,params:$p}')"
+    mcp_wait_id "$n" "$id" "${4:-20}"
+  }
+  mcp_init() {
+    local resp; resp="$(mcp_rpc "$1" initialize '{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}')" || return 1
+    mcp_send "$1" '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s' "$resp"
+  }
+  mcp_call() { # mcp_call <name> <tool> <args-json> [seconds] -> the whole response line
+    mcp_rpc "$1" tools/call "$(jq -cn --arg t "$2" --argjson a "${3:-{\}}" '{name:$t,arguments:$a}')" "${4:-20}"
+  }
+  mcp_tool() { # the result text; fails on isError
+    local resp; resp="$(mcp_call "$@")" || return 1
+    if [[ "$(jq -r '.result.isError // false' <<<"$resp")" == true ]]; then jq -r '.result.content[0].text' <<<"$resp" >&2; return 9; fi
+    jq -r '.result.content[0].text' <<<"$resp"
+  }
+  mcp_tool_err() { # expects isError; prints its text
+    local resp; resp="$(mcp_call "$@")" || return 1
+    [[ "$(jq -r '.result.isError // false' <<<"$resp")" == true ]] || { echo "not an error: $resp" >&2; return 1; }
+    jq -r '.result.content[0].text' <<<"$resp"
+  }
+
+  # ---- handshake, tool list, unknown method ----
+  mcp_start a --id "$A1" --store "$work/a.store"
+  r="$(mcp_init a)"
+  [[ "$(jq -r .result.protocolVersion <<<"$r")" == 2025-06-18 ]] || fail "protocolVersion: $r"
+  jq -e '.result.capabilities.tools != null and .result.serverInfo.name == "roger"' <<<"$r" >/dev/null || fail "initialize result: $r"
+  local tools; tools="$(mcp_rpc a tools/list '{}' | jq -r '[.result.tools[].name] | sort | join(" ")')"
+  [[ "$tools" == "roger_board roger_claim roger_inbox roger_label roger_receipt roger_release roger_renew roger_send" ]] || fail "tools: $tools"
+  mcp_rpc a ping '{}' | jq -e '.result == {}' >/dev/null || fail "ping"
+  mcp_rpc a no/such/method '{}' | jq -e '.error.code == -32601' >/dev/null || fail "an unknown method must be -32601"
+  mcp_rpc a initialize '{"protocolVersion":"2024-11-05"}' | jq -e '.result.protocolVersion == "2024-11-05"' >/dev/null || fail "an older protocol version must be answered with itself"
+  printf '%s\n' 'not json' >&"${MFD[a]}"
+  wait_for 10 "a parse error answer" bash -c "jq -e 'select(.id == null and .error.code == -32700)' '$work/a.out'"
+
+  # ---- an Address from a named variable is used verbatim (a whole composite), by --id-env ----
+  MY_CONVERSATION="$COMPOSITE" mcp_start b --id-env MY_CONVERSATION --store "$work/b.store"
+  mcp_init b >/dev/null
+  local bd; bd="$(mcp_tool a roger_board '{}')"
+  jq -e --arg me "$A1" --arg c "$COMPOSITE" '.me == $me and ([.sessions[].session] | index($me) != null) and ([.sessions[].session] | index($c) != null)' <<<"$bd" >/dev/null || fail "board: $bd"
+  [[ "$(mcp_tool b roger_board '{}' | jq -r .me)" == "$COMPOSITE" ]] || fail "the composite Address was not registered verbatim"
+
+  # ---- mail with headers; the inbox, its Cursor, and the Store holding each body once ----
+  local s; s="$(mcp_tool a roger_send "$(jq -cn --arg to "$COMPOSITE" '{to:$to, mail:"m1", body:"hello ✓", headers:{"x-ticket":"4417","note":"a \"b\"\n"}}')")"
+  [[ "$(jq -r .mail <<<"$s")" == m1 ]] || fail "send result: $s"
+  local in1; in1="$(mcp_tool b roger_inbox '{"wait_seconds":10}')"
+  jq -e --arg a "$A1" '(.mail | length) == 1 and .mail[0].mail == "m1" and .mail[0].from == $a and .mail[0].body == "hello ✓" and .mail[0].kind == "directed" and .mail[0].headers == {"x-ticket":"4417","note":"a \"b\"\n"} and .cursor == .mail[0].record' <<<"$in1" >/dev/null || fail "inbox: $in1"
+  mcp_tool b roger_inbox '{"wait_seconds":0}' | jq -e '.mail == [] and .cursor == null' >/dev/null || fail "a second read must be empty"
+  log_count '"mail":"m1"' 1 "$work/b.store" || fail "the Store must hold m1 once"
+  [[ -s "$work/b.store.cursor" ]] || fail "no Cursor file next to the Store"
+  rc="$(mcp_tool a roger_receipt '{"mail":"m1"}')"
+  jq -e --arg c "$COMPOSITE" '.to == $c and .record == "r-1" and .kind == "directed" and .headers["x-ticket"] == "4417" and (.accepted_at_ms | type) == "number"' <<<"$rc" >/dev/null || fail "receipt: $rc"
+  mcp_tool_err a roger_receipt '{"mail":"nope"}' | grep -qi "nope" || fail "an unknown mail's receipt must be an error naming it"
+  mcp_tool_err a roger_send "$(jq -cn --arg to "$COMPOSITE" '{to:$to, body:"x", headers:{"a":1}}')" | grep -qi "header" || fail "a refused header set must say why"
+  mcp_tool_err a roger_send '{"to":5,"body":"x"}' | grep -q "expected.*saw" || fail "a wrong-typed argument must say what was expected and seen"
+  mcp_tool_err a roger_nothing '{}' | grep -q "roger_nothing" || fail "an unknown tool must be named in its error"
+
+  # ---- limit and peek ----
+  local i
+  for i in 1 2 3; do mcp_tool a roger_send "$(jq -cn --arg to "$COMPOSITE" --arg m "p$i" '{to:$to,mail:$m,body:$m}')" >/dev/null; done
+  wait_for 15 "p3 in the Store" grep -q '"mail":"p3"' "$work/b.store"
+  mcp_tool b roger_inbox '{"peek":true,"limit":2}' | jq -e '[.mail[].mail] == ["p1","p2"]' >/dev/null || fail "peek limit 2"
+  mcp_tool b roger_inbox '{"peek":true,"limit":2}' | jq -e '[.mail[].mail] == ["p1","p2"]' >/dev/null || fail "peek must not move the Cursor"
+  mcp_tool b roger_inbox '{"limit":2}' | jq -e '[.mail[].mail] == ["p1","p2"]' >/dev/null || fail "read limit 2"
+  mcp_tool b roger_inbox '{"wait_seconds":0}' | jq -e '[.mail[].mail] == ["p3"]' >/dev/null || fail "the rest after the limit"
+
+  # ---- a waiting inbox does not block another call; the next delivery ends the wait ----
+  local id; id=$(( $(cat "$work/b.id") + 1 )); echo "$id" >"$work/b.id"
+  mcp_send b "$(jq -cn --argjson id "$id" '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:"roger_inbox",arguments:{wait_seconds:30}}}')"
+  mcp_rpc b ping '{}' | jq -e '.result == {}' >/dev/null || fail "a waiting inbox blocked a ping"
+  mcp_tool b roger_board '{}' >/dev/null || fail "a waiting inbox blocked the board"
+  mcp_tool a roger_send "$(jq -cn --arg to "$COMPOSITE" '{to:$to,mail:"w1",body:"late"}')" >/dev/null
+  r="$(mcp_wait_id b "$id" 10)" || fail "the delivery did not end the wait"
+  jq -r '.result.content[0].text' <<<"$r" | jq -e '[.mail[].mail] == ["w1"]' >/dev/null || fail "waiting read: $r"
+
+  # ---- a Broadcast carries kind broadcast ----
+  mcp_tool a roger_send '{"to":"*","body":"all","mail":"bc1"}' >/dev/null
+  mcp_tool b roger_inbox '{"wait_seconds":10}' | jq -e '.mail[0].kind == "broadcast"' >/dev/null || fail "broadcast kind"
+
+  # ---- claims: refusal is a result, not an error ----
+  r="$(mcp_tool a roger_claim '{"key":"job-1","ttl_seconds":60}')"; jq -e '.ok == true and .op == "acquire"' <<<"$r" >/dev/null || fail "claim: $r"
+  r="$(mcp_tool b roger_claim '{"key":"job-1","ttl_seconds":60}')"; jq -e --arg a "$A1" '.ok == false and .holder == $a' <<<"$r" >/dev/null || fail "a second owner must be refused with the holder: $r"
+  r="$(mcp_tool a roger_renew '{"key":"job-1","ttl_seconds":120}')"; jq -e '.ok == true and .remaining_ms > 60000' <<<"$r" >/dev/null || fail "renew: $r"
+  r="$(mcp_tool a roger_release '{"key":"job-1"}')"; jq -e '.ok == true' <<<"$r" >/dev/null || fail "release: $r"
+  r="$(mcp_tool b roger_claim '{"key":"job-1"}')"; jq -e '.ok == true' <<<"$r" >/dev/null || fail "claim after release: $r"
+  mcp_tool a roger_label '{"label":"builder"}' | jq -e '.label == "builder" and .session == "'"$A1"'"' >/dev/null || fail "label"
+  mcp_tool a roger_board '{}' | jq -e '[.sessions[] | select(.label == "builder")] | length == 1' >/dev/null || fail "the label is not on the Board"
+
+  # ---- the Cursor survives a restart; SIGKILL between the Store write and the Ack loses nothing ----
+  mcp_tool b roger_inbox '{"wait_seconds":0}' >/dev/null
+  mcp_close b; wait "${MPID[b]}" || fail "roger mcp must exit 0 when its stdin closes"
+  rm -f "$work/held"
+  MY_CONVERSATION="$COMPOSITE" mcp_start b --id-env MY_CONVERSATION --store "$work/b.store" --hold-before-ack "$work/held"
+  mcp_init b >/dev/null
+  mcp_tool a roger_send '{"to":"'"$COMPOSITE"'","mail":"k1","body":"survive","headers":{"h":"v"}}' >/dev/null
+  wait_for 15 "held marker" test -f "$work/held"
+  grep -q '"mail":"k1"' "$work/b.store" || fail "k1 is not in the Store before the kill window"
+  kill -9 "${MPID[b]}"; wait "${MPID[b]}" 2>/dev/null || true
+  if "$bin" receipt --socket "$sock" --mail k1 | grep -q '^RECEIPT'; then fail "a receipt before the Ack"; fi
+  MY_CONVERSATION="$COMPOSITE" mcp_start b --id-env MY_CONVERSATION --store "$work/b.store"
+  mcp_init b >/dev/null
+  wait_for 15 "receipt after restart" bash -c "'$bin' receipt --socket '$sock' --mail k1 | grep -q '^RECEIPT'"
+  "$bin" receipt --socket "$sock" --mail k1 | grep -q 'record=r-' || fail "the receipt does not name the record"
+  local want; want="$(jq -r 'select(.mail == "k1") | .record' "$work/b.store")"
+  mcp_tool a roger_receipt '{"mail":"k1"}' | jq -e --arg r "$want" '.record == $r' >/dev/null || fail "the receipt must name the Store's record $want"
+  log_count '"mail":"k1"' 1 "$work/b.store" || fail "k1 stored more than once"
+  r="$(mcp_tool b roger_inbox '{"wait_seconds":5}')"
+  jq -e '[.mail[].mail] == ["k1"]' <<<"$r" >/dev/null || fail "after the restart the inbox must hold only k1: $r"
+
+  # ---- closing stdin unregisters ----
+  mcp_close b; wait "${MPID[b]}" || fail "roger mcp must exit 0 when its stdin closes"
+  wait_for 10 "b left the Board" bash -c "! '$bin' board --socket '$sock' | grep -qF 'SESSION address=$COMPOSITE '"
+
+  # ---- the default Store: a health check leaves nothing; an explicit Store is never removed ----
+  local state="$work/state" env_id="health-$$"
+  mkdir -p "$state"
+  XDG_STATE_HOME="$state" mcp_start h --id "$env_id"
+  mcp_init h >/dev/null
+  [[ -f "$state/roger/mcp/$env_id.store" ]] || fail "the default Store is not at XDG_STATE_HOME/roger/mcp/<address>.store"
+  mcp_close h; wait "${MPID[h]}" || fail "health check exit"
+  [[ ! -e "$state/roger/mcp/$env_id.store" && ! -e "$state/roger/mcp/$env_id.store.cursor" ]] || fail "an empty default Store was left behind"
+  [[ -e "$work/a.store" ]] || fail "an explicit Store was removed"
+
+  # ---- a lost daemon connection ends the process nonzero with the reason on stderr ----
+  kill "${pids[0]}"
+  local st=0; wait "${MPID[a]}" || st=$?
+  [[ "$st" != 0 ]] || fail "roger mcp must exit nonzero when the host daemon is lost"
+  grep -q "host daemon" "$work/a.err" || fail "no reason on stderr: $(cat "$work/a.err")"
+  jq -e . "$work/a.out" >/dev/null || fail "stdout must carry only protocol messages"
+
+  # ---- a missing socket is an error naming the path ----
+  "$bin" mcp --socket "$work/none.sock" --store "$work/n.store" </dev/null >"$work/n.out" 2>"$work/n.err" && fail "a missing socket must fail"
+  grep -q "$work/none.sock" "$work/n.err" || fail "the missing-socket error must name the path: $(cat "$work/n.err")"
+  [[ ! -s "$work/n.out" ]] || fail "stdout must carry only protocol messages"
+
+  echo "PASS mcp: handshake, tools, headers, Cursor (limit, peek, restart), claims, receipt, a composite Address verbatim, a waiting inbox that blocks nothing, SIGKILL between Store and Ack losing nothing, default Store cleanup"
+}
+
 usage() {
-  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers>"
+  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp>"
   echo "cross-host, claims, broadcast require ROGER_REMOTE_HOST (SSH destination) and"
   echo "ROGER_ACCEPT_BIND (local IPv4 reachable from that host). Other suites use loopback."
 }
@@ -880,5 +1050,6 @@ case "$1" in
   references) references ;;
   broadcast) broadcast ;;
   headers) headers ;;
+  mcp) mcp ;;
   *) usage >&2; exit 2 ;;
 esac
