@@ -50,6 +50,10 @@ struct State {
     /// Each local session's declared text, repeated on every Register
     /// upstream: a Register without it clears the declaration.
     declared: HashMap<String, String>,
+    /// Local sessions that asked for `registered` (`confirm_register`) and
+    /// those already told on this registration.
+    confirm_asked: HashSet<String>,
+    confirmed: HashSet<String>,
     upstream: Option<Writer>,
     next_req: i64,
     waiters: HashMap<i64, mpsc::Sender<Value>>,
@@ -76,6 +80,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         receipts: Vec::new(),
         sessions: HashMap::new(),
         declared: HashMap::new(),
+        confirm_asked: HashSet::new(),
+        confirmed: HashSet::new(),
         upstream: None,
         next_req: 1,
         waiters: HashMap::new(),
@@ -268,6 +274,26 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         let v = line?;
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
+            // The coordinator holds a Register. Not a reply to any request.
+            "registered" => {
+                let session = net::field(&v, "session")?.to_string();
+                let tell = {
+                    let mut st = state.lock().unwrap();
+                    if st.confirm_asked.contains(&session) && !st.confirmed.contains(&session) {
+                        st.sessions.get(&session).cloned().inspect(|_| {
+                            st.confirmed.insert(session.clone());
+                        })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(w) = tell {
+                    let _ = net::send(
+                        &w,
+                        &obj(vec![("type", s("registered")), ("session", s(&session))]),
+                    );
+                }
+            }
             // Every other line answers one request, by its req.
             kind => {
                 // Upstream has this receipt now, so it leaves the replay list.
@@ -419,6 +445,8 @@ fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
         if st.sessions.get(id).is_some_and(|w| Arc::ptr_eq(w, writer)) {
             st.sessions.remove(id);
             st.declared.remove(id);
+            st.confirm_asked.remove(id);
+            st.confirmed.remove(id);
             st.upstream.clone()
         } else {
             None
@@ -446,6 +474,12 @@ fn local_loop(
                 let (upstream, pending) = {
                     let mut st = state.lock().unwrap();
                     st.sessions.insert(session.clone(), Arc::clone(writer));
+                    st.confirmed.remove(&session);
+                    if matches!(v.get("confirm_register"), Some(Value::Bool(true))) {
+                        st.confirm_asked.insert(session.clone());
+                    } else {
+                        st.confirm_asked.remove(&session);
+                    }
                     match &declared {
                         Some(d) => st.declared.insert(session.clone(), d.clone()),
                         None => st.declared.remove(&session),

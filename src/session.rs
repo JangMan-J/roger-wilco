@@ -20,6 +20,8 @@ pub static HOLD_BEFORE_ACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::
 
 /// What the MCP face hooks into the session loop; the loop itself is shared.
 pub struct McpHooks {
+    /// Called once the coordinator holds the Register (`registered`).
+    pub confirmed: Box<dyn Fn() + Send>,
     /// Called once after Register is sent, with the writer to the host daemon.
     pub registered: Option<Box<dyn FnOnce(net::Writer) + Send>>,
     /// Called after each delivery has reached the Store, never before.
@@ -33,7 +35,8 @@ pub struct McpHooks {
 /// client stream, or the MCP server's hooks.
 pub enum Face {
     Tracer,
-    Adapter(net::Writer),
+    /// The client stream, and whether the client asked for `registered`.
+    Adapter(net::Writer, bool),
     Mcp(McpHooks),
 }
 
@@ -59,6 +62,10 @@ pub fn run(
 /// line follows the Store write and never gates the ack: the client renders
 /// what the adapter already holds and acknowledges nothing.
 /// `declared` is the client's opaque self-description, sent with Register.
+/// `ready` means the Register was written to the host daemon. With
+/// `confirm` (the `--registered` flag) the client is also sent
+/// `{"type":"registered","session"}` once, after `ready`, when the coordinator
+/// holds the Register; without it that line is never sent.
 /// When the client's stdin closes, the session unregisters and the process exits.
 pub fn adapter(
     socket: PathBuf,
@@ -66,9 +73,17 @@ pub fn adapter(
     label: Option<String>,
     store_path: PathBuf,
     declared: Option<String>,
+    confirm: bool,
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
-    serve(socket, id, label, store_path, declared, Face::Adapter(out))
+    serve(
+        socket,
+        id,
+        label,
+        store_path,
+        declared,
+        Face::Adapter(out, confirm),
+    )
 }
 
 /// The adapter's client side, started once the session has registered.
@@ -179,10 +194,10 @@ pub fn serve(
     declared: Option<String>,
     face: Face,
 ) -> io::Result<()> {
-    let (client, mut mcp) = match face {
-        Face::Tracer => (None, None),
-        Face::Adapter(w) => (Some(w), None),
-        Face::Mcp(h) => (None, Some(h)),
+    let (client, mut mcp, confirm) = match face {
+        Face::Tracer => (None, None, true),
+        Face::Adapter(w, c) => (Some(w), None, c),
+        Face::Mcp(h) => (None, Some(h), true),
     };
     let tracer = client.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
@@ -210,6 +225,9 @@ pub fn serve(
     }
     if let Some(d) = &declared {
         register.push(("declared", s(d)));
+    }
+    if confirm {
+        register.push(("confirm_register", Value::Bool(true)));
     }
     net::send(&writer, &obj(register))?;
     match &client {
@@ -307,6 +325,19 @@ pub fn serve(
                         ("record", s(&record)),
                     ]),
                 )?;
+            }
+            "registered" if confirm => {
+                if let Some(w) = &client {
+                    net::send(
+                        w,
+                        &obj(vec![("type", s("registered")), ("session", s(&id))]),
+                    )?;
+                } else if let Some(h) = &mcp {
+                    (h.confirmed)();
+                } else {
+                    println!("REGISTERED session={id}");
+                    io::stdout().flush()?;
+                }
             }
             "acked" if tracer => {
                 println!(

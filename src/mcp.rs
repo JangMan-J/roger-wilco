@@ -246,7 +246,7 @@ fn initialize_result(params: &Value) -> Value {
 // ---- tools ----
 
 /// (name, description, input schema)
-const TOOLS: [(&str, &str, &str); 8] = [
+const TOOLS: [(&str, &str, &str); 9] = [
     (
         "roger_send",
         "Send one Mail to an Address, or to every session with \"*\". Headers are opaque strings the sender attaches.",
@@ -286,6 +286,11 @@ const TOOLS: [(&str, &str, &str); 8] = [
         "roger_receipt",
         "Read one Mail's Receipt: its recipient, when it was Accepted, and the recipient's Record id once acked.",
         r#"{"type":"object","properties":{"mail":{"type":"string"}},"required":["mail"]}"#,
+    ),
+    (
+        "roger_registered",
+        "Say whether the coordinator holds this session's Register, so the Board, a claim or a relabel from another connection will see it. With wait_seconds, wait that long for it.",
+        r#"{"type":"object","properties":{"wait_seconds":{"type":"integer","minimum":0,"maximum":60}}}"#,
     ),
 ];
 
@@ -378,6 +383,9 @@ struct Ctx {
     socket: PathBuf,
     me: String,
     inbox: Inbox,
+    /// True once the coordinator's `registered` has arrived.
+    confirmed: Mutex<bool>,
+    confirmed_cv: Condvar,
 }
 
 fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
@@ -438,6 +446,29 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 ("mail", Value::Arr(mail)),
                 ("cursor", consumed.map_or(Value::Null, |c| s(&c))),
             ]))
+        }
+        "roger_registered" => {
+            let wait = opt_int(
+                name,
+                args,
+                "wait_seconds",
+                DEFAULT_WAIT_SECONDS,
+                (0, MAX_WAIT_SECONDS),
+                true,
+            )?;
+            // no-poll: bounds the wait for the confirmation; its arrival ends the wait.
+            let deadline = Instant::now() + Duration::from_secs(wait as u64);
+            let mut held = ctx.confirmed.lock().unwrap();
+            while !*held {
+                // no-poll: the same bound; elapsed time is read only to end the wait.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                // no-poll: waits on the confirmation the face signals, with the bound above.
+                held = ctx.confirmed_cv.wait_timeout(held, left).unwrap().0;
+            }
+            Ok(obj(vec![("registered", Value::Bool(*held))]))
         }
         "roger_board" => {
             let all = opt_bool(name, args, "all")?;
@@ -758,11 +789,20 @@ pub fn run(args: &[String]) -> io::Result<()> {
         socket: cfg.socket.clone(),
         me: cfg.address.clone(),
         inbox: Inbox::open(&cfg.store)?,
+        confirmed: Mutex::new(false),
+        confirmed_cv: Condvar::new(),
     });
     let gate = Arc::new(Mutex::new(false));
     let (tx, rx) = mpsc::channel::<Event>();
 
     let hooks = McpHooks {
+        confirmed: Box::new({
+            let ctx = Arc::clone(&ctx);
+            move || {
+                *ctx.confirmed.lock().unwrap() = true;
+                ctx.confirmed_cv.notify_all();
+            }
+        }),
         registered: Some(Box::new({
             let tx = tx.clone();
             move |daemon| {
@@ -1032,7 +1072,7 @@ mod tests {
         let Some(Value::Arr(tools)) = list.get("tools") else {
             panic!("no tools");
         };
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert!(tools
             .iter()
             .all(|t| t.get("inputSchema").is_some() && t.get("description").is_some()));

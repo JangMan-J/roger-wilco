@@ -76,7 +76,7 @@ environment, never from argv, which `ps` shows to every user.
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
 | `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session` | the same session, fronted by a stdin/stdout line stream for a client |
+| `adapter` | same as `session`, plus `[--registered]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
@@ -212,11 +212,22 @@ that speaks one needs nothing more from the core.
 
 - **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket: `register`,
   `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`
-  Tracer and the one-shot subcommands above are clients of it.
+  Tracer and the one-shot subcommands above are clients of it. A `register` line may carry
+  `"confirm_register":true`; the host daemon then sends `{"type":"registered","session":"<address>"}`
+  once, when the coordinator holds that Register. Without the field no such line is ever sent.
 - **The `roger adapter` stream.** The same session fronted by one JSON line stream on stdin and
   stdout, for a client (see Adapters).
 - **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
   that can register an MCP server needs no client code.
+
+Two signals, in order. `READY` (the Tracer), `ready` (the adapter) mean the Register was written to
+the host daemon. `REGISTERED session=<address>` (the Tracer), `{"type":"registered","session":"<address>"}`
+(the adapter, only when started with `--registered`, written after `ready`) and the `roger_registered`
+tool (`roger mcp`) mean the coordinator holds the Register. A client that needs its registration visible
+to others (Board, Claim, relabel) waits for `registered` first. During a coordinator outage it simply
+arrives later, after the link is back; each face reports it once per registration. An old host daemon
+or coordinator never sends it, so a client that waits for it bounds the wait. The socket's Register
+field is `confirm_register`; the host daemon does not forward it upstream.
 
 ### `roger mcp`
 
@@ -263,6 +274,7 @@ Streamable HTTP is not offered.
 | `roger_claim` | `key`, `ttl_seconds?` (900) | `{"ok","op","key","holder"?,"remaining_ms"?,"reason"?}`; acquires, or refreshes a claim this session holds; a refusal is `"ok":false`, not an error |
 | `roger_renew` | `key`, `ttl_seconds` | the same claim result |
 | `roger_release` | `key` | the same claim result |
+| `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true}` once the coordinator holds this session's Register, else, after waiting up to `wait_seconds`, `{"registered":false}` |
 | `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
 
 `roger_inbox` returns the Store entries after this session's read position, oldest first. With

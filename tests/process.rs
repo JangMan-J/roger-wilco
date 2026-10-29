@@ -1560,9 +1560,13 @@ fn presence_is_the_open_session_connection_then_own_activity() {
     let mut rig = Rig::new("presence");
     rig.start_stack();
     let recipient = rig.start_recipient("recipient.out", false);
-    // READY means the Register left for the host daemon, not that the
-    // coordinator holds it: read the Board only once its row is there.
-    wait_board_lists(&rig, "a.sock", RECIPIENT, true);
+    // READY means the Register left for the host daemon; REGISTERED, that
+    // the coordinator holds it.
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "REGISTERED",
+        Duration::from_secs(10),
+    );
 
     // Connected and quiet: last seen is the moment of each read.
     let (connected, first) = presence(&rig, "a.sock", None);
@@ -2355,7 +2359,11 @@ fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
     let recipient = rig.start_recipient("recipient1.out", false);
     // A Claim needs a registered owner at the coordinator, and READY only
     // says the Register left for the host daemon.
-    wait_board_lists(&rig, "a.sock", RECIPIENT, true);
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "REGISTERED",
+        Duration::from_secs(10),
+    );
     assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000).0, 0);
     rig.send("m-before", "before the rename");
     wait_for_text(
@@ -2879,5 +2887,126 @@ fn the_port_file_appears_whole_and_leaves_no_temporary_file() {
         let aside = rig.p(&format!("port.{i}.tmp"));
         assert!(!aside.exists(), "run {i}: {} left behind", aside.display());
         rig.kill(idx);
+    }
+}
+
+/// Lines of one raw connection to a host daemon socket.
+struct RawConn {
+    conn: std::os::unix::net::UnixStream,
+}
+
+impl RawConn {
+    fn open(rig: &Rig, sock: &str) -> RawConn {
+        RawConn {
+            conn: std::os::unix::net::UnixStream::connect(rig.p(sock)).unwrap(),
+        }
+    }
+
+    fn say(&mut self, line: &str) {
+        writeln!(self.conn, "{line}").unwrap();
+    }
+
+    fn line(&mut self) -> String {
+        let mut answer = String::new();
+        let mut byte = [0u8; 1];
+        while self.conn.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+            answer.push(byte[0] as char);
+        }
+        answer
+    }
+}
+
+/// After REGISTERED the Board lists the Address at once, and REGISTERED is printed once.
+#[test]
+fn registered_means_the_coordinator_holds_the_register() {
+    let mut rig = Rig::new("registered-tracer");
+    rig.start_stack();
+    let out = "recipient.out";
+    rig.start_recipient(out, false);
+    wait_for_text(&rig.p(out), "REGISTERED", Duration::from_secs(10));
+    let text = read(&rig.p(out));
+    assert!(
+        text.find("READY").unwrap() < text.find("REGISTERED").unwrap(),
+        "{text}"
+    );
+    assert!(
+        board(&rig, "a.sock").contains(&format!("SESSION address={RECIPIENT} ")),
+        "not listed at once"
+    );
+    assert_eq!(count_lines_with(&read(&rig.p(out)), "REGISTERED"), 1);
+}
+
+/// With the coordinator down READY comes and REGISTERED does not; the restart brings it.
+#[test]
+fn registered_arrives_after_a_coordinator_outage() {
+    let mut rig = Rig::new("registered-outage");
+    rig.start_stack();
+    rig.kill(rig.coord_idx);
+    let out = "recipient.out";
+    rig.start_recipient(out, false);
+    assert!(!read(&rig.p(out)).contains("REGISTERED"));
+    rig.restart_coordinator();
+    wait_for_text(&rig.p(out), "REGISTERED", Duration::from_secs(15));
+    assert!(
+        board(&rig, "a.sock").contains(&format!("SESSION address={RECIPIENT} ")),
+        "not listed once REGISTERED"
+    );
+    assert_eq!(count_lines_with(&read(&rig.p(out)), "REGISTERED"), 1);
+}
+
+/// `--registered` adds one `registered` line after `ready`; without it none is ever sent.
+#[test]
+fn the_adapter_reports_registered_only_when_asked() {
+    let mut rig = Rig::new("registered-adapter");
+    rig.start_stack();
+    let (_a, _a_in) = rig.start_adapter("b.sock", RECIPIENT, "plain.store", "plain.out", &[]);
+    let (_b, _b_in) = rig.start_adapter(
+        "b.sock",
+        THIRD,
+        "asked.store",
+        "asked.out",
+        &["--registered"],
+    );
+    wait_for_text(
+        &rig.p("asked.out"),
+        "\"type\":\"registered\"",
+        Duration::from_secs(10),
+    );
+    // The daemon handles upstream lines in order, and the plain adapter's
+    // Register went upstream first: had it been confirmed, it already was.
+    let asked = read(&rig.p("asked.out"));
+    assert!(
+        asked.find("\"type\":\"ready\"").unwrap() < asked.find("\"type\":\"registered\"").unwrap(),
+        "{asked}"
+    );
+    assert_eq!(count_lines_with(&asked, "\"type\":\"registered\""), 1);
+    assert!(
+        !read(&rig.p("plain.out")).contains("registered"),
+        "{}",
+        read(&rig.p("plain.out"))
+    );
+}
+
+/// A raw register line gets `registered` only with `confirm_register`, and then once.
+#[test]
+fn a_raw_register_is_confirmed_only_when_it_asks() {
+    let mut rig = Rig::new("registered-raw");
+    rig.start_stack();
+    let mut plain = RawConn::open(&rig, "b.sock");
+    plain.say(&format!(r#"{{"type":"register","session":"{RECIPIENT}"}}"#));
+    let mut asked = RawConn::open(&rig, "b.sock");
+    asked.say(&format!(
+        r#"{{"type":"register","session":"{THIRD}","confirm_register":true}}"#
+    ));
+    assert_eq!(
+        asked.line(),
+        format!(r#"{{"type":"registered","session":"{THIRD}"}}"#)
+    );
+    // Upstream lines are handled in order: a `registered` for the plain
+    // session would already be ahead of this board reply on its connection.
+    for c in [&mut plain, &mut asked] {
+        c.say(r#"{"type":"board","req":3}"#);
+        let reply = c.line();
+        assert!(reply.contains(r#""type":"board""#), "{reply}");
     }
 }
