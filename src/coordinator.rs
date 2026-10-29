@@ -455,6 +455,12 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 for p in pushes {
                     let _ = net::send(&writer, &p);
                 }
+                // The coordinator holds this Register now. A host daemon
+                // forwards it only to a session that asked.
+                let _ = net::send(
+                    &writer,
+                    &obj(vec![("type", s("registered")), ("session", s(&session))]),
+                );
             }
             "send" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);

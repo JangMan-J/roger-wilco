@@ -52,6 +52,7 @@ Commands:
   daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+              [--registered]   (also tell the client `registered` once the coordinator holds the Register)
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
               [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
@@ -121,6 +122,7 @@ fn main() -> io::Result<()> {
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--declare"),
+            args.iter().any(|a| a == "--registered"),
         ),
         "mcp" => mcp::run(&args),
         "send" => session::send(

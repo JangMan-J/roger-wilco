@@ -29,6 +29,7 @@ struct Rig {
     dir: PathBuf,
     daemon: usize,
     children: Vec<Child>,
+    port: String,
 }
 
 impl Drop for Rig {
@@ -65,6 +66,7 @@ impl Rig {
             dir,
             daemon: 0,
             children: Vec::new(),
+            port: String::new(),
         };
         let port_file = rig.p("coord.port");
         rig.spawn(&[
@@ -81,10 +83,8 @@ impl Rig {
                 .ok()
                 .filter(|t| !t.is_empty())
         });
-        let coord = format!(
-            "127.0.0.1:{}",
-            fs::read_to_string(&port_file).unwrap().trim()
-        );
+        rig.port = fs::read_to_string(&port_file).unwrap().trim().to_string();
+        let coord = format!("127.0.0.1:{}", rig.port);
         rig.daemon = rig.spawn(&[
             "daemon",
             "--coordinator",
@@ -104,6 +104,33 @@ impl Rig {
 
     fn p(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// Kill the coordinator (the first child) and, with `restart`, start it
+    /// again on the same port and log.
+    fn coordinator_down(&mut self) {
+        self.children[0].kill().unwrap();
+        self.children[0].wait().unwrap();
+    }
+
+    fn coordinator_up(&mut self) {
+        let bind = format!("127.0.0.1:{}", self.port);
+        let port_file = self.p("coord2.port");
+        let log = self.p("coord.log");
+        let args = [
+            "coordinator",
+            "--bind",
+            &bind,
+            "--port-file",
+            port_file.to_str().unwrap(),
+            "--data",
+            log.to_str().unwrap(),
+        ];
+        let idx = self.spawn(&args);
+        until("the restarted coordinator port", 15, || {
+            port_file.exists().then_some(())
+        });
+        self.children.swap(0, idx);
     }
 
     fn sock(&self) -> PathBuf {
@@ -429,6 +456,7 @@ fn handshake_versions_ping_unknown_method_and_parse_error() {
             "roger_inbox",
             "roger_label",
             "roger_receipt",
+            "roger_registered",
             "roger_release",
             "roger_renew",
             "roger_send"
@@ -1004,4 +1032,30 @@ fn a_second_server_on_one_store_is_refused_not_started() {
         "{}",
         second.stderr()
     );
+}
+
+#[test]
+fn roger_registered_waits_for_the_coordinator_to_hold_the_register() {
+    let rig = Rig::new("registered");
+    let mut a = rig.session("a", A1, &[]);
+    let r = a.ok("roger_registered", r#"{"wait_seconds":10}"#);
+    assert_eq!(r.get("registered"), Some(&Value::Bool(true)));
+    assert!(rig.on_board(A1));
+    let r = a.ok("roger_registered", "{}");
+    assert_eq!(r.get("registered"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn roger_registered_is_false_during_an_outage_and_true_after_the_restart() {
+    let mut rig = Rig::new("registered-outage");
+    rig.coordinator_down();
+    let mut a = rig.session("a", A1, &[]);
+    let r = a.ok("roger_registered", r#"{"wait_seconds":0}"#);
+    assert_eq!(r.get("registered"), Some(&Value::Bool(false)));
+    rig.coordinator_up();
+    let r = a.ok("roger_registered", r#"{"wait_seconds":20}"#);
+    assert_eq!(r.get("registered"), Some(&Value::Bool(true)));
+    assert!(rig.on_board(A1));
+    let e = a.fails("roger_registered", r#"{"wait_seconds":-1}"#);
+    assert!(e.contains("wait_seconds"), "{e}");
 }
