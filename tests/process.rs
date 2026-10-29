@@ -2651,8 +2651,7 @@ fn the_adapter_carries_kind_and_headers_both_ways() {
         .lines()
         .find(|l| l.contains("\"mail\":\"ah-3\""))
         .unwrap();
-    // The one transition field for the installed shim, computed from kind.
-    assert!(mail.ends_with(",\"wake\":true}"), "{mail}"); // legacy-wire: emit check
+    assert!(!mail.contains("wake"), "{mail}"); // legacy-wire: no older field is written
 }
 
 /// The three shapes of an old host daemon log: a deliver event with the
@@ -2683,7 +2682,6 @@ fn an_old_host_daemon_log_replays_with_the_right_kinds() {
         );
     }
     assert!(!read(&rig.p("recipient.out")).contains("HEADERS"));
-    // A rollback to the previous binary reads the log this one writes.
     rig.send("o-4", "new");
     wait_for_text(
         &rig.p("recipient.out"),
@@ -2697,7 +2695,7 @@ fn an_old_host_daemon_log_replays_with_the_right_kinds() {
         .unwrap();
     assert!(line.contains("\"kind\":\"directed\""), "{line}");
     assert!(line.contains("\"headers\":{}"), "{line}");
-    assert!(line.ends_with(",\"wake\":true}"), "{line}"); // legacy-wire: emit check
+    assert!(!line.contains("wake"), "{line}"); // legacy-wire: no older field is written
 }
 
 /// A coordinator log whose events lack `headers` replays: its Mail reads as

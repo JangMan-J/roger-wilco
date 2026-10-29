@@ -40,15 +40,7 @@ pub fn deliver_msg(
         ("body", s(body)),
         ("kind", s(kind)),
         ("headers", headers.clone()),
-        legacy_field(kind), // legacy-wire: emit for the previous release's readers
     ])
-}
-
-/// The one field an earlier release's readers still look for on a delivery,
-/// computed from the Kind. The release after this one deletes it, and every
-/// caller of it.
-pub fn legacy_field(kind: &str) -> (&'static str, Value) {
-    ("wake", Value::Bool(kind != BROADCAST)) // legacy-wire: emit for the previous release's readers
 }
 
 /// A delivery's Kind. A line written before Kind existed says it in the

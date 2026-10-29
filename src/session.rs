@@ -285,7 +285,6 @@ pub fn serve(
                             ("record", s(&record)),
                             ("kind", s(&kind)),
                             ("headers", net::headers_of(&v)),
-                            net::legacy_field(&kind), // legacy-wire: emit for the installed shim
                         ]),
                     )?;
                 }
