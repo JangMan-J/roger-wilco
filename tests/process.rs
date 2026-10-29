@@ -2843,3 +2843,41 @@ fn a_store_without_kind_and_headers_replays() {
         "{store}"
     );
 }
+
+/// `--port-file` appears whole: a reader that stops at "the file exists" reads
+/// a port, never an empty file, and no temporary file stays behind.
+#[test]
+fn the_port_file_appears_whole_and_leaves_no_temporary_file() {
+    let mut rig = Rig::new("port-file");
+    for i in 0..20 {
+        let port_file = rig.p(&format!("port.{i}"));
+        let data = rig.p(&format!("coord.{i}.log"));
+        let idx = rig.spawn(
+            &[
+                "coordinator",
+                "--bind",
+                "127.0.0.1:0",
+                "--port-file",
+                port_file.to_str().unwrap(),
+                "--data",
+                data.to_str().unwrap(),
+            ],
+            &format!("coord.{i}.out"),
+        );
+        // A tight loop, so a gap between "created" and "written" would be seen.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let seen = loop {
+            if port_file.exists() {
+                break read(&port_file);
+            }
+            assert!(Instant::now() < deadline, "no port file {i}");
+        };
+        assert!(
+            seen.trim().parse::<u16>().is_ok(),
+            "run {i}: the first read of the port file was {seen:?}"
+        );
+        let aside = rig.p(&format!("port.{i}.tmp"));
+        assert!(!aside.exists(), "run {i}: {} left behind", aside.display());
+        rig.kill(idx);
+    }
+}
