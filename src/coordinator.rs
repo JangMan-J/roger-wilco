@@ -9,6 +9,7 @@
 
 use crate::claims::{Change, Claims, Held, Op};
 use crate::durlog::DurLog;
+use crate::headers;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
 use std::collections::{HashMap, HashSet};
@@ -22,8 +23,10 @@ struct Mail {
     from: String,
     to: String,
     body: String,
-    /// False only for a Broadcast copy: a broadcast makes no wake request.
-    wake: bool,
+    /// How the Mail reached its recipient: `net::DIRECTED` or `net::BROADCAST`.
+    kind: &'static str,
+    /// The sender's headers, validated once at the send and carried verbatim.
+    headers: Value,
     /// When this coordinator committed the send and answered Accepted
     /// (`accepted_at_ms`, coordinator epoch ms). None for a Mail replayed from
     /// a log written before the stamp existed: absent, never zero.
@@ -223,7 +226,9 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                         from: from.into(),
                         to: to.into(),
                         body: body.into(),
-                        wake: true,
+                        kind: net::DIRECTED,
+                        // An event written before headers existed has none.
+                        headers: net::headers_of(v),
                         accepted_at: stamp_of(v, "accepted_at_ms"),
                         receipt: None,
                     },
@@ -241,7 +246,13 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                     .iter()
                     .filter_map(|x| x.as_str().map(str::to_string))
                     .collect();
-                fan_out(state, mail, from, body, &to, stamp_of(v, "accepted_at_ms"));
+                let headers = net::headers_of(v);
+                fan_out(
+                    state,
+                    (mail, from, body, &headers),
+                    &to,
+                    stamp_of(v, "accepted_at_ms"),
+                );
             }
         }
         Some("receipt") => {
@@ -344,7 +355,9 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
         } else if host_of(state, &m.to) != Some(host) {
             continue;
         }
-        out.push(net::deliver_msg(id, &m.from, &m.to, &m.body, m.wake));
+        out.push(net::deliver_msg(
+            id, &m.from, &m.to, &m.body, m.kind, &m.headers,
+        ));
     }
     out
 }
@@ -435,6 +448,22 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     )?;
                     continue;
                 }
+                // The one place headers are bounded, before anything commits.
+                let headers = match headers::validate(v.get("headers")) {
+                    Ok(h) => h,
+                    Err(reason) => {
+                        net::send(
+                            &writer,
+                            &obj(vec![
+                                ("type", s("error")),
+                                ("req", Value::Int(req)),
+                                ("mail", s(&mail)),
+                                ("reason", s(&reason)),
+                            ]),
+                        )?;
+                        continue;
+                    }
+                };
                 let mut push: Vec<(Writer, Value)> = Vec::new();
                 {
                     let mut st = state.lock().unwrap();
@@ -445,6 +474,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                             &mail,
                             net::field(&v, "from")?,
                             net::field(&v, "body")?,
+                            &headers,
                         )?;
                     } else if !st.mails.contains_key(&mail) {
                         let ev = obj(vec![
@@ -453,6 +483,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                             ("from", s(net::field(&v, "from")?)),
                             ("to", s(net::field(&v, "to")?)),
                             ("body", s(net::field(&v, "body")?)),
+                            ("headers", headers),
                             ("accepted_at_ms", Value::Int(now_ms())),
                         ]);
                         commit(&mut st, ev)?;
@@ -460,7 +491,9 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         if let Some((_, w)) = host_of(&st, &m.to).and_then(|h| st.hosts.get(h)) {
                             push.push((
                                 Arc::clone(w),
-                                net::deliver_msg(&mail, &m.from, &m.to, &m.body, true),
+                                net::deliver_msg(
+                                    &mail, &m.from, &m.to, &m.body, m.kind, &m.headers,
+                                ),
                             ));
                         }
                     }
@@ -795,6 +828,8 @@ fn receipt(st: &State, v: &Value) -> io::Result<Value> {
         ("req", Value::Int(req)),
         ("mail", s(mail)),
         ("to", s(&m.to)),
+        ("kind", s(m.kind)),
+        ("headers", m.headers.clone()),
     ];
     if let Some(t) = m.accepted_at {
         pairs.push(("accepted_at_ms", Value::Int(t)));
@@ -814,13 +849,12 @@ fn copy_id(mail: &str, to: &str) -> String {
     format!("{mail}{COPY_SEP}{to}")
 }
 
-/// Expand a committed Broadcast into one Mail per recipient, carrying no wake
-/// request. Used on commit and on replay, so both see the same copies.
+/// Expand a committed Broadcast `(id, from, body, headers)` into one Mail of
+/// kind `broadcast` per recipient, each carrying the Broadcast's headers.
+/// Used on commit and on replay, so both see the same copies.
 fn fan_out(
     st: &mut State,
-    mail: &str,
-    from: &str,
-    body: &str,
+    (mail, from, body, headers): (&str, &str, &str, &Value),
     to: &[String],
     accepted_at: Option<i64>,
 ) {
@@ -839,7 +873,8 @@ fn fan_out(
                 from: from.to_string(),
                 to: addr.clone(),
                 body: body.to_string(),
-                wake: false,
+                kind: net::BROADCAST,
+                headers: headers.clone(),
                 accepted_at,
                 receipt: None,
             },
@@ -855,6 +890,7 @@ fn broadcast(
     mail: &str,
     from: &str,
     body: &str,
+    headers: &Value,
 ) -> io::Result<Vec<(Writer, Value)>> {
     if st.broadcasts.contains(mail) {
         return Ok(Vec::new());
@@ -868,6 +904,7 @@ fn broadcast(
         ("from", s(from)),
         ("body", s(body)),
         ("to", Value::Arr(to.iter().map(|a| s(a)).collect())),
+        ("headers", headers.clone()),
         ("accepted_at_ms", Value::Int(now_ms())),
     ]);
     commit(st, ev)?;
@@ -876,7 +913,14 @@ fn broadcast(
         if let Some((_, w)) = host_of(st, addr).and_then(|h| st.hosts.get(h)) {
             push.push((
                 Arc::clone(w),
-                net::deliver_msg(&copy_id(mail, addr), from, addr, body, false),
+                net::deliver_msg(
+                    &copy_id(mail, addr),
+                    from,
+                    addr,
+                    body,
+                    net::BROADCAST,
+                    headers,
+                ),
             ));
         }
     }

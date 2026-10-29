@@ -30,11 +30,12 @@ pub fn run(
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
 /// on stdin/stdout for a shim. The shim sends `{"type":"send","to","body"}`
-/// (optional `"mail"`), `{"type":"board"}` (read as this session),
+/// (optional `"mail"` and `"headers"`, an object of string values), `{"type":"board"}` (read as this session),
 /// `{"type":"relabel","label"}` (optional `"session"`, default this one), or
 /// `{"type":"claim","op","key"}` (optional `"ttl_ms"`, owned by this session),
 /// and is answered in order with `accepted`, `board`, `relabeled`,
-/// `claim_result`, or `error`; it is also told `ready` once and `mail` per delivery. A `mail`
+/// `claim_result`, or `error`; it is also told `ready` once and `mail` per delivery,
+/// which carries the delivery's `kind` and `headers`. A `mail`
 /// line follows the Store write and never gates the ack: the shim renders
 /// what the adapter already holds and acknowledges nothing.
 /// `declared` is the shim's opaque self-description, sent with Register.
@@ -142,6 +143,7 @@ fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
         net::field(v, "to")?,
         &mail,
         net::field(v, "body")?,
+        v.get("headers"),
     )?;
     Ok(obj(vec![("type", s("accepted")), ("mail", s(&mail))]))
 }
@@ -203,20 +205,24 @@ fn serve(
                             ("mail", s(&mail)),
                             ("from", s(net::field(&v, "from")?)),
                             ("body", s(net::field(&v, "body")?)),
+                            ("kind", s(&net::kind_of(&v))),
+                            ("headers", net::headers_of(&v)),
                         ]);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
                         if shim.is_none() {
                             println!(
-                                "STORED mail={mail} record={record} wake={}",
-                                net::wake_of(&v)
+                                "STORED mail={mail} record={record} kind={}",
+                                net::kind_of(&v)
                             );
+                            print_headers(&mail, &net::headers_of(&v));
                             io::stdout().flush()?;
                         }
                         record
                     }
                 };
                 if let Some(w) = &shim {
+                    let kind = net::kind_of(&v);
                     net::send(
                         w,
                         &obj(vec![
@@ -225,7 +231,9 @@ fn serve(
                             ("from", s(net::field(&v, "from")?)),
                             ("body", s(net::field(&v, "body")?)),
                             ("record", s(&record)),
-                            ("wake", Value::Bool(net::wake_of(&v))),
+                            ("kind", s(&kind)),
+                            ("headers", net::headers_of(&v)),
+                            net::legacy_field(&kind), // legacy-wire: emit for the installed shim
                         ]),
                     )?;
                 }
@@ -270,8 +278,9 @@ pub fn send(
     to: String,
     mail: String,
     body: String,
+    headers: Option<Value>,
 ) -> io::Result<()> {
-    let mail = send_mail(&socket, &from, &to, &mail, &body)?;
+    let mail = send_mail(&socket, &from, &to, &mail, &body, headers.as_ref())?;
     println!("ACCEPTED mail={mail}");
     Ok(())
 }
@@ -291,21 +300,29 @@ pub fn relabel(socket: PathBuf, session: String, label: String) -> io::Result<()
     Ok(())
 }
 
-fn send_mail(socket: &PathBuf, from: &str, to: &str, mail: &str, body: &str) -> io::Result<String> {
+fn send_mail(
+    socket: &PathBuf,
+    from: &str,
+    to: &str,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> io::Result<String> {
     let conn = UnixStream::connect(socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     let mut lines = net::lines(Box::new(conn));
-    net::send(
-        &writer,
-        &obj(vec![
-            ("type", s("send")),
-            ("req", Value::Int(1)),
-            ("mail", s(mail)),
-            ("from", s(from)),
-            ("to", s(to)),
-            ("body", s(body)),
-        ]),
-    )?;
+    let mut ask = vec![
+        ("type", s("send")),
+        ("req", Value::Int(1)),
+        ("mail", s(mail)),
+        ("from", s(from)),
+        ("to", s(to)),
+        ("body", s(body)),
+    ];
+    if let Some(h) = headers {
+        ask.push(("headers", h.clone()));
+    }
+    net::send(&writer, &obj(ask))?;
     for line in &mut lines {
         let v = line?;
         match net::field(&v, "type")? {
@@ -323,6 +340,14 @@ fn send_mail(socket: &PathBuf, from: &str, to: &str, mail: &str, body: &str) -> 
         }
     }
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
+}
+
+/// The line that follows a Mail's own line when it has headers: the set as
+/// one JSON object, key order as the sender gave it.
+fn print_headers(mail: &str, headers: &Value) {
+    if matches!(headers, Value::Obj(pairs) if !pairs.is_empty()) {
+        println!("HEADERS mail={mail} {}", json::stringify(headers));
+    }
 }
 
 /// One request to the host daemon, answered by exactly one line.
@@ -374,22 +399,26 @@ pub fn receipt(socket: PathBuf, mail: String) -> io::Result<()> {
     let accepted = reply.get("accepted_at_ms").and_then(|x| x.as_i64());
     let shown = |t: Option<i64>| t.map_or_else(|| "absent".to_string(), |t| t.to_string());
     let to = net::field(&reply, "to")?;
+    let kind = net::field(&reply, "kind")
+        .map(|k| format!(" kind={k}"))
+        .unwrap_or_default();
     match net::field(&reply, "record") {
         Ok(record) => {
             let receipted = reply.get("receipted_at_ms").and_then(|x| x.as_i64());
             let latency = accepted.zip(receipted).map(|(a, r)| r - a);
             println!(
-                "RECEIPT mail={mail} to={to} record={record} accepted_at_ms={} receipted_at_ms={} latency_ms={}",
+                "RECEIPT mail={mail} to={to} record={record} accepted_at_ms={} receipted_at_ms={} latency_ms={}{kind}",
                 shown(accepted),
                 shown(receipted),
                 shown(latency)
             );
         }
         Err(_) => println!(
-            "PENDING mail={mail} to={to} accepted_at_ms={}",
+            "PENDING mail={mail} to={to} accepted_at_ms={}{kind}",
             shown(accepted)
         ),
     }
+    print_headers(&mail, &net::headers_of(&reply));
     Ok(())
 }
 

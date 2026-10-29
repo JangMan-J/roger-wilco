@@ -1251,7 +1251,7 @@ fn wait_until_board_reaches_both(rig: &Rig) {
     }
 }
 
-const IDLE: &str = "44444444-4444-4444-8444-444444444444";
+const THIRD: &str = "44444444-4444-4444-8444-444444444444";
 
 fn start_session(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str) -> usize {
     let args = [
@@ -1284,11 +1284,11 @@ fn wait_for_count(path: &Path, needle: &str, n: usize) {
 }
 
 #[test]
-fn broadcast_reaches_every_registered_session_once_without_a_wake() {
+fn broadcast_reaches_every_registered_session_once_with_kind_broadcast() {
     let mut rig = Rig::new("broadcast");
     rig.start_stack();
     start_session(&mut rig, "a.sock", SENDER, "sender.store", "sender.out");
-    start_session(&mut rig, "b.sock", IDLE, "idle.store", "idle.out");
+    start_session(&mut rig, "b.sock", THIRD, "third.store", "third.out");
     let recipient = rig.start_recipient("recipient1.out", true);
     wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 3);
 
@@ -1334,26 +1334,26 @@ fn broadcast_reaches_every_registered_session_once_without_a_wake() {
 
     for (store, out) in [
         ("sender.store", "sender.out"),
-        ("idle.store", "idle.out"),
+        ("third.store", "third.out"),
         ("recipient.store", "recipient1.out"),
     ] {
         let text = read(&rig.p(store));
         assert_eq!(text.lines().count(), 1, "{store}: {text}");
         assert_eq!(count_lines_with(&text, body), 1, "{store}: {text}");
         let out = read(&rig.p(out));
-        assert!(out.contains("record=r-1 wake=false"), "{out}");
+        assert!(out.contains("record=r-1 kind=broadcast"), "{out}");
     }
 }
 
 #[test]
-fn directed_mail_requests_a_wake() {
-    let mut rig = Rig::new("directed-wake");
+fn directed_mail_carries_kind_directed() {
+    let mut rig = Rig::new("directed-kind");
     rig.start_stack();
     rig.start_recipient("recipient.out", false);
     rig.send("m-1", "directed");
     wait_for_text(
         &rig.p("recipient.out"),
-        "STORED mail=m-1 record=r-1 wake=true",
+        "STORED mail=m-1 record=r-1 kind=directed",
         Duration::from_secs(10),
     );
 }
@@ -1406,7 +1406,7 @@ fn a_directed_mail_id_can_never_equal_a_broadcast_copy_id() {
 fn declared_text_reaches_the_board_verbatim_and_survives_a_coordinator_restart() {
     let mut rig = Rig::new("declared");
     rig.start_stack();
-    let declared = "wake-latency-ms=1500 [[153:Meteor Shower:7]]";
+    let declared = "role=reviewer [[153:Meteor Shower:7]]";
     let sock = rig.p("b.sock").to_str().unwrap().to_string();
     let store = rig.p("recipient.store").to_str().unwrap().to_string();
     rig.spawn(
@@ -1519,7 +1519,7 @@ fn send_from_recipient(rig: &Rig, mail: &str) {
     assert!(sent.status.success(), "{sent:?}");
 }
 
-/// An idle session is present for as long as its connection is open; once it
+/// A session with no traffic is present for as long as its connection is open; once it
 /// closes, last_seen_ms is the disconnect moment and only the session's own
 /// activity moves it.
 #[test]
@@ -1528,7 +1528,7 @@ fn presence_is_the_open_session_connection_then_own_activity() {
     rig.start_stack();
     let recipient = rig.start_recipient("recipient.out", false);
 
-    // Connected and idle: last seen is the moment of each read.
+    // Connected and quiet: last seen is the moment of each read.
     let (connected, first) = presence(&rig, "a.sock", None);
     assert!(connected);
     std::thread::sleep(Duration::from_millis(50));
@@ -1809,7 +1809,7 @@ fn a_second_session_on_one_store_is_refused() {
         .args(["session", "--socket", rig.p("b.sock").to_str().unwrap()])
         .args([
             "--id",
-            IDLE,
+            THIRD,
             "--store",
             rig.p("recipient.store").to_str().unwrap(),
         ])
@@ -1901,9 +1901,9 @@ fn a_second_daemon_on_a_live_socket_is_refused_and_the_first_keeps_serving() {
     assert!(err.contains(sock.to_str().unwrap()), "{err}");
     assert!(err.contains("refusing to take over"), "{err}");
     // A session that connects now is served by the first daemon, host-b.
-    start_session(&mut rig, "b.sock", IDLE, "idle.store", "idle.out");
-    let b = wait_board_lists(&rig, "a.sock", IDLE, true);
-    assert!(b.contains(&format!("address={IDLE} host=host-b")), "{b}");
+    start_session(&mut rig, "b.sock", THIRD, "third.store", "third.out");
+    let b = wait_board_lists(&rig, "a.sock", THIRD, true);
+    assert!(b.contains(&format!("address={THIRD} host=host-b")), "{b}");
     rig.send("m-sock", "still served");
     wait_for_text(
         &rig.p("recipient1.out"),
@@ -1939,7 +1939,7 @@ fn a_daemon_replaces_a_stale_socket_left_by_a_dead_one() {
         "host daemon listening",
         Duration::from_secs(10),
     );
-    start_session(&mut rig, "stale.sock", IDLE, "idle.store", "idle.out");
+    start_session(&mut rig, "stale.sock", THIRD, "third.store", "third.out");
 }
 
 #[test]
@@ -2203,12 +2203,12 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
     assert_eq!(
         receipt_line(&rig, "old-1"),
         format!(
-            "RECEIPT mail=old-1 to={to} record=r-1 accepted_at_ms=absent receipted_at_ms=absent latency_ms=absent"
+            "RECEIPT mail=old-1 to={to} record=r-1 accepted_at_ms=absent receipted_at_ms=absent latency_ms=absent kind=directed"
         )
     );
     assert_eq!(
         receipt_line(&rig, &format!("old-b/{to}")),
-        format!("PENDING mail=old-b/{to} to={to} accepted_at_ms=absent")
+        format!("PENDING mail=old-b/{to} to={to} accepted_at_ms=absent kind=broadcast")
     );
 }
 
@@ -2328,4 +2328,441 @@ fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
         let row = format!("\"ev\":\"receipt\",\"mail\":\"{mail}\"");
         assert_eq!(count_lines_with(&coord, &row), 1, "{coord}");
     }
+}
+
+/// `roger send` with `--header key=value` pairs, from host-a's daemon.
+fn send_with_headers(rig: &Rig, to: &str, mail: &str, headers: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--from", SENDER, "--to", to, "--mail", mail, "--body", "b"]);
+    for h in headers {
+        cmd.args(["--header", h]);
+    }
+    cmd.output().unwrap()
+}
+
+/// Kind and headers travel from `roger send` through the coordinator log, the
+/// host daemon log, the delivery, the Store, the printed lines and the receipt,
+/// for directed mail and for each copy of a Broadcast, key order kept.
+#[test]
+fn kind_and_headers_round_trip_on_directed_and_broadcast_mail() {
+    let mut rig = Rig::new("kind-headers");
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.start_recipient("recipient.out", false);
+    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 2);
+
+    let set = r#"{"z":"1","a":"","m":"héllo \"q\" \\ x"}"#;
+    let out = send_with_headers(&rig, RECIPIENT, "h-1", &["z=1", "a=", "m=héllo \"q\" \\ x"]);
+    assert!(out.status.success(), "{out:?}");
+    let out = send_with_headers(&rig, "*", "hb-1", &["k=a=b"]);
+    assert!(out.status.success(), "{out:?}");
+    let copy = format!("hb-1/{RECIPIENT}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail={copy} record=r-2"),
+        Duration::from_secs(10),
+    );
+
+    let shown = read(&rig.p("recipient.out"));
+    assert!(
+        shown.contains("STORED mail=h-1 record=r-1 kind=directed\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("\nHEADERS mail=h-1 {set}\n")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("STORED mail={copy} record=r-2 kind=broadcast\n")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("HEADERS mail={copy} {{\"k\":\"a=b\"}}\n")),
+        "{shown}"
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert!(
+        store.contains(&format!("\"kind\":\"directed\",\"headers\":{set}}}")),
+        "{store}"
+    );
+    assert!(
+        store.contains("\"kind\":\"broadcast\",\"headers\":{\"k\":\"a=b\"}}"),
+        "{store}"
+    );
+    for log in ["coord.log", "b.log"] {
+        let text = read(&rig.p(log));
+        assert!(
+            text.contains(&format!("\"headers\":{set}")),
+            "{log}: {text}"
+        );
+        assert!(
+            text.contains("\"headers\":{\"k\":\"a=b\"}"),
+            "{log}: {text}"
+        );
+    }
+    let daemon = read(&rig.p("b.log"));
+    assert!(daemon.contains("\"kind\":\"directed\""), "{daemon}");
+    assert!(daemon.contains("\"kind\":\"broadcast\""), "{daemon}");
+
+    // The receipt line and reply carry both, and survive a coordinator restart.
+    for round in 0..2 {
+        if round == 1 {
+            rig.restart_coordinator();
+        }
+        let start = Instant::now();
+        let line = loop {
+            let o = Command::new(BIN)
+                .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+                .args(["--mail", "h-1"])
+                .output()
+                .unwrap();
+            if o.status.success() {
+                break String::from_utf8_lossy(&o.stdout).to_string();
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "{o:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(line.contains(" latency_ms="), "{line}");
+        assert!(
+            line.lines().next().unwrap().ends_with(" kind=directed"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("\nHEADERS mail=h-1 {set}\n")),
+            "{line}"
+        );
+        let reply = raw_request(&rig, "a.sock", r#"{"type":"receipt","req":1,"mail":"h-1"}"#);
+        assert!(reply.contains("\"kind\":\"directed\""), "{reply}");
+        assert!(
+            reply.contains("\"headers\":{\"z\":\"1\",\"a\":\"\","),
+            "{reply}"
+        );
+    }
+    let copy_line = receipt_line(&rig, &copy);
+    assert!(
+        copy_line
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(" kind=broadcast"),
+        "{copy_line}"
+    );
+    assert!(
+        copy_line.ends_with(&format!("HEADERS mail={copy} {{\"k\":\"a=b\"}}")),
+        "{copy_line}"
+    );
+}
+
+/// A Mail sent with no headers carries an empty set on its delivery, and its
+/// printed lines have no HEADERS line.
+#[test]
+fn a_mail_without_headers_carries_an_empty_set() {
+    let mut rig = Rig::new("kind-no-headers");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    rig.send("n-1", "plain");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=n-1",
+        Duration::from_secs(10),
+    );
+    assert!(!read(&rig.p("recipient.out")).contains("HEADERS"));
+    assert!(read(&rig.p("recipient.store")).contains("\"headers\":{}"));
+    let line = receipt_line(&rig, "n-1");
+    assert!(line.ends_with(" kind=directed"), "{line}");
+}
+
+/// Each bound is refused once, at the coordinator, with a reason that says what
+/// was expected and what was seen; nothing is committed, and the host daemon's
+/// link survives to carry the next send.
+#[test]
+fn each_header_bound_is_refused_with_its_reason_and_commits_nothing() {
+    let mut rig = Rig::new("header-bounds");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let many: Vec<String> = (0..33).map(|i| format!("\"k{i}\":\"v\"")).collect();
+    let cases: Vec<(String, &str)> = vec![
+        (
+            format!("{{{}}}", many.join(",")),
+            "headers: expected at most 32 headers, saw 33",
+        ),
+        (
+            format!("{{\"k\":\"{}\"}}", "x".repeat(5000)),
+            "header \\\"k\\\": expected a value of at most 4096 bytes, saw 5000",
+        ),
+        (
+            format!("{{\"{}\":\"v\"}}", "k".repeat(129)),
+            "headers: expected a key of 1 to 128 bytes, saw a key of 129 bytes",
+        ),
+        (
+            "{\"\":\"v\"}".into(),
+            "headers: expected a key of 1 to 128 bytes, saw a key of 0 bytes",
+        ),
+        (
+            "[\"a\"]".into(),
+            "headers: expected an object of string values, saw an array",
+        ),
+        (
+            "{\"a\":1}".into(),
+            "headers: expected an object of string values, saw a number for key \\\"a\\\"",
+        ),
+        (
+            "{\"a\":\"1\",\"a\":\"2\"}".into(),
+            "headers: duplicate key \\\"a\\\"",
+        ),
+    ];
+    for (i, (headers, reason)) in cases.iter().enumerate() {
+        for to in [RECIPIENT, "*"] {
+            let req = format!(
+                "{{\"type\":\"send\",\"req\":1,\"mail\":\"x-{i}\",\"from\":\"{SENDER}\",\"to\":\"{to}\",\"body\":\"b\",\"headers\":{headers}}}"
+            );
+            let reply = raw_request(&rig, "a.sock", &req);
+            assert!(reply.starts_with("{\"type\":\"error\""), "{reply}");
+            assert!(
+                reply.contains(&format!("\"reason\":\"{reason}\"")),
+                "{reply}"
+            );
+        }
+    }
+    // The CLI says the same, and a refused Mail is unknown at the coordinator.
+    let mut args: Vec<String> = (0..33).map(|i| format!("k{i}=v")).collect();
+    args.push("last=v".into());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = send_with_headers(&rig, RECIPIENT, "x-cli", &refs);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("headers: expected at most 32 headers, saw 34"),
+        "{out:?}"
+    );
+    for id in ["x-0", "x-1", "x-cli"] {
+        let o = Command::new(BIN)
+            .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+            .args(["--mail", id])
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{id}: {o:?}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("unknown mail"),
+            "{o:?}"
+        );
+    }
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 0, "{coord}");
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"broadcast\""),
+        0,
+        "{coord}"
+    );
+    assert!(!read(&rig.p("recipient.out")).contains("STORED"));
+    // The same link still carries a good send, and a resend of its id does not
+    // replace its headers.
+    let ok = send_with_headers(&rig, RECIPIENT, "good", &["a=1"]);
+    assert!(ok.status.success(), "{ok:?}");
+    let again = send_with_headers(&rig, RECIPIENT, "good", &["a=2"]);
+    assert!(again.status.success(), "{again:?}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=good",
+        Duration::from_secs(10),
+    );
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
+    assert!(coord.contains("\"headers\":{\"a\":\"1\"}"), "{coord}");
+}
+
+/// The largest set the bounds allow survives the whole path byte-identical.
+#[test]
+fn the_largest_allowed_header_set_arrives_intact() {
+    let mut rig = Rig::new("header-max");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let pairs: Vec<String> = (0..32)
+        .map(|i| format!("{i:0>128}={}", "é".repeat(2048)))
+        .collect();
+    let refs: Vec<&str> = pairs.iter().map(String::as_str).collect();
+    let out = send_with_headers(&rig, RECIPIENT, "max-1", &refs);
+    assert!(out.status.success(), "{out:?}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=max-1",
+        Duration::from_secs(20),
+    );
+    let want: Vec<String> = pairs
+        .iter()
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap();
+            format!("\"{k}\":\"{v}\"")
+        })
+        .collect();
+    let want = format!("{{{}}}", want.join(","));
+    let shown = read(&rig.p("recipient.out"));
+    assert!(
+        shown.contains(&format!("\nHEADERS mail=max-1 {want}\n")),
+        "HEADERS line differs"
+    );
+    assert!(read(&rig.p("recipient.store")).contains(&want));
+}
+
+/// The adapter takes `headers` on `send` and reports `kind` and `headers` on
+/// `mail`; a refusal comes back as an `error` line and the adapter keeps going.
+#[test]
+fn the_adapter_carries_kind_and_headers_both_ways() {
+    let mut rig = Rig::new("adapter-headers");
+    rig.start_stack();
+    rig.start_recipient("tracer.out", false);
+    let (_, mut shim_in) = rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ah-1\",\"body\":\"x\",\"headers\":{{\"t\":\"1\\n2\"}}}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("tracer.out"),
+        "HEADERS mail=ah-1 {\"t\":\"1\\n2\"}",
+        Duration::from_secs(10),
+    );
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ah-2\",\"body\":\"x\",\"headers\":[]}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("adapter.out"),
+        "headers: expected an object of string values, saw an array",
+        Duration::from_secs(10),
+    );
+    // Back to the adapter: the mail line.
+    let sent = Command::new(BIN)
+        .args(["send", "--socket", rig.p("b.sock").to_str().unwrap()])
+        .args(["--from", RECIPIENT, "--to", SENDER, "--mail", "ah-3"])
+        .args(["--body", "y", "--header", "q=w"])
+        .output()
+        .unwrap();
+    assert!(sent.status.success(), "{sent:?}");
+    wait_for_text(
+        &rig.p("adapter.out"),
+        "\"kind\":\"directed\",\"headers\":{\"q\":\"w\"}",
+        Duration::from_secs(10),
+    );
+    let out = read(&rig.p("adapter.out"));
+    let mail = out
+        .lines()
+        .find(|l| l.contains("\"mail\":\"ah-3\""))
+        .unwrap();
+    // The one transition field for the installed shim, computed from kind.
+    assert!(mail.ends_with(",\"wake\":true}"), "{mail}"); // legacy-wire: emit check
+}
+
+/// The three shapes of an old host daemon log: a deliver event with the
+/// older flag false is a Broadcast copy; with it true, or without it, directed.
+#[test]
+fn an_old_host_daemon_log_replays_with_the_right_kinds() {
+    let mut rig = Rig::new("old-daemon-log");
+    let head = |m: &str| {
+        format!("{{\"ev\":\"deliver\",\"mail\":\"{m}\",\"from\":\"{SENDER}\",\"to\":\"{RECIPIENT}\",\"body\":\"x\"")
+    };
+    let old = [
+        format!("{},\"wake\":false}}\n", head("o-1")), // legacy-wire: read shape
+        format!("{},\"wake\":true}}\n", head("o-2")),  // legacy-wire: read shape
+        format!("{}}}\n", head("o-3")),
+    ];
+    fs::write(rig.p("b.log"), old.concat()).unwrap();
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    for (mail, record, kind) in [
+        ("o-1", "r-1", "broadcast"),
+        ("o-2", "r-2", "directed"),
+        ("o-3", "r-3", "directed"),
+    ] {
+        wait_for_text(
+            &rig.p("recipient.out"),
+            &format!("STORED mail={mail} record={record} kind={kind}\n"),
+            Duration::from_secs(10),
+        );
+    }
+    assert!(!read(&rig.p("recipient.out")).contains("HEADERS"));
+    // A rollback to the previous binary reads the log this one writes.
+    rig.send("o-4", "new");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=o-4",
+        Duration::from_secs(10),
+    );
+    let log = read(&rig.p("b.log"));
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"mail\":\"o-4\""))
+        .unwrap();
+    assert!(line.contains("\"kind\":\"directed\""), "{line}");
+    assert!(line.contains("\"headers\":{}"), "{line}");
+    assert!(line.ends_with(",\"wake\":true}"), "{line}"); // legacy-wire: emit check
+}
+
+/// A coordinator log whose events lack `headers` replays: its Mail reads as
+/// directed or broadcast with an empty set and is delivered with both.
+#[test]
+fn an_old_coordinator_log_replays_and_delivers_with_kind_and_empty_headers() {
+    let mut rig = Rig::new("old-coord-log");
+    let to = RECIPIENT;
+    fs::write(
+        rig.p("coord.log"),
+        format!(
+            "{{\"ev\":\"session\",\"session\":\"{to}\",\"host\":\"host-b\"}}\n\
+             {{\"ev\":\"mail\",\"mail\":\"c-1\",\"from\":\"{SENDER}\",\"to\":\"{to}\",\"body\":\"x\"}}\n\
+             {{\"ev\":\"broadcast\",\"mail\":\"c-b\",\"from\":\"{SENDER}\",\"body\":\"y\",\"to\":[\"{to}\"]}}\n"
+        ),
+    )
+    .unwrap();
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    for line in [
+        "STORED mail=c-1 record=r-1 kind=directed\n",
+        &format!("STORED mail=c-b/{to} record=r-2 kind=broadcast\n"),
+    ] {
+        wait_for_text(&rig.p("recipient.out"), line, Duration::from_secs(10));
+    }
+    assert!(!read(&rig.p("recipient.out")).contains("HEADERS"));
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=c-b/{to} record=r-2"),
+        Duration::from_secs(10),
+    );
+    assert!(receipt_line(&rig, "c-1").ends_with(" kind=directed"));
+}
+
+/// A Store whose entries lack `kind` and `headers` replays: a redelivery of
+/// the stored Mail reuses its record and writes nothing; a new Mail's entry
+/// carries both.
+#[test]
+fn a_store_without_kind_and_headers_replays() {
+    let mut rig = Rig::new("old-store");
+    let old = format!(
+        "{{\"record\":\"r-1\",\"mail\":\"s-old\",\"from\":\"{SENDER}\",\"body\":\"old\"}}\n"
+    );
+    fs::write(rig.p("recipient.store"), &old).unwrap();
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    rig.send("s-old", "old");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=s-old record=r-1",
+        Duration::from_secs(10),
+    );
+    assert!(!read(&rig.p("recipient.out")).contains("STORED mail=s-old"));
+    assert_eq!(read(&rig.p("recipient.store")), old);
+    let out = send_with_headers(&rig, RECIPIENT, "s-new", &["a=b"]);
+    assert!(out.status.success(), "{out:?}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=s-new record=r-2",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert!(store.starts_with(&old), "{store}");
+    assert!(
+        store.ends_with("\"kind\":\"directed\",\"headers\":{\"a\":\"b\"}}\n"),
+        "{store}"
+    );
 }

@@ -2,6 +2,7 @@ mod claims;
 mod coordinator;
 mod daemon;
 mod durlog;
+mod headers;
 mod json;
 mod net;
 mod session;
@@ -16,6 +17,22 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 fn need(args: &[String], name: &str) -> io::Result<String> {
     arg(args, name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
+}
+
+/// Every `--header key=value`, split at the first `=`, as the object a send
+/// carries; None when there is none. Bounds are the coordinator's to check.
+fn headers(args: &[String]) -> io::Result<Option<json::Value>> {
+    let mut pairs = Vec::new();
+    for w in args.windows(2).filter(|w| w[0] == "--header") {
+        let (k, v) = w[1].split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--header expects key=value, saw {}", w[1]),
+            )
+        })?;
+        pairs.push((k.to_string(), json::s(v)));
+    }
+    Ok((!pairs.is_empty()).then_some(json::Value::Obj(pairs)))
 }
 
 /// Read the fleet token from the environment to keep it out of command-line listings.
@@ -35,6 +52,7 @@ Commands:
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
+              [--header <key=value>]...
   claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   renew       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   release     --socket <path> --owner <address> --key <text>
@@ -110,6 +128,7 @@ fn main() -> io::Result<()> {
                 None => session::gen_uuid()?,
             },
             need(&args, "--body")?,
+            headers(&args)?,
         ),
         "claim" | "renew" | "release" => {
             let op = claims::Op::parse(if cmd == "claim" { "acquire" } else { cmd })
