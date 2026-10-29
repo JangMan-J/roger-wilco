@@ -1756,11 +1756,50 @@ fn adapter_stdin_eof_unregisters_at_once_and_keeps_later_mail() {
     assert!(b.contains(SENDER), "{b}");
 
     rig.send("m-after", "kept for a later Register");
-    rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "adapter2.out", &[]);
+    // The second registration stays live: a dropped stdin would end it at once
+    // and race the delivery.
+    let (_, _stdin2) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "adapter2.out", &[]);
     wait_for_text(
         &rig.p("adapter2.out"),
         "\"mail\":\"m-after\"",
         Duration::from_secs(10),
+    );
+}
+
+/// A session that registers and ends at once (its stdin closes straight after
+/// the adapter reports ready) may or may not be handed Mail already accepted
+/// for it before it unregisters. Either way the Mail is neither lost nor
+/// duplicated: the next registration at that Address gets it if the first did
+/// not, the Store holds the body once, and the coordinator holds one receipt.
+#[test]
+fn a_session_that_ends_at_once_keeps_its_mail_once_for_the_next_register() {
+    let mut rig = Rig::new("unregister-at-once");
+    rig.start_stack();
+    rig.send("m-once", "accepted before any registration");
+
+    let (idx, stdin) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended1.out", &[]);
+    drop(stdin);
+    rig.children[idx].wait().unwrap();
+    let unregister = format!("\"ev\":\"unregister\",\"session\":\"{RECIPIENT}\"");
+    wait_for_count(&rig.p("coord.log"), &unregister, 1);
+
+    let (_, _stdin2) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended2.out", &[]);
+    wait_for_count(
+        &rig.p("coord.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-once\"",
+        1,
+    );
+    let store = read(&rig.p("adapter.store"));
+    assert_eq!(
+        count_lines_with(&store, "\"mail\":\"m-once\""),
+        1,
+        "{store}"
+    );
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"mail\",\"mail\":\"m-once\""),
+        1,
+        "{coord}"
     );
 }
 
