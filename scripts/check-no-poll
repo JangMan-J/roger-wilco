@@ -4,7 +4,7 @@
 # no sleep, timed wait, interval, elapsed-time sweep, or try-and-retry spin.
 #
 # A legitimate non-correctness use (reconnect backoff, a bounded wait that
-# turns a silent peer into an error) is allowed only when the matching line,
+# converts a silent peer into an error) is allowed only when the matching line,
 # or the line directly above it, carries a marker with a reason:
 #   // no-poll: <why this is not on the correctness path>
 #
@@ -21,7 +21,7 @@ cd "$ROOT"
 #   *_timeout(      recv_timeout, park_timeout, wait_timeout, set_read_timeout, ...
 #   Instant/elapsed  elapsed-time periodic sweeps
 #   interval         timers and tickers
-#   try_recv/try_lock/yield_now/spin_loop  busy polling
+#   try_recv/try_lock/yield_now/spin_loop  polling in a loop
 PATTERN='sleep|_timeout|Instant|\.elapsed\(|[Ii]nterval|try_recv|try_lock|yield_now|spin_loop'
 MARKER='//[[:space:]]*no-poll:[[:space:]]*[^[:space:]]'
 
