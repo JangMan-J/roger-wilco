@@ -28,8 +28,16 @@ cd "$ROOT"
 HARNESSES='pi|claude|claude-code|codex|gemini|cursor|aider|copilot|herdr|zellij|opencode|goose|cline|roo|amp|letta|windsurf'
 MODELS='anthropic|openai|fireworks|opus|sonnet|haiku|gpt|deepseek|llama|qwen|mistral|grok|kimi|glm'
 
-mapfile -t files < <(git ls-files --cached --others --exclude-standard -- "${@:-.}" |
-  grep -vE '^(shims|VECTORS)/|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+# A checkout lists its files through git; a plain export (no .git) lists the tree minus target/.
+list_files() {
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    git ls-files --cached --others --exclude-standard -- "$@"
+  else
+    find "$@" -type f -not -path '*/target/*' -not -path '*/.git/*' | sed 's#^\./##'
+  fi
+}
+mapfile -t files < <(list_files "${@:-.}" |
+  grep -vE '^(shims|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 

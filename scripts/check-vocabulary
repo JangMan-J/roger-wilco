@@ -9,6 +9,7 @@
 # Exempt:
 #   frontmatter         a leading YAML block in a markdown file
 #   shims/              adapters on top of the core; each may have its own vocabulary
+#   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence
 #   AGENTS.md           the director's file; it quotes dated directives verbatim
@@ -26,8 +27,16 @@ cd "$ROOT"
 # Whole words: "return" and "returns" are not "turn".
 WORDS='wake|wakes|woke|woken|waking|turn|turns|idle|busy'
 
-mapfile -t files < <(git ls-files --cached --others --exclude-standard -- "${@:-.}" |
-  grep -vE '^(shims|VECTORS)/|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+# A checkout lists its files through git; a plain export (no .git) lists the tree minus target/.
+list_files() {
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    git ls-files --cached --others --exclude-standard -- "$@"
+  else
+    find "$@" -type f -not -path '*/target/*' -not -path '*/.git/*' | sed 's#^\./##'
+  fi
+}
+mapfile -t files < <(list_files "${@:-.}" |
+  grep -vE '^(shims|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
