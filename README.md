@@ -39,7 +39,7 @@ cargo test --offline --features test-hooks   # unit seams + process seam (real c
 cargo build --release --offline              # no test hooks; what deploy ships
 ```
 
-The `test-hooks` feature adds `--hold-before-ack <marker>` to `session` and `adapter`: park
+The `test-hooks` feature adds `--hold-before-ack <marker>` to `session`, `adapter` and `mcp`: park
 between the Store write and the Ack, so a test can SIGKILL a session in that window. Only
 tests and `scripts/acceptance` build with it; deploy refuses a binary that carries it.
 
@@ -78,6 +78,7 @@ environment, never from argv, which `ps` shows to every user.
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session` | the same session, fronted by a stdin/stdout line stream for a shim |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
+| `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
@@ -203,6 +204,78 @@ already acked is not replayed.
 `--declare` is opaque text a session states about itself at Register; the core stores it and
 returns it on the Board, and reads none of it.
 
+## Faces
+
+A Face is one complete way a client reaches the core as a session. All three give a session the
+same Mail, Store, Ack, Board, Claim and Receipt semantics and add none of their own; a client
+that speaks one needs no adapter of its own.
+
+- **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket: `register`,
+  `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`
+  Tracer and the one-shot subcommands above are clients of it.
+- **The `roger adapter` stream.** The same session fronted by one JSON line stream on stdin and
+  stdout, for a shim (see Adapters).
+- **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
+  that can register an MCP server needs no shim.
+
+### `roger mcp`
+
+```
+roger mcp [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
+          [--label <text>] [--declare <text>]
+```
+
+To register it with an MCP client, give the client the command line `roger mcp` with any of
+the flags above, and set environment variables for it where the client allows. Nothing else is
+needed: the process is a session, it registers when it starts, and the client ends it by
+closing its stdin.
+
+| Setting | Order |
+| --- | --- |
+| Address | `--id`; else the variable named by `--id-env NAME` (so a client's own registration can hand the server a stable per-conversation id; unset or empty falls through); else `ROGER_ADDRESS`; else a fresh UUID. Used verbatim, never parsed. |
+| Socket | `--socket`; else `ROGER_SOCKET`; else `$XDG_RUNTIME_DIR/roger/daemon.sock`. A missing socket, or none of these set, is an error naming what was expected and what was seen. |
+| Store | `--store`; else `ROGER_STORE`; else `${XDG_STATE_HOME:-~/.local/state}/roger/mcp/<address>.store`. |
+
+It writes each delivery to its Store, then acks naming that Record id, exactly as the adapter
+does; the Ack waits for no reader and for nothing a tool call does. stdout carries only
+protocol messages; everything else goes to stderr. When stdin closes it unregisters and exits
+0. If the host daemon connection is lost it exits 1 with the reason on stderr (it does not
+reconnect). At exit, a Store at the default path that holds no entries is removed with its
+`.cursor` file, so a health check leaves nothing; an explicit `--store` is never removed.
+`--hold-before-ack <marker>` (feature `test-hooks`) works here as for `session`.
+
+The protocol is newline-delimited JSON-RPC 2.0, one message per line. `initialize` answers
+with the client's `protocolVersion` when it is `2025-06-18`, `2025-03-26` or `2024-11-05`
+(else `2025-06-18`), `capabilities` `{"tools":{}}` and `serverInfo` `roger` with the crate
+version. Notifications get no reply, `ping` gets `{}`, any other method is error -32601, and
+unparseable input is -32700 with a null id. Calls run concurrently, so a waiting
+`roger_inbox` blocks no other call. A tool failure is a result with `isError: true` and the
+reason in its text; an unknown tool or an argument of the wrong type says what was expected
+and what was seen. Every result is one `text` item holding one compact JSON object.
+Streamable HTTP is not offered.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `roger_send` | `to`, `body`, `mail?`, `headers?` | `{"mail"}`; `to` may be `"*"`; `headers` is an object of strings passed through unread, and the core's refusal reason is the error text |
+| `roger_inbox` | `limit?` (50, max 200), `wait_seconds?` (10, max 60, 0 = no wait), `peek?` | `{"mail":[{"record","mail","from","body","kind","headers"}],"cursor"}` |
+| `roger_board` | `all?`, `window_seconds?` (600) | `{"me","sessions","claims","now_ms"}`, rows as the Board gave them; by default only sessions connected or seen within the window of `now_ms` |
+| `roger_label` | `label` | `{"session","label"}` |
+| `roger_claim` | `key`, `ttl_seconds?` (900) | `{"ok","op","key","holder"?,"remaining_ms"?,"reason"?}`; acquires, or refreshes a claim this session holds; a refusal is `"ok":false`, not an error |
+| `roger_renew` | `key`, `ttl_seconds` | the same claim result |
+| `roger_release` | `key` | the same claim result |
+| `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
+
+`roger_inbox` returns the Store entries after this session's read position, oldest first. With
+none it waits up to `wait_seconds` for the next delivery to reach the Store; that write ends
+the wait, not a timer scan. Unless `peek` is true the position moves past the entries returned
+and is saved before the reply is sent: it is the file `<store>.cursor`, written by temp file,
+fsync and rename, and read at start, so it survives SIGKILL and restart. An entry already
+returned is not returned again, an entry stored before the process died is returned once, and
+`cursor` is the last record returned (null when none). It never gates an Ack. An entry written
+before kinds and headers existed shows neither. Which sessions count as present on the Board
+is the reader's choice, made here by `all` and `window_seconds`; nothing compares an Address,
+a label or a token.
+
 ## Checks
 
 Every script accepts `--help` (or `-h`) and prints usage without running its work.
@@ -223,6 +296,7 @@ scripts/acceptance broadcast      # proof 3: one broadcast reaches every registe
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance references     # proof 6: references keep both tokens verbatim; relabel keeps the Address
 scripts/acceptance headers        # proof 7: kind and headers arrive byte-identical; a refused set commits nothing; old logs replay
+scripts/acceptance mcp            # proof 8 (K8): `roger mcp` is a session; tools, position, SIGKILL between Store and Ack; loopback
 scripts/check-vocabulary          # invariant: the core never names what a session does with its Mail
 ```
 
@@ -257,10 +331,12 @@ core log grows while nobody asks.
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped agent session (Tracer), adapter, and the clients |
+| `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
 | `tests/process.rs` | process seam, including the SIGKILL window |
+| `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |

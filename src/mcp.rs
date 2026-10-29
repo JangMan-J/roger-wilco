@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn address_precedence_is_flag_then_named_variable_then_default_variable_then_fresh() {
         let e = [("MINE", "from-named"), ("ROGER_ADDRESS", "from-default")];
-        let base = [("ROGER_SOCKET", "/s")];
+        let base = [("ROGER_SOCKET", "/s"), ("HOME", "/h")];
         let all: Vec<_> = e.iter().chain(base.iter()).copied().collect();
         let a = |flags: &[&str], env: &[(&str, &str)]| resolved(flags, env).unwrap().address;
         assert_eq!(a(&["--id", "X", "--id-env", "MINE"], &all), "X");
@@ -918,7 +918,12 @@ mod tests {
         assert_eq!(a(&[], &all), "from-default");
         assert_eq!(a(&["--id-env", "MINE"], &base), "fresh-uuid");
         // an unset or empty named variable falls through
-        let empty = [("MINE", ""), ("ROGER_ADDRESS", "from-default"), base[0]];
+        let empty = [
+            ("MINE", ""),
+            ("ROGER_ADDRESS", "from-default"),
+            base[0],
+            base[1],
+        ];
         assert_eq!(a(&["--id-env", "MINE"], &empty), "from-default");
         assert_eq!(a(&["--id-env", "UNSET"], &empty), "from-default");
     }
