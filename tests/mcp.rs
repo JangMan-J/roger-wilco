@@ -96,8 +96,11 @@ impl Rig {
             "--data",
             rig.p("daemon.log").to_str().unwrap(),
         ]);
-        until("the daemon socket", 10, || {
-            rig.sock().exists().then_some(())
+        // The socket file exists before the daemon listens: wait for an accept.
+        until("the daemon socket to accept", 10, || {
+            std::os::unix::net::UnixStream::connect(rig.sock())
+                .ok()
+                .map(drop)
         });
         rig
     }
@@ -173,7 +176,17 @@ impl Rig {
         let store = self.p(&format!("{name}.store"));
         let mut args = vec!["--id", address, "--store", store.to_str().unwrap()];
         args.extend_from_slice(extra);
-        let mut m = self.mcp(name, &args, &[]);
+        let mut m = self.unregistered_session(name, &args);
+        // The coordinator must hold the Register before a first send.
+        let r = m.ok("roger_registered", r#"{"wait_seconds":20}"#);
+        assert_eq!(r.get("registered"), Some(&Value::Bool(true)), "{r:?}");
+        m
+    }
+
+    /// A session started and initialized, not waited for: it may be registered
+    /// at the coordinator or not yet (or never, during an outage).
+    fn unregistered_session(&self, name: &str, args: &[&str]) -> Mcp {
+        let mut m = self.mcp(name, args, &[]);
         m.initialize();
         m
     }
@@ -1049,7 +1062,8 @@ fn roger_registered_waits_for_the_coordinator_to_hold_the_register() {
 fn roger_registered_is_false_during_an_outage_and_true_after_the_restart() {
     let mut rig = Rig::new("registered-outage");
     rig.coordinator_down();
-    let mut a = rig.session("a", A1, &[]);
+    let store = rig.p("a.store");
+    let mut a = rig.unregistered_session("a", &["--id", A1, "--store", store.to_str().unwrap()]);
     let r = a.ok("roger_registered", r#"{"wait_seconds":0}"#);
     assert_eq!(r.get("registered"), Some(&Value::Bool(false)));
     rig.coordinator_up();
