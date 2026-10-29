@@ -76,21 +76,24 @@ minutes), described in `roger-command.ts`.
 
 The shim writes each delivery into Pi's transcript. It declares `wake-latency-ms=<n>`
 through `--declare` (`ROGER_WAKE_LATENCY_MS`, default 1000; `off` declares nothing and never
-wakes). A delivery with `wake: true` goes to Pi as
+wakes). Pi maps the core's delivery `kind: directed` to its wake behavior (`startsTurn` in
+`roger-adapter.ts`); `kind` wins over the older `wake` field, which is read only when `kind` is
+absent (an older core). Headers are carried by the core and ignored by this shim. A directed
+delivery goes to Pi as
 `sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })`: an idle Pi starts a turn, a
-busy Pi queues it and hands it to the model at the turn boundary. A `wake: false` delivery
-(a broadcast copy) is rendered with `triggerTurn: false`.
+busy Pi queues it and hands it to the model at the turn boundary. A `broadcast` kind (or an older
+core's `wake: false`) queues no turn and is rendered with `triggerTurn: false`.
 
 ## Checks
 
 ```sh
 shims/pi/check                    # unit tests under test/; no pi binary needed
-scripts/acceptance pi-shim        # lifecycle and the roger_send tool callback in a real Pi; no model
-scripts/acceptance wake           # proof 5: directed mail wakes an idle Pi; busy queues to the turn boundary
+shims/pi/acceptance pi-shim        # lifecycle and the roger_send tool callback in a real Pi; no model
+shims/pi/acceptance wake           # proof 5: directed mail wakes an idle Pi; busy queues to the turn boundary
 scripts/acceptance independence   # proof 2: this shim is one of the two harnesses
 ```
 
 The three acceptance checks run on loopback and need `pi` and `jq`.
-`scripts/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
+`shims/pi/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
 `scripts/acceptance independence` Pi runs in RPC mode with wake off and makes no model
 call; that check also needs the Claude Code shim's requirements.

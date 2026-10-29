@@ -22,7 +22,25 @@ import { settings, type Env, type Settings } from "./roger-env.ts";
 export type Reply = Record<string, unknown>;
 type Pending = { ok: (reply: Reply) => void; fail: (e: Error) => void };
 /** A `mail` line of the adapter, or any other event; the shim reads `type`. */
-export type AdapterMail = { mail: string; from: string; body: string; record: string; wake?: boolean };
+export type AdapterMail = {
+	mail: string;
+	from: string;
+	body: string;
+	record: string;
+	/** `directed` or `broadcast`; a kind this shim does not know starts no turn. */
+	kind?: string;
+	/** The sender's opaque headers; carried by the core, ignored by this shim. */
+	headers?: Record<string, string>;
+	/** The field of older cores (no `kind`): false on a broadcast copy. */
+	wake?: boolean;
+};
+
+/** Whether a delivery starts a Pi turn. `kind` wins; `wake` is read only when `kind` is absent. */
+export function startsTurn(mail: AdapterMail, wakeMs: number | undefined): boolean {
+	if (wakeMs === undefined) return false;
+	if (typeof mail.kind === "string") return mail.kind === "directed";
+	return mail.wake !== false;
+}
 
 export type Backoff = {
 	/** First delay in ms; each consecutive failure doubles it. */
