@@ -160,7 +160,7 @@ impl Rig {
         let args = self.coordinator_args("127.0.0.1:0", &port_file, &self.p("coord.log"));
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.spawn(&arg_refs, "coord.out");
-        wait_for_file(&port_file, Duration::from_secs(10));
+        wait_for_port(&port_file, Duration::from_secs(10));
         let port = fs::read_to_string(&port_file).unwrap().trim().to_string();
         self.coord_port = port.clone();
         let coord = format!("127.0.0.1:{port}");
@@ -182,7 +182,7 @@ impl Rig {
                 ],
                 out,
             );
-            wait_for_file(&self.p(sock), Duration::from_secs(10));
+            wait_for_socket(&self.p(sock), Duration::from_secs(10));
         }
     }
 
@@ -338,7 +338,7 @@ impl Rig {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let _ = fs::remove_file(self.p("b.sock"));
         self.spawn(&arg_refs, "daemon-b2.out");
-        wait_for_file(&self.p("b.sock"), Duration::from_secs(10));
+        wait_for_socket(&self.p("b.sock"), Duration::from_secs(10));
     }
 }
 
@@ -375,6 +375,35 @@ fn wait_for_file(path: &Path, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+/// The coordinator creates its port file and then writes the port: a reader
+/// that stops at "the file exists" can read it empty. Wait for the port itself.
+fn wait_for_port(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if read(path).trim().parse::<u16>().is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for a port in {}", path.display());
+}
+
+/// A Unix socket file exists from `bind`, before `listen`: a client that
+/// connects in between is refused. Wait until a connection is accepted.
+fn wait_for_socket(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for a daemon to accept on {}",
+        path.display()
+    );
 }
 
 fn wait_for_text(path: &Path, needle: &str, timeout: Duration) {
@@ -1775,6 +1804,7 @@ fn adapter_stdin_eof_unregisters_at_once_and_keeps_later_mail() {
 fn a_session_that_ends_at_once_keeps_its_mail_once_for_the_next_register() {
     let mut rig = Rig::new("unregister-at-once");
     rig.start_stack();
+    wait_until_board_reaches_both(&rig);
     rig.send("m-once", "accepted before any registration");
 
     let (idx, stdin) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended1.out", &[]);
