@@ -184,6 +184,9 @@ impl Rig {
             );
             wait_for_socket(&self.p(sock), Duration::from_secs(10));
         }
+        // A daemon accepts local connections before its link to the
+        // coordinator is up; a test that sends first would be refused.
+        wait_until_board_reaches_both(self);
     }
 
     fn start_recipient(&mut self, out: &str, hold: bool) -> usize {
@@ -1804,7 +1807,6 @@ fn adapter_stdin_eof_unregisters_at_once_and_keeps_later_mail() {
 fn a_session_that_ends_at_once_keeps_its_mail_once_for_the_next_register() {
     let mut rig = Rig::new("unregister-at-once");
     rig.start_stack();
-    wait_until_board_reaches_both(&rig);
     rig.send("m-once", "accepted before any registration");
 
     let (idx, stdin) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended1.out", &[]);
