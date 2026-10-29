@@ -62,7 +62,7 @@ $roger claim --socket $d/daemon.sock --owner <address a> --key job-1 --ttl-ms 60
 $roger board --socket $d/daemon.sock
 ```
 
-Session b prints `STORED mail=m1 record=r-1 wake=true`, then `DELIVERED mail=m1 record=r-1`
+Session b prints `STORED mail=m1 record=r-1 kind=directed`, then `DELIVERED mail=m1 record=r-1`
 once its Ack is recorded. Stop the processes with `kill %1 %2 %3 %4`.
 
 ## Commands
@@ -77,7 +77,7 @@ environment, never from argv, which `ps` shows to every user.
 | `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session` | the same session, fronted by a stdin/stdout line stream for a shim |
-| `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>]` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID |
+| `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
@@ -89,8 +89,9 @@ whole composite `[[<token>:<label>:<token>]]<uuid>` (the label may hold spaces; 
 command takes it whole and every record keeps it byte-identical; the core never splits it, and
 the tokens inside mean something only to the consumer that composed them. A relabel changes the
 Board's display label and never the Address, inner label included. The Tracer prints `READY session=<address>`
-after it registers, `STORED mail= record= wake=` after each Store write, and
-`DELIVERED mail= record=` when its Ack is recorded.
+after it registers, `STORED mail= record= kind=` after each Store write (followed by a
+`HEADERS mail= <json>` line when the Mail has headers), and `DELIVERED mail= record=` when
+its Ack is recorded.
 
 `claim`, `renew` and `release` print `CLAIMED`, `RENEWED`, `RELEASED` or `REFUSED` with the
 current holder, and exit 3 when refused. `--owner` must be a registered session Address;
@@ -109,8 +110,28 @@ Labels are stored and returned verbatim and never change an Address or its mailb
 `send --to '*'` is a Broadcast: the coordinator commits it once and fans it out to every
 session registered at that moment, one Mail per recipient with id `<mail>/<address>`, each
 delivered and acked like directed mail. A Mail id containing `/` is refused, so no directed
-id can equal a copy id. Every delivery carries `wake`: true for directed mail, false for a
-broadcast copy.
+id can equal a copy id.
+
+## Kind and headers
+
+Every delivery carries a `kind`: `directed` for a Mail sent to one Address, `broadcast` for a
+copy of a Broadcast. It says how the Mail reached the recipient and nothing about what the
+recipient does with it. The same hop carries `headers`: a JSON object of string keys to
+string values that the sender set with `send` (`--header key=value`, repeatable, or
+`"headers"` on the adapter's `send`); `{}` when there are none. The core never reads, compares
+or ranks a key or a value. They are carried verbatim, key order included, through the
+coordinator log, the host daemon log, the delivery, the session's Store entry (which gains
+`kind` and `headers`) and the receipt reply. A Broadcast's headers go on every copy; resending
+an existing Mail id commits nothing new and does not update them.
+
+The coordinator bounds them once, before anything is committed: at most 32 headers; each key 1
+to 128 bytes; each value 0 to 4096 bytes; keys unique; values strings. A set outside the
+bounds is refused with an error whose reason says what was expected and what was seen (for
+example `headers: expected at most 32 headers, saw 33`), and no Mail, log line or receipt
+exists for it. A key that contains `=` cannot be given to `--header`; send it through the
+adapter or the socket. Logs and Stores written before `kind` and `headers` existed replay
+unchanged: such a Mail is directed, or a Broadcast copy where its log line says so, with no
+headers.
 
 ## Receipts and latency
 
@@ -119,8 +140,9 @@ The coordinator stamps each Mail twice on its own clock (milliseconds since the 
 records the Receipt. Both stamps come from one clock, so their difference is end-to-end
 latency with no skew between hosts. Broadcast copies carry the broadcast's `accepted_at_ms`
 and their own `receipted_at_ms`. `receipt --mail <id>` (a copy by its `<mail>/<address>` id)
-prints `RECEIPT mail= to= record= accepted_at_ms= receipted_at_ms= latency_ms=` once the
-recipient has acked, else `PENDING mail= to= accepted_at_ms=`; an unknown id exits nonzero.
+prints `RECEIPT mail= to= record= accepted_at_ms= receipted_at_ms= latency_ms= kind=` once the
+recipient has acked, else `PENDING mail= to= accepted_at_ms= kind=`, and a following
+`HEADERS mail= <json>` line when the Mail has headers; an unknown id exits nonzero.
 A Mail or Receipt committed before the stamps existed replays unchanged and prints `absent`,
 never 0. The core reports these numbers and does nothing else with them.
 
@@ -169,15 +191,17 @@ under `shims/<name>/`, each with its own README, install script and `check`. A s
 adapter's stdin reaches EOF it unregisters its Address (see Registration) and exits; a shim
 ends its adapter by closing that stdin.
 
-Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
-the Mail to its Store (durable), then tells the shim, then sends the Ack; the Ack stays the
-adapter's responsibility and a shim never sends it. What a shim has shown its program is not
-durable. If the adapter died before its Ack, the core redelivers and the Store reuses the same
-record, so a restarted shim is told again; Mail already acked is not replayed to a model.
+A delivery reaches the shim after the adapter has written it to its Store, as one `mail` line
+that carries the Mail's `kind` and `headers`. What a shim does when a delivery arrives is the
+shim's own: the core carries no state about it, and the Store write and the Ack wait for
+nothing the shim does. The adapter writes the Mail to its Store (durable), then tells the shim,
+then sends the Ack; the Ack stays the adapter's responsibility and a shim never sends it. What
+a shim has shown its program is not durable. If the adapter died before its Ack, the core
+redelivers and the Store reuses the same record, so a restarted shim is told again; Mail
+already acked is not replayed.
 
-Wake is the shim's job; the core carries no busy or idle state. A shim that can start a turn
-declares `wake-latency-ms=<n>` through `--declare` and acts on each delivery's `wake` flag;
-the Store write and the Ack wait for neither.
+`--declare` is opaque text a session states about itself at Register; the core stores it and
+returns it on the Board, and reads none of it.
 
 ## Checks
 
@@ -195,10 +219,11 @@ scripts/check-seal                # the director's seal on the sealed documents 
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
 scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
-scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
+scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, kind broadcast
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
-scripts/acceptance wake           # proof 5: directed mail wakes an idle session; busy queues to the turn boundary
 scripts/acceptance references     # proof 6: references keep both tokens verbatim; relabel keeps the Address
+scripts/acceptance headers        # proof 7: kind and headers arrive byte-identical; a refused set commits nothing; old logs replay
+scripts/check-vocabulary          # invariant: the core never names what a session does with its Mail
 ```
 
 `cross-host`, `broadcast` and `claims` run on two hosts. Set `ROGER_REMOTE_HOST` to the
@@ -215,8 +240,8 @@ What `scripts/check-harness-free` counts as the core, and what it exempts, is re
 in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 `scripts/acceptance no-poll` runs the real binaries with no sweep (the core has none; a sweep
-added later needs a switch that this check turns off). Each phase leaves one event trigger as
-the only path to its result, so removing any trigger fails it, and its idle windows fail if any
+added later needs a switch that this check switches off). Each phase leaves one event trigger as
+the only path to its result, so removing any trigger fails it, and its quiet windows fail if any
 core log grows while nobody asks.
 
 `scripts/acceptance references` reads the Board through `roger board` and also searches
@@ -234,6 +259,7 @@ core log grows while nobody asks.
 | `src/session.rs` | contract-shaped agent session (Tracer), adapter, and the clients |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing and message helpers |
+| `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
 | `tests/process.rs` | process seam, including the SIGKILL window |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
