@@ -96,4 +96,4 @@ scripts/acceptance independence   # proof 2: this shim is one of the two harness
 The three acceptance checks run on loopback and need `pi` and `jq`.
 `shims/pi/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
 `scripts/acceptance independence` Pi runs in RPC mode with wake off and makes no model
-call; that check also needs the Claude Code shim's requirements.
+call; that check also needs `claude` (logged in), `pi`, `jq`.

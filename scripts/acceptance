@@ -121,18 +121,8 @@ cross_host() {
 # binary. Two actual harness sessions exchange Mail in both directions:
 #   - Pi (RPC mode; shims/pi/roger.ts) on host-a. A slash command and a
 #     delivery skip the model, so Pi needs no model call.
-#   - Claude Code (`claude -p`; shims/claude/roger-mcp.mjs) on host-b. This
-#     makes ONE REAL model call (haiku, the user's subscription): the model
-#     must call roger_inbox and roger_send. The tool results are read from
-#     Claude's own stream-json output, not from the model's prose.
-# Then the Tracer, a standalone session with no harness, exchanges Mail with
-# Pi as an additional check. Loopback only.
-
-# Proof 2. One coordinator, two host daemons, one client binary, one adapter
-# binary. Two actual harness sessions exchange Mail in both directions:
-#   - Pi (RPC mode; shims/pi/roger.ts) on host-a. A slash command and a
-#     delivery skip the model, so Pi needs no model call.
-#   - Claude Code (`claude -p`; shims/claude/roger-mcp.mjs) on host-b. This
+#   - Claude Code (`claude -p`, with the built-in `roger mcp` face
+#     registered as its MCP server) on host-b. This
 #     makes ONE REAL model call (haiku, the user's subscription): the model
 #     must call roger_inbox and roger_send. The evidence is the structure of
 #     Claude's own stream-json: the tool_result paired by tool_use_id with the
@@ -142,7 +132,6 @@ cross_host() {
 independence() {
   command -v pi >/dev/null || fail "pi CLI required for the Pi session"
   command -v claude >/dev/null || fail "claude CLI required for the Claude Code session"
-  command -v node >/dev/null || fail "node required for the Claude Code shim"
   command -v jq >/dev/null || fail "jq required to read Claude's stream-json"
   local pi_addr="$SENDER" tracer_addr="$RECIPIENT" claude_addr="$CLAUDE"
   loopback_stack
@@ -174,12 +163,12 @@ independence() {
   wait_for 15 "coordinator accepted Pi's mail for Claude" grep -qF "$pi_to_claude" "$work/coord.log"
 
   local mcp
-  mcp="$(jq -cn --arg shim "$ROOT/shims/claude/roger-mcp.mjs" --arg bin "$bin" --arg sock "$work/b.sock" \
-    --arg store "$work/claude.store" --arg id "$claude_addr" \
-    '{mcpServers:{roger:{command:"node",args:[$shim],env:{ROGER_BIN:$bin,ROGER_SOCKET:$sock,ROGER_STORE:$store,ROGER_SESSION:$id}}}}')"
+  mcp="$(jq -cn --arg bin "$bin" --arg sock "$work/b.sock" --arg store "$work/claude.store" \
+    '{mcpServers:{roger:{command:$bin,args:["mcp","--socket",$sock,"--store",$store,"--id-env","CLAUDE_CODE_SESSION_ID"]}}}')"
   (cd "$work" && timeout 180 claude -p \
     "Call the roger_inbox tool once. Then call the roger_send tool with to=$pi_addr and body exactly: $claude_to_pi. Do nothing else." \
     --model haiku --mcp-config "$mcp" --strict-mcp-config --tools "" \
+    --session-id "$claude_addr" \
     --allowedTools mcp__roger__roger_inbox mcp__roger__roger_send \
     --no-session-persistence --max-budget-usd 1 \
     --output-format stream-json --verbose >"$work/claude.out" 2>"$work/claude.err") \
@@ -189,7 +178,8 @@ independence() {
         | select(.type == "tool_use" and .name == "mcp__roger__roger_inbox") | .id] as $ids
       | any(.[] | select(.type == "user") | .message.content[]?
           | select(.type == "tool_result" and (.tool_use_id as $t | $ids | index($t)) != null
-                   and (.content | tostring | contains($b))); .)' \
+                   and ((.content | if type == "string" then . else map(.text? // "") | join("") end)
+                        | fromjson? | any(.mail[]?; .body == $b))); .)' \
     "$work/claude.out" >/dev/null \
     || fail "no roger_inbox tool_result carrying Pi's body in Claude's stream"
   jq -es --arg to "$pi_addr" --arg b "$claude_to_pi" '
@@ -211,7 +201,7 @@ independence() {
   log_count '"record":"r-2"' 1 "$work/coord.log" || fail "Pi's second record must be r-2"
 
   "$ROOT/scripts/check-harness-free" || fail "core names a harness"
-  echo "PASS independence: Pi and Claude Code sessions exchanged Mail both ways (Claude via one real haiku call), and the Tracer exchanged Mail with Pi, through one coordinator, two host daemons, one client and one adapter binary; each Store holds each body once"
+  echo "PASS independence: a session on the built-in MCP face and a Pi session exchanged Mail both ways (Claude Code via one real haiku call), and the Tracer exchanged Mail with Pi, through one coordinator, two host daemons, one client and one adapter binary; each Store holds each body once"
 }
 
 # Proof 4. Two hosts, one coordinator. A local and B remote
