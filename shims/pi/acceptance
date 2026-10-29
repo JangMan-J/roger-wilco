@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# Acceptance for the Pi shim: its lifecycle (`pi-shim`) and its wake behavior (`wake`).
+# Real Pi runtime and real shim, no model call. Loopback only.
+# Usage: shims/pi/acceptance <pi-shim|wake>
+set -euo pipefail
+SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SHIM_DIR/../../scripts/acceptance-lib"
+source "$SHIM_DIR/acceptance-lib"
+SENDER="11111111-1111-4111-8111-111111111111"
+
+# Pi shim lifecycle, no model and no Claude. Real Pi runtime and real shim;
+# the first two cases substitute a stub for the adapter binary only to make
+# it fail; the last two use the real adapter.
+pi_shim() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  loopback_stack
+  start_tracer
+  local ext="$ROOT/shims/pi/roger.ts"
+
+  # A missing adapter binary: the failure is reported, the harness survives.
+  pi_start missing "$SENDER" "$work/no-such-binary" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "ENOENT reported" grep -q 'roger-send failed: .*ENOENT' "$work/missing.out"
+  pi_call alive '{"type":"get_state"}' || fail "Pi died with a missing adapter binary"
+  pi_stop
+
+  # The adapter dying while a send is pending: the send fails, not hangs.
+  printf '#!/bin/sh\nread line\nexit 3\n' >"$work/dying"
+  chmod +x "$work/dying"
+  pi_start dying "$SENDER" "$work/dying" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "exit reported for the pending send" grep -q 'roger-send failed: roger adapter exited (3)' "$work/dying.out"
+  pi_stop
+
+  # session_start recurs on new_session: still one adapter on this Store.
+  # A function, so wait_for recounts on every try (a "$(...)" argument would
+  # be expanded once, before the first try).
+  adapters() { pgrep -fc "adapter --socket $work/a.sock" || true; }
+  adapters_are() { [[ "$(adapters)" == "$1" ]]; }
+  pi_start recur "$SENDER" "$bin" "$ext"
+  wait_for 10 "one adapter" adapters_are 1
+  pi_call new1 '{"type":"new_session"}' || fail "new_session unanswered"
+  pi_call new2 '{"type":"new_session"}' || fail "new_session unanswered"
+  adapters_are 1 || fail "session_start left more than one adapter on the Store"
+  pi_stop
+  wait_for 10 "adapter exits with Pi" adapters_are 0
+
+  # The model-facing roger_send tool's callback, invoked directly in the
+  # real Pi runtime (no model call), reaches the Tracer.
+  pi_start tool "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  pi_slash "/call-roger-send $RECIPIENT tool body [[153:Meteor Shower:7]]" || fail "Pi did not answer /call-roger-send"
+  wait_for 15 "tracer received the tool's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
+  log_count "tool body [[153:Meteor Shower:7]]" 1 "$work/tracer.store" || fail "tracer Store must hold the tool's body once"
+
+  # /roger in the same real Pi runtime: label, board, and messaging by
+  # address prefix and by label. ctx.ui.notify text lands in Pi's rpc output.
+  pi_slash "/roger label [[0:FLEET:0]] pi" || fail "Pi did not answer /roger label"
+  wait_for 10 "own label confirmed" grep -qF "$SENDER is now [[0:FLEET:0]] pi" "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a connected=true last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "board does not show the label set by /roger label: $("$bin" board --socket "$work/a.sock")"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
+  wait_for 10 "tracer label confirmed" grep -qF "$RECIPIENT is now Tracer" "$work/tool.out"
+  # /roger with no args: the Board, then the picker. Pick the tracer, choose
+  # "Set label…", and type a new label; the Board shows it.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"22222222-2222-4222-8222-222222222222 — host host-b — Tracer"}'
+  pi_ui select '{value:"Set label…"}'
+  pi_ui input '{value:"Picked"}'
+  pi_answered
+  wait_for 10 "picker relabel on the Board" sh -c "'$bin' board --socket '$work/b.sock' | grep -q '^SESSION address=$RECIPIENT .* label=Picked\$'"
+  grep -qF "Present sessions (connected or seen within 600s) (2)" "$work/tool.out" || fail "/roger board lacks the present heading"
+  grep -qF "Your host: host-a" "$work/tool.out" || fail "/roger board lacks the own host"
+  grep -qF "$RECIPIENT — host host-b — Tracer" "$work/tool.out" || fail "/roger board lacks the tracer row with its label"
+  grep -qF "$SENDER (you) — host host-a — [[0:FLEET:0]] pi" "$work/tool.out" || fail "/roger board lacks the own row"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
+  pi_slash "/roger ${RECIPIENT:0:8} by prefix [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger <prefix>"
+  wait_for 15 "prefix-addressed mail stored" log_count "by prefix [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  pi_slash "/roger Tracer by label [[0:FLEET:0]]" || fail "Pi did not answer /roger <label>"
+  wait_for 15 "label-addressed mail stored" log_count "by label [[0:FLEET:0]]" 1 "$work/tracer.store"
+  pi_slash "/roger [[0:FLEET:0]] pi by spaced label" || fail "Pi did not answer /roger <label with spaces>"
+  wait_for 15 "spaced-label mail stored" log_count "by spaced label" 1 "$work/tool.store"
+  pi_slash "/roger * broadcast [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger *"
+  wait_for 15 "broadcast stored by the tracer" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  wait_for 15 "broadcast stored by Pi" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tool.store"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  wait_for 10 "board all rendered" grep -qF "All registered sessions (2)" "$work/tool.out"
+  pi_slash '/call-roger-tool roger_claim {"key":"[[0:build:0]]","ttl_seconds":60}' || fail "Pi did not answer roger_claim"
+  wait_for 10 "roger_claim granted" grep -qF '"ok\":true' "$work/tool.out"
+  "$bin" board --socket "$work/b.sock" | grep -qF "CLAIM holder=$SENDER " || fail "board lacks the claim taken by roger_claim"
+  # The /roger view shows the claim key JSON-quoted, then its holder verbatim.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "\\\"[[0:build:0]]\\\" — $SENDER (" "$work/tool.out" || fail "/roger does not show the claim key JSON-quoted with its holder"
+  pi_slash '/call-roger-tool roger_release {"key":"[[0:build:0]]"}' || fail "Pi did not answer roger_release"
+  wait_for 10 "claim released" sh -c "'$bin' board --socket '$work/b.sock' | grep -q 'claims=0'"
+  # A /roger relabel whose target does not resolve says so and changes nothing.
+  pi_slash "/roger relabel zzzz nope" || fail "Pi did not answer /roger relabel <unknown>"
+  wait_for 10 "relabel of an unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -q "^SESSION address=$SENDER .* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "/roger relabel <unknown> changed this session's label"
+  # A full Address not on the Board still routes: the core holds the Mail
+  # until that Address registers.
+  local later="55555555-5555-4555-8555-555555555555"
+  pi_slash "/roger $later for whoever registers [[0:FLEET:0]]" || fail "Pi did not answer /roger <absent address>"
+  wait_for 10 "mail to an absent Address accepted" grep -qF "\"to\":\"$later\"" "$work/coord.log"
+  pi_slash "/roger zzzz nope" || fail "Pi did not answer /roger <unknown>"
+  wait_for 10 "unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
+  wait_for 10 "roger_board tool answered" grep -qF '\"label\":\"Tracer\"' "$work/tool.out"
+  grep -qF '\"last_seen_ms\":' "$work/tool.out" || fail "roger_board rows lack last_seen_ms"
+  grep -qF '\"connected\":true' "$work/tool.out" || fail "roger_board rows lack connected"
+  pi_stop
+
+  # Presence is the open connection: with a 1 s window, the idle Tracer stays
+  # in the default /roger view long after its last act, while a session whose
+  # connection closed drops out of it and stays under /roger all.
+  local gone="44444444-4444-4444-8444-444444444444"
+  "$bin" session --socket "$work/b.sock" --id "$gone" --store "$work/gone.store" >"$work/gone.out" 2>&1 &
+  local gone_pid=$!
+  pids+=("$gone_pid")
+  wait_for 10 "short-lived session READY" grep -q READY "$work/gone.out"
+  kill "$gone_pid"
+  wait_for 10 "closed session disconnected" sh -c "'$bin' board --socket '$work/a.sock' | grep -q '^SESSION address=$gone host=host-b connected=false '"
+  ROGER_PRESENCE_WINDOW_MS=1000 pi_start idle "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  # Idle past the window: nothing on either side acts for 2 s.
+  sleep 2
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "Present sessions (connected or seen within 1s) (2)" "$work/idle.out" \
+    || fail "/roger default view lost the idle connected session"
+  grep -qF "$RECIPIENT — host host-b — Tracer — connected" "$work/idle.out" || fail "/roger lacks the idle Tracer as connected"
+  grep -qF "$gone" "$work/idle.out" && fail "/roger default view shows a session whose connection closed"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "$gone — host host-b — last seen" "$work/idle.out" || fail "/roger all lacks the disconnected session"
+  # roger_board applies the same filter, against the coordinator's clock.
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
+  wait_for 10 "roger_board answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 1"
+  grep 'tool result: ' "$work/idle.out" | grep -qF "$gone" && fail "roger_board default view shows a session whose connection closed"
+  grep 'tool result: ' "$work/idle.out" | grep -qF '\"now\":' || fail "roger_board lacks the coordinator's now"
+  pi_slash '/call-roger-tool roger_board {"all":true}' || fail "Pi did not answer roger_board all"
+  wait_for 10 "roger_board all answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 2"
+  grep 'tool result: ' "$work/idle.out" | tail -n1 | grep -qF "$gone" || fail "roger_board all lacks the disconnected session"
+  pi_stop
+
+  # Last, because the killed session stays on the Board as seen-recently.
+  # The link: ROGER_ADDRESS is the Address verbatim; an adapter killed by exact
+  # pid is replaced; Mail Accepted while it was down arrives once, in the Store
+  # and in Pi's transcript; and no adapter respawns after Pi ends.
+  local full="[[1a:FLEET:zz]]66666666-6666-4666-8666-666666666666"
+  adapter_pid() { # the adapter run for $full, by exact argv
+    local p
+    for p in $(pgrep -f "adapter --socket $work/a.sock" || true); do
+      if tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$full"; then echo "$p"; return; fi
+    done
+  }
+  board_has_full() { "$bin" board --socket "$work/a.sock" | grep -qF "address=$full host=host-a connected=true"; }
+  replaced() { local n; n="$(adapter_pid)"; [[ -n "$n" && "$n" != "$1" ]]; }
+  pi_env=(ROGER_ADDRESS="$full")
+  pi_start link "" "$bin" "$ext"
+  pi_env=()
+  wait_for 15 "ROGER_ADDRESS on the Board verbatim" board_has_full
+  local old
+  old="$(adapter_pid)"; [[ -n "$old" ]] || fail "no adapter for $full"
+  kill -KILL "$old"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$full" --mail down-1 \
+    --body "queued while the adapter was down" | grep -q "^ACCEPTED" || fail "mail to $full not accepted"
+  wait_for 20 "a replacement adapter" replaced "$old"
+  wait_for 15 "Board shows $full connected again" board_has_full
+  wait_for 15 "queued mail in Pi's transcript" pi_transcript_has "queued while the adapter was down"
+  log_count "queued while the adapter was down" 1 "$work/link.store" || fail "link Store must hold the body once"
+  pi_call msgs2 '{"type":"get_messages"}' || fail "get_messages unanswered"
+  [[ "$(grep '"command":"get_messages"' "$work/link.out" | tail -n1 | jq -r '.data.messages[]? | select(.customType == "roger-mail") | .content' | grep -c "queued while the adapter was down")" == 1 ]] \
+    || fail "Pi's transcript must hold the mail exactly once"
+  wait_for 15 "receipt for down-1" grep -q '"ev":"receipt","mail":"down-1"' "$work/coord.log"
+  log_count '"ev":"receipt","mail":"down-1"' 1 "$work/coord.log" || fail "down-1 must have exactly one receipt"
+  # Kill again and end Pi at once: the pending respawn must not outlive the session.
+  old="$(adapter_pid)"
+  kill -KILL "$old"
+  pi_stop
+  sleep 3
+  [[ -z "$(adapter_pid)" ]] || fail "an adapter for $full exists after Pi ended"
+
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; ROGER_ADDRESS is the Address verbatim, a killed adapter is replaced and the Mail queued meanwhile arrives once, none respawns after Pi ends; roger_send tool callback delivered; /roger label and relabel, board (present and all, in /roger and roger_board; an idle connected session stays present past the window, a closed one drops out), address-prefix, label, absent-Address and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
+}
+
+# Proof 5. A Pi session (real Pi runtime and shim, scripted faux model, no
+# network) on host-a declares its wake latency on the Board; the Tracer on
+# host-b sends it directed Mail. Idle: the Mail starts a turn within the
+# declared latency, measured from before the send to the first observation of
+# agent_start. Busy: the same kind of Mail is stored and acked at once (the
+# core's Deliver does not wait), the shim queues it as a follow-up, and Pi
+# hands it to the model only after the busy turn's reply. Then a Broadcast,
+# which carries no wake request, reaches the same idle session and starts no
+# turn. Loopback only.
+pi_events() { # pi_events <event-type> <fixed-string>: count of such event lines
+  grep "^{\"type\":\"$1\"" "$pi_out" | grep -cF -- "$2" || true
+}
+pi_events_at_least() { [[ "$(pi_events "$1" "")" -ge "$2" ]]; } # re-read on every wait_for try
+first_line() { # first_line <event-type> <fixed-string>: line number in $pi_out
+  grep -n "^{\"type\":\"$1\"" "$pi_out" | grep -F -- "$2" | head -n1 | cut -d: -f1
+}
+
+wake() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  local pi_addr="$SENDER" declared t0 t1 n
+  loopback_stack
+  start_tracer
+  ROGER_WAKE_LATENCY_MS=1500 pi_start wake "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts" \
+    -e "$ROOT/shims/pi/test/faux-model.ts" --model faux/faux-1
+
+  # The sender reads the recipient's declaration from the Board on its own host.
+  local row="DECLARED address=$pi_addr declared=wake-latency-ms="
+  wait_for 15 "Pi's declaration on the Board" bash -c "'$bin' board --socket '$work/b.sock' | grep -qF '$row'"
+  declared="$("$bin" board --socket "$work/b.sock" | grep -F "$row" | sed 's/.*declared=wake-latency-ms=//')"
+  [[ "$declared" =~ ^[0-9]+$ ]] || fail "declared wake latency is not a number: '$declared'"
+  [[ "$(pi_events agent_start "")" == 0 ]] || fail "a turn started before any Mail"
+
+  # Idle: the Mail starts a turn within the declared latency.
+  local idle_body="wake while idle [[153:Meteor Shower:7]]"
+  t0="$(now_ms)"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-1 --body "$idle_body" | grep -q "ACCEPTED mail=wake-1" || fail "idle send not accepted"
+  until [[ "$(pi_events agent_start "")" -ge 1 ]]; do
+    (( $(now_ms) - t0 <= declared )) || fail "no turn within the declared ${declared} ms of the idle send"
+    sleep 0.01
+  done
+  t1="$(now_ms)"
+  (( t1 - t0 <= declared )) || fail "turn started $(( t1 - t0 )) ms after the idle send, over the declared ${declared} ms"
+  wait_for 15 "idle wake turn ends" pi_events_at_least agent_end 1
+  [[ "$(pi_events message_end "saw: Mail wake-1 from $RECIPIENT")" == 1 ]] \
+    || fail "the wake turn's model was not given the idle Mail"
+
+  # Busy: a turn holds the model; the Mail is Delivered and acked now, and
+  # reaches the model only at the turn boundary.
+  pi_call busy '{"type":"prompt","message":"busy 4000"}' || fail "busy prompt unanswered"
+  wait_for 10 "busy turn starts" pi_events_at_least agent_start 2
+  local busy_body="wake while busy [[0:FLEET:0]]"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-2 --body "$busy_body" | grep -q "ACCEPTED mail=wake-2" || fail "busy send not accepted"
+  wait_for 10 "busy session's Store holds the Mail" grep -qF "$busy_body" "$work/wake.store"
+  wait_for 10 "receipt while busy" log_count '"ev":"receipt"' 2 "$work/coord.log"
+  [[ "$(pi_events agent_end "")" == 1 ]] || fail "the busy turn ended before the Mail was stored; nothing was proven busy"
+  [[ "$(pi_events message_start '"mail":"wake-2"')" == 0 ]] \
+    || fail "the Mail entered the transcript mid-turn instead of queueing"
+  wait_for 15 "busy turn and its follow-up end" pi_events_at_least agent_end 2
+  local done_at mail_at saw_at
+  done_at="$(first_line message_end '"text":"busy done"')"
+  mail_at="$(first_line message_start '"mail":"wake-2"')"
+  saw_at="$(first_line message_end "saw: Mail wake-2 from $RECIPIENT")"
+  [[ -n "$done_at" && -n "$mail_at" && -n "$saw_at" ]] \
+    || fail "missing busy reply ($done_at), queued Mail ($mail_at), or follow-up reply ($saw_at)"
+  (( done_at < mail_at && mail_at < saw_at )) \
+    || fail "Mail not handed over at the turn boundary: busy reply line $done_at, Mail line $mail_at, follow-up line $saw_at"
+
+  # A Broadcast to the now idle session: shown, stored, acked, no turn.
+  local bcast_body="broadcast to an idle Pi [[0:FLEET:0]]" starts
+  starts="$(pi_events agent_start "")"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to '*' \
+    --mail bcast-1 --body "$bcast_body" | grep -q "ACCEPTED mail=bcast-1" || fail "broadcast not accepted"
+  wait_for 10 "Pi Store holds the broadcast" grep -qF "$bcast_body" "$work/wake.store"
+  wait_for 10 "Pi transcript shows the broadcast" pi_transcript_has "$bcast_body"
+  wait_for 10 "broadcast receipts" log_count '"ev":"receipt"' 4 "$work/coord.log"
+  [[ "$(pi_events agent_start "")" == "$starts" ]] || fail "a broadcast started a turn"
+
+  # Exactly once, end to end.
+  for n in 1 2; do
+    [[ "$(pi_events message_end "\"mail\":\"wake-$n\"")" == 1 ]] || fail "Pi transcript must show wake-$n once"
+  done
+  log_count "$idle_body" 1 "$work/wake.store" || fail "Store must hold the idle body once"
+  log_count "$busy_body" 1 "$work/wake.store" || fail "Store must hold the busy body once"
+  log_count '"ev":"mail"' 2 "$work/coord.log" || fail "coordinator must hold exactly two mail rows"
+  log_count "$bcast_body" 1 "$work/wake.store" || fail "Store must hold the broadcast once"
+  log_count '"ev":"receipt"' 4 "$work/coord.log" || fail "coordinator must hold two directed and two broadcast receipts"
+  pi_stop
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS wake: idle Pi session started a turn $(( t1 - t0 )) ms after directed Mail (declared ${declared} ms on the Board); busy session stored and acked the same Mail at once and handed it to the model at the turn boundary; a broadcast to the idle session started no turn; each Mail stored, acked, and shown once"
+}
+
+usage() { echo "usage: $0 <pi-shim|wake>"; echo "Both run on loopback and need pi and jq."; }
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
+[[ $# == 1 ]] || { usage >&2; exit 2; }
+case "$1" in
+  pi-shim) pi_shim ;;
+  wake) wake ;;
+  *) usage >&2; exit 2 ;;
+esac

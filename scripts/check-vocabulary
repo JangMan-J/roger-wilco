@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Invariant check: the core never speaks of what a session is doing with its Mail.
+# No turn, wake, idle, or busy state or request exists in the core, its wire, or its
+# documents, so the same core serves a call center and an agent team. What a consumer
+# does when Mail arrives is the consumer's.
+#
+# The core is every file in the checkout (tracked or untracked, minus .gitignore)
+# outside shims/, VECTORS/, and docs/reviews/, as for scripts/check-harness-free.
+# Exempt:
+#   frontmatter         a leading YAML block in a markdown file
+#   shims/              adapters on top of the core; each may have its own vocabulary
+#   VECTORS/            the record of what was tried
+#   docs/reviews/       historical review evidence
+#   AGENTS.md           the director's file; it quotes dated directives verbatim
+#   scripts/check-vocabulary  this list of words
+#   a line carrying `legacy-wire:` and a reason, for the one transition field an
+#                       earlier release's reader still needs; the final release has none
+#
+# Usage: scripts/check-vocabulary [path ...]   (default: the whole core)
+set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole core)"; exit 0; fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+# Whole words: "return" and "returns" are not "turn".
+WORDS='wake|wakes|woke|woken|waking|turn|turns|idle|busy'
+
+mapfile -t files < <(git ls-files --cached --others --exclude-standard -- "${@:-.}" |
+  grep -vE '^(shims|VECTORS)/|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+  while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
+((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
+
+hits="$(for f in "${files[@]}"; do
+  if [[ "$f" == *.md ]]; then
+    awk 'NR == 1 && /^---[[:space:]]*$/ { fm = 1 }
+         fm { buf[++n] = $0; if (NR > 1 && /^---[[:space:]]*$/) { for (i = 1; i <= n; i++) print ""; fm = n = 0 }; next }
+         { print }
+         END { for (i = 1; i <= n; i++) print buf[i] }' "$f" |
+      grep -HniIE --label="$f" "\b($WORDS)\b" || true
+  else
+    grep -HniIE "\b($WORDS)\b" -- "$f" || true
+  fi
+done | grep -v 'legacy-wire:' || true)"
+if [[ -n "$hits" ]]; then
+  echo "FAIL: turn, wake, idle, or busy vocabulary in the core (only shims/ may use it):" >&2
+  echo "$hits" >&2
+  exit 1
+fi
+echo "PASS vocabulary: no turn, wake, idle, or busy vocabulary in ${#files[@]} core files under ${*:-.}"
