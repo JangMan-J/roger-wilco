@@ -1,6 +1,6 @@
 This project has a director: run `slice status`, then read NEXT.md (`slice path next`), before changing anything. Its purpose, proofs, invariants and terms are sealed in the director's records outside this repo, not here. `VECTORS/` is read-only history; write no new vectors.
 
-The sealed documents name no harness or model; provenance frontmatter (`agent:`, `session:`) may. The core ships no per-client code: a program that uses Roger connects through a face and its code lives in that program's own project. `legacy/` holds the one client still shipped here, scheduled for removal (see NEXT.md); it is not core. Work is delegated as slices (`slice define`, `slice new`); the director gates each attempt and merges with `slice merge <id> <n> --check scripts/check-all`.
+The sealed documents name no harness or model; provenance frontmatter (`agent:`, `session:`) may. The core ships no per-client code: a program that uses Roger connects through a face and its code lives in that program's own project. Work is delegated as slices (`slice define`, `slice new`); the director gates each attempt and merges with `slice merge <id> <n> --check scripts/check-all`.
 
 ## Directives
 
@@ -13,9 +13,9 @@ The sealed documents name no harness or model; provenance frontmatter (`agent:`,
 
 The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
 `scripts/check-harness-free`, `scripts/check-vocabulary`, and `scripts/check-no-poll`. It names no harness.
-`scripts/check-all` runs it, then every `legacy/<name>/check` it finds, then `scripts/check-seal`
+`scripts/check-all` runs it, then `scripts/check-seal`
 (the director's seal on the sealed documents is intact; it passes quietly where no seal exists).
-A legacy client brings its own check and the core gate never changes for it. Nothing lands on main until
+Nothing lands on main until
 `scripts/check-all` exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
 those warnings into errors.
 
@@ -36,9 +36,8 @@ These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md wi
    looks up by, or names the tokens in a Reference or on a session. They pass
    through byte-identical. `scripts/acceptance references` is the check.
 4. **No harness in the core.** The core names no harness or model, reads no harness store,
-   and `[dependencies]` stays empty. The core ships no per-client code; only `legacy/` (a client
-   awaiting removal) may know a harness. The core is every
-   file in the checkout, tracked or untracked but not ignored, outside `legacy/`, `VECTORS/`, and
+   and `[dependencies]` stays empty. The core ships no per-client code. The core is every
+   file in the checkout, tracked or untracked but not ignored, outside `VECTORS/` and
    `docs/reviews/` (historical review evidence): source, tests, scripts, deploy units, and
    docs (`README.md` and `deploy/README.md` included). Exempt are markdown frontmatter
    (`agent:`, `session:` record who wrote a file), `scripts/acceptance`, since proof 2 runs a real
@@ -50,9 +49,8 @@ These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md wi
    state, request, field, flag, or doc exists in the core; a delivery carries
    its `kind` (`directed` or `broadcast`) and the sender's opaque `headers`, and what a
    consumer does on arrival is the consumer's. A client's own code may have such words; the core
-   may not. `scripts/check-vocabulary` is the check. A line that must name the old wire field for
-   one transition release carries `legacy-wire:` and a reason; the release that drops the
-   field drops the line.
+   may not. `scripts/check-vocabulary` is the check. A line that must name the old wire field (a reader of logs
+   written before `kind`) carries `legacy-wire:` and a reason; nothing writes the field.
 7. **Opaque headers stay opaque.** Nothing in `src/` compares, branches on, ranks, or
    names a header key or value; they pass through byte-identical, bounded, with a refusal
    that names what was expected and what was seen.
