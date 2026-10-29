@@ -5,17 +5,16 @@
 # does when Mail arrives is the consumer's.
 #
 # The core is every file in the checkout (tracked or untracked, minus .gitignore)
-# outside legacy/, VECTORS/, and docs/reviews/, as for scripts/check-harness-free.
+# outside VECTORS/ and docs/reviews/, as for scripts/check-harness-free.
 # Exempt:
 #   frontmatter         a leading YAML block in a markdown file
-#   legacy/             a client awaiting removal; it may have its own vocabulary
 #   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence
 #   AGENTS.md           the director's file; it quotes dated directives verbatim
 #   scripts/check-vocabulary  this list of words
-#   a line carrying `legacy-wire:` and a reason, for the one transition field an
-#                       earlier release's reader still needs; the final release has none
+#   a line carrying `legacy-wire:` and a reason, for the old wire field that a
+#                       reader of logs written before `kind` still needs
 #
 # The same files may not use the retired terms `shim`, `shims`, or `agent session(s)`:
 # session and client are the words.
@@ -41,7 +40,7 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(legacy|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+  grep -vE '^(VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
@@ -63,13 +62,13 @@ scan() {
 
 hits="$(scan "$WORDS" | grep -v 'legacy-wire:' || true)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: turn, wake, idle, or busy vocabulary in the core (only legacy/ may use it):" >&2
+  echo "FAIL: turn, wake, idle, or busy vocabulary in the core:" >&2
   echo "$hits" >&2
   exit 1
 fi
 hits="$(scan "$RETIRED")"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: retired terms: session and client are the words (only legacy/ may use them):" >&2
+  echo "FAIL: retired terms: session and client are the words:" >&2
   echo "$hits" >&2
   exit 1
 fi

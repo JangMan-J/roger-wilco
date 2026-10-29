@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Invariant check: the core never learns which harness runs a session.
 # Coordinator, host daemon, client, and adapter name no harness, read no
-# harness store, and link no harness SDK. Only a legacy client may know.
+# harness store, and link no harness SDK.
 #
 # The core is every file in the checkout (tracked or untracked, minus
-# .gitignore) outside legacy/, VECTORS/, and docs/reviews/: source, tests, scripts, deploy
+# .gitignore) outside VECTORS/ and docs/reviews/: source, tests, scripts, deploy
 # units, and docs, README.md included. The sealed documents (purpose, proofs, invariants,
 # terms) live outside the repo and were scanned with this check before they were sealed. A model
 # name counts as a harness name. Exempt:
 #   frontmatter         a leading YAML block (--- ... ---) in a markdown file
 #                       records who wrote the file (agent:, session:), not
 #                       what the core is
-#   legacy/             a client awaiting removal; it may know its harness
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence, not core docs
 #   scripts/acceptance  proofs 2 and 5 run real harnesses by definition
@@ -39,7 +38,7 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(legacy|VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+  grep -vE '^(VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
@@ -58,7 +57,7 @@ hits="$(for f in "${files[@]}"; do
   fi
 done)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: harness or model named in the core (only legacy/ may name one):" >&2
+  echo "FAIL: harness or model named in the core:" >&2
   echo "$hits" >&2
   status=1
 fi
