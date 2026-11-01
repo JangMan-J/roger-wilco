@@ -1882,8 +1882,18 @@ fn a_dead_session_is_unregistered_after_its_grace_and_keeps_its_mail() {
     rig.send("m-grace", "sent while it is dead");
 
     std::thread::sleep(Duration::from_millis(700));
+    let read_at = epoch_ms();
     let out = wait_board_lists(&rig, "a.sock", RECIPIENT, false);
     assert!(out.contains(&format!("SESSION address={SENDER} ")), "{out}");
+    // The Board read that expired it committed its unregister line, stamped
+    // at that read, not at its death.
+    let ev = session_events(&rig, RECIPIENT);
+    assert_eq!(kinds(&ev), ["session", "unregister"], "{ev:?}");
+    assert!(
+        at_ms_of(&ev[1]) >= read_at,
+        "{} >= {read_at}",
+        json::stringify(&ev[1])
+    );
     let b = broadcast_from_sender(&rig, "b-grace");
     assert!(!b.contains(RECIPIENT) && b.contains(SENDER), "{b}");
 
@@ -3122,4 +3132,114 @@ fn a_register_commits_a_session_line_stamped_at_ms_then_label_then_declared() {
     assert_eq!(str_field(&ev[0], "host"), "host-b");
     assert_eq!(str_field(&ev[1], "label"), "first");
     assert_eq!(str_field(&ev[2], "declared"), DECLARED);
+}
+
+/// The same Address registering again on the same host, same label and
+/// declared text, is one more `session` line stamped later-or-equal. The
+/// Register carries a label, so it commits its `label` line as any Register
+/// does; the declared text is what the coordinator holds, so no `declared`
+/// line follows. A re-Register that carries neither (the host daemon's, after
+/// a coordinator restart) is the `session` line alone.
+#[test]
+fn a_second_register_on_the_same_host_is_one_more_stamped_session_line() {
+    let mut rig = Rig::new("stamps-reregister");
+    rig.start_stack();
+    let extra = ["--label", "first", "--declare", DECLARED];
+    start_tracer(
+        &mut rig,
+        "b.sock",
+        RECIPIENT,
+        "recipient1.store",
+        "recipient1.out",
+        &extra,
+    );
+    let first = session_events(&rig, RECIPIENT);
+    assert_eq!(kinds(&first), ["session", "label", "declared"], "{first:?}");
+
+    start_tracer(
+        &mut rig,
+        "b.sock",
+        RECIPIENT,
+        "recipient2.store",
+        "recipient2.out",
+        &extra,
+    );
+    let again = session_events(&rig, RECIPIENT);
+    assert_eq!(
+        kinds(&again),
+        ["session", "label", "declared", "session", "label"],
+        "{again:?}"
+    );
+    assert_eq!(str_field(&again[3], "host"), "host-b");
+    assert!(
+        at_ms_of(&again[3]) >= at_ms_of(&first[0]),
+        "{} >= {}",
+        json::stringify(&again[3]),
+        json::stringify(&first[0])
+    );
+    assert!(at_ms_of(&again[4]) >= at_ms_of(&again[3]), "{again:?}");
+
+    // The host daemon's re-Register after a coordinator restart repeats the
+    // declared text and no label: one stamped session line, nothing else.
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after_restart = loop {
+        let ev = session_events(&rig, RECIPIENT);
+        if ev.len() == 6 {
+            break ev;
+        }
+        assert!(Instant::now() < deadline, "{ev:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        kinds(&after_restart),
+        ["session", "label", "declared", "session", "label", "session"],
+        "{after_restart:?}"
+    );
+    assert!(at_ms_of(&after_restart[5]) >= at_ms_of(&again[4]));
+}
+
+/// A relabel is one `label` line and the adapter's stdin closing is one
+/// `unregister` line, each stamped `at_ms` within the moment it happened.
+#[test]
+fn relabel_and_unregister_lines_carry_at_ms() {
+    let mut rig = Rig::new("stamps-unregister");
+    rig.start_stack();
+    let (idx, stdin) = rig.start_adapter(
+        "b.sock",
+        RECIPIENT,
+        "adapter.store",
+        "adapter.out",
+        &["--registered"],
+    );
+    wait_for_text(
+        &rig.p("adapter.out"),
+        "\"type\":\"registered\"",
+        Duration::from_secs(10),
+    );
+
+    let before = epoch_ms();
+    let relabel = Command::new(BIN)
+        .args(["label", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--from", RECIPIENT, "--label", "renamed"])
+        .output()
+        .unwrap();
+    assert!(relabel.status.success(), "{relabel:?}");
+    let after = epoch_ms();
+    let ev = session_events(&rig, RECIPIENT);
+    assert_eq!(kinds(&ev), ["session", "label"], "{ev:?}");
+    assert_eq!(str_field(&ev[1], "label"), "renamed");
+    let at = at_ms_of(&ev[1]);
+    assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
+
+    let before = epoch_ms();
+    drop(stdin);
+    rig.children[idx].wait().unwrap();
+    wait_board_lists(&rig, "a.sock", RECIPIENT, false);
+    let after = epoch_ms();
+    let ev = session_events(&rig, RECIPIENT);
+    assert_eq!(kinds(&ev), ["session", "label", "unregister"], "{ev:?}");
+    let at = at_ms_of(&ev[2]);
+    assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
 }

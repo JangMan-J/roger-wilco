@@ -335,7 +335,11 @@ fn commit(state: &mut State, ev: Value) -> io::Result<()> {
 fn unregister(st: &mut State, session: &str) -> io::Result<()> {
     commit(
         st,
-        obj(vec![("ev", s("unregister")), ("session", s(session))]),
+        obj(vec![
+            ("ev", s("unregister")),
+            ("session", s(session)),
+            ("at_ms", Value::Int(now_ms())),
+        ]),
     )?;
     st.connected.remove(session);
     st.seen.remove(session);
