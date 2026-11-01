@@ -2297,7 +2297,10 @@ fn a_mail_not_yet_acked_reads_pending_with_its_accepted_stamp() {
 }
 
 /// A log written before the stamps existed replays as is: its Mail and
-/// Receipts read with every stamp absent, never zero.
+/// Receipts read with every stamp absent, never zero; its bare `session`,
+/// `label`, `declared` and `unregister` lines make the same Board they always
+/// did, with `last_seen_ms` 0 (memory, not the log); and every session line
+/// the coordinator writes from then on carries `at_ms`.
 #[test]
 fn unstamped_log_rows_replay_with_their_stamps_absent() {
     let mut rig = Rig::new("ack-time-old");
@@ -2306,6 +2309,10 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
         rig.p("coord.log"),
         format!(
             "{{\"ev\":\"session\",\"session\":\"{to}\",\"host\":\"host-b\"}}\n\
+             {{\"ev\":\"label\",\"session\":\"{to}\",\"label\":\"old\"}}\n\
+             {{\"ev\":\"declared\",\"session\":\"{to}\",\"declared\":\"d-old\"}}\n\
+             {{\"ev\":\"session\",\"session\":\"{THIRD}\",\"host\":\"host-a\"}}\n\
+             {{\"ev\":\"unregister\",\"session\":\"{THIRD}\"}}\n\
              {{\"ev\":\"mail\",\"mail\":\"old-1\",\"from\":\"{SENDER}\",\"to\":\"{to}\",\"body\":\"x\"}}\n\
              {{\"ev\":\"receipt\",\"mail\":\"old-1\",\"session\":\"{to}\",\"record\":\"r-1\"}}\n\
              {{\"ev\":\"broadcast\",\"mail\":\"old-b\",\"from\":\"{SENDER}\",\"body\":\"y\",\"to\":[\"{to}\"]}}\n"
@@ -2323,6 +2330,53 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
         receipt_line(&rig, &format!("old-b/{to}")),
         format!("PENDING mail=old-b/{to} to={to} accepted_at_ms=absent kind=broadcast")
     );
+    let old = raw_request(
+        &rig,
+        "a.sock",
+        r#"{"type":"receipt","req":1,"mail":"old-1"}"#,
+    );
+    assert!(
+        old.contains(&format!(r#""to":"{to}","from":"{SENDER}","#)),
+        "{old}"
+    );
+    assert!(!old.contains("accepted_at_ms"), "{old}");
+
+    let b = board(&rig, "a.sock");
+    assert!(
+        b.contains(&format!(
+            "SESSION address={to} host=host-b connected=false last_seen_ms=0 label=old\n"
+        )),
+        "{b}"
+    );
+    assert!(
+        b.contains(&format!("DECLARED address={to} declared=d-old\n")),
+        "{b}"
+    );
+    assert!(!b.contains(THIRD), "{b}");
+
+    // From here on the coordinator stamps what it writes.
+    let before = epoch_ms();
+    rig.register("a.sock", SENDER);
+    let relabel = Command::new(BIN)
+        .args(["label", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--from", to, "--label", "new"])
+        .output()
+        .unwrap();
+    assert!(relabel.status.success(), "{relabel:?}");
+    let sender = session_events(&rig, SENDER);
+    assert_eq!(kinds(&sender), ["session"], "{sender:?}");
+    assert!(at_ms_of(&sender[0]) >= before, "{sender:?}");
+    let to_events = session_events(&rig, to);
+    assert_eq!(
+        kinds(&to_events),
+        ["session", "label", "declared", "receipt", "label"],
+        "{to_events:?}"
+    );
+    assert_eq!(str_field(&to_events[4], "label"), "new");
+    assert!(at_ms_of(&to_events[4]) >= before, "{to_events:?}");
+    for bare in &to_events[..4] {
+        assert!(bare.get("at_ms").is_none(), "{}", json::stringify(bare));
+    }
 }
 
 /// The host daemon's wait for the coordinator to answer a forwarded ack runs
@@ -3242,4 +3296,67 @@ fn relabel_and_unregister_lines_carry_at_ms() {
     assert_eq!(kinds(&ev), ["session", "label", "unregister"], "{ev:?}");
     let at = at_ms_of(&ev[2]);
     assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
+}
+
+/// The receipt reply names the sender: `from` right after `to`, the Address
+/// the `mail` or `broadcast` line holds, for a directed Mail and for a
+/// Broadcast copy alike. What `roger receipt` prints does not change.
+#[test]
+fn the_receipt_reply_carries_from_after_to_and_the_printed_line_is_unchanged() {
+    let mut rig = Rig::new("receipt-from");
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.start_recipient("recipient.out", false);
+    rig.send("m-from", "who sent me");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-from record=r-1",
+        Duration::from_secs(10),
+    );
+    broadcast_from_sender(&rig, "b-from");
+    let copy = format!("b-from/{RECIPIENT}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail={copy} record=r-2"),
+        Duration::from_secs(10),
+    );
+
+    for (mail, kind) in [("m-from", "directed"), (copy.as_str(), "broadcast")] {
+        let reply = raw_request(
+            &rig,
+            "b.sock",
+            &format!(r#"{{"type":"receipt","req":4,"mail":"{mail}"}}"#),
+        );
+        assert!(
+            reply.contains(&format!(
+                r#""mail":"{mail}","to":"{RECIPIENT}","from":"{SENDER}","kind":"{kind}","#
+            )),
+            "{reply}"
+        );
+        let printed = receipt_line(&rig, mail);
+        let words: Vec<&str> = printed.split(' ').collect();
+        let keys: Vec<&str> = words
+            .iter()
+            .map(|w| w.split_once('=').map_or(*w, |(k, _)| k))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "RECEIPT",
+                "mail",
+                "to",
+                "record",
+                "accepted_at_ms",
+                "receipted_at_ms",
+                "latency_ms",
+                "kind"
+            ],
+            "{printed}"
+        );
+        assert!(
+            printed.starts_with(&format!("RECEIPT mail={mail} to={RECIPIENT} record=")),
+            "{printed}"
+        );
+        assert!(printed.ends_with(&format!(" kind={kind}")), "{printed}");
+    }
 }

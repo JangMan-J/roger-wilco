@@ -847,10 +847,10 @@ fn board(st: &State, v: &Value) -> Value {
     ])
 }
 
-/// One Mail's lifecycle as this coordinator recorded it: its recipient, when
-/// it was Accepted, and, once acked, the Receipt's Record id and when it was
-/// recorded. A stamp the log never held is left out, never sent as zero. A
-/// Broadcast copy is read by its copy id.
+/// One Mail's lifecycle as this coordinator recorded it: its recipient and
+/// sender, when it was Accepted, and, once acked, the Receipt's Record id and
+/// when it was recorded. A stamp the log never held is left out, never sent
+/// as zero. A Broadcast copy is read by its copy id.
 fn receipt(st: &State, v: &Value) -> io::Result<Value> {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let mail = net::field(v, "mail")?;
@@ -867,6 +867,7 @@ fn receipt(st: &State, v: &Value) -> io::Result<Value> {
         ("req", Value::Int(req)),
         ("mail", s(mail)),
         ("to", s(&m.to)),
+        ("from", s(&m.from)),
         ("kind", s(m.kind)),
         ("headers", m.headers.clone()),
     ];
