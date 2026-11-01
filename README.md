@@ -79,6 +79,7 @@ environment, never from argv, which `ps` shows to every user.
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
+| `audit` | `[--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
 | `release` | `--socket --owner <address> --key <text>` | give a Claim up |
@@ -147,6 +148,75 @@ A Mail or Receipt committed before the stamps existed replays unchanged and prin
 never 0. The receipt reply on the socket (and so `roger_receipt`) also carries `from`, the
 sender Address as the `mail` or `broadcast` line holds it, right after `to`; the printed
 lines do not show it. The core reports these numbers and does nothing else with them.
+
+## Audit
+
+```
+roger audit [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
+            [--address <address>] [--bodies] [--json]
+```
+
+At least one input is required. Each is read as a plain file: no lock, no write, no
+truncation, safe on a live log or Store even while its writer holds the lock. Files
+are read separately, not as an atomic snapshot of the fleet. A trailing fragment
+without a newline is reported and ignored; non-object or invalid JSON lines are
+reported and ignored. Findings do not fail the command; unreadable inputs do.
+
+The default output is one `WORD key=value ...` record per line, free text last.
+`--json` gives one object per line with `type` equal to WORD and the same fields;
+`line` and counts are integers, `absent` is `null`. Use JSON for unambiguous text
+with spaces or newlines. Header and body tails become `headers` and `body` fields;
+`mails` on a duplicate finding is an array rather than comma-separated text.
+
+Sources appear in argument order, followed by the coordinator timeline, each daemon
+log, each Store, then findings and the summary. Timeline order is file order, never
+a sort by timestamp. `line` is the original 1-based complete-line number.
+
+| WORD | Fields, in text order |
+| --- | --- |
+| `SOURCE` | `kind=coordinator\|daemon\|store path= lines=` (complete lines, skipped included) |
+| `TORN` | `path= bytes=` (trailing fragment length) |
+| `SKIPPED` | `path= line=` (not a JSON object) |
+| `REGISTER` | `address= host= at_ms= line=` |
+| `UNREGISTER` | `address= at_ms= line=` |
+| `LABEL` | `address= at_ms= line= label=` |
+| `DECLARED` | `address= at_ms= line= declared=` |
+| `UNDECLARED` | `address= at_ms= line=` (declared text cleared) |
+| `MAIL` | `mail= kind= from= to= accepted_at_ms= receipted_at_ms= latency_ms= record= receipt_line= body_bytes= line=` |
+| `HEADERS` | `mail= <json object or absent>`, immediately after its Mail, delivery or Store entry |
+| `BODY` | `mail= <JSON string>`, after headers, only with `--bodies` (Mail and Store) |
+| `CLAIM` | `key= owner= expires_ms= line=` |
+| `RELEASE` | `key= line=` |
+| `STRAY_RECEIPT` | `mail= session= record= line=` (no earlier acceptance) |
+| `DAEMON_DELIVER` | `path= mail= kind= from= to= line=` |
+| `DAEMON_RECEIPT` | `path= mail= session= record= line=` |
+| `STORE` | `path= record= mail= from= kind= line=` |
+| `UNRECEIPTED` | `mail= kind= from= to= accepted_at_ms= line=` |
+| `DUPLICATE_RECORD` | `path= record= mails=` (distinct Mail ids, comma-separated) |
+| `RECORD_MISMATCH` | `mail= coordinator= daemon= store=` (record ids, or absent) |
+| `AUDIT` | `sources= registers= unregisters= mails= receipted= unreceipted= duplicates= mismatches= torn= skipped=` |
+
+Each Broadcast yields one `MAIL` per recipient with id `<mail>/<address>` and kind
+`broadcast`. Its acceptance stamp is the Broadcast's; the first Receipt for each id
+supplies its record, receipt line and receipt stamp. Unreceipted Mail has
+`record=pending`. Latency is the difference of the two stamps; `body_bytes` is UTF-8
+length. Old missing stamps and session `at_ms` read `absent`, never zero. Old delivery
+kinds use the existing compatibility reader; a Store without either kind field reads
+`absent`. Missing header sets read `HEADERS mail=... absent` (JSON `headers:null`);
+an explicitly empty set emits no HEADERS line. Nonempty sets retain key order.
+
+`--address` matches whole Addresses: session events, sender or recipient of Mail and
+delivery, each Broadcast copy, receipt sessions, and claim owners. Receipt-only evidence
+is also kept when supplied Mail, delivery or Store records identify that sender or
+recipient. A release follows the key's last claim owner. Stores have no recipient
+Address and are always listed in full: pass the desired Address's own Store. Counts
+cover the listed records. Duplicate records are scoped to one input, and to a session
+within coordinator and daemon logs; mismatches compare records for the same Mail.
+
+Audit verifies nothing: it compares no token, header, label or declared text, and
+interprets no body. A consumer's own checks run over its output. See
+[consumer conventions](docs/CONVENTIONS.md) for what a consumer may put in these fields
+and how it verifies them; the core checks none of it.
 
 ## Registration
 
@@ -318,6 +388,7 @@ scripts/acceptance broadcast      # proof 3: one broadcast reaches every registe
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance references     # proof 6: references keep both tokens verbatim; relabel keeps the Address
 scripts/acceptance headers        # proof 7: kind and headers arrive byte-identical; a refused set commits nothing; old logs replay
+scripts/acceptance audit          # proof 9: read-only history, findings, old and live records; loopback
 scripts/acceptance mcp            # proof 8 (K8): `roger mcp` is a session; tools, position, SIGKILL between Store and Ack; loopback
 scripts/check-vocabulary          # invariant: the core never names what a session does with its Mail
 ```
@@ -348,6 +419,7 @@ core log grows while nobody asks.
 | --- | --- |
 | `AGENTS.md` | the director pointer, directives, coding standards and review rules |
 | `src/main.rs` | subcommand dispatch and flags |
+| `src/audit.rs` | read-only record history and findings |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
@@ -357,6 +429,7 @@ core log grows while nobody asks.
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
 | `tests/process.rs` | process seam, including the SIGKILL window |
+| `tests/audit.rs` | exact history fixtures, filtering, findings, JSON, live read-only audit |
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |

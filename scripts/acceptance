@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by the project's proofs (README.md, Checks).
-# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp>
+# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit>
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/acceptance-lib"
@@ -1004,8 +1004,124 @@ mcp() {
   echo "PASS mcp: handshake, tools, headers, Cursor (limit, peek, restart), claims, receipt, a composite Address verbatim, a waiting inbox that blocks nothing, SIGKILL between Store and Ack losing nothing, default Store cleanup"
 }
 
+# Proof K9: real processes, live read-only inputs, then immutable copies.
+audit() {
+  command -v python3 >/dev/null || fail "python3 required"
+  loopback_stack
+  local a='[[1a:Meteor Shower:zz]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  local b="$RECIPIENT" x='audit-adapter' bpid apid pid m
+  local declared='{"scheme":"opaque","text":"é text"}'
+  "$bin" session --socket "$work/a.sock" --id "$a" --label 'first label' --declare "$declared" \
+    --store "$work/a.store" >"$work/a.out" 2>&1 &
+  pids+=("$!")
+  "$bin" session --socket "$work/b.sock" --id "$b" --label 'second label' --declare "$declared" \
+    --store "$work/b.store" >"$work/b.out" 2>&1 &
+  bpid=$!; pids+=("$bpid")
+  wait_for 10 'A registered' grep -q REGISTERED "$work/a.out"
+  wait_for 10 'B registered' grep -q REGISTERED "$work/b.out"
+  "$bin" send --socket "$work/a.sock" --from "$a" --to "$b" --mail audit-1 --body 'héllo' \
+    --header 'note=ü v' --header 'empty=' >"$work/send.out"
+  "$bin" send --socket "$work/b.sock" --from "$b" --to "$a" --mail audit-2 --body 'reply' \
+    --header 'note=ü v' --header 'empty=' >>"$work/send.out"
+  "$bin" send --socket "$work/a.sock" --from "$a" --to '*' --mail audit-b --body 'all' \
+    --header 'note=ü v' --header 'empty=' >>"$work/send.out"
+  wait_for 10 'four receipts' log_count '"ev":"receipt"' 4 "$work/coord.log"
+  "$bin" label --socket "$work/a.sock" --from "$b" --label 'new label ✓' >/dev/null
+  kill "$bpid"; wait "$bpid" 2>/dev/null || true
+  unset 'pids[${#pids[@]}-1]'
+  "$bin" session --socket "$work/b.sock" --id "$b" --store "$work/b.store" \
+    --hold-before-ack "$work/held" >"$work/b2.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 'B registered without declared text' grep -q REGISTERED "$work/b2.out"
+  "$bin" send --socket "$work/a.sock" --from "$a" --to "$b" --mail audit-held --body 'held' >/dev/null
+  wait_for 10 'held Store write' test -f "$work/held"
+  mkfifo "$work/adapter.in"
+  "$bin" adapter --socket "$work/a.sock" --id "$x" --store "$work/x.store" --registered \
+    <"$work/adapter.in" >"$work/x.out" 2>&1 &
+  apid=$!; pids+=("$apid")
+  exec 4>"$work/adapter.in"
+  wait_for 10 'adapter registered' grep -q '"type":"registered"' "$work/x.out"
+  exec 4>&-
+  wait "$apid"
+  unset 'pids[${#pids[@]}-1]'
+  wait_for 10 'adapter unregistered' grep -q '"ev":"unregister"' "$work/coord.log"
+  sha256sum "$work/coord.log" "$work/b.log" "$work/b.store" >"$work/before.sha"
+  "$bin" audit --coordinator-log "$work/coord.log" --daemon-log "$work/b.log" --store "$work/b.store" >"$work/live.out"
+  sha256sum "$work/coord.log" "$work/b.log" "$work/b.store" >"$work/after.sha"
+  cmp "$work/before.sha" "$work/after.sha" || fail 'audit changed live inputs'
+  "$bin" send --socket "$work/b.sock" --from "$b" --to "$a" --mail audit-after --body 'after audit' \
+    | grep -q 'ACCEPTED mail=audit-after' || fail 'send after audit failed'
+  wait_for 10 'fifth receipt' log_count '"ev":"receipt"' 5 "$work/coord.log"
+  for m in audit-1 audit-2 "audit-b/$a" "audit-b/$b" audit-after; do
+    "$bin" receipt --socket "$work/a.sock" --mail "$m" >>"$work/receipts"
+  done
+  for pid in "${pids[@]}"; do kill "$pid"; wait "$pid" 2>/dev/null || true; done
+  pids=()
+  kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true; coord_pid=''
+  cp "$work/coord.log" "$work/c.copy"
+  cp "$work/b.log" "$work/d.copy"
+  cp "$work/b.store" "$work/s.copy"
+  printf '{"ev":' >>"$work/c.copy"
+  local args=(--coordinator-log "$work/c.copy" --daemon-log "$work/d.copy" --store "$work/s.copy")
+  sha256sum "$work/c.copy" "$work/d.copy" "$work/s.copy" >"$work/copies.sha"
+  "$bin" audit "${args[@]}" >"$work/text"
+  "$bin" audit "${args[@]}" --json >"$work/json"
+  "$bin" audit "${args[@]}" --address "$b" >"$work/filtered-text"
+  "$bin" audit "${args[@]}" --address "$b" --json >"$work/filtered"
+  sha256sum -c "$work/copies.sha" >/dev/null || fail 'audit changed copied inputs'
+  printf '%s\n' '{"ev":"session","session":"old","host":"old-host"}' \
+    '{"ev":"mail","mail":"old-m","from":"old","to":"other","body":"x"}' \
+    '{"ev":"receipt","mail":"old-m","session":"other","record":"r-1"}' >"$work/old-c"
+  printf '%s\n' '{"ev":"deliver","mail":"old-m","from":"old","to":"other","body":"x","wake":false}' >"$work/old-d" # legacy-wire: old delivery read compatibility
+  printf '%s\n' '{"mail":"old-m","record":"r-1","from":"old","body":"x"}' >"$work/old-s"
+  "$bin" audit --coordinator-log "$work/old-c" --daemon-log "$work/old-d" --store "$work/old-s" --json >"$work/old-json"
+  python3 - "$work" "$a" "$b" "$declared" <<'PY'
+import json, pathlib, sys
+w, a, b, declared = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+def rows(name): return [json.loads(l) for l in (w/name).read_text().splitlines()]
+r = rows('json')
+def of(t, data=r): return [v for v in data if v['type'] == t]
+assert of('AUDIT') == [dict(type='AUDIT', sources=3, registers=4, unregisters=1, mails=6,
+    receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)]
+assert of('TORN') == [dict(type='TORN', path=str(w/'c.copy'), bytes=6)]
+for t in ['REGISTER','LABEL','DECLARED','UNDECLARED','UNREGISTER']:
+    assert of(t) and all(isinstance(v['at_ms'], int) for v in of(t)), t
+assert [(v['address'],v['declared']) for v in of('DECLARED')] == [(a,declared),(b,declared)]
+assert [v['address'] for v in of('UNDECLARED')] == [b]
+assert [v['label'] for v in of('LABEL')] == ['first label','second label','new label ✓']
+assert [v['address'] for v in of('UNREGISTER')] == ['audit-adapter']
+receipts = (w/'receipts').read_text().splitlines()
+for v in of('MAIL'):
+    if v['mail'] == 'audit-held':
+        assert v['record'] == 'pending' and v['receipted_at_ms'] is None and v['latency_ms'] is None
+    else:
+        assert v['latency_ms'] == v['receipted_at_ms'] - v['accepted_at_ms']
+        assert any(l.startswith('RECEIPT mail='+v['mail']+' ') and ' record='+v['record']+' ' in l for l in receipts)
+assert {v['mail'] for v in of('MAIL') if v['kind']=='broadcast'} == {'audit-b/'+a,'audit-b/'+b}
+assert [v['mail'] for v in of('UNRECEIPTED')] == ['audit-held']
+tracer = (w/'a.out').read_text().splitlines() + (w/'b.out').read_text().splitlines()
+for line in (w/'text').read_text().splitlines():
+    if line.startswith('HEADERS ') and not line.endswith(' absent'):
+        assert line in tracer, line
+assert all(v['headers'] == {'note':'ü v','empty':''} for v in of('HEADERS'))
+f = rows('filtered')
+assert all(v['address']==b for v in f if v['type'] in ['REGISTER','LABEL','DECLARED','UNDECLARED','UNREGISTER'])
+assert of('STORE',f) == of('STORE')
+assert [v['mail'] for v in of('MAIL',f)] == ['audit-1','audit-2','audit-b/'+b,'audit-held','audit-after']
+assert of('AUDIT',f)[0] == dict(type='AUDIT', sources=3, registers=2, unregisters=0, mails=5,
+    receipted=4, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)
+old = rows('old-json')
+assert of('REGISTER',old)[0]['at_ms'] is None
+assert all(of('MAIL',old)[0][k] is None for k in ['accepted_at_ms','receipted_at_ms','latency_ms'])
+assert of('DAEMON_DELIVER',old)[0]['kind']=='broadcast'
+assert of('STORE',old)[0]['kind'] is None
+assert all(v['headers'] is None for v in of('HEADERS',old))
+PY
+  echo 'PASS audit: live read-only history, both stamps, receipts, headers, broadcast copies, filtering, held Mail, registration events, torn copies and old records'
+}
+
 usage() {
-  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp>"
+  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit>"
   echo "cross-host, claims, broadcast require ROGER_REMOTE_HOST (SSH destination) and"
   echo "ROGER_ACCEPT_BIND (local IPv4 reachable from that host). Other suites use loopback."
 }
@@ -1020,5 +1136,6 @@ case "$1" in
   broadcast) broadcast ;;
   headers) headers ;;
   mcp) mcp ;;
+  audit) audit ;;
   *) usage >&2; exit 2 ;;
 esac
