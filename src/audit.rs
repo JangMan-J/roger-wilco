@@ -277,7 +277,8 @@ struct Audit<'a> {
     duplicates: Vec<Line>,
     /// Record ids per mail from the coordinator, a daemon log and a Store, in
     /// the order each mail was first listed.
-    records: Vec<(String, [Option<String>; 3])>,
+    records: Vec<(String, Vec<RecordEvidence>)>,
+    current_source: usize,
     record_index: HashMap<String, usize>,
     registers: usize,
     unregisters: usize,
@@ -285,6 +286,12 @@ struct Audit<'a> {
     receipted: usize,
     torn: usize,
     skipped: usize,
+}
+
+struct RecordEvidence {
+    source: usize,
+    kind: usize,
+    id: String,
 }
 
 /// Record ids within one source, keyed by `key`, in order of first mention,
@@ -340,13 +347,20 @@ impl Audit<'_> {
         let i = match self.record_index.get(mail) {
             Some(&i) => i,
             None => {
-                self.records.push((mail.to_string(), [None, None, None]));
+                self.records.push((mail.to_string(), Vec::new()));
                 self.record_index
                     .insert(mail.to_string(), self.records.len() - 1);
                 self.records.len() - 1
             }
         };
-        self.records[i].1[which].get_or_insert_with(|| id.to_string());
+        let records = &mut self.records[i].1;
+        if !records.iter().any(|r| r.source == self.current_source) {
+            records.push(RecordEvidence {
+                source: self.current_source,
+                kind: which,
+                id: id.to_string(),
+            });
+        }
     }
 
     fn sources(&mut self, inputs: &[Input]) {
@@ -716,20 +730,25 @@ impl Audit<'_> {
         let mismatches: Vec<Line> = self
             .records
             .iter()
-            .filter(|(_, ids)| {
-                let held: Vec<&String> = ids.iter().flatten().collect();
-                held.len() >= 2 && held.iter().any(|r| *r != held[0])
-            })
-            .map(|(mail, ids)| {
-                line(
+            .filter_map(|(mail, records)| {
+                let first = records.first()?;
+                let conflict = records.iter().find(|r| r.id != first.id)?;
+                let mut ids = [None; 3];
+                for r in records {
+                    ids[r.kind].get_or_insert(r.id.as_str());
+                }
+                // Show a conflicting record even when it is in a later input
+                // of the same kind. The timeline lists every source's evidence.
+                ids[conflict.kind] = Some(conflict.id.as_str());
+                Some(line(
                     "RECORD_MISMATCH",
                     vec![
                         ("mail", s(mail)),
-                        ("coordinator", opt_str(ids[0].as_deref())),
-                        ("daemon", opt_str(ids[1].as_deref())),
-                        ("store", opt_str(ids[2].as_deref())),
+                        ("coordinator", opt_str(ids[0])),
+                        ("daemon", opt_str(ids[1])),
+                        ("store", opt_str(ids[2])),
                     ],
-                )
+                ))
             })
             .collect();
         let summary = line(
@@ -786,6 +805,7 @@ fn listing(inputs: &[Input], opts: &Opts) -> Vec<Line> {
         unreceipted: Vec::new(),
         duplicates: Vec::new(),
         records: Vec::new(),
+        current_source: 0,
         record_index: HashMap::new(),
         registers: 0,
         unregisters: 0,
@@ -796,7 +816,12 @@ fn listing(inputs: &[Input], opts: &Opts) -> Vec<Line> {
     };
     audit.sources(inputs);
     for source in [Source::Coordinator, Source::Daemon, Source::Store] {
-        for input in inputs.iter().filter(|i| i.source == source) {
+        for (index, input) in inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.source == source)
+        {
+            audit.current_source = index;
             match source {
                 Source::Coordinator => audit.coordinator(input),
                 Source::Daemon => audit.daemon(input),

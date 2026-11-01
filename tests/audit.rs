@@ -480,6 +480,28 @@ fn fixture(dir: &Dir) -> (String, String, String) {
 }
 
 #[test]
+fn audit_checks_every_supplied_store_for_mismatches() {
+    let dir = Dir::new("multiple-stores");
+    let d = dir.write(
+        "d",
+        "{\"ev\":\"receipt\",\"mail\":\"m\",\"session\":\"b\",\"record\":\"r-1\"}\n",
+    );
+    let first = dir.write(
+        "first",
+        "{\"mail\":\"m\",\"record\":\"r-1\",\"from\":\"a\",\"body\":\"x\"}\n",
+    );
+    let second = dir.write(
+        "second",
+        "{\"mail\":\"m\",\"record\":\"r-3\",\"from\":\"a\",\"body\":\"x\"}\n",
+    );
+    let out = audit_ok(&["--daemon-log", &d, "--store", &first, "--store", &second]);
+    assert!(
+        out.contains("RECORD_MISMATCH mail=m coordinator=absent daemon=r-1 store=r-3\n"),
+        "{out}"
+    );
+}
+
+#[test]
 fn audit_missing_headers_are_distinct_from_empty() {
     let dir = Dir::new("headers");
     let s = dir.write(

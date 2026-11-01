@@ -1014,10 +1014,10 @@ audit() {
   "$bin" session --socket "$work/a.sock" --id "$a" --label 'first label' --declare "$declared" \
     --store "$work/a.store" >"$work/a.out" 2>&1 &
   pids+=("$!")
+  wait_for 10 'A registered' grep -q REGISTERED "$work/a.out"
   "$bin" session --socket "$work/b.sock" --id "$b" --label 'second label' --declare "$declared" \
     --store "$work/b.store" >"$work/b.out" 2>&1 &
   bpid=$!; pids+=("$bpid")
-  wait_for 10 'A registered' grep -q REGISTERED "$work/a.out"
   wait_for 10 'B registered' grep -q REGISTERED "$work/b.out"
   "$bin" send --socket "$work/a.sock" --from "$a" --to "$b" --mail audit-1 --body 'héllo' \
     --header 'note=ü v' --header 'empty=' >"$work/send.out"
@@ -1055,7 +1055,11 @@ audit() {
   for m in audit-1 audit-2 "audit-b/$a" "audit-b/$b" audit-after; do
     "$bin" receipt --socket "$work/a.sock" --mail "$m" >>"$work/receipts"
   done
-  for pid in "${pids[@]}"; do kill "$pid"; wait "$pid" 2>/dev/null || true; done
+  local i
+  for ((i=${#pids[@]}-1; i>=0; i--)); do
+    pid="${pids[i]}"
+    kill "$pid"; wait "$pid" 2>/dev/null || true
+  done
   pids=()
   kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true; coord_pid=''
   cp "$work/coord.log" "$work/c.copy"
