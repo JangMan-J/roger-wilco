@@ -211,7 +211,9 @@ is also kept when supplied Mail, delivery or Store records identify that sender 
 recipient. A release follows the key's last claim owner. Stores have no recipient
 Address and are always listed in full: pass the desired Address's own Store. Counts
 cover the listed records. Duplicate records are scoped to one input, and to a session
-within coordinator and daemon logs; mismatches compare records for the same Mail.
+within coordinator and daemon logs; mismatches compare the first record for the same
+Mail in each supplied source. With several inputs of one kind, the finding shows a
+conflicting representative for that kind; the timeline retains every source's evidence.
 
 Audit verifies nothing: it compares no token, header, label or declared text, and
 interprets no body. A consumer's own checks run over its output. See
