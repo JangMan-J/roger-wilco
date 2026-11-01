@@ -1,3 +1,4 @@
+mod audit;
 mod claims;
 mod coordinator;
 mod daemon;
@@ -63,6 +64,8 @@ Commands:
   board       --socket <path> [--from <address>]
   label       --socket <path> --from <address> --label <text>
   receipt     --socket <path> --mail <id>
+  audit       [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
+              [--address <address>] [--bodies] [--json]   (read-only; no lock, no write)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
 Session addresses and mail IDs are generated when omitted.
@@ -173,6 +176,7 @@ fn main() -> io::Result<()> {
             need(&args, "--from")?,
             need(&args, "--label")?,
         ),
+        "audit" => audit::run(&args[2..]),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
