@@ -144,7 +144,9 @@ prints `RECEIPT mail= to= record= accepted_at_ms= receipted_at_ms= latency_ms= k
 recipient has acked, else `PENDING mail= to= accepted_at_ms= kind=`, and a following
 `HEADERS mail= <json>` line when the Mail has headers; an unknown id exits nonzero.
 A Mail or Receipt committed before the stamps existed replays unchanged and prints `absent`,
-never 0. The core reports these numbers and does nothing else with them.
+never 0. The receipt reply on the socket (and so `roger_receipt`) also carries `from`, the
+sender Address as the `mail` or `broadcast` line holds it, right after `to`; the printed
+lines do not show it. The core reports these numbers and does nothing else with them.
 
 ## Registration
 
@@ -160,6 +162,15 @@ in one of two ways, both committed to the coordinator log as an `unregister` eve
 
 Mail already accepted for an unregistered Address stays pending and is delivered if that
 Address registers again; a connected session never expires.
+
+Every Register, unregister, relabel and change of declared text is one line on the
+coordinator log (`session`, `unregister`, `label`, `declared`), stamped `at_ms` on the
+coordinator's clock, the clock `accepted_at_ms` is read on: a Register commits its `session`
+line whether or not the Address was already registered on that host, then the `label` line
+it carries, then a `declared` line when its text differs from what the coordinator holds.
+Lines written before the stamp existed have none and replay unchanged; the coordinator reads
+nothing from `at_ms`. The Board's `last_seen_ms` is unchanged: it is memory, not the log, so
+a replayed session that has not re-registered still reads 0.
 
 ## Claims
 
@@ -274,7 +285,7 @@ Streamable HTTP is not offered.
 | `roger_renew` | `key`, `ttl_seconds` | the same claim result |
 | `roger_release` | `key` | the same claim result |
 | `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true}` once the coordinator holds this session's Register, else, after waiting up to `wait_seconds`, `{"registered":false}` |
-| `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
+| `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `from`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
 
 `roger_inbox` returns the Store entries after this session's read position, oldest first. With
 none it waits up to `wait_seconds` for the next delivery to reach the Store; that write ends
