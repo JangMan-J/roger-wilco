@@ -199,7 +199,9 @@ fn publish_port(path: &std::path::Path, port: u16) -> io::Result<()> {
 
 /// Replay one committed event. Claim events must be whole: a `claim` or
 /// `release` line missing a field is an `InvalidData` error that names the
-/// line, so start-up fails instead of silently freeing a held key.
+/// line, so start-up fails instead of silently freeing a held key. The
+/// `at_ms` on a session event is for a reader of the log: replay reads none
+/// of it, so a line written before the stamp existed applies the same.
 fn apply(state: &mut State, v: &Value) -> io::Result<()> {
     match v.get("ev").and_then(|x| x.as_str()) {
         Some("session") => {
