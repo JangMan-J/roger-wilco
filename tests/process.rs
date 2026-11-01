@@ -5,6 +5,10 @@
 #[cfg(not(feature = "test-hooks"))]
 compile_error!("tests/process.rs needs the test hooks: cargo test --features test-hooks");
 
+#[allow(dead_code)]
+#[path = "../src/json.rs"]
+mod json;
+
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -3030,4 +3034,92 @@ fn a_raw_register_is_confirmed_only_when_it_asks() {
         let reply = c.line();
         assert!(reply.contains(r#""type":"board""#), "{reply}");
     }
+}
+
+// ---- session events on the coordinator log: one stamped line per Register ----
+
+/// Start a Tracer on `sock` as `id` with its own Store, passing `extra`
+/// (`--label`, `--declare`) through verbatim, and wait until the
+/// coordinator holds its Register.
+fn start_tracer(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str, extra: &[&str]) {
+    let args = [
+        "session",
+        "--socket",
+        rig.p(sock).to_str().unwrap(),
+        "--id",
+        id,
+        "--store",
+        rig.p(store).to_str().unwrap(),
+    ]
+    .map(String::from);
+    let mut refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    refs.extend_from_slice(extra);
+    rig.spawn(&refs, out);
+    wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
+    rig.await_registered(out);
+}
+
+/// Every parsed coordinator-log line whose `session` field is `address`,
+/// in log order.
+fn session_events(rig: &Rig, address: &str) -> Vec<json::Value> {
+    read(&rig.p("coord.log"))
+        .lines()
+        .filter_map(|l| json::parse(l).ok())
+        .filter(|v| v.get("session").and_then(|x| x.as_str()) == Some(address))
+        .collect()
+}
+
+fn kinds(events: &[json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|v| str_field(v, "ev").to_string())
+        .collect()
+}
+
+fn str_field<'a>(v: &'a json::Value, key: &str) -> &'a str {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| panic!("no string {key} in {}", json::stringify(v)))
+}
+
+/// The line's `at_ms`, which must be an integer.
+fn at_ms_of(v: &json::Value) -> i64 {
+    v.get("at_ms")
+        .and_then(|x| x.as_i64())
+        .unwrap_or_else(|| panic!("no at_ms in {}", json::stringify(v)))
+}
+
+const DECLARED: &str = "role=reviewer [[153:Meteor Shower:7]]";
+
+/// A Register is one `session` line on the coordinator log, stamped `at_ms`
+/// on the coordinator's clock, then the `label` line the Register carries,
+/// then the `declared` line its text makes, each stamped alike.
+#[test]
+fn a_register_commits_a_session_line_stamped_at_ms_then_label_then_declared() {
+    let mut rig = Rig::new("stamps-register");
+    rig.start_stack();
+    let before = epoch_ms();
+    start_tracer(
+        &mut rig,
+        "b.sock",
+        RECIPIENT,
+        "recipient.store",
+        "recipient.out",
+        &["--label", "first", "--declare", DECLARED],
+    );
+    let after = epoch_ms();
+
+    let ev = session_events(&rig, RECIPIENT);
+    assert_eq!(kinds(&ev), ["session", "label", "declared"], "{ev:?}");
+    for e in &ev {
+        let at = at_ms_of(e);
+        assert!(
+            before <= at && at <= after,
+            "{before} <= {at} <= {after}: {}",
+            json::stringify(e)
+        );
+    }
+    assert_eq!(str_field(&ev[0], "host"), "host-b");
+    assert_eq!(str_field(&ev[1], "label"), "first");
+    assert_eq!(str_field(&ev[2], "declared"), DECLARED);
 }

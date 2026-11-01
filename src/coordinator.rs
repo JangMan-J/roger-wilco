@@ -317,6 +317,7 @@ fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
             ("ev", s("label")),
             ("session", s(session)),
             ("label", s(label)),
+            ("at_ms", Value::Int(now_ms())),
         ]),
     )
 }
@@ -431,14 +432,15 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     let mut st = state.lock().unwrap();
                     st.seen.insert(session.clone(), now_ms());
                     st.connected.insert(session.clone());
-                    if host_of(&st, &session) != Some(host.as_str()) {
-                        let ev = obj(vec![
-                            ("ev", s("session")),
-                            ("session", s(&session)),
-                            ("host", s(&host)),
-                        ]);
-                        commit(&mut st, ev)?;
-                    }
+                    // Every Register is one stamped line, so the log says
+                    // when an Address registered even when nothing changed.
+                    let ev = obj(vec![
+                        ("ev", s("session")),
+                        ("session", s(&session)),
+                        ("host", s(&host)),
+                        ("at_ms", Value::Int(now_ms())),
+                    ]);
+                    commit(&mut st, ev)?;
                     if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
                         set_label(&mut st, &session, label)?;
                     }
@@ -448,6 +450,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         if let Some(d) = &declared {
                             ev.push(("declared", s(d)));
                         }
+                        ev.push(("at_ms", Value::Int(now_ms())));
                         commit(&mut st, obj(ev))?;
                     }
                     pending_pushes(&st, &host, Some(&session))
