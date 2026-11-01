@@ -114,6 +114,9 @@ fn expected_json(text: &str) -> Value {
             "receipt_line",
             "body_bytes",
             "session",
+            "coordinator",
+            "daemon",
+            "store",
             "key",
             "owner",
             "expires_ms",
@@ -290,6 +293,24 @@ fn audit_duplicate_and_mismatched_records() {
         ),
     );
     let out = audit_ok(&["--coordinator-log", &c, "--daemon-log", &d, "--store", &s]);
+    let mail = "MAIL mail=m kind=directed from=a to=b accepted_at_ms=absent receipted_at_ms=absent latency_ms=absent record=r-1 receipt_line=2 body_bytes=0 line=1";
+    assert_eq!(out.lines().find(|l| l.starts_with("MAIL ")), Some(mail));
+    let json_out = audit_ok(&[
+        "--coordinator-log",
+        &c,
+        "--daemon-log",
+        &d,
+        "--store",
+        &s,
+        "--json",
+    ]);
+    assert_eq!(
+        json_out
+            .lines()
+            .map(|l| json::parse(l).unwrap())
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("MAIL")),
+        Some(expected_json(mail))
+    );
     let findings: Vec<_> = out
         .lines()
         .filter(|l| l.starts_with("DUPLICATE") || l.starts_with("RECORD_MISMATCH"))
@@ -499,6 +520,78 @@ fn audit_checks_every_supplied_store_for_mismatches() {
         out.contains("RECORD_MISMATCH mail=m coordinator=absent daemon=r-1 store=r-3\n"),
         "{out}"
     );
+}
+
+#[test]
+fn audit_repeated_records_preserve_cross_source_disagreement() {
+    let dir = Dir::new("repeated-records");
+    for (daemon_records, store_records, daemon, store, mismatches) in [
+        (vec!["r-1"], vec!["r-1", "r-3", "r-1"], "r-1", "r-3", 1),
+        (vec!["r-1", "r-3", "r-1"], vec!["r-1"], "r-3", "r-1", 1),
+        (vec!["r-1", "r-3"], vec!["r-3"], "r-1", "r-3", 1),
+        (vec!["r-3"], vec!["r-1", "r-3"], "r-3", "r-1", 1),
+        (vec!["r-1", "r-1"], vec!["r-1", "r-1"], "r-1", "r-1", 0),
+        (vec![], vec!["r-1", "r-3"], "absent", "r-3", 0),
+        (vec!["r-1", "r-3"], vec![], "r-3", "absent", 0),
+    ] {
+        let d = dir.write(
+            "d",
+            &daemon_records
+                .iter()
+                .map(|record| {
+                    format!(r#"{{"ev":"receipt","mail":"m","session":"b","record":"{record}"}}"#)
+                        + "\n"
+                })
+                .collect::<String>(),
+        );
+        let s = dir.write(
+            "s",
+            &store_records
+                .iter()
+                .map(|record| {
+                    format!(
+                        r#"{{"mail":"m","record":"{record}","from":"a","body":"x","headers":{{}}}}"#
+                    ) + "\n"
+                })
+                .collect::<String>(),
+        );
+        let mut expected = vec![
+            format!("SOURCE kind=daemon path={d} lines={}", daemon_records.len()),
+            format!("SOURCE kind=store path={s} lines={}", store_records.len()),
+        ];
+        expected.extend(daemon_records.iter().enumerate().map(|(i, record)| {
+            format!(
+                "DAEMON_RECEIPT path={d} mail=m session=b record={record} line={}",
+                i + 1
+            )
+        }));
+        expected.extend(store_records.iter().enumerate().map(|(i, record)| {
+            format!(
+                "STORE path={s} record={record} mail=m from=a kind=absent line={}",
+                i + 1
+            )
+        }));
+        if mismatches > 0 {
+            expected.push(format!(
+                "RECORD_MISMATCH mail=m coordinator=absent daemon={daemon} store={store}"
+            ));
+        }
+        expected.push(format!("AUDIT sources=2 registers=0 unregisters=0 mails=0 receipted=0 unreceipted=0 duplicates=0 mismatches={mismatches} torn=0 skipped=0"));
+        assert_eq!(
+            audit_ok(&["--daemon-log", &d, "--store", &s]),
+            expected.join("\n") + "\n"
+        );
+        let out = audit_ok(&["--daemon-log", &d, "--store", &s, "--json"]);
+        assert_eq!(
+            out.lines()
+                .map(|l| json::parse(l).unwrap())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|l| expected_json(l))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
