@@ -629,6 +629,7 @@ fn two_sessions_exchange_mail_with_headers_and_each_body_is_stored_once() {
     });
     assert_eq!(s(&receipt, "record"), "r-1");
     assert_eq!(s(&receipt, "to"), COMPOSITE);
+    assert_eq!(s(&receipt, "from"), A1);
     assert_eq!(s(&receipt, "kind"), "directed");
     assert!(receipt
         .get("accepted_at_ms")
