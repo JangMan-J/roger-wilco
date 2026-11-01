@@ -1085,6 +1085,27 @@ w, a, b, declared = pathlib.Path(sys.argv[1]), *sys.argv[2:]
 def rows(name): return [json.loads(l) for l in (w/name).read_text().splitlines()]
 r = rows('json')
 def of(t, data=r): return [v for v in data if v['type'] == t]
+def text(v):
+    def field(value):
+        if value is None: return 'absent'
+        if isinstance(value, list): return ','.join(value)
+        return str(value)
+    parts = [v['type']]
+    for key, value in v.items():
+        if key == 'type': continue
+        if key in ['headers', 'body']:
+            parts.append('absent' if value is None else json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+        else:
+            parts.append(key+'='+field(value))
+    return ' '.join(parts)
+assert (w/'text').read_text().splitlines() == [text(v) for v in r]
+live = (w/'live.out').read_text().splitlines()
+for t in ['REGISTER', 'LABEL', 'DECLARED', 'UNDECLARED', 'UNREGISTER', 'MAIL', 'UNRECEIPTED']:
+    assert [l for l in live if l.startswith(t+' ')] == [
+        text(v) for v in of(t) if v.get('mail') != 'audit-after'
+    ], t
+assert live[-1] == ('AUDIT sources=3 registers=4 unregisters=1 mails=5 receipted=4 '
+    'unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0')
 assert of('AUDIT') == [dict(type='AUDIT', sources=3, registers=4, unregisters=1, mails=6,
     receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)]
 assert of('TORN') == [dict(type='TORN', path=str(w/'c.copy'), bytes=6)]
@@ -1109,6 +1130,7 @@ for line in (w/'text').read_text().splitlines():
         assert line in tracer, line
 assert all(v['headers'] == {'note':'ü v','empty':''} for v in of('HEADERS'))
 f = rows('filtered')
+assert (w/'filtered-text').read_text().splitlines() == [text(v) for v in f]
 assert all(v['address']==b for v in f if v['type'] in ['REGISTER','LABEL','DECLARED','UNDECLARED','UNREGISTER'])
 assert of('STORE',f) == of('STORE')
 assert [v['mail'] for v in of('MAIL',f)] == ['audit-1','audit-2','audit-b/'+b,'audit-held','audit-after']

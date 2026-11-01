@@ -290,7 +290,7 @@ struct Audit<'a> {
 
 struct RecordEvidence {
     source: usize,
-    kind: usize,
+    kind: Source,
     id: String,
 }
 
@@ -343,7 +343,7 @@ impl Audit<'_> {
         }
     }
 
-    fn record(&mut self, mail: &str, which: usize, id: &str) {
+    fn record(&mut self, mail: &str, which: Source, id: &str) {
         let i = match self.record_index.get(mail) {
             Some(&i) => i,
             None => {
@@ -354,7 +354,10 @@ impl Audit<'_> {
             }
         };
         let records = &mut self.records[i].1;
-        if !records.iter().any(|r| r.source == self.current_source) {
+        if !records
+            .iter()
+            .any(|r| r.source == self.current_source && r.id == id)
+        {
             records.push(RecordEvidence {
                 source: self.current_source,
                 kind: which,
@@ -566,7 +569,7 @@ impl Audit<'_> {
                     mail,
                 } => {
                     if self.keep(&[&session]) || self.kept_mail.contains(&mail) {
-                        self.record(&mail, 0, &record);
+                        self.record(&mail, Source::Coordinator, &record);
                         seen.note((session, record), &mail);
                         self.out.push(line);
                     }
@@ -609,7 +612,7 @@ impl Audit<'_> {
                         Some(r) => {
                             self.receipted += 1;
                             seen.note((r.session.clone(), r.record.clone()), &row.id);
-                            self.record(&row.id, 0, &r.record);
+                            self.record(&row.id, Source::Coordinator, &r.record);
                         }
                         None => self.unreceipted.push(line(
                             "UNRECEIPTED",
@@ -678,7 +681,7 @@ impl Audit<'_> {
                                 ],
                             ));
                             seen.note((session.to_string(), record.to_string()), mail);
-                            self.record(mail, 1, record);
+                            self.record(mail, Source::Daemon, record);
                         }
                     }
                 }
@@ -718,7 +721,7 @@ impl Audit<'_> {
                     self.out.push(body_line(mail, body));
                 }
                 seen.note((String::new(), record.to_string()), mail);
-                self.record(mail, 2, record);
+                self.record(mail, Source::Store, record);
             }
         }
         self.duplicates.extend(seen.duplicates(&input.path));
@@ -731,22 +734,28 @@ impl Audit<'_> {
             .records
             .iter()
             .filter_map(|(mail, records)| {
-                let first = records.first()?;
-                let conflict = records.iter().find(|r| r.id != first.id)?;
-                let mut ids = [None; 3];
-                for r in records {
-                    ids[r.kind].get_or_insert(r.id.as_str());
-                }
-                // Show a conflicting record even when it is in a later input
-                // of the same kind. The timeline lists every source's evidence.
-                ids[conflict.kind] = Some(conflict.id.as_str());
+                let (reference, conflict) = records.iter().find_map(|reference| {
+                    records
+                        .iter()
+                        .find(|r| r.source != reference.source && r.id != reference.id)
+                        .map(|conflict| (reference, conflict))
+                })?;
+                // Show the disagreeing pair where the kinds differ; a single
+                // kind has one field, and its full evidence stays in the timeline.
+                let id = |kind| {
+                    [conflict, reference]
+                        .into_iter()
+                        .chain(records.iter())
+                        .find(|r| r.kind == kind)
+                        .map(|r| r.id.as_str())
+                };
                 Some(line(
                     "RECORD_MISMATCH",
                     vec![
                         ("mail", s(mail)),
-                        ("coordinator", opt_str(ids[0])),
-                        ("daemon", opt_str(ids[1])),
-                        ("store", opt_str(ids[2])),
+                        ("coordinator", opt_str(id(Source::Coordinator))),
+                        ("daemon", opt_str(id(Source::Daemon))),
+                        ("store", opt_str(id(Source::Store))),
                     ],
                 ))
             })
