@@ -302,8 +302,7 @@ fn takeover_socket(
     socket
 }
 
-fn takeover_read(socket: &mut std::io::BufReader<std::os::unix::net::UnixStream>) -> json::Value {
-    use std::io::BufRead;
+fn takeover_read(socket: &mut impl std::io::BufRead) -> json::Value {
     let mut line = String::new();
     socket.read_line(&mut line).unwrap();
     json::parse(&line).unwrap()
@@ -484,6 +483,140 @@ fn takeover_offline_replacements_are_retained_but_restore_is_not_replacement() {
             .matches("\"ev\":\"takeover\"")
             .count(),
         2
+    );
+}
+
+#[test]
+fn takeover_offline_closed_winner_does_not_restore_displaced_registrations() {
+    use std::io::BufRead;
+    let mut rig = Rig::new("takeover-offline-closed");
+    rig.start_stack();
+    let mut a = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    rig.send("offline-close", "local registration barrier");
+    takeover_read(&mut a);
+    rig.kill(rig.coord_idx);
+    let mut clients = vec![a];
+    for _ in 0..2 {
+        let mut socket = std::os::unix::net::UnixStream::connect(rig.p("a.sock")).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(
+            socket,
+            "{{\"type\":\"register\",\"session\":\"{RECIPIENT}\",\"notify_superseded\":true}}"
+        )
+        .unwrap();
+        let mut socket = std::io::BufReader::new(socket);
+        assert_eq!(
+            takeover_read(&mut socket).get("type").unwrap().as_str(),
+            Some("deliver")
+        );
+        clients.push(socket);
+    }
+    let mut c = clients.pop().unwrap();
+    // EOF after the deliberately invalid line establishes that Unregister
+    // was processed locally while upstream is unavailable.
+    writeln!(
+        c.get_mut(),
+        "{{\"type\":\"unregister\"}}\n{{\"type\":\"invalid-test-line\"}}"
+    )
+    .unwrap();
+    assert_eq!(c.read_line(&mut String::new()).unwrap(), 0);
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    assert!(
+        !presence(&rig, "a.sock", None).0,
+        "displaced Register was restored as connected"
+    );
+    for old in &mut clients {
+        let notice = takeover_read(old);
+        assert_eq!(notice.get("type").unwrap().as_str(), Some("superseded"));
+    }
+}
+
+#[test]
+fn takeover_old_coordinator_reconnect_restores_only_current_registration() {
+    use std::io::BufReader;
+    let mut rig = Rig::new("takeover-old-coordinator");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &listener.local_addr().unwrap().to_string(),
+            "--host-id",
+            "h",
+            "--socket",
+            rig.p("d.sock").to_str().unwrap(),
+            "--data",
+            rig.p("d.log").to_str().unwrap(),
+        ],
+        "daemon.out",
+    );
+    let (up, _) = listener.accept().unwrap();
+    up.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut up = BufReader::new(up);
+    takeover_read(&mut up);
+    writeln!(up.get_mut(), "{{\"type\":\"hello_ok\"}}").unwrap();
+    let register = format!("{{\"type\":\"register\",\"session\":\"{RECIPIENT}\",\"confirm_register\":true,\"notify_superseded\":true}}");
+    let mut a = std::os::unix::net::UnixStream::connect(rig.p("d.sock")).unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    writeln!(a, "{register}").unwrap();
+    let mut a = BufReader::new(a);
+    assert_eq!(
+        takeover_read(&mut up).get("type").unwrap().as_str(),
+        Some("register")
+    );
+    writeln!(up.get_mut(), "{{\"type\":\"registered\",\"session\":\"{RECIPIENT}\"}}\n{{\"type\":\"deliver\",\"mail\":\"local-barrier\",\"from\":\"sender\",\"to\":\"{RECIPIENT}\",\"body\":\"pending\"}}").unwrap();
+    for _ in 0..2 {
+        takeover_read(&mut a);
+    }
+    drop(up);
+    let (up, _) = listener.accept().unwrap();
+    up.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut up = BufReader::new(up);
+    takeover_read(&mut up); // Withhold hello_ok until both local replacements exist.
+    let mut clients = vec![a];
+    for _ in 0..2 {
+        let mut client = std::os::unix::net::UnixStream::connect(rig.p("d.sock")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(client, "{register}").unwrap();
+        let mut client = BufReader::new(client);
+        assert_eq!(
+            takeover_read(&mut client).get("type").unwrap().as_str(),
+            Some("deliver")
+        );
+        clients.push(client);
+    }
+    writeln!(up.get_mut(), "{{\"type\":\"hello_ok\"}}").unwrap();
+    assert_eq!(
+        takeover_read(&mut up).get("type").unwrap().as_str(),
+        Some("register")
+    );
+    writeln!(
+        up.get_mut(),
+        "{{\"type\":\"registered\",\"session\":\"{RECIPIENT}\"}}"
+    )
+    .unwrap();
+    let c = &mut clients[2];
+    assert_eq!(
+        takeover_read(c).get("type").unwrap().as_str(),
+        Some("registered")
+    );
+    writeln!(c.get_mut(), "{{\"type\":\"board\"}}").unwrap();
+    let next = takeover_read(&mut up);
+    assert_eq!(next.get("type").unwrap().as_str(), Some("board"));
+    writeln!(
+        up.get_mut(),
+        "{{\"type\":\"board\",\"req\":{}}}",
+        next.get("req").unwrap().as_i64().unwrap()
+    )
+    .unwrap();
+    assert_eq!(
+        takeover_read(c).get("type").unwrap().as_str(),
+        Some("board")
     );
 }
 
