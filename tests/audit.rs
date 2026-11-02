@@ -74,6 +74,12 @@ fn takeover_is_an_event_and_a_finding_with_verbatim_address() {
         assert_eq!(row.get("host").unwrap().as_str(), Some("b"));
         assert_eq!(row.get("at_ms").unwrap().as_i64(), Some(123));
     }
+    let text = audit_ok(&["--coordinator-log", &path, "--address", A]);
+    for word in ["TAKEOVER", "ADDRESS_TAKEOVER"] {
+        assert!(text
+            .lines()
+            .any(|l| l == format!("{word} address={A} old_host=a host=b at_ms=123 line=1")));
+    }
     let filtered = audit_ok(&["--coordinator-log", &path, "--json", "--address", B]);
     assert!(!filtered.contains("TAKEOVER"));
 }
