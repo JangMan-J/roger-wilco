@@ -340,14 +340,15 @@ pub fn serve(
                 if let Some(h) = &mcp {
                     (h.superseded)(notice.clone());
                 }
-                eprintln!("SUPERSEDED {}: client should stop sending as this Address, notify its supervisor/user, and not automatically re-register", json::stringify(&notice));
+                let _ = writeln!(io::stderr().lock(), "SUPERSEDED {}: client should stop sending as this Address, notify its supervisor/user, and not automatically re-register", json::stringify(&notice));
                 if let Some(w) = &client {
                     if superseded {
-                        net::send(w, &notice)?;
+                        let _ = net::send(w, &notice);
                     }
                 } else if tracer {
-                    println!("SUPERSEDED {}", json::stringify(&notice));
-                    io::stdout().flush()?;
+                    let mut out = io::stdout().lock();
+                    let _ = writeln!(out, "SUPERSEDED {}", json::stringify(&notice));
+                    let _ = out.flush();
                 }
             }
             "registered" if confirm => {

@@ -290,7 +290,20 @@ fn takeover_mcp_retains_notice_and_keeps_tools_and_process_alive() {
 
 #[test]
 fn takeover_before_confirmation_is_sticky_and_ends_registration_wait() {
-    let rig = Rig::new("takeover-late-confirm");
+    takeover_late_confirmation(false);
+}
+
+#[test]
+fn takeover_mcp_closed_stderr_preserves_state_and_tools() {
+    takeover_late_confirmation(true);
+}
+
+fn takeover_late_confirmation(closed_stderr: bool) {
+    let rig = Rig::new(if closed_stderr {
+        "takeover-late-confirm-closed-stderr"
+    } else {
+        "takeover-late-confirm"
+    });
     let listener = std::os::unix::net::UnixListener::bind(rig.p("mock.sock")).unwrap();
     let mut cmd = Command::new(BIN);
     cmd.args([
@@ -302,8 +315,11 @@ fn takeover_before_confirmation_is_sticky_and_ends_registration_wait() {
         "--store",
         rig.p("late.store").to_str().unwrap(),
     ]);
-    let mut m = Mcp::start(cmd, &rig.p("late.err"));
+    let mut m = Mcp::start_with_stderr(cmd, &rig.p("late.err"), closed_stderr);
     let (socket, _) = listener.accept().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut socket = BufReader::new(socket);
     let mut register = String::new();
     socket.read_line(&mut register).unwrap();
@@ -316,7 +332,24 @@ fn takeover_before_confirmation_is_sticky_and_ends_registration_wait() {
     let state = json::parse(&result.1).unwrap();
     assert_eq!(state.get("registered"), Some(&Value::Bool(false)));
     writeln!(socket.get_mut(), "{{\"type\":\"registered\",\"session\":\"{COMPOSITE}\"}}\n{{\"type\":\"deliver\",\"mail\":\"barrier\",\"from\":\"sender\",\"to\":\"{COMPOSITE}\",\"body\":\"mail unchanged\",\"kind\":\"directed\",\"headers\":{{}}}}").unwrap();
-    m.ok("roger_inbox", r#"{"wait_seconds":5}"#);
+    let mut ack = String::new();
+    socket.read_line(&mut ack).unwrap();
+    assert_eq!(
+        json::parse(&ack)
+            .unwrap()
+            .get("type")
+            .and_then(Value::as_str),
+        Some("ack")
+    );
+    let inbox = m.ok("roger_inbox", r#"{"wait_seconds":0}"#);
+    let Some(Value::Arr(mail)) = inbox.get("mail") else {
+        panic!("expected stored Mail: {inbox:?}");
+    };
+    assert_eq!(mail.len(), 1);
+    assert_eq!(
+        mail[0].get("body").and_then(Value::as_str),
+        Some("mail unchanged")
+    );
     assert_eq!(m.ok("roger_registered", r#"{"wait_seconds":0}"#), state);
     assert!(m.child.try_wait().unwrap().is_none());
 }
@@ -333,13 +366,22 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn start(mut cmd: Command, err: &Path) -> Mcp {
+    fn start(cmd: Command, err: &Path) -> Mcp {
+        Self::start_with_stderr(cmd, err, false)
+    }
+
+    fn start_with_stderr(mut cmd: Command, err: &Path, closed_stderr: bool) -> Mcp {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::from(fs::File::create(err).unwrap()))
+            .stderr(if closed_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::from(fs::File::create(err).unwrap())
+            })
             .spawn()
             .unwrap();
+        drop(child.stderr.take());
         let out = child.stdout.take().unwrap();
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
