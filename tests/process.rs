@@ -56,6 +56,407 @@ fn cli_help_and_unknown_command() {
         .starts_with("Usage: roger"));
 }
 
+#[test]
+fn takeover_notifies_each_replaced_adapter_once_without_ending_it() {
+    let mut rig = Rig::new("takeover-adapter");
+    rig.start_stack();
+    let address = "[[153:replacement:7]]opaque-address";
+    let mut inputs = Vec::new();
+    for (n, sock) in ["a.sock", "a.sock", "b.sock"].iter().enumerate() {
+        let out = format!("takeover-{n}.out");
+        let (idx, input) = rig.start_adapter(
+            sock,
+            address,
+            &format!("{n}.store"),
+            &out,
+            &["--registered", "--superseded"],
+        );
+        wait_for_text(
+            &rig.p(&out),
+            "\"type\":\"registered\"",
+            Duration::from_secs(10),
+        );
+        inputs.push((idx, input));
+        if n > 0 {
+            let previous = rig.p(&format!("takeover-{}.out", n - 1));
+            wait_for_text(
+                &previous,
+                "\"type\":\"superseded\"",
+                Duration::from_secs(10),
+            );
+            let text = fs::read_to_string(previous).unwrap();
+            let notices: Vec<_> = text
+                .lines()
+                .filter(|l| l.contains("\"type\":\"superseded\""))
+                .collect();
+            assert_eq!(notices.len(), 1);
+            let notice = json::parse(notices[0]).unwrap();
+            assert_eq!(notice.get("session").unwrap().as_str(), Some(address));
+            assert_eq!(
+                notice.get("host").unwrap().as_str(),
+                Some(if n == 1 { "host-a" } else { "host-b" })
+            );
+            assert!(notice.get("at_ms").unwrap().as_i64().unwrap() > 0);
+            assert!(rig.children[inputs[n - 1].0].try_wait().unwrap().is_none());
+        }
+    }
+    for (_, input) in &mut inputs {
+        writeln!(input, "{{\"type\":\"board\"}}").unwrap();
+    }
+    for n in 0..3 {
+        wait_for_text(
+            &rig.p(&format!("takeover-{n}.out")),
+            "\"type\":\"board\"",
+            Duration::from_secs(10),
+        );
+    }
+}
+
+#[test]
+fn takeover_tracer_prints_once_on_same_and_distinct_hosts() {
+    let mut rig = Rig::new("takeover-tracer");
+    rig.start_stack();
+    let mut children = Vec::new();
+    for (n, sock) in ["a.sock", "a.sock", "b.sock"].iter().enumerate() {
+        let out = format!("tracer-{n}.out");
+        let idx = rig.spawn(
+            &[
+                "session",
+                "--socket",
+                rig.p(sock).to_str().unwrap(),
+                "--id",
+                RECIPIENT,
+                "--store",
+                rig.p(&format!("tracer-{n}.store")).to_str().unwrap(),
+            ],
+            &out,
+        );
+        rig.await_registered(&out);
+        children.push(idx);
+        if n > 0 {
+            let old = rig.p(&format!("tracer-{}.out", n - 1));
+            wait_for_text(&old, "SUPERSEDED", Duration::from_secs(5));
+            assert_eq!(
+                fs::read_to_string(old)
+                    .unwrap()
+                    .matches("SUPERSEDED")
+                    .count(),
+                1
+            );
+            assert!(rig.children[children[n - 1]].try_wait().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn takeover_socket_opt_out_and_disconnected_restore_have_no_notice() {
+    let mut rig = Rig::new("takeover-opt-out");
+    rig.start_stack();
+    let mut a = takeover_socket(&rig, "a.sock", RECIPIENT, false);
+    let mut b = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    writeln!(a.get_mut(), "{{\"type\":\"board\"}}").unwrap();
+    assert_eq!(
+        takeover_read(&mut a).get("type").unwrap().as_str(),
+        Some("board")
+    );
+    writeln!(
+        b.get_mut(),
+        "{{\"type\":\"unregister\"}}\n{{\"type\":\"board\"}}"
+    )
+    .unwrap();
+    assert_eq!(
+        takeover_read(&mut b).get("type").unwrap().as_str(),
+        Some("board")
+    );
+    let mut c = takeover_socket(&rig, "b.sock", RECIPIENT, true);
+    writeln!(c.get_mut(), "{{\"type\":\"board\"}}").unwrap();
+    assert_eq!(
+        takeover_read(&mut c).get("type").unwrap().as_str(),
+        Some("board")
+    );
+    assert_eq!(
+        fs::read_to_string(rig.p("coord.log"))
+            .unwrap()
+            .matches("\"ev\":\"takeover\"")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn takeover_delayed_upstream_notices_follow_registration_not_current_address() {
+    use std::io::{BufRead, BufReader};
+    let mut rig = Rig::new("takeover-delayed");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &listener.local_addr().unwrap().to_string(),
+            "--host-id",
+            "h",
+            "--socket",
+            rig.p("d.sock").to_str().unwrap(),
+            "--data",
+            rig.p("d.log").to_str().unwrap(),
+        ],
+        "daemon.out",
+    );
+    let (up, _) = listener.accept().unwrap();
+    up.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut up = BufReader::new(up);
+    let mut line = String::new();
+    up.read_line(&mut line).unwrap();
+    writeln!(up.get_mut(), "{{\"type\":\"hello_ok\"}}").unwrap();
+    let mut clients = Vec::new();
+    let mut registrations = Vec::new();
+    for _ in 0..3 {
+        let mut client = std::os::unix::net::UnixStream::connect(rig.p("d.sock")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(client, "{{\"type\":\"register\",\"session\":\"{RECIPIENT}\",\"confirm_register\":true,\"notify_superseded\":true}}").unwrap();
+        line.clear();
+        up.read_line(&mut line).unwrap();
+        let msg = json::parse(&line).unwrap();
+        registrations.push(
+            msg.get("registration")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        clients.push(BufReader::new(client));
+    }
+    assert_ne!(registrations[0], registrations[1]);
+    assert_ne!(registrations[1], registrations[2]);
+    for id in &registrations[..2] {
+        for _ in 0..2 {
+            writeln!(up.get_mut(), "{{\"type\":\"superseded\",\"session\":\"{RECIPIENT}\",\"registration\":\"{id}\",\"host\":\"h\",\"at_ms\":42}}").unwrap();
+        }
+    }
+    // Confirmations deliberately arrive after both replacements.
+    for id in &registrations {
+        writeln!(
+            up.get_mut(),
+            "{{\"type\":\"registered\",\"session\":\"{RECIPIENT}\",\"registration\":\"{id}\"}}"
+        )
+        .unwrap();
+    }
+    for (n, client) in clients.iter_mut().enumerate() {
+        if n < 2 {
+            let notice = takeover_read(client);
+            assert_eq!(notice.get("type").unwrap().as_str(), Some("superseded"));
+            assert_eq!(notice.get("at_ms").unwrap().as_i64(), Some(42));
+        }
+        assert_eq!(
+            takeover_read(client).get("type").unwrap().as_str(),
+            Some("registered")
+        );
+    }
+}
+
+fn takeover_socket(
+    rig: &Rig,
+    sock: &str,
+    address: &str,
+    notify: bool,
+) -> std::io::BufReader<std::os::unix::net::UnixStream> {
+    let mut socket = std::os::unix::net::UnixStream::connect(rig.p(sock)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(socket, "{{\"type\":\"register\",\"session\":\"{address}\",\"confirm_register\":true,\"notify_superseded\":{notify}}}").unwrap();
+    let mut socket = std::io::BufReader::new(socket);
+    while takeover_read(&mut socket).get("type").unwrap().as_str() != Some("registered") {}
+    socket
+}
+
+fn takeover_read(socket: &mut std::io::BufReader<std::os::unix::net::UnixStream>) -> json::Value {
+    use std::io::BufRead;
+    let mut line = String::new();
+    socket.read_line(&mut line).unwrap();
+    json::parse(&line).unwrap()
+}
+
+#[test]
+fn takeover_socket_correlation_old_ack_and_release_keep_winner() {
+    let mut rig = Rig::new("takeover-socket");
+    rig.start_stack();
+    let mut a = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    rig.send("takeover-inflight", "body survives replacement");
+    assert_eq!(
+        takeover_read(&mut a).get("type").unwrap().as_str(),
+        Some("deliver")
+    );
+    let mut b = takeover_socket(&rig, "b.sock", RECIPIENT, true);
+    // C registers before A consumes the first notice.
+    let mut c = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    for (old, host) in [(&mut a, "host-b"), (&mut b, "host-a")] {
+        let mut notice = takeover_read(old);
+        if notice.get("type").unwrap().as_str() == Some("deliver") {
+            notice = takeover_read(old);
+        }
+        assert_eq!(notice.get("type").unwrap().as_str(), Some("superseded"));
+        assert_eq!(notice.get("host").unwrap().as_str(), Some(host));
+        let log = fs::read_to_string(rig.p("coord.log")).unwrap();
+        assert!(log.lines().map(|l| json::parse(l).unwrap()).any(|e| e
+            .get("ev")
+            .and_then(json::Value::as_str)
+            == Some("takeover")
+            && e.get("host") == notice.get("host")
+            && e.get("at_ms") == notice.get("at_ms")));
+    }
+    writeln!(
+        a.get_mut(),
+        "{{\"type\":\"ack\",\"mail\":\"takeover-inflight\",\"record\":\"old-record\"}}"
+    )
+    .unwrap();
+    assert_eq!(
+        takeover_read(&mut a).get("type").unwrap().as_str(),
+        Some("acked")
+    );
+    for old in [&mut a, &mut b] {
+        writeln!(
+            old.get_mut(),
+            "{{\"type\":\"unregister\"}}\n{{\"type\":\"board\",\"req\":10}}"
+        )
+        .unwrap();
+        let board = takeover_read(old);
+        assert_eq!(board.get("type").unwrap().as_str(), Some("board"));
+        assert!(json::stringify(&board).contains(RECIPIENT));
+    }
+    writeln!(c.get_mut(), "{{\"type\":\"board\",\"req\":11}}").unwrap();
+    let mut reply = takeover_read(&mut c);
+    while reply.get("type").unwrap().as_str() == Some("deliver") {
+        reply = takeover_read(&mut c);
+    }
+    assert_eq!(reply.get("type").unwrap().as_str(), Some("board"));
+}
+
+#[test]
+fn takeover_adapter_legacy_stdout_stays_reply_only_and_process_can_send() {
+    for confirm in [false, true] {
+        let mut rig = Rig::new(if confirm {
+            "takeover-legacy-confirm"
+        } else {
+            "takeover-legacy"
+        });
+        rig.start_stack();
+        let flags: &[&str] = if confirm { &["--registered"] } else { &[] };
+        let (idx, mut input) =
+            rig.start_adapter("a.sock", RECIPIENT, "old.store", "old.out", flags);
+        // A Board on this connection is not the Register stream; wait on the log.
+        wait_for_text(&rig.p("coord.log"), RECIPIENT, Duration::from_secs(5));
+        if confirm {
+            wait_for_text(&rig.p("old.out"), "registered", Duration::from_secs(5));
+        }
+        writeln!(input, "{{\"type\":\"board\"}}").unwrap();
+        let _new = takeover_socket(&rig, "b.sock", RECIPIENT, false);
+        wait_for_text(&rig.p("old.out.err"), "SUPERSEDED", Duration::from_secs(5));
+        writeln!(input, "{{\"type\":\"send\",\"to\":\"absent\",\"body\":\"still allowed\",\"mail\":\"after-notice\"}}").unwrap();
+        wait_for_text(&rig.p("old.out"), "accepted", Duration::from_secs(5));
+        let text = fs::read_to_string(rig.p("old.out")).unwrap();
+        let types: Vec<_> = text
+            .lines()
+            .map(|l| {
+                json::parse(l)
+                    .unwrap()
+                    .get("type")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            if confirm {
+                vec!["ready", "registered", "board", "accepted"]
+            } else {
+                vec!["ready", "board", "accepted"]
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(rig.p("old.out.err"))
+                .unwrap()
+                .matches("SUPERSEDED")
+                .count(),
+            1
+        );
+        assert!(rig.children[idx].try_wait().unwrap().is_none());
+    }
+}
+
+#[test]
+fn takeover_offline_replacements_are_retained_but_restore_is_not_replacement() {
+    let mut rig = Rig::new("takeover-offline");
+    rig.start_stack();
+    let mut a = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    rig.send(
+        "offline-barrier",
+        "pending local Mail establishes registration order",
+    );
+    assert_eq!(
+        takeover_read(&mut a).get("type").unwrap().as_str(),
+        Some("deliver")
+    );
+    rig.kill(rig.coord_idx);
+    let mut clients = vec![a];
+    for _ in 0..2 {
+        let mut client = std::os::unix::net::UnixStream::connect(rig.p("a.sock")).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        writeln!(client, "{{\"type\":\"register\",\"session\":\"{RECIPIENT}\",\"confirm_register\":true,\"notify_superseded\":true}}").unwrap();
+        let mut client = std::io::BufReader::new(client);
+        assert_eq!(
+            takeover_read(&mut client).get("type").unwrap().as_str(),
+            Some("deliver")
+        );
+        // Repeating Register on the same connection must not discard its
+        // unconfirmed replacement edge during the outage.
+        writeln!(client.get_mut(), "{{\"type\":\"register\",\"session\":\"{RECIPIENT}\",\"confirm_register\":true,\"notify_superseded\":true}}").unwrap();
+        assert_eq!(
+            takeover_read(&mut client).get("type").unwrap().as_str(),
+            Some("deliver")
+        );
+        clients.push(client);
+    }
+    rig.restart_coordinator();
+    for client in &mut clients[..2] {
+        loop {
+            let v = takeover_read(client);
+            if v.get("type").unwrap().as_str() == Some("superseded") {
+                break;
+            }
+        }
+    }
+    let c = &mut clients[2];
+    while takeover_read(c).get("type").unwrap().as_str() != Some("registered") {}
+    writeln!(
+        c.get_mut(),
+        "{{\"type\":\"ack\",\"mail\":\"offline-barrier\",\"record\":\"r-1\"}}"
+    )
+    .unwrap();
+    while takeover_read(c).get("type").unwrap().as_str() != Some("acked") {}
+    rig.kill(rig.coord_idx);
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    writeln!(c.get_mut(), "{{\"type\":\"board\"}}").unwrap();
+    assert_eq!(
+        takeover_read(c).get("type").unwrap().as_str(),
+        Some("board")
+    );
+    assert_eq!(
+        fs::read_to_string(rig.p("coord.log"))
+            .unwrap()
+            .matches("\"ev\":\"takeover\"")
+            .count(),
+        2
+    );
+}
+
 struct Rig {
     dir: PathBuf,
     children: Vec<Child>,
@@ -3221,10 +3622,10 @@ fn a_second_register_on_the_same_host_is_one_more_stamped_session_line() {
     let again = session_events(&rig, RECIPIENT);
     assert_eq!(
         kinds(&again),
-        ["session", "label", "declared", "session", "label"],
+        ["session", "label", "declared", "takeover", "session", "label"],
         "{again:?}"
     );
-    assert_eq!(str_field(&again[3], "host"), "host-b");
+    assert_eq!(str_field(&again[4], "host"), "host-b");
     assert!(
         at_ms_of(&again[3]) >= at_ms_of(&first[0]),
         "{} >= {}",
@@ -3240,7 +3641,7 @@ fn a_second_register_on_the_same_host_is_one_more_stamped_session_line() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let after_restart = loop {
         let ev = session_events(&rig, RECIPIENT);
-        if ev.len() == 6 {
+        if ev.len() == 7 {
             break ev;
         }
         assert!(Instant::now() < deadline, "{ev:?}");
@@ -3248,10 +3649,10 @@ fn a_second_register_on_the_same_host_is_one_more_stamped_session_line() {
     };
     assert_eq!(
         kinds(&after_restart),
-        ["session", "label", "declared", "session", "label", "session"],
+        ["session", "label", "declared", "takeover", "session", "label", "session"],
         "{after_restart:?}"
     );
-    assert!(at_ms_of(&after_restart[5]) >= at_ms_of(&again[4]));
+    assert!(at_ms_of(&after_restart[6]) >= at_ms_of(&again[5]));
 }
 
 /// A relabel is one `label` line and the adapter's stdin closing is one

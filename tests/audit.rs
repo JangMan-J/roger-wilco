@@ -56,6 +56,28 @@ impl Drop for Dir {
     }
 }
 
+#[test]
+fn takeover_is_an_event_and_a_finding_with_verbatim_address() {
+    let dir = Dir::new("takeover");
+    let path = dir.write("coordinator", &format!("{{\"ev\":\"takeover\",\"session\":\"{A}\",\"old_host\":\"a\",\"host\":\"b\",\"at_ms\":123}}\n"));
+    let output = audit_ok(&["--coordinator-log", &path, "--json", "--address", A]);
+    let rows: Vec<_> = output.lines().map(|l| json::parse(l).unwrap()).collect();
+    for kind in ["TAKEOVER", "ADDRESS_TAKEOVER"] {
+        let matches: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get("type").unwrap().as_str() == Some(kind))
+            .collect();
+        assert_eq!(matches.len(), 1, "expected one {kind}");
+        let row = matches[0];
+        assert_eq!(row.get("address").unwrap().as_str(), Some(A));
+        assert_eq!(row.get("old_host").unwrap().as_str(), Some("a"));
+        assert_eq!(row.get("host").unwrap().as_str(), Some("b"));
+        assert_eq!(row.get("at_ms").unwrap().as_i64(), Some(123));
+    }
+    let filtered = audit_ok(&["--coordinator-log", &path, "--json", "--address", B]);
+    assert!(!filtered.contains("TAKEOVER"));
+}
+
 fn audit(args: &[&str]) -> Output {
     Command::new(BIN).arg("audit").args(args).output().unwrap()
 }

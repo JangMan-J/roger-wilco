@@ -54,6 +54,7 @@ Commands:
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
+              [--superseded]   (also emit replacement notices on stdout; stderr always warns)
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
               [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
@@ -126,6 +127,7 @@ fn main() -> io::Result<()> {
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--declare"),
             args.iter().any(|a| a == "--registered"),
+            args.iter().any(|a| a == "--superseded"),
         ),
         "mcp" => mcp::run(&args),
         "send" => session::send(

@@ -37,6 +37,30 @@ make the unchecked fields evidence by having **a party other than the session**,
 consumer's own authority, sign them, and by having the reader verify the signature against
 a key it already trusts.
 
+## Replacement registration
+
+Newest Register wins without refusal or a recovery secret. A client receiving `superseded`
+should stop sending as that Address, tell its supervisor/user, and not automatically
+re-register. This is the consumer's convention, not enforcement by the core: the connection
+stays alive and sends, Mail and Acks remain usable.
+
+The notice is `{"type":"superseded","session":"<full Address>","host":"<new host>","at_ms":<integer>}`.
+The coordinator stamps it and commits a `takeover`; audit exposes `TAKEOVER` and
+`ADDRESS_TAKEOVER` with the full Address, old/new hosts, stamp and log line. Neither event
+nor stamp authenticates the new registrant or proves the old connection received it.
+
+Raw socket consumers opt in with `notify_superseded:true` on Register, independently of
+`confirm_register`. Adapter stderr always warns; stdout emits the notice only with
+`--superseded`, not merely `--registered`. Tracer prints `SUPERSEDED <JSON notice>`.
+MCP stderr warns and `roger_registered` retains the notice in `superseded` (otherwise null),
+reports `registered:false`, and ends any registration wait; a late confirmation cannot
+clear it. Tools are not disabled. See README Registration/Faces for the complete contract.
+
+Observer notices are best-effort, not durable Mail. Transport failure or process death can
+lose one; use the audit for recorded evidence. A daemon reconnect still re-announces its
+latest live local connections, including a previously superseded connection: receiving a
+notice does not change that old recovery behavior. The client must implement its own action.
+
 ## The authority
 
 A consumer has something the core does not: it knows which sessions it started, at which

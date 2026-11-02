@@ -75,7 +75,7 @@ environment, never from argv, which `ps` shows to every user.
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
 | `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session`, plus `[--registered]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
+| `adapter` | same as `session`, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
@@ -247,6 +247,32 @@ Lines written before the stamp existed have none and replay unchanged; the coord
 nothing from `at_ms`. The Board's `last_seen_ms` is unchanged: it is memory, not the log, so
 a replayed session that has not re-registered still reads 0.
 
+### Replacement registration
+
+Newest Register always wins, including on the same host. There is no secret, refusal or
+recovery barrier. Replacing a connected Address commits a `takeover` event with `session`
+(the full Address), `old_host`, `host` (the new host), `at_ms` (coordinator clock), and an
+internal `registration` correlation id. `roger audit` lists `TAKEOVER` followed by the
+`ADDRESS_TAKEOVER` finding with `address`, both hosts, `at_ms`, and source `line`, in text
+and JSON; Address filtering applies to both. Older logs are not used to infer takeovers.
+
+A client receiving `superseded` should stop sending as that Address, tell its supervisor/user,
+and not automatically re-register. This is consumer action, not core policy: the old
+connection stays open, sends and in-flight Acks remain allowed, and Mail handling is unchanged.
+The notice itself triggers no Register. Existing daemon reconnect behavior is retained:
+it re-announces each latest still-open local connection, even one previously superseded
+on another host. Such a reconnect can take the Address back; clients must act themselves.
+Restoring a disconnected registration alone is not a takeover.
+
+Daemon-generated registration ids correlate confirmations, replacements and releases to
+connections; they are not Address tokens or credentials. Local replacements awaiting upstream
+confirmation are retained in memory and replayed in order after reconnect, including their
+superseded predecessor. Notification is best-effort, once per local registration: transport
+failure or daemon/process death can lose an observer notice. It is not Mail, has no Ack or
+Store durability guarantee, and the committed audit event does not prove receipt. A delayed
+notice's stamp is when the coordinator recorded it, not the local replacement time; stamps
+are not unique event ids. New notification requires upgraded daemon and coordinator.
+
 ## Claims
 
 A claim's deadline is `now + ttl_ms` on the coordinator's wall clock, in milliseconds since
@@ -300,10 +326,24 @@ that speaks one needs nothing more from the core.
   Tracer and the one-shot subcommands above are clients of it. A `register` line may carry
   `"confirm_register":true`; the host daemon then sends `{"type":"registered","session":"<address>"}`
   once, when the coordinator holds that Register. Without the field no such line is ever sent.
+  Separately, `"notify_superseded":true` opts in to exactly
+  `{"type":"superseded","session":"<full Address>","host":"<new host>","at_ms":<integer>}`.
+  Without that opt-in no unsolicited replacement line is sent.
 - **The `roger adapter` stream.** The same session fronted by one JSON line stream on stdin and
   stdout, for a client (see Adapters).
 - **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
   that can register an MCP server needs no client code.
+
+Replacement notices on the other faces use the same payload:
+- The adapter always requests socket notices and prints an actionable `SUPERSEDED` warning
+  on stderr. Only `--superseded` also emits the JSON notice on stdout. `--registered` alone
+  does **not** enable it; existing reply-order clients keep their stdout contract and lifetime.
+- The Tracer prints `SUPERSEDED <JSON notice>` on stdout and an actionable warning on stderr.
+- MCP prints the warning only on stderr; stdout remains JSON-RPC responses. `roger_registered`
+  returns `{"registered":true|false,"superseded":null|<notice>}`. The notice is sticky for this
+  process, makes `registered` false, and ends a registration wait immediately. A late
+  confirmation cannot clear it. Other tools remain usable; no new tool or unsolicited RPC
+  notification is added.
 
 Two signals, in order. `READY` (the Tracer), `ready` (the adapter) mean the Register was written to
 the host daemon. `REGISTERED session=<address>` (the Tracer), `{"type":"registered","session":"<address>"}`
@@ -359,7 +399,7 @@ Streamable HTTP is not offered.
 | `roger_claim` | `key`, `ttl_seconds?` (900) | `{"ok","op","key","holder"?,"remaining_ms"?,"reason"?}`; acquires, or refreshes a claim this session holds; a refusal is `"ok":false`, not an error |
 | `roger_renew` | `key`, `ttl_seconds` | the same claim result |
 | `roger_release` | `key` | the same claim result |
-| `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true}` once the coordinator holds this session's Register, else, after waiting up to `wait_seconds`, `{"registered":false}` |
+| `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true,"superseded":null}` once confirmed; otherwise false after the bounded wait, or immediately with the sticky notice when superseded |
 | `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `from`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
 
 `roger_inbox` returns the Store entries after this session's read position, oldest first. With

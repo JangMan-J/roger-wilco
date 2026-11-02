@@ -214,6 +214,108 @@ impl Rig {
     }
 }
 
+#[test]
+fn takeover_mcp_retains_notice_and_keeps_tools_and_process_alive() {
+    let mut rig = Rig::new("takeover");
+    let coord = format!("127.0.0.1:{}", rig.port);
+    rig.spawn(&[
+        "daemon",
+        "--coordinator",
+        &coord,
+        "--host-id",
+        "h2",
+        "--socket",
+        rig.p("second.sock").to_str().unwrap(),
+        "--data",
+        rig.p("second.log").to_str().unwrap(),
+    ]);
+    until("second socket", 10, || {
+        std::os::unix::net::UnixStream::connect(rig.p("second.sock")).ok()
+    });
+    let mut first = rig.session("first", COMPOSITE, &[]);
+    let mut second = rig.session("second", COMPOSITE, &[]);
+    until("first superseded", 10, || {
+        let state = first.ok("roger_registered", r#"{"wait_seconds":0}"#);
+        (state.get("registered") == Some(&Value::Bool(false))).then_some(())
+    });
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "mcp",
+        "--socket",
+        rig.p("second.sock").to_str().unwrap(),
+        "--id",
+        COMPOSITE,
+        "--store",
+        rig.p("third.store").to_str().unwrap(),
+    ]);
+    let mut third = Mcp::start(cmd, &rig.p("third.err"));
+    third.initialize();
+    assert_eq!(
+        third
+            .ok("roger_registered", r#"{"wait_seconds":10}"#)
+            .get("registered"),
+        Some(&Value::Bool(true))
+    );
+    until("second superseded", 10, || {
+        let state = second.ok("roger_registered", r#"{"wait_seconds":0}"#);
+        (state.get("registered") == Some(&Value::Bool(false))).then_some(())
+    });
+    for (m, name, host) in [(&mut first, "first", "h1"), (&mut second, "second", "h2")] {
+        let state = m.ok("roger_registered", r#"{"wait_seconds":60}"#);
+        let notice = state.get("superseded").unwrap();
+        assert_eq!(
+            notice.get("session").and_then(Value::as_str),
+            Some(COMPOSITE)
+        );
+        assert_eq!(notice.get("host").and_then(Value::as_str), Some(host));
+        assert!(notice.get("at_ms").and_then(Value::as_i64).unwrap() > 0);
+        assert_eq!(
+            fs::read_to_string(rig.p(&format!("{name}.err")))
+                .unwrap()
+                .matches("SUPERSEDED")
+                .count(),
+            1
+        );
+        m.ok("roger_send", r#"{"to":"absent","body":"still allowed"}"#);
+        assert!(m.child.try_wait().unwrap().is_none());
+        assert!(m.seen.is_empty());
+    }
+    drop(third);
+}
+
+#[test]
+fn takeover_before_confirmation_is_sticky_and_ends_registration_wait() {
+    let rig = Rig::new("takeover-late-confirm");
+    let listener = std::os::unix::net::UnixListener::bind(rig.p("mock.sock")).unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "mcp",
+        "--socket",
+        rig.p("mock.sock").to_str().unwrap(),
+        "--id",
+        COMPOSITE,
+        "--store",
+        rig.p("late.store").to_str().unwrap(),
+    ]);
+    let mut m = Mcp::start(cmd, &rig.p("late.err"));
+    let (socket, _) = listener.accept().unwrap();
+    let mut socket = BufReader::new(socket);
+    let mut register = String::new();
+    socket.read_line(&mut register).unwrap();
+    assert!(register.contains("notify_superseded"));
+    m.initialize();
+    let request = m.request_tool("roger_registered", r#"{"wait_seconds":60}"#);
+    writeln!(socket.get_mut(), "{{\"type\":\"superseded\",\"session\":\"{COMPOSITE}\",\"host\":\"new-host\",\"at_ms\":42}}").unwrap();
+    let result = Mcp::result_of(&m.response(request, 5));
+    assert!(!result.0);
+    let state = json::parse(&result.1).unwrap();
+    assert_eq!(state.get("registered"), Some(&Value::Bool(false)));
+    writeln!(socket.get_mut(), "{{\"type\":\"registered\",\"session\":\"{COMPOSITE}\"}}\n{{\"type\":\"deliver\",\"mail\":\"barrier\",\"from\":\"sender\",\"to\":\"{COMPOSITE}\",\"body\":\"mail unchanged\",\"kind\":\"directed\",\"headers\":{{}}}}").unwrap();
+    m.ok("roger_inbox", r#"{"wait_seconds":5}"#);
+    assert_eq!(m.ok("roger_registered", r#"{"wait_seconds":0}"#), state);
+    assert!(m.child.try_wait().unwrap().is_none());
+}
+
 // ---- a JSON-RPC client over stdio ----
 
 struct Mcp {

@@ -129,6 +129,7 @@ fn read_input(source: Source, path: &str) -> io::Result<Input> {
 
 /// One output record: the word, its keyed fields in order, and an optional
 /// JSON tail (a header set or a body) shown bare in the text form.
+#[derive(Clone)]
 struct Line {
     word: &'static str,
     fields: Vec<(&'static str, Value)>,
@@ -423,6 +424,28 @@ impl Audit<'_> {
             .filter_map(|(n, v)| Some((*n, v.as_ref()?)))
         {
             let item = match v.get("ev").and_then(|x| x.as_str()) {
+                Some("takeover") => {
+                    match (
+                        net::field(v, "session"),
+                        net::field(v, "old_host"),
+                        net::field(v, "host"),
+                    ) {
+                        (Ok(session), Ok(old_host), Ok(host)) => Some(Item::Plain {
+                            line: line(
+                                "TAKEOVER",
+                                vec![
+                                    ("address", s(session)),
+                                    ("old_host", s(old_host)),
+                                    ("host", s(host)),
+                                    ("at_ms", opt_int(stamp_of(v, "at_ms"))),
+                                    ("line", int(n)),
+                                ],
+                            ),
+                            names: vec![session.to_string()],
+                        }),
+                        _ => None,
+                    }
+                }
                 Some("session") => session_event(v, "REGISTER", n, None).ok(),
                 Some("unregister") => session_event(v, "UNREGISTER", n, None).ok(),
                 Some("label") => net::field(v, "label")
@@ -559,7 +582,14 @@ impl Audit<'_> {
                             "UNREGISTER" => self.unregisters += 1,
                             _ => {}
                         }
-                        self.out.push(line);
+                        if line.word == "TAKEOVER" {
+                            let mut finding = line.clone();
+                            finding.word = "ADDRESS_TAKEOVER";
+                            self.out.push(line);
+                            self.out.push(finding);
+                        } else {
+                            self.out.push(line);
+                        }
                     }
                 }
                 Item::Stray {

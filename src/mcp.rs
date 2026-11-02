@@ -289,7 +289,7 @@ const TOOLS: [(&str, &str, &str); 9] = [
     ),
     (
         "roger_registered",
-        "Say whether the coordinator holds this session's Register, so the Board, a claim or a relabel from another connection will see it. With wait_seconds, wait that long for it.",
+        "Say whether the coordinator confirmed this Register and no superseded notice arrived. Returns registered and sticky superseded (null or the notice). With wait_seconds, wait for confirmation or supersession. A superseded client should stop sending as this Address, tell its supervisor/user, and not automatically re-register; tools remain usable.",
         r#"{"type":"object","properties":{"wait_seconds":{"type":"integer","minimum":0,"maximum":60}}}"#,
     ),
 ];
@@ -384,7 +384,7 @@ struct Ctx {
     me: String,
     inbox: Inbox,
     /// True once the coordinator's `registered` has arrived.
-    confirmed: Mutex<bool>,
+    confirmed: Mutex<(bool, Option<Value>)>,
     confirmed_cv: Condvar,
 }
 
@@ -459,7 +459,7 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             // no-poll: bounds the wait for the confirmation; its arrival ends the wait.
             let deadline = Instant::now() + Duration::from_secs(wait as u64);
             let mut held = ctx.confirmed.lock().unwrap();
-            while !*held {
+            while !held.0 && held.1.is_none() {
                 // no-poll: the same bound; elapsed time is read only to end the wait.
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -468,7 +468,10 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 // no-poll: waits on the confirmation the face signals, with the bound above.
                 held = ctx.confirmed_cv.wait_timeout(held, left).unwrap().0;
             }
-            Ok(obj(vec![("registered", Value::Bool(*held))]))
+            Ok(obj(vec![
+                ("registered", Value::Bool(held.0 && held.1.is_none())),
+                ("superseded", held.1.clone().unwrap_or(Value::Null)),
+            ]))
         }
         "roger_board" => {
             let all = opt_bool(name, args, "all")?;
@@ -789,17 +792,24 @@ pub fn run(args: &[String]) -> io::Result<()> {
         socket: cfg.socket.clone(),
         me: cfg.address.clone(),
         inbox: Inbox::open(&cfg.store)?,
-        confirmed: Mutex::new(false),
+        confirmed: Mutex::new((false, None)),
         confirmed_cv: Condvar::new(),
     });
     let gate = Arc::new(Mutex::new(false));
     let (tx, rx) = mpsc::channel::<Event>();
 
     let hooks = McpHooks {
+        superseded: Box::new({
+            let ctx = Arc::clone(&ctx);
+            move |notice| {
+                ctx.confirmed.lock().unwrap().1 = Some(notice);
+                ctx.confirmed_cv.notify_all();
+            }
+        }),
         confirmed: Box::new({
             let ctx = Arc::clone(&ctx);
             move || {
-                *ctx.confirmed.lock().unwrap() = true;
+                ctx.confirmed.lock().unwrap().0 = true;
                 ctx.confirmed_cv.notify_all();
             }
         }),
