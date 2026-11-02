@@ -442,7 +442,13 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         host: host.clone(),
         conn_id,
     };
-    net::send(&writer, &obj(vec![("type", s("hello_ok"))]))?;
+    net::send(
+        &writer,
+        &obj(vec![
+            ("type", s("hello_ok")),
+            ("registration_notices", Value::Bool(true)),
+        ]),
+    )?;
     let pushes = {
         let st = state.lock().unwrap();
         pending_pushes(&st, &host, None)
@@ -454,6 +460,26 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
     for line in lines {
         let v = line?;
         match net::field(&v, "type")? {
+            "replacement" => {
+                let session = net::field(&v, "session")?;
+                let registration = net::field(&v, "registration")?;
+                let old = net::field(&v, "replaces")?;
+                {
+                    let mut st = state.lock().unwrap();
+                    let notice = takeover(&mut st, session, &host, &host, old, None)?;
+                    if let Some(tx) = st.notice_writers.get(&conn_id) {
+                        let _ = tx.send(notice);
+                    }
+                }
+                net::send(
+                    &writer,
+                    &obj(vec![
+                        ("type", s("replacement_recorded")),
+                        ("session", s(session)),
+                        ("registration", s(registration)),
+                    ]),
+                )?;
+            }
             "register" => {
                 let session = net::field(&v, "session")?.to_string();
                 let pushes = {

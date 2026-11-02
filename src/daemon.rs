@@ -250,13 +250,36 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
             "hello refused",
         ));
     }
+    let notices = matches!(resp.get("registration_notices"), Some(Value::Bool(true)));
     let receipts = {
         let mut st = state.lock().unwrap();
         st.upstream = Some(Arc::clone(&writer));
+        if !notices {
+            // Old coordinators understand only the original current-session
+            // restore. Do not send them the new evidence-only message.
+            st.pending_registers.clear();
+        }
         // Labels are not repeated here: the coordinator's log already holds
         // the latest one, and a relabel may have gone through another host.
-        for msg in &st.pending_registers {
-            let _ = net::send(&writer, msg);
+        for pending in &st.pending_registers {
+            let mut msg = pending.clone();
+            if let Value::Obj(pairs) = &mut msg {
+                pairs.retain(|(key, _)| key != "label");
+            }
+            let session = net::field(&msg, "session")?;
+            let registration = net::field(&msg, "registration")?;
+            if st.current.get(session).map(String::as_str) != Some(registration) {
+                if msg.get("replaces").is_none() {
+                    continue;
+                }
+                // Preserve the replacement evidence without restoring an
+                // obsolete registration or changing the reconnect winner.
+                if let Value::Obj(pairs) = &mut msg {
+                    pairs.retain(|(key, _)| key != "type");
+                    pairs.push(("type".into(), s("replacement")));
+                }
+            }
+            let _ = net::send(&writer, &msg);
         }
         for (id, registration) in &st.current {
             if st
@@ -297,7 +320,7 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
             // The coordinator holds a Register. Not a reply to any request.
-            "registered" | "superseded" => {
+            "registered" | "superseded" | "replacement_recorded" => {
                 let mut st = state.lock().unwrap();
                 let session = net::field(&v, "session")?;
                 // An older coordinator has no identity to echo. Retain its
@@ -317,6 +340,9 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
                 if !superseded {
                     st.pending_registers
                         .retain(|v| net::field(v, "registration").ok() != registration.as_deref());
+                }
+                if net::field(&v, "type")? == "replacement_recorded" {
+                    continue;
                 }
                 if let Some(r) = registration.and_then(|id| st.registrations.get_mut(&id)) {
                     let superseded = net::field(&v, "type")? == "superseded";
@@ -513,8 +539,10 @@ fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
         .map(|(id, _)| id.clone())
         .collect();
     st.registrations.retain(|id, _| !removed.contains(id));
-    st.pending_registers
-        .retain(|v| !removed.contains(net::field(v, "registration").unwrap_or("")));
+    st.pending_registers.retain(|v| {
+        v.get("replaces").is_some()
+            || !removed.contains(net::field(v, "registration").unwrap_or(""))
+    });
     if st.sessions.get(id).is_some_and(|w| Arc::ptr_eq(w, writer)) {
         st.sessions.remove(id);
         st.declared.remove(id);

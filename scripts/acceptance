@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by the project's proofs (README.md, Checks).
-# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit>
+# Usage: scripts/acceptance <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit|takeover>
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/acceptance-lib"

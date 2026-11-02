@@ -266,8 +266,12 @@ Restoring a disconnected registration alone is not a takeover.
 
 Daemon-generated registration ids correlate confirmations, replacements and releases to
 connections; they are not Address tokens or credentials. Local replacements awaiting upstream
-confirmation are retained in memory and replayed in order after reconnect, including their
-superseded predecessor. Notification is best-effort, once per local registration: transport
+confirmation retain replacement evidence in memory. After reconnect only the latest live
+local connection is re-registered; obsolete replacements are reported as evidence only,
+without restoring their routing or presence, even if the newest connection has closed.
+The coordinator advertises `registration_notices:true` in `hello_ok` before a daemon uses
+these internal evidence-only messages; older coordinators keep the original restore path.
+Notification is best-effort, once per local registration: transport
 failure or daemon/process death can lose an observer notice. It is not Mail, has no Ack or
 Store durability guarantee, and the committed audit event does not prove receipt. A delayed
 notice's stamp is when the coordinator recorded it, not the local replacement time; stamps
