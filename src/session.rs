@@ -22,6 +22,7 @@ pub static HOLD_BEFORE_ACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::
 pub struct McpHooks {
     /// Called once the coordinator holds the Register (`registered`).
     pub confirmed: Box<dyn Fn() + Send>,
+    pub superseded: Box<dyn Fn(Value) + Send>,
     /// Called once after Register is sent, with the writer to the host daemon.
     pub registered: Option<Box<dyn FnOnce(net::Writer) + Send>>,
     /// Called after each delivery has reached the Store, never before.
@@ -36,7 +37,7 @@ pub struct McpHooks {
 pub enum Face {
     Tracer,
     /// The client stream, and whether the client asked for `registered`.
-    Adapter(net::Writer, bool),
+    Adapter(net::Writer, bool, bool),
     Mcp(McpHooks),
 }
 
@@ -74,6 +75,7 @@ pub fn adapter(
     store_path: PathBuf,
     declared: Option<String>,
     confirm: bool,
+    superseded: bool,
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
     serve(
@@ -82,7 +84,7 @@ pub fn adapter(
         label,
         store_path,
         declared,
-        Face::Adapter(out, confirm),
+        Face::Adapter(out, confirm, superseded),
     )
 }
 
@@ -194,10 +196,10 @@ pub fn serve(
     declared: Option<String>,
     face: Face,
 ) -> io::Result<()> {
-    let (client, mut mcp, confirm) = match face {
-        Face::Tracer => (None, None, true),
-        Face::Adapter(w, c) => (Some(w), None, c),
-        Face::Mcp(h) => (None, Some(h), true),
+    let (client, mut mcp, confirm, superseded) = match face {
+        Face::Tracer => (None, None, true, true),
+        Face::Adapter(w, c, n) => (Some(w), None, c, n),
+        Face::Mcp(h) => (None, Some(h), true, true),
     };
     let tracer = client.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
@@ -229,6 +231,7 @@ pub fn serve(
     if confirm {
         register.push(("confirm_register", Value::Bool(true)));
     }
+    register.push(("notify_superseded", Value::Bool(true)));
     net::send(&writer, &obj(register))?;
     match &client {
         Some(w) => {
@@ -325,6 +328,26 @@ pub fn serve(
                         ("record", s(&record)),
                     ]),
                 )?;
+            }
+            "superseded" => {
+                let notice = obj(vec![
+                    ("type", s("superseded")),
+                    ("session", s(net::field(&v, "session")?)),
+                    ("host", s(net::field(&v, "host")?)),
+                    ("at_ms", v.get("at_ms").cloned().unwrap_or(Value::Null)),
+                ]);
+                eprintln!("SUPERSEDED {}: client should stop sending as this Address, notify its supervisor/user, and not automatically re-register", json::stringify(&notice));
+                if let Some(h) = &mcp {
+                    (h.superseded)(notice.clone());
+                }
+                if let Some(w) = &client {
+                    if superseded {
+                        net::send(w, &notice)?;
+                    }
+                } else if tracer {
+                    println!("SUPERSEDED {}", json::stringify(&notice));
+                    io::stdout().flush()?;
+                }
             }
             "registered" if confirm => {
                 if let Some(w) = &client {

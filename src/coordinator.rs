@@ -90,12 +90,16 @@ struct State {
     /// whose host daemon's link here is up. Set by Register, cleared by that
     /// daemon's disconnect report or by its link dropping.
     connected: HashSet<String>,
+    // Daemon-generated registration identity, scoped to a host link. Not an Address token.
+    registrations: HashMap<String, (u64, String)>,
+    takeovers: HashMap<String, Value>,
     mails: HashMap<String, Mail>,
     order: Vec<String>,
     /// Broadcast ids already committed, so a resent broadcast fans out once.
     broadcasts: HashSet<String>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
+    notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
     claims: Claims,
 }
 
@@ -128,11 +132,14 @@ pub fn run(
         unregister_after_ms,
         seen: HashMap::new(),
         connected: HashSet::new(),
+        registrations: HashMap::new(),
+        takeovers: HashMap::new(),
         mails: HashMap::new(),
         order: Vec::new(),
         broadcasts: HashSet::new(),
         hosts: HashMap::new(),
         next_conn: 1,
+        notice_writers: HashMap::new(),
         claims: Claims::default(),
     };
     // DurLog::open already drops a crash-truncated tail, so every line here
@@ -215,6 +222,11 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                         label: String::new(),
                         declared: None,
                     });
+            }
+        }
+        Some("takeover") => {
+            if let Ok(id) = net::field(v, "registration") {
+                state.takeovers.insert(id.to_string(), v.clone());
             }
         }
         Some("unregister") => {
@@ -411,6 +423,16 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         let id = st.next_conn;
         st.next_conn += 1;
         st.hosts.insert(host.clone(), (id, Arc::clone(&writer)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = writer.clone();
+        std::thread::spawn(move || {
+            for notice in rx {
+                if net::send(&observer, &notice).is_err() {
+                    break;
+                }
+            }
+        });
+        st.notice_writers.insert(id, tx);
         id
     };
     // However this connection ends (EOF, error, or a `?` below), the link drop
@@ -436,7 +458,43 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let session = net::field(&v, "session")?.to_string();
                 let pushes = {
                     let mut st = state.lock().unwrap();
-                    st.seen.insert(session.clone(), now_ms());
+                    let registration = net::field(&v, "registration").unwrap_or("");
+                    let at = now_ms();
+                    let previous = st.registrations.get(&session).cloned();
+                    if st.connected.contains(&session)
+                        && previous
+                            .as_ref()
+                            .is_none_or(|(_, r)| r != registration || registration.is_empty())
+                    {
+                        let old_host = st.sessions[&session].host.clone();
+                        let old_registration =
+                            previous.as_ref().map(|(_, r)| r.as_str()).unwrap_or("");
+                        let notice = takeover(
+                            &mut st,
+                            &session,
+                            &old_host,
+                            &host,
+                            old_registration,
+                            Some(at),
+                        )?;
+                        if let Some((old_conn, _)) = previous {
+                            if let Some(tx) = st.notice_writers.get(&old_conn) {
+                                let _ = tx.send(notice);
+                            }
+                        }
+                    }
+                    // A local replacement can happen while this host's link
+                    // is down. Its retained edge is evidence of that live
+                    // local connection, not a reconnect of the same one.
+                    if let Ok(old) = net::field(&v, "replaces") {
+                        let notice = takeover(&mut st, &session, &host, &host, old, None)?;
+                        if let Some(tx) = st.notice_writers.get(&conn_id) {
+                            let _ = tx.send(notice);
+                        }
+                    }
+                    st.registrations
+                        .insert(session.clone(), (conn_id, registration.to_string()));
+                    st.seen.insert(session.clone(), at);
                     st.connected.insert(session.clone());
                     // Every Register is one stamped line, so the log says
                     // when an Address registered even when nothing changed.
@@ -468,7 +526,14 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 // forwards it only to a session that asked.
                 let _ = net::send(
                     &writer,
-                    &obj(vec![("type", s("registered")), ("session", s(&session))]),
+                    &obj(vec![
+                        ("type", s("registered")),
+                        ("session", s(&session)),
+                        (
+                            "registration",
+                            s(net::field(&v, "registration").unwrap_or("")),
+                        ),
+                    ]),
                 );
             }
             "send" => {
@@ -557,7 +622,9 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let mut st = state.lock().unwrap();
                 // A session that has since registered through another host
                 // is still connected there.
-                if host_of(&st, &session) == Some(host.as_str()) && st.connected.remove(&session) {
+                if owns_registration(&st, &session, &host, conn_id, &v)
+                    && st.connected.remove(&session)
+                {
                     st.seen.insert(session, now_ms());
                 }
             }
@@ -566,7 +633,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             "unregister" => {
                 let session = net::field(&v, "session")?.to_string();
                 let mut st = state.lock().unwrap();
-                if host_of(&st, &session) == Some(host.as_str()) {
+                if owns_registration(&st, &session, &host, conn_id, &v) {
                     unregister(&mut st, &session)?;
                 }
             }
@@ -688,6 +755,50 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
     Ok(())
 }
 
+fn takeover(
+    st: &mut State,
+    session: &str,
+    old_host: &str,
+    host: &str,
+    registration: &str,
+    at: Option<i64>,
+) -> io::Result<Value> {
+    let event = match st
+        .takeovers
+        .get(registration)
+        .filter(|_| !registration.is_empty() && at.is_none())
+    {
+        Some(event) => event.clone(),
+        None => {
+            let event = obj(vec![
+                ("ev", s("takeover")),
+                ("session", s(session)),
+                ("old_host", s(old_host)),
+                ("host", s(host)),
+                ("at_ms", Value::Int(at.unwrap_or_else(now_ms))),
+                ("registration", s(registration)),
+            ]);
+            commit(st, event.clone())?;
+            event
+        }
+    };
+    Ok(obj(vec![
+        ("type", s("superseded")),
+        ("session", s(session)),
+        ("host", event.get("host").unwrap().clone()),
+        ("at_ms", event.get("at_ms").unwrap().clone()),
+        ("registration", s(registration)),
+    ]))
+}
+
+fn owns_registration(st: &State, session: &str, host: &str, conn: u64, v: &Value) -> bool {
+    host_of(st, session) == Some(host)
+        && st
+            .registrations
+            .get(session)
+            .is_some_and(|(c, r)| *c == conn && r == net::field(v, "registration").unwrap_or(""))
+}
+
 /// One host daemon's link. When it drops, the host's slot is freed and every
 /// session on that host stops being connected, at that moment.
 struct HostLink {
@@ -701,6 +812,7 @@ impl Drop for HostLink {
         let Ok(mut st) = self.state.lock() else {
             return;
         };
+        st.notice_writers.remove(&self.conn_id);
         // Only this connection may take the slot: a host that reconnected
         // while this thread was finishing already owns it, and its
         // re-registration has already marked its live sessions connected.

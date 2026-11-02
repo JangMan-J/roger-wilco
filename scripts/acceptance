@@ -1146,8 +1146,13 @@ PY
   echo 'PASS audit: live read-only history, both stamps, receipts, headers, broadcast copies, filtering, held Mail, registration events, torn copies and old records'
 }
 
+takeover() {
+  (cd "$ROOT" && cargo test --offline --features test-hooks takeover -- --nocapture) || fail "takeover process seams"
+  echo 'PASS takeover: socket, adapter, MCP, Tracer, correlation, compatibility, reconnect, Mail and audit'
+}
+
 usage() {
-  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit>"
+  echo "usage: $0 <cross-host|no-poll|independence|claims|references|broadcast|headers|mcp|audit|takeover>"
   echo "cross-host, claims, broadcast require ROGER_REMOTE_HOST (SSH destination) and"
   echo "ROGER_ACCEPT_BIND (local IPv4 reachable from that host). Other suites use loopback."
 }
@@ -1163,5 +1168,6 @@ case "$1" in
   headers) headers ;;
   mcp) mcp ;;
   audit) audit ;;
+  takeover) takeover ;;
   *) usage >&2; exit 2 ;;
 esac

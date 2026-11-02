@@ -36,6 +36,15 @@ struct Receipt {
     record: String,
 }
 
+struct Registration {
+    writer: Writer,
+    notices: mpsc::Sender<Value>,
+    confirm: bool,
+    confirmed: bool,
+    notify: bool,
+    superseded: bool,
+}
+
 struct State {
     log: DurLog,
     inbox: HashMap<String, Mail>,
@@ -50,10 +59,9 @@ struct State {
     /// Each local session's declared text, repeated on every Register
     /// upstream: a Register without it clears the declaration.
     declared: HashMap<String, String>,
-    /// Local sessions that asked for `registered` (`confirm_register`) and
-    /// those already told on this registration.
-    confirm_asked: HashSet<String>,
-    confirmed: HashSet<String>,
+    current: HashMap<String, String>,
+    registrations: HashMap<String, Registration>,
+    pending_registers: Vec<Value>,
     upstream: Option<Writer>,
     next_req: i64,
     waiters: HashMap<i64, mpsc::Sender<Value>>,
@@ -80,8 +88,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         receipts: Vec::new(),
         sessions: HashMap::new(),
         declared: HashMap::new(),
-        confirm_asked: HashSet::new(),
-        confirmed: HashSet::new(),
+        current: HashMap::new(),
+        registrations: HashMap::new(),
+        pending_registers: Vec::new(),
         upstream: None,
         next_req: 1,
         waiters: HashMap::new(),
@@ -241,21 +250,34 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
             "hello refused",
         ));
     }
-    let (known, receipts): (Vec<Value>, Vec<Receipt>) = {
+    let receipts = {
         let mut st = state.lock().unwrap();
         st.upstream = Some(Arc::clone(&writer));
         // Labels are not repeated here: the coordinator's log already holds
         // the latest one, and a relabel may have gone through another host.
-        let known = st
-            .sessions
-            .keys()
-            .map(|id| register_msg(id, None, st.declared.get(id).map(String::as_str)))
-            .collect();
-        (known, st.receipts.clone())
+        for msg in &st.pending_registers {
+            let _ = net::send(&writer, msg);
+        }
+        for (id, registration) in &st.current {
+            if st
+                .pending_registers
+                .iter()
+                .any(|v| net::field(v, "registration").ok() == Some(registration.as_str()))
+            {
+                continue;
+            }
+            let _ = net::send(
+                &writer,
+                &register_msg(
+                    id,
+                    registration,
+                    None,
+                    st.declared.get(id).map(String::as_str),
+                ),
+            );
+        }
+        st.receipts.clone()
     };
-    for msg in known {
-        let _ = net::send(&writer, &msg);
-    }
     // A receipt committed while upstream was down still has to arrive. The
     // coordinator's acked answers trim `receipts` in the loop below.
     if !receipts.is_empty() {
@@ -275,23 +297,45 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
             // The coordinator holds a Register. Not a reply to any request.
-            "registered" => {
-                let session = net::field(&v, "session")?.to_string();
-                let tell = {
-                    let mut st = state.lock().unwrap();
-                    if st.confirm_asked.contains(&session) && !st.confirmed.contains(&session) {
-                        st.sessions.get(&session).cloned().inspect(|_| {
-                            st.confirmed.insert(session.clone());
-                        })
+            "registered" | "superseded" => {
+                let mut st = state.lock().unwrap();
+                let session = net::field(&v, "session")?;
+                // An older coordinator has no identity to echo. Retain its
+                // confirmation behavior, but never guess a notice's recipient.
+                let superseded = net::field(&v, "type")? == "superseded";
+                let registration = v
+                    .get("registration")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        if superseded {
+                            None
+                        } else {
+                            st.current.get(session).map(String::as_str)
+                        }
+                    })
+                    .map(str::to_string);
+                if !superseded {
+                    st.pending_registers
+                        .retain(|v| net::field(v, "registration").ok() != registration.as_deref());
+                }
+                if let Some(r) = registration.and_then(|id| st.registrations.get_mut(&id)) {
+                    let superseded = net::field(&v, "type")? == "superseded";
+                    let tell = if superseded {
+                        let tell = r.notify && !r.superseded;
+                        r.superseded = true;
+                        tell
                     } else {
-                        None
+                        let tell = r.confirm && !r.confirmed;
+                        r.confirmed = true;
+                        tell
+                    };
+                    if tell {
+                        let mut notice = v.clone();
+                        if let Value::Obj(pairs) = &mut notice {
+                            pairs.retain(|(k, _)| k != "registration");
+                        }
+                        let _ = r.notices.send(notice);
                     }
-                };
-                if let Some(w) = tell {
-                    let _ = net::send(
-                        &w,
-                        &obj(vec![("type", s("registered")), ("session", s(&session))]),
-                    );
                 }
             }
             // Every other line answers one request, by its req.
@@ -326,8 +370,29 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
     Ok(())
 }
 
-fn register_msg(session: &str, label: Option<&str>, declared: Option<&str>) -> Value {
-    let mut pairs = vec![("type", s("register")), ("session", s(session))];
+fn notice_sender(writer: Writer) -> mpsc::Sender<Value> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for notice in rx {
+            if net::send(&writer, &notice).is_err() {
+                break;
+            }
+        }
+    });
+    tx
+}
+
+fn register_msg(
+    session: &str,
+    registration: &str,
+    label: Option<&str>,
+    declared: Option<&str>,
+) -> Value {
+    let mut pairs = vec![
+        ("type", s("register")),
+        ("session", s(session)),
+        ("registration", s(registration)),
+    ];
     if let Some(label) = label {
         pairs.push(("label", s(label)));
     }
@@ -440,20 +505,31 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
 /// the coordinator marked this host's sessions disconnected when the link
 /// dropped, and the reconnect re-registers only live ones.
 fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
-    let upstream = {
-        let mut st = state.lock().unwrap();
-        if st.sessions.get(id).is_some_and(|w| Arc::ptr_eq(w, writer)) {
-            st.sessions.remove(id);
-            st.declared.remove(id);
-            st.confirm_asked.remove(id);
-            st.confirmed.remove(id);
-            st.upstream.clone()
-        } else {
-            None
+    let mut st = state.lock().unwrap();
+    let removed: HashSet<String> = st
+        .registrations
+        .iter()
+        .filter(|(_, r)| Arc::ptr_eq(&r.writer, writer))
+        .map(|(id, _)| id.clone())
+        .collect();
+    st.registrations.retain(|id, _| !removed.contains(id));
+    st.pending_registers
+        .retain(|v| !removed.contains(net::field(v, "registration").unwrap_or("")));
+    if st.sessions.get(id).is_some_and(|w| Arc::ptr_eq(w, writer)) {
+        st.sessions.remove(id);
+        st.declared.remove(id);
+        if let Some(registration) = st.current.remove(id) {
+            if let Some(up) = &st.upstream {
+                let _ = net::send(
+                    up,
+                    &obj(vec![
+                        ("type", s(kind)),
+                        ("session", s(id)),
+                        ("registration", s(&registration)),
+                    ]),
+                );
+            }
         }
-    };
-    if let Some(up) = upstream {
-        let _ = net::send(&up, &obj(vec![("type", s(kind)), ("session", s(id))]));
     }
 }
 
@@ -471,15 +547,48 @@ fn local_loop(
                 let label = v.get("label").and_then(|x| x.as_str()).map(str::to_string);
                 *session_id = Some(session.clone());
                 let declared = net::declared_of(&v);
-                let (upstream, pending) = {
+                let pending = {
                     let mut st = state.lock().unwrap();
-                    st.sessions.insert(session.clone(), Arc::clone(writer));
-                    st.confirmed.remove(&session);
-                    if matches!(v.get("confirm_register"), Some(Value::Bool(true))) {
-                        st.confirm_asked.insert(session.clone());
+                    let registration = if st
+                        .sessions
+                        .get(&session)
+                        .is_some_and(|w| Arc::ptr_eq(w, writer))
+                    {
+                        st.current[&session].clone()
                     } else {
-                        st.confirm_asked.remove(&session);
-                    }
+                        crate::session::gen_uuid()?
+                    };
+                    let replaced = st
+                        .current
+                        .get(&session)
+                        .filter(|old| *old != &registration)
+                        .cloned()
+                        .or_else(|| {
+                            st.pending_registers
+                                .iter()
+                                .find(|v| {
+                                    net::field(v, "registration").ok()
+                                        == Some(registration.as_str())
+                                })
+                                .and_then(|v| net::field(v, "replaces").ok())
+                                .map(str::to_string)
+                        });
+                    st.sessions.insert(session.clone(), Arc::clone(writer));
+                    st.current.insert(session.clone(), registration.clone());
+                    let local = st
+                        .registrations
+                        .entry(registration.clone())
+                        .or_insert_with(|| Registration {
+                            notices: notice_sender(writer.clone()),
+                            writer: writer.clone(),
+                            confirm: matches!(v.get("confirm_register"), Some(Value::Bool(true))),
+                            confirmed: false,
+                            notify: matches!(v.get("notify_superseded"), Some(Value::Bool(true))),
+                            superseded: false,
+                        });
+                    local.confirm = matches!(v.get("confirm_register"), Some(Value::Bool(true)));
+                    local.confirmed = false;
+                    local.notify = matches!(v.get("notify_superseded"), Some(Value::Bool(true)));
                     match &declared {
                         Some(d) => st.declared.insert(session.clone(), d.clone()),
                         None => st.declared.remove(&session),
@@ -499,14 +608,23 @@ fn local_loop(
                             )
                         })
                         .collect();
-                    (st.upstream.clone(), pending)
-                };
-                if let Some(up) = upstream {
-                    let _ = net::send(
-                        &up,
-                        &register_msg(&session, label.as_deref(), declared.as_deref()),
+                    let mut msg = register_msg(
+                        &session,
+                        &registration,
+                        label.as_deref(),
+                        declared.as_deref(),
                     );
-                }
+                    if let (Some(old), Value::Obj(pairs)) = (replaced, &mut msg) {
+                        pairs.push(("replaces".into(), s(&old)));
+                    }
+                    st.pending_registers
+                        .retain(|v| net::field(v, "registration").ok() != Some(&registration));
+                    st.pending_registers.push(msg.clone());
+                    if let Some(up) = &st.upstream {
+                        let _ = net::send(up, &msg);
+                    }
+                    pending
+                };
                 for p in pending {
                     let _ = net::send(writer, &p);
                 }
