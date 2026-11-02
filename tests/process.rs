@@ -57,6 +57,159 @@ fn cli_help_and_unknown_command() {
 }
 
 #[test]
+fn takeover_adapter_closed_stderr_keeps_serving_actual_replies() {
+    use std::io::BufReader;
+    for notices in [false, true] {
+        let mut rig = Rig::new(if notices {
+            "takeover-stderr-opt-in"
+        } else {
+            "takeover-stderr-legacy"
+        });
+        let listener = std::os::unix::net::UnixListener::bind(rig.p("mock.sock")).unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.args([
+            "adapter",
+            "--socket",
+            rig.p("mock.sock").to_str().unwrap(),
+            "--id",
+            RECIPIENT,
+            "--store",
+            rig.p("old.store").to_str().unwrap(),
+            "--registered",
+        ]);
+        if notices {
+            cmd.arg("--superseded");
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::from(fs::File::create(rig.p("old.out")).unwrap()))
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        drop(child.stderr.take());
+        rig.children.push(child);
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut socket = BufReader::new(socket);
+        let register = takeover_read(&mut socket);
+        assert_eq!(
+            register.get("notify_superseded"),
+            Some(&json::Value::Bool(true))
+        );
+        writeln!(socket.get_mut(), "{{\"type\":\"registered\",\"session\":\"{RECIPIENT}\"}}\n{{\"type\":\"superseded\",\"session\":\"{RECIPIENT}\",\"host\":\"new-host\",\"at_ms\":42}}\n{{\"type\":\"deliver\",\"mail\":\"notice-barrier\",\"from\":\"sender\",\"to\":\"{RECIPIENT}\",\"body\":\"after the notice\",\"kind\":\"directed\",\"headers\":{{}}}}").unwrap();
+        // Ack proves the shared loop processed the notice and subsequent Mail;
+        // a request on its independent connection alone would not prove that.
+        assert_eq!(
+            takeover_read(&mut socket).get("type").unwrap().as_str(),
+            Some("ack")
+        );
+        writeln!(input, "{{\"type\":\"send\",\"to\":\"recipient\",\"mail\":\"after-closed-stderr\",\"body\":\"still allowed\"}}").unwrap();
+        let (request, _) = listener.accept().unwrap();
+        request
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = BufReader::new(request);
+        let send = takeover_read(&mut request);
+        assert_eq!(send.get("type").unwrap().as_str(), Some("send"));
+        assert_eq!(
+            send.get("mail").unwrap().as_str(),
+            Some("after-closed-stderr")
+        );
+        writeln!(
+            request.get_mut(),
+            "{{\"type\":\"accepted\",\"mail\":\"after-closed-stderr\"}}"
+        )
+        .unwrap();
+        wait_for_text(&rig.p("old.out"), "accepted", Duration::from_secs(5));
+        let text = fs::read_to_string(rig.p("old.out")).unwrap();
+        let types: Vec<_> = text
+            .lines()
+            .map(|l| {
+                json::parse(l)
+                    .unwrap()
+                    .get("type")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            types,
+            if notices {
+                vec!["ready", "registered", "superseded", "mail", "accepted"]
+            } else {
+                vec!["ready", "registered", "mail", "accepted"]
+            }
+        );
+        assert!(rig.children[0].try_wait().unwrap().is_none());
+    }
+}
+
+#[test]
+fn takeover_closed_notice_outputs_do_not_fail_session_or_adapter() {
+    use std::io::{BufRead, BufReader};
+    for face in ["session", "adapter"] {
+        let mut rig = Rig::new(&format!("takeover-closed-output-{face}"));
+        let listener = std::os::unix::net::UnixListener::bind(rig.p("mock.sock")).unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.args([
+            face,
+            "--socket",
+            rig.p("mock.sock").to_str().unwrap(),
+            "--id",
+            RECIPIENT,
+            "--store",
+            rig.p("old.store").to_str().unwrap(),
+        ]);
+        if face == "adapter" {
+            cmd.args(["--registered", "--superseded"]);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        drop(child.stderr.take());
+        rig.children.push(child);
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut socket = BufReader::new(socket);
+        takeover_read(&mut socket);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap(); // READY/ready must precede closing stdout.
+        writeln!(
+            socket.get_mut(),
+            "{{\"type\":\"registered\",\"session\":\"{RECIPIENT}\"}}"
+        )
+        .unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        assert!(line.to_ascii_lowercase().contains("registered"));
+        drop(output);
+        writeln!(socket.get_mut(), "{{\"type\":\"superseded\",\"session\":\"{RECIPIENT}\",\"host\":\"new-host\",\"at_ms\":42}}").unwrap();
+        // EOF after the notice makes successful completion deterministic,
+        // without asking the closed stdout to carry a later Mail or reply.
+        socket
+            .get_ref()
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        assert!(
+            rig.children[0].wait().unwrap().success(),
+            "{face} failed on notice output"
+        );
+    }
+}
+
+#[test]
 fn takeover_notifies_each_replaced_adapter_once_without_ending_it() {
     let mut rig = Rig::new("takeover-adapter");
     rig.start_stack();
