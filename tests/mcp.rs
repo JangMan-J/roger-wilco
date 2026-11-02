@@ -269,6 +269,11 @@ fn takeover_mcp_retains_notice_and_keeps_tools_and_process_alive() {
         );
         assert_eq!(notice.get("host").and_then(Value::as_str), Some(host));
         assert!(notice.get("at_ms").and_then(Value::as_i64).unwrap() > 0);
+        until("superseded diagnostic", 5, || {
+            fs::read_to_string(rig.p(&format!("{name}.err")))
+                .ok()
+                .filter(|s| s.contains("SUPERSEDED"))
+        });
         assert_eq!(
             fs::read_to_string(rig.p(&format!("{name}.err")))
                 .unwrap()

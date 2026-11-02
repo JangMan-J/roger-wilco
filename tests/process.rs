@@ -149,6 +149,36 @@ fn takeover_tracer_prints_once_on_same_and_distinct_hosts() {
 }
 
 #[test]
+fn takeover_disconnected_restore_is_quiet_and_failed_observer_does_not_block_winner() {
+    let mut rig = Rig::new("takeover-failed-observer");
+    rig.start_stack();
+    let a = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    drop(a);
+    wait_connected(&rig, "a.sock", false);
+    let b = takeover_socket(&rig, "b.sock", RECIPIENT, true);
+    assert!(!fs::read_to_string(rig.p("coord.log"))
+        .unwrap()
+        .contains("\"ev\":\"takeover\""));
+    b.get_ref().shutdown(std::net::Shutdown::Read).unwrap();
+    let mut c = takeover_socket(&rig, "b.sock", RECIPIENT, true);
+    writeln!(c.get_mut(), "{{\"type\":\"board\"}}").unwrap();
+    assert_eq!(
+        takeover_read(&mut c).get("type").unwrap().as_str(),
+        Some("board")
+    );
+    drop((b, c));
+    wait_connected(&rig, "a.sock", false);
+    let _d = takeover_socket(&rig, "a.sock", RECIPIENT, true);
+    assert_eq!(
+        fs::read_to_string(rig.p("coord.log"))
+            .unwrap()
+            .matches("\"ev\":\"takeover\"")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn takeover_socket_opt_out_and_disconnected_restore_have_no_notice() {
     let mut rig = Rig::new("takeover-opt-out");
     rig.start_stack();

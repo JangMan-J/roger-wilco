@@ -36,7 +36,7 @@ pub struct McpHooks {
 /// client stream, or the MCP server's hooks.
 pub enum Face {
     Tracer,
-    /// The client stream, and whether the client asked for `registered`.
+    /// The client stream, and independent `registered` / `superseded` opt-ins.
     Adapter(net::Writer, bool, bool),
     Mcp(McpHooks),
 }
@@ -66,7 +66,8 @@ pub fn run(
 /// `ready` means the Register was written to the host daemon. With
 /// `confirm` (the `--registered` flag) the client is also sent
 /// `{"type":"registered","session"}` once, after `ready`, when the coordinator
-/// holds the Register; without it that line is never sent.
+/// holds the Register; without it that line is never sent. `superseded`
+/// independently enables replacement notices on stdout; stderr always warns.
 /// When the client's stdin closes, the session unregisters and the process exits.
 pub fn adapter(
     socket: PathBuf,
@@ -336,10 +337,10 @@ pub fn serve(
                     ("host", s(net::field(&v, "host")?)),
                     ("at_ms", v.get("at_ms").cloned().unwrap_or(Value::Null)),
                 ]);
-                eprintln!("SUPERSEDED {}: client should stop sending as this Address, notify its supervisor/user, and not automatically re-register", json::stringify(&notice));
                 if let Some(h) = &mcp {
                     (h.superseded)(notice.clone());
                 }
+                eprintln!("SUPERSEDED {}: client should stop sending as this Address, notify its supervisor/user, and not automatically re-register", json::stringify(&notice));
                 if let Some(w) = &client {
                     if superseded {
                         net::send(w, &notice)?;
