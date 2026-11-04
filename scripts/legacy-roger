@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Build the `roger` binary of an earlier revision from this repository's own history
+# and print its path. A test of how today's `roger` replays what an earlier one wrote
+# runs that earlier binary for real, rather than writing its files by hand.
+# The build is cached under target/legacy/<commit>; concurrent callers wait on one lock.
+# Usage: scripts/legacy-roger <rev>
+set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 <rev> (print the path of that revision's built roger)"; exit 0; fi
+[[ $# == 1 ]] || { echo "usage: $0 <rev>" >&2; exit 2; }
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rev="$(git -C "$ROOT" rev-parse --verify --quiet "$1^{commit}")" \
+  || { echo "legacy-roger: expected a commit in this repository's history, saw '$1' (a shallow or exported tree has no history to build from)" >&2; exit 1; }
+base="$ROOT/target/legacy"
+bin="$base/$rev/target/debug/roger"
+if [[ ! -x "$bin" ]]; then
+  mkdir -p "$base"
+  exec 9>"$base/.lock"
+  flock 9
+  if [[ ! -x "$bin" ]]; then
+    rm -rf "$base/$rev"
+    mkdir -p "$base/$rev/src"
+    git -C "$ROOT" archive "$rev" | tar -x -C "$base/$rev/src"
+    (cd "$base/$rev/src" && CARGO_TARGET_DIR="$base/$rev/target" cargo build --offline -q) >&2 \
+      || { echo "legacy-roger: cargo build of $rev failed" >&2; rm -rf "$base/$rev"; exit 1; }
+  fi
+fi
+echo "$bin"
