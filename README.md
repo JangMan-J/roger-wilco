@@ -440,6 +440,7 @@ scripts/acceptance headers        # proof 7: kind and headers arrive byte-identi
 scripts/acceptance audit          # proof 9: read-only history, findings, old and live records; loopback
 scripts/acceptance mcp            # proof 8 (K8): `roger mcp` is a session; tools, position, SIGKILL between Store and Ack; loopback
 scripts/check-vocabulary          # invariant: the core never names what a session does with its Mail
+checks/portability-pack.sh        # builds, tests and installs in a clean HOME with no checkout path; ./install.sh installs for the current user
 ```
 
 `cross-host`, `broadcast` and `claims` run on two hosts. Set `ROGER_REMOTE_HOST` to the
@@ -485,4 +486,4 @@ core log grows while nobody asks.
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).

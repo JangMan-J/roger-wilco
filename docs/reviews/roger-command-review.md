@@ -1,4 +1,4 @@
-# Review: roger-wilco-rebuild ee311ab..d6764ec (/roger command, Board, Presence last_seen, adapter board/relabel/claim)
+# Review: roger-wilco ee311ab..d6764ec (/roger command, Board, Presence last_seen, adapter board/relabel/claim)
 
 Method: `review` skill, three axes (fitness, intent-fit, syntactical) in parallel sub-agents plus a direct read. Static only: `git show`/`git diff`. The syntactical agent ran `check-harness-free`, `check-no-poll` and the invariant-3 grep on an archive of d6764ec, and all three passed. No acceptance proofs were rerun; the vector reports them passing at 4b7758a.
 Line numbers are at d6764ec.
