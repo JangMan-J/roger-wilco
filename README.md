@@ -11,12 +11,10 @@ durable state, one host daemon per machine serves local sessions on a Unix socke
 anything else (a command-line client, a test session, an adapter for a particular agent
 program) sits on top of that socket.
 
-The project's purpose, proofs, invariants and terms (Mail, Ack, Store, Board and the rest) are
-held by its director in sealed records outside this repository; `slice status` shows where. Their
-last copy in this repository is `de73721` (`git show de73721:KERNEL.md`, `INVARIANTS.md`,
-`GLOSSARY.md`), the readable copy for anyone without the records. Work is assigned to workers
-as slices, each in its own worktree with a reduced copy of those documents, and merged by the
-director; the gate is described under Checks.
+This README describes the core contract, commands and checks. For development, follow the
+coding standards and review rules in [AGENTS.md](AGENTS.md#coding-standards); for installation
+and operations, see [deploy/README.md](deploy/README.md). Run `scripts/check-all` before
+landing changes on main (see [Checks](#checks)).
 
 | Module | Doc |
 | --- | --- |
@@ -429,7 +427,7 @@ rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 scripts/check                     # the core gate
 scripts/check-all                 # the core gate, then the seal guard
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
-scripts/check-seal                # the director's seal on the sealed documents is intact (quiet where none exists)
+scripts/check-seal                # verifies document integrity when a seal is present; skips otherwise
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
 scripts/acceptance independence   # proof 2: a real outside program on `roger mcp` and a Tracer exchange mail both ways; one real model call; loopback
@@ -467,7 +465,7 @@ core log grows while nobody asks.
 
 | Path | Role |
 | --- | --- |
-| `AGENTS.md` | the director pointer, directives, coding standards and review rules |
+| `AGENTS.md` | development guidance, coding standards and review rules |
 | `src/main.rs` | subcommand dispatch and flags |
 | `src/audit.rs` | read-only record history and findings |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
