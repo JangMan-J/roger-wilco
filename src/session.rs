@@ -205,8 +205,8 @@ pub fn serve(
     let tracer = client.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
     let mut records: HashMap<String, String> = HashMap::new(); // mail -> record
-    for line in &prior {
-        if let Ok(v) = json::parse(line) {
+    for line in prior {
+        if let Ok(v) = json::parse(&line?) {
             if let (Ok(mail), Ok(record)) = (net::field(&v, "mail"), net::field(&v, "record")) {
                 records.insert(mail.to_string(), record.to_string());
             }

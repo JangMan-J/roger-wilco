@@ -465,10 +465,11 @@ broadcast() {
 
 # Invariant 2: no fixed-interval scan on the correctness path. Mail, receipts,
 # claim expiry and unregister follow committed events, with every sweep
-# disabled. The core has no sweep to disable: nothing in src runs on a timer
-# (scripts/check-no-poll finds only the daemon's reconnect backoff, the
-# daemon's bounded wait for one upstream reply, and the Store lock's single
-# try). A sweep added later must take a switch that this check switches off; the
+# disabled. The core has no sweep to disable: nothing in src looks for work
+# on a timer (scripts/check-no-poll finds only the daemon's reconnect backoff,
+# the daemon's bounded wait for one upstream reply, the Store lock's single
+# try, and the link's liveness ping with its silence bound, which carries no
+# Mail and commits nothing). A sweep added later must take a switch that this check switches off; the
 # quiet windows below fail while one runs, since they require that nothing is
 # committed while nobody asks.
 #

@@ -12,9 +12,9 @@ use crate::durlog::DurLog;
 use crate::headers;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +22,13 @@ use std::sync::{Arc, Mutex};
 struct Mail {
     from: String,
     to: String,
-    body: String,
+    /// Held until the Receipt and dropped with it: nothing sends a receipted
+    /// Mail again, and its body stays on the log.
+    body: Option<String>,
+    /// What a resend of this id is compared with once the body is gone.
+    mark: BodyMark,
+    /// This Mail's place in commit order among the Mail awaiting a Receipt.
+    seq: u64,
     /// How the Mail reached its recipient: `net::DIRECTED` or `net::BROADCAST`.
     kind: &'static str,
     /// The sender's headers, validated once at the send and carried verbatim.
@@ -45,6 +51,46 @@ struct Receipt {
     at: Option<i64>,
 }
 
+/// A body's length and a hash of it, kept in memory only and never written:
+/// enough to tell a resend of a Mail from a different Mail under the same id
+/// after the body itself has been dropped.
+type BodyMark = (usize, u64);
+
+fn mark_of(body: &str) -> BodyMark {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    (body.len(), h.finish())
+}
+
+/// What a second send under an existing Mail id differs in, if anything. A
+/// resend that repeats the sender, recipient and body commits nothing and is
+/// accepted again; one that differs would be dropped silently if it were
+/// accepted, so it is refused. Headers are not compared: the core reads none.
+fn resend_differs(
+    (from, to, mark): (&str, Option<&str>, BodyMark),
+    (new_from, new_to, new_body): (&str, Option<&str>, &str),
+) -> Option<String> {
+    let mut what = Vec::new();
+    if from != new_from {
+        what.push("sender");
+    }
+    if to != new_to {
+        what.push("recipient");
+    }
+    if mark != mark_of(new_body) {
+        what.push("body");
+    }
+    (!what.is_empty()).then(|| what.join(", "))
+}
+
+/// The refusal for such a send.
+fn resend_refusal(mail: &str, what: &str) -> String {
+    format!(
+        "mail {mail}: expected a resend to repeat the Mail already accepted under this id, saw a different {what}"
+    )
+}
+
 /// An optional stamp from a committed event: absent stays absent.
 fn stamp_of(v: &Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
@@ -58,6 +104,10 @@ pub const BROADCAST: &str = "*";
 /// a copy id, and two copy ids are equal only for the same broadcast and
 /// recipient.
 const COPY_SEP: char = '/';
+
+/// The longest hello line read from a connection that has not yet shown the
+/// fleet token.
+const HELLO_MAX: usize = 64 * 1024;
 
 /// How long a registered session may stay disconnected before it is
 /// unregistered: longer than a host daemon or coordinator restart takes.
@@ -94,13 +144,41 @@ struct State {
     registrations: HashMap<String, (u64, String)>,
     takeovers: HashMap<String, Value>,
     mails: HashMap<String, Mail>,
-    order: Vec<String>,
-    /// Broadcast ids already committed, so a resent broadcast fans out once.
-    broadcasts: HashSet<String>,
+    /// The Mail awaiting a Receipt, in commit order: what a Register or a
+    /// hello has to push. A Receipt takes its Mail out.
+    pending: BTreeMap<u64, String>,
+    next_seq: u64,
+    /// Broadcasts already committed, each with its sender and body mark, so a
+    /// resent broadcast fans out once and a different one under its id is refused.
+    broadcasts: HashMap<String, (String, BodyMark)>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
     notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
     claims: Claims,
+}
+
+impl State {
+    /// Nothing registered, accepted or claimed yet: what a replay starts from.
+    fn new(log: DurLog, unregister_after_ms: i64) -> State {
+        State {
+            log,
+            sessions: HashMap::new(),
+            started: now_ms(),
+            unregister_after_ms,
+            seen: HashMap::new(),
+            connected: HashSet::new(),
+            registrations: HashMap::new(),
+            takeovers: HashMap::new(),
+            mails: HashMap::new(),
+            pending: BTreeMap::new(),
+            next_seq: 0,
+            broadcasts: HashMap::new(),
+            hosts: HashMap::new(),
+            next_conn: 1,
+            notice_writers: HashMap::new(),
+            claims: Claims::default(),
+        }
+    }
 }
 
 /// Coordinator wall clock in milliseconds since the Epoch: the one clock
@@ -125,28 +203,13 @@ pub fn run(
     unregister_after_ms: i64,
 ) -> io::Result<()> {
     let (log, prior) = DurLog::open(&data)?;
-    let mut state = State {
-        log,
-        sessions: HashMap::new(),
-        started: now_ms(),
-        unregister_after_ms,
-        seen: HashMap::new(),
-        connected: HashSet::new(),
-        registrations: HashMap::new(),
-        takeovers: HashMap::new(),
-        mails: HashMap::new(),
-        order: Vec::new(),
-        broadcasts: HashSet::new(),
-        hosts: HashMap::new(),
-        next_conn: 1,
-        notice_writers: HashMap::new(),
-        claims: Claims::default(),
-    };
-    // DurLog::open already drops a crash-truncated tail, so every line here
-    // was appended whole. A line that is not JSON is skipped as before; a
-    // claim event that parses but lacks a field fails start-up (see `apply`).
-    for line in &prior {
-        if let Ok(v) = json::parse(line) {
+    let mut state = State::new(log, unregister_after_ms);
+    // The replay drops a crash-truncated tail, so every line here was
+    // appended whole, and it hands them over one at a time. A line that is
+    // not JSON is skipped as before; a claim event that parses but lacks a
+    // field fails start-up (see `apply`).
+    for line in prior {
+        if let Ok(v) = json::parse(&line?) {
             apply(&mut state, &v)?;
         }
     }
@@ -259,13 +322,17 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                 net::field(v, "to"),
                 net::field(v, "body"),
             ) {
-                state.order.push(mail.to_string());
-                state.mails.insert(
+                let seq = state.next_seq;
+                state.next_seq += 1;
+                state.pending.insert(seq, mail.to_string());
+                let replaced = state.mails.insert(
                     mail.to_string(),
                     Mail {
                         from: from.into(),
                         to: to.into(),
-                        body: body.into(),
+                        body: Some(body.into()),
+                        mark: mark_of(body),
+                        seq,
                         kind: net::DIRECTED,
                         // An event written before headers existed has none.
                         headers: net::headers_of(v),
@@ -273,6 +340,9 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                         receipt: None,
                     },
                 );
+                if let Some(old) = replaced {
+                    state.pending.remove(&old.seq);
+                }
             }
         }
         Some("broadcast") => {
@@ -298,10 +368,14 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
         Some("receipt") => {
             if let (Ok(mail), Ok(record)) = (net::field(v, "mail"), net::field(v, "record")) {
                 if let Some(m) = state.mails.get_mut(mail) {
-                    m.receipt.get_or_insert(Receipt {
-                        record: record.to_string(),
-                        at: stamp_of(v, "receipted_at_ms"),
-                    });
+                    if m.receipt.is_none() {
+                        m.receipt = Some(Receipt {
+                            record: record.to_string(),
+                            at: stamp_of(v, "receipted_at_ms"),
+                        });
+                        m.body = None;
+                        state.pending.remove(&m.seq);
+                    }
                 }
             }
         }
@@ -388,11 +462,9 @@ fn host_of<'a>(state: &'a State, session: &str) -> Option<&'a str> {
 /// Pending deliveries for sessions on `host`, or for one session.
 fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<Value> {
     let mut out = Vec::new();
-    for id in &state.order {
+    for id in state.pending.values() {
         let m = &state.mails[id];
-        if m.receipt.is_some() {
-            continue;
-        }
+        let Some(body) = &m.body else { continue };
         if let Some(want) = only_session {
             if m.to != want {
                 continue;
@@ -401,15 +473,41 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
             continue;
         }
         out.push(net::deliver_msg(
-            id, &m.from, &m.to, &m.body, m.kind, &m.headers,
+            id, &m.from, &m.to, body, m.kind, &m.headers,
         ));
     }
     out
 }
 
-fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io::Result<()> {
-    let writer = net::writer(Box::new(conn.try_clone()?));
-    let mut lines = net::lines(Box::new(conn));
+/// One connection, from accept to its end. Every line for the peer goes
+/// through its queue, so a host daemon that stops reading delays only its own
+/// lines; when the connection ends the queue is closed with it.
+fn serve(conn: TcpStream, state: Arc<Mutex<State>>, token: &str) -> io::Result<()> {
+    // One line is one segment, sent when it is written.
+    conn.set_nodelay(true)?;
+    let hang = conn.try_clone()?;
+    let writer = net::queued(
+        Box::new(conn.try_clone()?),
+        Box::new(move || {
+            let _ = hang.shutdown(Shutdown::Both);
+        }),
+    );
+    let result = serve_link(&conn, Arc::clone(&writer), state, token);
+    // A peer that closed its side may still be reading its answers; after an
+    // error nothing more is owed and the link ends at once.
+    net::close(&writer, result.is_ok());
+    result
+}
+
+fn serve_link(
+    conn: &TcpStream,
+    writer: Writer,
+    state: Arc<Mutex<State>>,
+    token: &str,
+) -> io::Result<()> {
+    let mut lines = net::lines(Box::new(conn.try_clone()?));
+    // Until the token is seen the peer is anyone who can reach the port.
+    lines.set_cap(HELLO_MAX);
 
     let hello = lines
         .next()
@@ -418,6 +516,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "bad hello"));
     }
     let host = net::field(&hello, "host")?.to_string();
+    lines.set_cap(usize::MAX);
     let conn_id = {
         let mut st = state.lock().unwrap();
         let id = st.next_conn;
@@ -447,6 +546,9 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         &obj(vec![
             ("type", s("hello_ok")),
             ("registration_notices", Value::Bool(true)),
+            // This coordinator answers `ping`; a host daemon that reads this
+            // may send them.
+            ("ping", Value::Bool(true)),
         ]),
     )?;
     let pushes = {
@@ -457,9 +559,23 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         let _ = net::send(&writer, &p);
     }
 
+    let mut pinged = false;
     for line in lines {
-        let v = line?;
+        let v = line.map_err(net::silence)?;
         match net::field(&v, "type")? {
+            // The link's own liveness. A host daemon that pings keeps pinging
+            // at `net::ping_every`, so from its first ping a link that stays
+            // silent for `net::link_silence` has lost its peer: the read ends,
+            // and the link drop marks its sessions disconnected. A host daemon
+            // that never pings is never held to this.
+            "ping" => {
+                if !pinged {
+                    pinged = true;
+                    // no-poll: link liveness, not Mail; a link silent this long has no peer and ends.
+                    conn.set_read_timeout(Some(net::link_silence()))?;
+                }
+                net::send(&writer, &obj(vec![("type", s("pong"))]))?;
+            }
             "replacement" => {
                 let session = net::field(&v, "session")?;
                 let registration = net::field(&v, "registration")?;
@@ -597,24 +713,31 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     }
                 };
                 let mut push: Vec<(Writer, Value)> = Vec::new();
-                {
+                let from = net::field(&v, "from")?;
+                let to = net::field(&v, "to")?;
+                let body = net::field(&v, "body")?;
+                let differs = {
                     let mut st = state.lock().unwrap();
-                    stamp(&mut st, net::field(&v, "from")?);
-                    if net::field(&v, "to")? == BROADCAST {
-                        push = broadcast(
-                            &mut st,
-                            &mail,
-                            net::field(&v, "from")?,
-                            net::field(&v, "body")?,
-                            &headers,
-                        )?;
-                    } else if !st.mails.contains_key(&mail) {
+                    stamp(&mut st, from);
+                    if to == BROADCAST {
+                        match st.broadcasts.get(&mail) {
+                            Some((sent_from, mark)) => {
+                                resend_differs((sent_from, None, *mark), (from, None, body))
+                            }
+                            None => {
+                                push = broadcast(&mut st, &mail, from, body, &headers)?;
+                                None
+                            }
+                        }
+                    } else if let Some(m) = st.mails.get(&mail) {
+                        resend_differs((&m.from, Some(&m.to), m.mark), (from, Some(to), body))
+                    } else {
                         let ev = obj(vec![
                             ("ev", s("mail")),
                             ("mail", s(&mail)),
-                            ("from", s(net::field(&v, "from")?)),
-                            ("to", s(net::field(&v, "to")?)),
-                            ("body", s(net::field(&v, "body")?)),
+                            ("from", s(from)),
+                            ("to", s(to)),
+                            ("body", s(body)),
                             ("headers", headers),
                             ("accepted_at_ms", Value::Int(now_ms())),
                         ]);
@@ -623,12 +746,23 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         if let Some((_, w)) = host_of(&st, &m.to).and_then(|h| st.hosts.get(h)) {
                             push.push((
                                 Arc::clone(w),
-                                net::deliver_msg(
-                                    &mail, &m.from, &m.to, &m.body, m.kind, &m.headers,
-                                ),
+                                net::deliver_msg(&mail, &m.from, &m.to, body, m.kind, &m.headers),
                             ));
                         }
+                        None
                     }
+                };
+                if let Some(what) = differs {
+                    net::send(
+                        &writer,
+                        &obj(vec![
+                            ("type", s("error")),
+                            ("req", Value::Int(req)),
+                            ("mail", s(&mail)),
+                            ("reason", s(&resend_refusal(&mail, &what))),
+                        ]),
+                    )?;
+                    continue;
                 }
                 net::send(
                     &writer,
@@ -1038,21 +1172,28 @@ fn fan_out(
     to: &[String],
     accepted_at: Option<i64>,
 ) {
-    if !st.broadcasts.insert(mail.to_string()) {
+    if st.broadcasts.contains_key(mail) {
         return;
     }
+    let mark = mark_of(body);
+    st.broadcasts
+        .insert(mail.to_string(), (from.to_string(), mark));
     for addr in to {
         let id = copy_id(mail, addr);
         if st.mails.contains_key(&id) {
             continue;
         }
-        st.order.push(id.clone());
+        let seq = st.next_seq;
+        st.next_seq += 1;
+        st.pending.insert(seq, id.clone());
         st.mails.insert(
             id,
             Mail {
                 from: from.to_string(),
                 to: addr.clone(),
-                body: body.to_string(),
+                body: Some(body.to_string()),
+                mark,
+                seq,
                 kind: net::BROADCAST,
                 headers: headers.clone(),
                 accepted_at,
@@ -1072,7 +1213,7 @@ fn broadcast(
     body: &str,
     headers: &Value,
 ) -> io::Result<Vec<(Writer, Value)>> {
-    if st.broadcasts.contains(mail) {
+    if st.broadcasts.contains_key(mail) {
         return Ok(Vec::new());
     }
     expire(st)?;
@@ -1105,4 +1246,100 @@ fn broadcast(
         }
     }
     Ok(push)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state on a fresh log, with `lines` applied as a replay would.
+    fn replayed(tag: &str, lines: &[&str]) -> State {
+        let path =
+            std::env::temp_dir().join(format!("roger-coord-{}-{tag}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (log, mut prior) = DurLog::open(&path).unwrap();
+        assert!(prior.next().is_none());
+        let _ = std::fs::remove_file(&path);
+        let mut state = State::new(log, UNREGISTER_AFTER_MS);
+        for line in lines {
+            apply(&mut state, &json::parse(line).unwrap()).unwrap();
+        }
+        state
+    }
+
+    fn pushed(state: &State, host: &str, only: Option<&str>) -> Vec<String> {
+        pending_pushes(state, host, only)
+            .iter()
+            .map(|v| net::field(v, "mail").unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_receipt_drops_the_body_and_takes_the_mail_out_of_what_is_pushed() {
+        let st = replayed(
+            "receipt",
+            &[
+                r#"{"ev":"session","session":"b","host":"h"}"#,
+                r#"{"ev":"session","session":"c","host":"h"}"#,
+                r#"{"ev":"mail","mail":"m1","from":"a","to":"b","body":"one","headers":{"k":"v"},"accepted_at_ms":5}"#,
+                r#"{"ev":"mail","mail":"m2","from":"a","to":"c","body":"two"}"#,
+                r#"{"ev":"mail","mail":"m3","from":"a","to":"b","body":"three"}"#,
+                r#"{"ev":"broadcast","mail":"all","from":"a","body":"four","to":["b","c"]}"#,
+                r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-1","receipted_at_ms":9}"#,
+                r#"{"ev":"receipt","mail":"all/c","session":"c","record":"r-1"}"#,
+                // A second receipt for a Mail changes nothing.
+                r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-7"}"#,
+            ],
+        );
+        // Commit order, receipted Mail left out, for the host and for one session.
+        assert_eq!(pushed(&st, "h", None), ["m2", "m3", "all/b"]);
+        assert_eq!(pushed(&st, "h", Some("b")), ["m3", "all/b"]);
+        assert_eq!(pushed(&st, "other", None), Vec::<String>::new());
+        assert_eq!(st.pending.len(), 3);
+        for (mail, held) in [
+            ("m1", false),
+            ("m2", true),
+            ("m3", true),
+            ("all/b", true),
+            ("all/c", false),
+        ] {
+            assert_eq!(st.mails[mail].body.is_some(), held, "{mail}");
+        }
+        // The receipt reply needs no body: it reads as before.
+        let reply = receipt(&st, &json::parse(r#"{"req":3,"mail":"m1"}"#).unwrap()).unwrap();
+        assert_eq!(
+            json::stringify(&reply),
+            r#"{"type":"receipt","req":3,"mail":"m1","to":"b","from":"a","kind":"directed","headers":{"k":"v"},"accepted_at_ms":5,"record":"r-1","receipted_at_ms":9}"#
+        );
+    }
+
+    #[test]
+    fn a_resend_is_told_from_a_different_mail_with_and_without_the_body_held() {
+        let st = replayed(
+            "resend",
+            &[
+                r#"{"ev":"mail","mail":"m1","from":"a","to":"b","body":"one"}"#,
+                r#"{"ev":"mail","mail":"m2","from":"a","to":"b","body":"one"}"#,
+                r#"{"ev":"receipt","mail":"m2","session":"b","record":"r-1"}"#,
+            ],
+        );
+        for mail in ["m1", "m2"] {
+            let m = &st.mails[mail];
+            let was = (m.from.as_str(), Some(m.to.as_str()), m.mark);
+            assert_eq!(resend_differs(was, ("a", Some("b"), "one")), None, "{mail}");
+            for (new, what) in [
+                (("a", Some("b"), "onf"), "body"),
+                (("a", Some("b"), "one "), "body"),
+                (("x", Some("b"), "one"), "sender"),
+                (("a", Some("x"), "one"), "recipient"),
+                (("x", Some("x"), ""), "sender, recipient, body"),
+            ] {
+                assert_eq!(resend_differs(was, new).as_deref(), Some(what), "{mail}");
+            }
+        }
+        assert_eq!(
+            resend_refusal("m1", "body"),
+            "mail m1: expected a resend to repeat the Mail already accepted under this id, saw a different body"
+        );
+    }
 }
