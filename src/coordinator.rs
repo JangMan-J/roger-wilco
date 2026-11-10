@@ -485,18 +485,29 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
 fn serve(conn: TcpStream, state: Arc<Mutex<State>>, token: &str) -> io::Result<()> {
     // One line is one segment, sent when it is written.
     conn.set_nodelay(true)?;
-    let hang = conn.try_clone()?;
-    let writer = net::queued(
-        Box::new(conn.try_clone()?),
-        Box::new(move || {
-            let _ = hang.shutdown(Shutdown::Both);
-        }),
-    );
+    let conn = Arc::new(conn);
+    let writer = net::queued(Arc::clone(&conn), |c| {
+        let _ = c.shutdown(Shutdown::Both);
+    });
     let result = serve_link(&conn, Arc::clone(&writer), state, token);
-    // A peer that closed its side may still be reading its answers; after an
-    // error nothing more is owed and the link ends at once.
-    net::close(&writer, result.is_ok());
+    // What is already queued is owed to the peer: answers to requests this
+    // coordinator has committed. It is written before the link ends, unless
+    // the link ended because the peer went silent; then nothing can reach it,
+    // and the link ends at once, under any write still waiting on it.
+    let silent = matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut);
+    net::close(&writer, !silent);
     result
+}
+
+/// Answer the sender, then push what the send committed. A sender whose link
+/// is already gone cannot be answered, and that must not keep a committed
+/// Mail from its recipient: the pushes go out either way.
+fn answer_then_push(writer: &Writer, answer: &Value, push: Vec<(Writer, Value)>) -> io::Result<()> {
+    let answered = net::send(writer, answer);
+    for (w, msg) in push {
+        let _ = net::send(&w, &msg);
+    }
+    answered
 }
 
 fn serve_link(
@@ -764,17 +775,15 @@ fn serve_link(
                     )?;
                     continue;
                 }
-                net::send(
+                answer_then_push(
                     &writer,
                     &obj(vec![
                         ("type", s("accepted")),
                         ("req", Value::Int(req)),
                         ("mail", s(&mail)),
                     ]),
+                    push,
                 )?;
-                for (w, msg) in push {
-                    let _ = net::send(&w, &msg);
-                }
             }
             // The session's connection to this host daemon closed.
             "disconnect" => {
@@ -1311,6 +1320,28 @@ mod tests {
             json::stringify(&reply),
             r#"{"type":"receipt","req":3,"mail":"m1","to":"b","from":"a","kind":"directed","headers":{"k":"v"},"accepted_at_ms":5,"record":"r-1","receipted_at_ms":9}"#
         );
+    }
+
+    #[test]
+    fn a_sender_that_cannot_be_answered_does_not_keep_the_mail_from_its_recipient() {
+        use std::os::unix::net::UnixStream;
+        let hangup = |s: &UnixStream| {
+            let _ = s.shutdown(Shutdown::Both);
+        };
+        let (gone, _) = UnixStream::pair().unwrap();
+        let sender = net::queued(Arc::new(gone), hangup);
+        net::close(&sender, false);
+        let (near, far) = UnixStream::pair().unwrap();
+        let recipient = net::queued(Arc::new(near), hangup);
+        let deliver = net::deliver_msg("m1", "a", "b", "one", net::DIRECTED, &obj(vec![]));
+        let answered = answer_then_push(
+            &sender,
+            &obj(vec![("type", s("accepted"))]),
+            vec![(Arc::clone(&recipient), deliver.clone())],
+        );
+        assert!(answered.is_err(), "the closed link takes no answer");
+        let pushed = net::lines(Box::new(far)).next().unwrap().unwrap();
+        assert_eq!(pushed, deliver);
     }
 
     #[test]

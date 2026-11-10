@@ -280,13 +280,10 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
     let conn = TcpStream::connect(&cfg.coordinator)?;
     // One line is one segment, sent when it is written.
     conn.set_nodelay(true)?;
-    let hang = conn.try_clone()?;
-    let writer = net::queued(
-        Box::new(conn.try_clone()?),
-        Box::new(move || {
-            let _ = hang.shutdown(Shutdown::Both);
-        }),
-    );
+    let conn = Arc::new(conn);
+    let writer = net::queued(Arc::clone(&conn), |c| {
+        let _ = c.shutdown(Shutdown::Both);
+    });
     let result = upstream_link(cfg, state, &conn, Arc::clone(&writer));
     // The link is over either way; whatever it still held is replayed or
     // asked again on the next one.
@@ -319,15 +316,14 @@ fn upstream_link(
         ));
     }
     let notices = matches!(resp.get("registration_notices"), Some(Value::Bool(true)));
-    // A coordinator that answers pings is pinged at a fixed pace, and from
-    // then on a link that stays silent for `net::link_silence` has lost it:
-    // the read below ends and the reconnect loop takes over. A coordinator
-    // that does not say so is never pinged and never held to this. The hello
-    // itself is not bound: a daemon that gave up one hello and sent another
-    // would leave the coordinator two to answer, the dead one possibly last.
+    // A coordinator that answers pings is pinged at a fixed pace, so it can
+    // tell a host daemon that has gone silent from one with nothing to say.
+    // This side sets no bound of its own on the coordinator's silence. A
+    // coordinator that is stopped and not gone still holds this link and
+    // every line on it, and a second link dialed meanwhile would have its
+    // lines applied before the first one's leftovers. A coordinator that is
+    // gone fails the next ping's write instead, and that ends the link.
     if matches!(resp.get("ping"), Some(Value::Bool(true))) {
-        // no-poll: link liveness, not Mail; a link silent this long has no peer and ends.
-        conn.set_read_timeout(Some(net::link_silence()))?;
         let link = Arc::clone(&writer);
         std::thread::spawn(move || {
             // Ends with the link: a closed queue refuses the next ping.
@@ -402,7 +398,7 @@ fn upstream_link(
         let _ = net::send(&writer, &ack);
     }
     for line in lines {
-        let v = line.map_err(net::silence)?;
+        let v = line?;
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
             // The answer to a ping: its arrival is all it says.
@@ -599,14 +595,11 @@ fn with_req(mut v: Value, req: i64) -> Value {
 /// goes through its queue, so a session that stops reading delays only its
 /// own lines: the Mail it has not taken stays in the inbox, unacked.
 fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
-    let hang = conn.try_clone()?;
-    let writer = net::queued(
-        Box::new(conn.try_clone()?),
-        Box::new(move || {
-            let _ = hang.shutdown(Shutdown::Both);
-        }),
-    );
-    let lines = net::lines(Box::new(conn));
+    let conn = Arc::new(conn);
+    let writer = net::queued(Arc::clone(&conn), |c| {
+        let _ = c.shutdown(Shutdown::Both);
+    });
+    let lines = net::lines(Box::new(conn.try_clone()?));
     let mut session_id: Option<String> = None;
     let result = local_loop(&writer, lines, &state, &mut session_id);
     // Whatever ended the connection, a dead Writer must not stay registered:
@@ -616,9 +609,9 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     if let Some(id) = session_id {
         release(&state, &writer, &id, "disconnect");
     }
-    // A client that closed its side may still be reading its answers; after
-    // an error nothing more is owed and the connection ends at once.
-    net::close(&writer, result.is_ok());
+    // What is already queued is written before the connection ends: a
+    // client may still be reading the answers to what it asked.
+    net::close(&writer, true);
     result
 }
 

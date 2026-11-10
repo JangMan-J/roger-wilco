@@ -318,21 +318,31 @@ daemon that stops reading its link, delays only its own lines: the sessions besi
 other hosts keep sending, receiving and reading the Board, and the Mail it has not taken stays
 pending, unacked, for its next Register. The queue has no bound of its own: what it holds for
 a peer that is not reading is Mail the process already keeps for that peer until its Ack, plus
-the answers to that peer's own requests. A write that fails ends that connection.
+the answers to that peer's own requests. A write that fails ends that connection. When a
+connection ends, what is already queued for the peer is written first, unless the peer was
+given up as silent.
 
 A line is written whole, in one write, on a link with `TCP_NODELAY` set, so no hop waits for
 more to send.
 
 The link between a host daemon and the coordinator carries its own liveness. The coordinator
 says `"ping":true` in `hello_ok`; a host daemon that reads it sends `{"type":"ping"}` every
-10 s and is answered `{"type":"pong"}`. From then on each side gives the other up once the
-link has been silent for 30 s: the host daemon reconnects, and the coordinator drops the link,
-so that host's sessions read `connected=false` with `last_seen_ms` at that moment. A peer that
-is frozen, or whose host went away without closing the connection, is noticed this way; one
-that is only slow for less than that is not dropped. A ping carries no Mail and commits
-nothing. Either side keeps a link to an older peer as before: a host daemon sends no ping to
-a coordinator that did not offer it, and the coordinator holds a host daemon to the bound
-only after its first ping.
+10 s and is answered `{"type":"pong"}`. From its first ping, the coordinator gives a host
+daemon up once the link has been silent for 30 s: it drops the link, so that host's sessions
+read `connected=false` with `last_seen_ms` at that moment, and from then on they are
+disconnected sessions like any other (see Registration). A host daemon that is frozen, or
+whose host went away without closing the connection, is noticed this way; one that is only
+slow for less than that is not dropped. When it runs again it finds the link closed and
+reconnects.
+
+The host daemon sets no such bound on the coordinator. A coordinator that is stopped and not
+gone still holds the link and every line on it, and a second link dialed meanwhile would
+have its lines applied before the first one's leftovers; the daemon stays on its link, as it
+always did, and its pings make a coordinator that really is gone show as a failed write,
+which ends the link and starts the reconnect. A ping carries no Mail and commits nothing.
+Either side keeps a link to an older peer as before: a host daemon sends no ping to a
+coordinator that did not offer it, and the coordinator holds a host daemon to the bound only
+after its first ping.
 
 A connection that has not yet shown the fleet token can end only itself: its hello line may
 be at most 65536 bytes. On every connection and in every log, a JSON value nested more than
