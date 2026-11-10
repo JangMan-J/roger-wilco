@@ -21,6 +21,7 @@ landing changes on main (see [Checks](#checks)).
 | Core contract: commands, delivery, claims, checks | this file |
 | Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
 | The gate and the review rules | [AGENTS.md § Coding standards](AGENTS.md#coding-standards) |
+| A later direction: what a Usenet-like, peered core will need | [docs/USENET-MODEL.md](docs/USENET-MODEL.md) |
 
 ## Requirements
 
