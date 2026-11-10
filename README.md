@@ -111,6 +111,15 @@ session registered at that moment, one Mail per recipient with id `<mail>/<addre
 delivered and acked like directed mail. A Mail id containing `/` is refused, so no directed
 id can equal a copy id.
 
+A second `send` under a Mail id is a resend only when it repeats the first: the same sender,
+the same recipient and the same body. A resend prints `ACCEPTED` again and commits nothing, so
+a client that lost the answer can repeat its send. A send that differs in any of the three is
+refused with a reason that names what differs (for example `mail m1: expected a resend to
+repeat the Mail already accepted under this id, saw a different body`) and commits nothing:
+were it accepted, it would never be delivered. A Broadcast id is held to its sender and body
+the same way. Headers are not compared (see Kind and headers); the comparison still holds
+after the Mail is receipted and after a coordinator restart.
+
 ## Kind and headers
 
 Every delivery carries a `kind`: `directed` for a Mail sent to one Address, `broadcast` for a
@@ -296,6 +305,40 @@ nonzero. A host daemon likewise refuses a `--socket` path that a live process st
 on, naming the path, and replaces only a stale socket file; a coordinator refuses a `--bind`
 address already in use.
 
+Opening a log replays it one line at a time, never the whole file at once. The coordinator
+keeps a Mail's body in memory until its Receipt and a host daemon until its Ack; after that
+each keeps the Mail's id and record and the body stays only on the log. Nothing is removed
+from a log.
+
+## Links and peers
+
+The coordinator and each host daemon write to a peer through that peer's own queue, with one
+thread per peer doing the writing. A session that stops reading its connection, or a host
+daemon that stops reading its link, delays only its own lines: the sessions beside it and the
+other hosts keep sending, receiving and reading the Board, and the Mail it has not taken stays
+pending, unacked, for its next Register. The queue has no bound of its own: what it holds for
+a peer that is not reading is Mail the process already keeps for that peer until its Ack, plus
+the answers to that peer's own requests. A write that fails ends that connection.
+
+A line is written whole, in one write, on a link with `TCP_NODELAY` set, so no hop waits for
+more to send.
+
+The link between a host daemon and the coordinator carries its own liveness. The coordinator
+says `"ping":true` in `hello_ok`; a host daemon that reads it sends `{"type":"ping"}` every
+10 s and is answered `{"type":"pong"}`. From then on each side gives the other up once the
+link has been silent for 30 s: the host daemon reconnects, and the coordinator drops the link,
+so that host's sessions read `connected=false` with `last_seen_ms` at that moment. A peer that
+is frozen, or whose host went away without closing the connection, is noticed this way; one
+that is only slow for less than that is not dropped. A ping carries no Mail and commits
+nothing. Either side keeps a link to an older peer as before: a host daemon sends no ping to
+a coordinator that did not offer it, and the coordinator holds a host daemon to the bound
+only after its first ping.
+
+A connection that has not yet shown the fleet token can end only itself: its hello line may
+be at most 65536 bytes. On every connection and in every log, a JSON value nested more than
+64 levels deep is refused as malformed. Either ends that connection with a reason that says
+what was expected and what was seen; the process keeps serving.
+
 ## Adapters
 
 A client written for a program connects through a face, in its own project; the core ships
@@ -474,7 +517,7 @@ core log grows while nobody asks.
 | `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
-| `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing and message helpers |
+| `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing, per-peer outgoing queues and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
 | `tests/process.rs` | process seam, including the SIGKILL window |
 | `tests/audit.rs` | exact history fixtures, filtering, findings, JSON, live read-only audit |

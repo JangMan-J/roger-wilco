@@ -8,9 +8,9 @@
 use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -25,6 +25,8 @@ struct Mail {
     kind: String,
     /// The sender's headers, forwarded as the coordinator sent them.
     headers: Value,
+    /// This Mail's place in arrival order among the Mail awaiting an Ack.
+    seq: u64,
 }
 
 /// A receipt committed to this host's log: which Mail, which session acked
@@ -47,8 +49,13 @@ struct Registration {
 
 struct State {
     log: DurLog,
-    inbox: HashMap<String, Mail>,
-    order: Vec<String>,
+    /// Every Mail id this log holds a `deliver` line for. The Mail itself is
+    /// held until its Ack and dropped with it (`None`): nothing pushes an
+    /// acked Mail again, and its body stays on the log.
+    inbox: HashMap<String, Option<Mail>>,
+    /// The Mail awaiting an Ack, in arrival order: what a Register has to push.
+    pending: BTreeMap<u64, String>,
+    next_seq: u64,
     acked: HashSet<String>,
     /// Receipts committed locally and not yet confirmed upstream, in commit
     /// order. Replayed after every reconnect, because the coordinator's ack
@@ -67,6 +74,28 @@ struct State {
     waiters: HashMap<i64, mpsc::Sender<Value>>,
 }
 
+impl State {
+    /// Nothing delivered or acked yet: what a replay starts from.
+    fn new(log: DurLog) -> State {
+        State {
+            log,
+            inbox: HashMap::new(),
+            pending: BTreeMap::new(),
+            next_seq: 0,
+            acked: HashSet::new(),
+            receipts: Vec::new(),
+            sessions: HashMap::new(),
+            declared: HashMap::new(),
+            current: HashMap::new(),
+            registrations: HashMap::new(),
+            pending_registers: Vec::new(),
+            upstream: None,
+            next_req: 1,
+            waiters: HashMap::new(),
+        }
+    }
+}
+
 /// How long a session's send or ack waits for the coordinator to answer.
 const UPSTREAM_WAIT: Duration = Duration::from_secs(10);
 
@@ -80,23 +109,9 @@ pub struct Config {
 
 pub fn run(cfg: Config) -> io::Result<()> {
     let (log, prior) = DurLog::open(&cfg.data)?;
-    let mut state = State {
-        log,
-        inbox: HashMap::new(),
-        order: Vec::new(),
-        acked: HashSet::new(),
-        receipts: Vec::new(),
-        sessions: HashMap::new(),
-        declared: HashMap::new(),
-        current: HashMap::new(),
-        registrations: HashMap::new(),
-        pending_registers: Vec::new(),
-        upstream: None,
-        next_req: 1,
-        waiters: HashMap::new(),
-    };
-    for line in &prior {
-        if let Ok(v) = json::parse(line) {
+    let mut state = State::new(log);
+    for line in prior {
+        if let Ok(v) = json::parse(&line?) {
             apply(&mut state, &v);
         }
     }
@@ -178,16 +193,12 @@ fn apply(state: &mut State, v: &Value) {
                 net::field(v, "body"),
             ) {
                 if !state.inbox.contains_key(mail) {
-                    state.order.push(mail.to_string());
-                    state.inbox.insert(
-                        mail.to_string(),
-                        Mail {
-                            from: from.into(),
-                            to: to.into(),
-                            body: body.into(),
-                            kind: net::kind_of(v),
-                            headers: net::headers_of(v),
-                        },
+                    hold(
+                        state,
+                        mail,
+                        (from, to, body),
+                        net::kind_of(v),
+                        net::headers_of(v),
                     );
                 }
             }
@@ -199,6 +210,7 @@ fn apply(state: &mut State, v: &Value) {
                 net::field(v, "record"),
             ) {
                 if state.acked.insert(mail.to_string()) {
+                    settle(state, mail);
                     state.receipts.push(Receipt {
                         mail: mail.to_string(),
                         session: session.to_string(),
@@ -208,6 +220,38 @@ fn apply(state: &mut State, v: &Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Keep a Mail whose `deliver` line is on the log until its Ack. One that is
+/// already acked is only noted: it is never pushed.
+fn hold(
+    state: &mut State,
+    mail: &str,
+    (from, to, body): (&str, &str, &str),
+    kind: String,
+    headers: Value,
+) {
+    let held = (!state.acked.contains(mail)).then(|| {
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.pending.insert(seq, mail.to_string());
+        Mail {
+            from: from.into(),
+            to: to.into(),
+            body: body.into(),
+            kind,
+            headers,
+            seq,
+        }
+    });
+    state.inbox.insert(mail.to_string(), held);
+}
+
+/// The Ack for `mail` is on the log: drop the Mail, keep its id.
+fn settle(state: &mut State, mail: &str) {
+    if let Some(m) = state.inbox.get_mut(mail).and_then(Option::take) {
+        state.pending.remove(&m.seq);
     }
 }
 
@@ -229,10 +273,34 @@ fn upstream_loop(cfg: Arc<Config>, state: Arc<Mutex<State>>) {
     }
 }
 
+/// One link to the coordinator, from connect to its end. Every line for the
+/// coordinator goes through the link's queue, so a coordinator that stops
+/// reading never holds a thread that serves a local session.
 fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
     let conn = TcpStream::connect(&cfg.coordinator)?;
-    let writer = net::writer(Box::new(conn.try_clone()?));
-    let mut lines = net::lines(Box::new(conn));
+    // One line is one segment, sent when it is written.
+    conn.set_nodelay(true)?;
+    let hang = conn.try_clone()?;
+    let writer = net::queued(
+        Box::new(conn.try_clone()?),
+        Box::new(move || {
+            let _ = hang.shutdown(Shutdown::Both);
+        }),
+    );
+    let result = upstream_link(cfg, state, &conn, Arc::clone(&writer));
+    // The link is over either way; whatever it still held is replayed or
+    // asked again on the next one.
+    net::close(&writer, false);
+    result
+}
+
+fn upstream_link(
+    cfg: &Config,
+    state: &Arc<Mutex<State>>,
+    conn: &TcpStream,
+    writer: Writer,
+) -> io::Result<()> {
+    let mut lines = net::lines(Box::new(conn.try_clone()?));
     net::send(
         &writer,
         &obj(vec![
@@ -251,6 +319,24 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         ));
     }
     let notices = matches!(resp.get("registration_notices"), Some(Value::Bool(true)));
+    // A coordinator that answers pings is pinged at a fixed pace, and from
+    // then on a link that stays silent for `net::link_silence` has lost it:
+    // the read below ends and the reconnect loop takes over. A coordinator
+    // that does not say so is never pinged and never held to this. The hello
+    // itself is not bound: a daemon that gave up one hello and sent another
+    // would leave the coordinator two to answer, the dead one possibly last.
+    if matches!(resp.get("ping"), Some(Value::Bool(true))) {
+        // no-poll: link liveness, not Mail; a link silent this long has no peer and ends.
+        conn.set_read_timeout(Some(net::link_silence()))?;
+        let link = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            // Ends with the link: a closed queue refuses the next ping.
+            while net::send(&link, &obj(vec![("type", s("ping"))])).is_ok() {
+                // no-poll: the pace of the liveness ping; it carries no Mail and looks for no work.
+                std::thread::sleep(net::ping_every());
+            }
+        });
+    }
     let receipts = {
         let mut st = state.lock().unwrap();
         st.upstream = Some(Arc::clone(&writer));
@@ -316,9 +402,11 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         let _ = net::send(&writer, &ack);
     }
     for line in lines {
-        let v = line?;
+        let v = line.map_err(net::silence)?;
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
+            // The answer to a ping: its arrival is all it says.
+            "pong" => {}
             // The coordinator holds a Register. Not a reply to any request.
             "registered" | "superseded" | "replacement_recorded" => {
                 let mut st = state.lock().unwrap();
@@ -434,28 +522,26 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
     {
         let mut st = state.lock().unwrap();
         if !st.inbox.contains_key(&mail_id) {
-            let m = Mail {
-                from: net::field(v, "from")?.into(),
-                to: net::field(v, "to")?.into(),
-                body: net::field(v, "body")?.into(),
-                kind: net::kind_of(v),
-                headers: net::headers_of(v),
-            };
+            let (from, to, body) = (
+                net::field(v, "from")?,
+                net::field(v, "to")?,
+                net::field(v, "body")?,
+            );
+            let (kind, headers) = (net::kind_of(v), net::headers_of(v));
             let ev = obj(vec![
                 ("ev", s("deliver")),
                 ("mail", s(&mail_id)),
-                ("from", s(&m.from)),
-                ("to", s(&m.to)),
-                ("body", s(&m.body)),
-                ("kind", s(&m.kind)),
-                ("headers", m.headers.clone()),
+                ("from", s(from)),
+                ("to", s(to)),
+                ("body", s(body)),
+                ("kind", s(&kind)),
+                ("headers", headers.clone()),
             ]);
             st.log.append(&json::stringify(&ev))?;
-            st.order.push(mail_id.clone());
-            st.inbox.insert(mail_id.clone(), m);
+            hold(&mut st, &mail_id, (from, to, body), kind, headers);
         }
-        if !st.acked.contains(&mail_id) {
-            let m = st.inbox[&mail_id].clone();
+        // Held means not yet acked.
+        if let Some(Some(m)) = st.inbox.get(&mail_id) {
             if let Some(w) = st.sessions.get(&m.to) {
                 push = Some((
                     Arc::clone(w),
@@ -509,8 +595,17 @@ fn with_req(mut v: Value, req: i64) -> Value {
     v
 }
 
+/// One local connection, from accept to its end. Every line for the session
+/// goes through its queue, so a session that stops reading delays only its
+/// own lines: the Mail it has not taken stays in the inbox, unacked.
 fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
-    let writer = net::writer(Box::new(conn.try_clone()?));
+    let hang = conn.try_clone()?;
+    let writer = net::queued(
+        Box::new(conn.try_clone()?),
+        Box::new(move || {
+            let _ = hang.shutdown(Shutdown::Both);
+        }),
+    );
     let lines = net::lines(Box::new(conn));
     let mut session_id: Option<String> = None;
     let result = local_loop(&writer, lines, &state, &mut session_id);
@@ -521,6 +616,9 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     if let Some(id) = session_id {
         release(&state, &writer, &id, "disconnect");
     }
+    // A client that closed its side may still be reading its answers; after
+    // an error nothing more is owed and the connection ends at once.
+    net::close(&writer, result.is_ok());
     result
 }
 
@@ -622,18 +720,12 @@ fn local_loop(
                         None => st.declared.remove(&session),
                     };
                     let pending: Vec<Value> = st
-                        .order
-                        .iter()
-                        .filter(|id| !st.acked.contains(*id) && st.inbox[*id].to == session)
-                        .map(|id| {
-                            net::deliver_msg(
-                                id,
-                                &st.inbox[id].from,
-                                &st.inbox[id].to,
-                                &st.inbox[id].body,
-                                &st.inbox[id].kind,
-                                &st.inbox[id].headers,
-                            )
+                        .pending
+                        .values()
+                        .filter_map(|id| Some((id, st.inbox.get(id)?.as_ref()?)))
+                        .filter(|(_, m)| m.to == session)
+                        .map(|(id, m)| {
+                            net::deliver_msg(id, &m.from, &m.to, &m.body, &m.kind, &m.headers)
                         })
                         .collect();
                     let mut msg = register_msg(
@@ -727,6 +819,7 @@ fn local_loop(
                         // retry would not commit it either.
                         st.log.append(&json::stringify(&ev))?;
                         st.acked.insert(mail.clone());
+                        settle(&mut st, &mail);
                         st.receipts.push(Receipt {
                             mail: mail.clone(),
                             session: session.clone(),
@@ -784,4 +877,43 @@ fn local_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ack_drops_the_mail_and_keeps_its_id() {
+        let path = std::env::temp_dir().join(format!("roger-daemon-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (log, mut prior) = DurLog::open(&path).unwrap();
+        assert!(prior.next().is_none());
+        let _ = std::fs::remove_file(&path);
+        let mut st = State::new(log);
+        for line in [
+            r#"{"ev":"deliver","mail":"m1","from":"a","to":"b","body":"one","kind":"directed","headers":{}}"#,
+            r#"{"ev":"deliver","mail":"m2","from":"a","to":"b","body":"two","kind":"directed","headers":{}}"#,
+            r#"{"ev":"deliver","mail":"m3","from":"a","to":"c","body":"three","kind":"broadcast","headers":{}}"#,
+            r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-1"}"#,
+            // A receipt whose delivery this log holds later, or never.
+            r#"{"ev":"receipt","mail":"m4","session":"b","record":"r-2"}"#,
+            r#"{"ev":"deliver","mail":"m4","from":"a","to":"b","body":"four","kind":"directed","headers":{}}"#,
+            r#"{"ev":"receipt","mail":"m5","session":"b","record":"r-3"}"#,
+        ] {
+            apply(&mut st, &json::parse(line).unwrap());
+        }
+        // Awaiting an Ack, in arrival order: only what was never acked.
+        let waiting: Vec<&str> = st.pending.values().map(String::as_str).collect();
+        assert_eq!(waiting, ["m2", "m3"]);
+        for (mail, held) in [("m1", false), ("m2", true), ("m3", true), ("m4", false)] {
+            assert_eq!(st.inbox[mail].is_some(), held, "{mail}");
+        }
+        // Every delivered id is still known, so a second push logs nothing new.
+        assert!(!st.inbox.contains_key("m5"));
+        assert_eq!(st.inbox.len(), 4);
+        // Every receipt is still replayed upstream.
+        let replayed: Vec<&str> = st.receipts.iter().map(|r| r.mail.as_str()).collect();
+        assert_eq!(replayed, ["m1", "m4", "m5"]);
+    }
 }

@@ -79,6 +79,10 @@ fn main() -> io::Result<()> {
     if let Some(marker) = arg(&args, "--hold-before-ack") {
         let _ = session::HOLD_BEFORE_ACK.set(marker.into());
     }
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = arg(&args, "--link-pace-ms").and_then(|ms| ms.parse().ok()) {
+        let _ = net::LINK_PACE.set(std::time::Duration::from_millis(ms));
+    }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     if matches!(cmd, "--help" | "-h" | "help") {
         println!("{USAGE}");

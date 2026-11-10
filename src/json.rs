@@ -42,11 +42,17 @@ pub fn obj(pairs: Vec<(&str, Value)>) -> Value {
     Value::Obj(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
+/// The deepest nesting `parse` accepts. Every message and log line of this
+/// program nests a few levels; the bound keeps a line of nothing but opening
+/// brackets from running the parser out of stack.
+pub const MAX_DEPTH: usize = 64;
+
 pub fn parse(text: &str) -> Result<Value, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut p = Parser {
         chars: &chars,
         i: 0,
+        depth: 0,
     };
     p.ws();
     let v = p.value()?;
@@ -60,6 +66,8 @@ pub fn parse(text: &str) -> Result<Value, String> {
 struct Parser<'a> {
     chars: &'a [char],
     i: usize,
+    /// How many objects and arrays enclose the value being read.
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -79,58 +87,8 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Value, String> {
         self.ws();
         match self.peek()? {
-            '{' => {
-                self.i += 1;
-                let mut pairs = Vec::new();
-                self.ws();
-                if self.peek()? == '}' {
-                    self.i += 1;
-                    return Ok(Value::Obj(pairs));
-                }
-                loop {
-                    self.ws();
-                    let Value::Str(k) = self.value()? else {
-                        return Err("object key must be string".into());
-                    };
-                    self.ws();
-                    if self.peek()? != ':' {
-                        return Err("expected :".into());
-                    }
-                    self.i += 1;
-                    let v = self.value()?;
-                    pairs.push((k, v));
-                    self.ws();
-                    match self.peek()? {
-                        ',' => self.i += 1,
-                        '}' => {
-                            self.i += 1;
-                            return Ok(Value::Obj(pairs));
-                        }
-                        c => return Err(format!("expected , or }} got {c}")),
-                    }
-                }
-            }
-            '[' => {
-                self.i += 1;
-                let mut xs = Vec::new();
-                self.ws();
-                if self.peek()? == ']' {
-                    self.i += 1;
-                    return Ok(Value::Arr(xs));
-                }
-                loop {
-                    xs.push(self.value()?);
-                    self.ws();
-                    match self.peek()? {
-                        ',' => self.i += 1,
-                        ']' => {
-                            self.i += 1;
-                            return Ok(Value::Arr(xs));
-                        }
-                        c => return Err(format!("expected , or ] got {c}")),
-                    }
-                }
-            }
+            '{' => self.nested(Self::object),
+            '[' => self.nested(Self::array),
             '"' => Ok(Value::Str(self.string()?)),
             't' => self.lit("true", Value::Bool(true)),
             'f' => self.lit("false", Value::Bool(false)),
@@ -149,6 +107,74 @@ impl Parser<'_> {
                     .map_err(|e| e.to_string())
             }
             c => Err(format!("unexpected {c}")),
+        }
+    }
+
+    /// Read one object or array, counted against `MAX_DEPTH`.
+    fn nested(&mut self, read: fn(&mut Self) -> Result<Value, String>) -> Result<Value, String> {
+        if self.depth == MAX_DEPTH {
+            return Err(format!(
+                "expected nesting of at most {MAX_DEPTH} levels, saw a deeper value at {}",
+                self.i
+            ));
+        }
+        self.depth += 1;
+        let v = read(self);
+        self.depth -= 1;
+        v
+    }
+
+    fn object(&mut self) -> Result<Value, String> {
+        self.i += 1;
+        let mut pairs = Vec::new();
+        self.ws();
+        if self.peek()? == '}' {
+            self.i += 1;
+            return Ok(Value::Obj(pairs));
+        }
+        loop {
+            self.ws();
+            let Value::Str(k) = self.value()? else {
+                return Err("object key must be string".into());
+            };
+            self.ws();
+            if self.peek()? != ':' {
+                return Err("expected :".into());
+            }
+            self.i += 1;
+            let v = self.value()?;
+            pairs.push((k, v));
+            self.ws();
+            match self.peek()? {
+                ',' => self.i += 1,
+                '}' => {
+                    self.i += 1;
+                    return Ok(Value::Obj(pairs));
+                }
+                c => return Err(format!("expected , or }} got {c}")),
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<Value, String> {
+        self.i += 1;
+        let mut xs = Vec::new();
+        self.ws();
+        if self.peek()? == ']' {
+            self.i += 1;
+            return Ok(Value::Arr(xs));
+        }
+        loop {
+            xs.push(self.value()?);
+            self.ws();
+            match self.peek()? {
+                ',' => self.i += 1,
+                ']' => {
+                    self.i += 1;
+                    return Ok(Value::Arr(xs));
+                }
+                c => return Err(format!("expected , or ] got {c}")),
+            }
         }
     }
 
@@ -350,6 +376,25 @@ mod tests {
                 "expected error, not a panic, for {text}: {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn nesting_is_accepted_to_the_bound_and_refused_past_it_without_a_crash() {
+        let nest = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(parse(&nest(MAX_DEPTH)).is_ok());
+        let e = parse(&nest(MAX_DEPTH + 1)).unwrap_err();
+        assert!(e.contains("expected nesting of at most 64 levels"), "{e}");
+        // Mixed, unclosed and very deep: each is an error, none a stack overflow.
+        for text in [
+            "[".repeat(400_000),
+            "{\"a\":".repeat(400_000),
+            format!("{}1{}", "[{\"k\":".repeat(200_000), "}]".repeat(200_000)),
+        ] {
+            assert!(parse(&text).is_err());
+        }
+        // Siblings do not count: depth is how many containers enclose a value.
+        let wide = format!("[{}]", vec!["[[1]]"; 1000].join(","));
+        assert!(parse(&wide).is_ok());
     }
 
     #[test]

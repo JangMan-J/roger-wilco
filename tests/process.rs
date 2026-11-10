@@ -783,6 +783,8 @@ struct Rig {
     coord_unreachable: bool,
     /// Extra coordinator flags, applied to the first start and every restart.
     coord_extra: Vec<String>,
+    /// Extra host daemon flags, applied to both daemons of the stack.
+    daemon_extra: Vec<String>,
 }
 
 impl Rig {
@@ -806,6 +808,7 @@ impl Rig {
             coord_idx: 0,
             coord_unreachable: false,
             coord_extra: Vec::new(),
+            daemon_extra: Vec::new(),
         }
     }
 
@@ -893,20 +896,22 @@ impl Rig {
             ("host-a", "a.sock", "a.log", "daemon-a.out"),
             ("host-b", "b.sock", "b.log", "daemon-b.out"),
         ] {
-            self.spawn(
-                &[
-                    "daemon",
-                    "--coordinator",
-                    &coord,
-                    "--host-id",
-                    host,
-                    "--socket",
-                    self.p(sock).to_str().unwrap(),
-                    "--data",
-                    self.p(data).to_str().unwrap(),
-                ],
-                out,
-            );
+            let sock_path = self.p(sock);
+            let data_path = self.p(data);
+            let extra = self.daemon_extra.clone();
+            let mut args = vec![
+                "daemon",
+                "--coordinator",
+                &coord,
+                "--host-id",
+                host,
+                "--socket",
+                sock_path.to_str().unwrap(),
+                "--data",
+                data_path.to_str().unwrap(),
+            ];
+            args.extend(extra.iter().map(|s| s.as_str()));
+            self.spawn(&args, out);
             wait_for_socket(&self.p(sock), Duration::from_secs(10));
         }
         // A daemon accepts local connections before its link to the
@@ -4076,4 +4081,463 @@ fn the_receipt_reply_carries_from_after_to_and_the_printed_line_is_unchanged() {
         );
         assert!(printed.ends_with(&format!(" kind={kind}")), "{printed}");
     }
+}
+
+/// `kill -<sig> <the rig child at idx>`.
+fn signal(rig: &Rig, idx: usize, sig: &str) {
+    let pid = rig.children[idx].id().to_string();
+    assert!(Command::new("kill")
+        .args([sig, &pid])
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// `roger send` through `sock`, returned whether it succeeded or not.
+fn send_as(
+    rig: &Rig,
+    sock: &str,
+    (from, to): (&str, &str),
+    mail: &str,
+    body: &str,
+) -> std::process::Output {
+    Command::new(BIN)
+        .args(["send", "--socket", rig.p(sock).to_str().unwrap()])
+        .args(["--from", from, "--to", to, "--mail", mail, "--body", body])
+        .output()
+        .unwrap()
+}
+
+/// Send `count` Mail with bodies of `bytes` bytes on one raw connection to
+/// `sock`, each answered `accepted` before the next goes out.
+fn send_many(rig: &Rig, sock: &str, to: &str, tag: &str, count: usize, bytes: usize) {
+    let mut conn = RawConn::open(rig, sock);
+    let body = "x".repeat(bytes);
+    for n in 0..count {
+        conn.say(&format!(
+            "{{\"type\":\"send\",\"req\":{n},\"mail\":\"{tag}-{n}\",\"from\":\"{SENDER}\",\"to\":\"{to}\",\"body\":\"{body}\"}}"
+        ));
+        let answer = conn.line();
+        assert!(
+            answer.contains("\"type\":\"accepted\""),
+            "send {tag}-{n} of {count}: {answer:?}"
+        );
+    }
+}
+
+/// A session that registers and then never reads its connection holds up
+/// only itself. Mail for it piles up far past what its socket takes, and a
+/// session beside it on the same host daemon still gets its own Mail, the
+/// Board still answers through that daemon, and the Mail for the session that
+/// is not reading stays pending for its next Register.
+#[test]
+fn a_session_that_stops_reading_holds_up_nobody_else() {
+    let mut rig = Rig::new("stuck-session");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let stuck = "33333333-3333-4333-8333-333333333333";
+    let mut deaf = RawConn::open(&rig, "b.sock");
+    deaf.say(&format!(
+        "{{\"type\":\"register\",\"session\":\"{stuck}\",\"confirm_register\":true}}"
+    ));
+    assert!(deaf.line().contains("\"type\":\"registered\""));
+    // 4 MB for a connection nobody reads again: many times a socket buffer.
+    send_many(&rig, "a.sock", stuck, "deaf", 40, 100_000);
+
+    rig.send("beside", "for the session beside it");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=beside",
+        Duration::from_secs(10),
+    );
+    assert!(board(&rig, "b.sock").contains(&format!("SESSION address={stuck} ")));
+    assert!(board(&rig, "a.sock").contains("BOARD sessions=2"));
+    assert!(receipt_line(&rig, "deaf-0").starts_with("PENDING mail=deaf-0"));
+
+    // The same Address, registered again on a connection that reads, is
+    // pushed every one of them, and stores each once, in order.
+    drop(deaf);
+    start_session(&mut rig, "b.sock", stuck, "stuck.store", "stuck.out");
+    wait_for_text(
+        &rig.p("stuck.out"),
+        "DELIVERED mail=deaf-39",
+        Duration::from_secs(30),
+    );
+    let stored: Vec<String> = read(&rig.p("stuck.out"))
+        .lines()
+        .filter(|l| l.starts_with("STORED"))
+        .map(|l| l.split(' ').nth(1).unwrap().to_string())
+        .collect();
+    let want: Vec<String> = (0..40).map(|n| format!("mail=deaf-{n}")).collect();
+    assert_eq!(stored, want);
+}
+
+/// A host daemon that stops reading its link holds up only its own host.
+/// Mail for it piles up at the coordinator far past what the link takes, and
+/// the other host still sends, receives and reads the Board. When the frozen
+/// daemon runs again its host gets every Mail once.
+#[test]
+fn a_host_daemon_that_stops_reading_holds_up_no_other_host() {
+    let mut rig = Rig::new("stuck-host");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let local = "44444444-4444-4444-8444-444444444444";
+    start_session(&mut rig, "a.sock", local, "local.store", "local.out");
+
+    signal(&rig, 2, "-STOP"); // host-b's daemon
+                              // 12 MB toward the frozen host, from the other one.
+    send_many(&rig, "a.sock", RECIPIENT, "frozen", 60, 200_000);
+
+    let sent = send_as(&rig, "a.sock", (SENDER, local), "same-host", "still moving");
+    assert!(sent.status.success(), "{sent:?}");
+    wait_for_text(
+        &rig.p("local.out"),
+        "DELIVERED mail=same-host",
+        Duration::from_secs(10),
+    );
+    assert!(board(&rig, "a.sock").contains(&format!("SESSION address={local} ")));
+
+    signal(&rig, 2, "-CONT");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=frozen-59",
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("recipient.out")), "STORED"),
+        60
+    );
+}
+
+/// Eight senders at once to one session: every send is accepted and every
+/// Mail is stored and receipted once. The Acks cross the same connections as
+/// the deliveries, in the other direction, and neither waits on the other.
+#[test]
+fn a_burst_from_many_senders_to_one_session_is_all_delivered() {
+    let mut rig = Rig::new("burst");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let (senders, each) = (8, 150);
+    std::thread::scope(|scope| {
+        for w in 0..senders {
+            let rig = &rig;
+            scope.spawn(move || send_many(rig, "a.sock", RECIPIENT, &format!("b{w}"), each, 1000));
+        }
+    });
+    let start = Instant::now();
+    while count_lines_with(&read(&rig.p("recipient.out")), "DELIVERED") < senders * each {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "only {} of {} delivered",
+            count_lines_with(&read(&rig.p("recipient.out")), "DELIVERED"),
+            senders * each
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), senders * each);
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"receipt\""),
+        senders * each
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("recipient.store")), "\"record\""),
+        senders * each
+    );
+}
+
+/// What `bytes` gets back from the coordinator's port, to end of stream.
+fn coordinator_answer(rig: &Rig, bytes: &[u8]) -> String {
+    let mut conn = std::net::TcpStream::connect(format!("127.0.0.1:{}", rig.coord_port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // The coordinator may hang up while this is still being written.
+    let _ = conn.write_all(bytes);
+    let mut answer = String::new();
+    let _ = conn.read_to_string(&mut answer);
+    answer
+}
+
+/// A connection that has not shown the token can end only itself. A line of
+/// nothing but opening brackets, a line longer than a hello may be, and a
+/// stream with no newline at all each get no answer and an ended connection;
+/// the coordinator stays up and its fleet keeps working.
+#[test]
+fn a_hostile_line_before_the_hello_ends_that_connection_and_nothing_else() {
+    let mut rig = Rig::new("hostile-hello");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let deep = format!("{}\n", "[".repeat(60_000));
+    let long = format!(
+        "{{\"type\":\"hello\",\"pad\":\"{}\"}}\n",
+        "x".repeat(200_000)
+    );
+    let endless = "[".repeat(400_000);
+    for (what, bytes) in [("deep", &deep), ("long", &long), ("endless", &endless)] {
+        assert_eq!(coordinator_answer(&rig, bytes.as_bytes()), "", "{what}");
+        assert!(
+            rig.children[rig.coord_idx].try_wait().unwrap().is_none(),
+            "the coordinator ended on the {what} line: {}",
+            read(&rig.p("coord.out.err"))
+        );
+    }
+    let err = read(&rig.p("coord.out.err"));
+    assert!(
+        err.contains("expected nesting of at most 64 levels"),
+        "{err}"
+    );
+    assert!(
+        err.contains("expected a line of at most 65536 bytes, saw a longer one"),
+        "{err}"
+    );
+    rig.send("after", "the fleet is still here");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=after",
+        Duration::from_secs(10),
+    );
+}
+
+/// The same on a host daemon's socket: a line nested past the bound ends the
+/// connection that sent it, and the daemon keeps serving.
+#[test]
+fn a_deeply_nested_line_ends_one_local_connection_and_not_the_host_daemon() {
+    let mut rig = Rig::new("hostile-local");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let mut conn = RawConn::open(&rig, "b.sock");
+    conn.say(&"[".repeat(400_000));
+    assert_eq!(conn.line(), "");
+    assert!(rig.children[2].try_wait().unwrap().is_none());
+    assert!(read(&rig.p("daemon-b.out.err")).contains("expected nesting of at most 64 levels"));
+    rig.send("after", "the daemon is still here");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=after",
+        Duration::from_secs(10),
+    );
+}
+
+/// A second send under a Mail id is a resend only when it repeats the Mail:
+/// then it is accepted again and commits nothing. One that differs in sender,
+/// recipient or body is refused with what differs, and commits nothing
+/// either. That holds once the Mail is receipted and after a coordinator
+/// restart, and for a Broadcast id.
+#[test]
+fn a_send_under_an_existing_mail_id_is_accepted_only_when_it_repeats_the_mail() {
+    let mut rig = Rig::new("resend");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let other = "55555555-5555-4555-8555-555555555555";
+    let refused = |rig: &Rig, pair: (&str, &str), mail: &str, body: &str, what: &str| {
+        let out = send_as(rig, "a.sock", pair, mail, body);
+        assert!(!out.status.success(), "{what}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            err.contains(&format!(
+                "mail {mail}: expected a resend to repeat the Mail already accepted under this id, saw a different {what}"
+            )),
+            "{what}: {err}"
+        );
+    };
+    let check = |rig: &Rig| {
+        let again = send_as(rig, "a.sock", (SENDER, RECIPIENT), "m1", "first");
+        assert!(again.status.success(), "{again:?}");
+        refused(rig, (SENDER, RECIPIENT), "m1", "second", "body");
+        refused(rig, (other, RECIPIENT), "m1", "first", "sender");
+        refused(rig, (SENDER, other), "m1", "first", "recipient");
+        refused(
+            rig,
+            (other, SENDER),
+            "m1",
+            "second",
+            "sender, recipient, body",
+        );
+        let again = send_as(rig, "a.sock", (SENDER, "*"), "all", "to everyone");
+        assert!(again.status.success(), "{again:?}");
+        refused(rig, (SENDER, "*"), "all", "something else", "body");
+        refused(rig, (other, "*"), "all", "to everyone", "sender");
+    };
+    rig.send("m1", "first");
+    let all = send_as(&rig, "a.sock", (SENDER, "*"), "all", "to everyone");
+    assert!(all.status.success(), "{all:?}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=all/{RECIPIENT}"),
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m1",
+        Duration::from_secs(10),
+    );
+    check(&rig);
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    check(&rig);
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"broadcast\""),
+        1,
+        "{coord}"
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("recipient.store")), "\"record\""),
+        2
+    );
+}
+
+/// The receipt latency of a run of Mail, one at a time: the quickest of them
+/// crosses both hosts in a few milliseconds. A line that leaves in two
+/// segments, or waits for more to send, costs tens of milliseconds a hop and
+/// every Mail pays it.
+#[test]
+fn a_mail_does_not_wait_on_the_link_for_more_to_send() {
+    let mut rig = Rig::new("no-link-wait");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let mut quickest = i64::MAX;
+    for n in 0..20 {
+        let mail = format!("q{n}");
+        rig.send(&mail, "x");
+        wait_for_text(
+            &rig.p("recipient.out"),
+            &format!("DELIVERED mail={mail}"),
+            Duration::from_secs(10),
+        );
+        let line = receipt_line(&rig, &mail);
+        quickest = quickest.min(stamp_in(&line, "latency_ms"));
+    }
+    assert!(quickest < 25, "quickest of 20 took {quickest} ms");
+}
+
+/// A host daemon that stops (frozen, or its host gone without a word) is
+/// given up once its link has been silent for three pings: its sessions read
+/// disconnected, with the moment it was given up. When it runs again it
+/// reconnects and they read connected.
+#[test]
+fn a_host_daemon_gone_silent_is_given_up_and_its_sessions_read_disconnected() {
+    let mut rig = Rig::new("silent-daemon");
+    let pace: Vec<String> = ["--link-pace-ms", "150"].map(String::from).to_vec();
+    rig.coord_extra = pace.clone();
+    rig.daemon_extra = pace;
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    wait_connected(&rig, "a.sock", true);
+    // Several times the silence bound with every process running: nothing is given up.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(presence(&rig, "a.sock", None).0);
+    assert!(!read(&rig.p("daemon-b.out.err")).contains("upstream"));
+
+    let before = epoch_ms();
+    signal(&rig, 2, "-STOP");
+    let seen = wait_connected(&rig, "a.sock", false);
+    assert!(seen >= before, "given up at {seen}, frozen at {before}");
+    let err = read(&rig.p("coord.out.err"));
+    assert!(
+        err.contains("expected a line from the peer within 450 ms, saw none"),
+        "{err}"
+    );
+    signal(&rig, 2, "-CONT");
+    wait_connected(&rig, "a.sock", true);
+    rig.send("back", "after the freeze");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=back",
+        Duration::from_secs(10),
+    );
+}
+
+/// The other direction: a coordinator that goes silent is given up by its
+/// host daemons, which reconnect when it runs again. Mail accepted before is
+/// delivered then.
+#[test]
+fn a_coordinator_gone_silent_is_given_up_and_found_again() {
+    let mut rig = Rig::new("silent-coordinator");
+    let pace: Vec<String> = ["--link-pace-ms", "150"].map(String::from).to_vec();
+    rig.coord_extra = pace.clone();
+    rig.daemon_extra = pace;
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    signal(&rig, rig.coord_idx, "-STOP");
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        "upstream error: expected a line from the peer within 450 ms, saw none",
+        Duration::from_secs(10),
+    );
+    signal(&rig, rig.coord_idx, "-CONT");
+    wait_connected(&rig, "a.sock", true);
+    rig.send("found", "after the silence");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=found",
+        Duration::from_secs(10),
+    );
+}
+
+/// A host daemon that never pings is never held to the silence bound, and a
+/// coordinator that does not say it answers pings is never pinged: each side
+/// keeps a link to an older peer exactly as before.
+#[test]
+fn a_peer_that_does_not_ping_is_not_held_to_the_silence_bound() {
+    use std::io::{BufRead, BufReader};
+    let mut rig = Rig::new("no-ping-peer");
+    rig.coord_extra = ["--link-pace-ms", "100"].map(String::from).to_vec();
+    rig.start_stack();
+    // An older host daemon: hello, then nothing for many times the bound.
+    let conn = std::net::TcpStream::connect(format!("127.0.0.1:{}", rig.coord_port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut old = BufReader::new(conn);
+    writeln!(
+        old.get_mut(),
+        "{{\"type\":\"hello\",\"token\":\"{TOKEN}\",\"host\":\"host-old\"}}"
+    )
+    .unwrap();
+    let mut line = String::new();
+    old.read_line(&mut line).unwrap();
+    assert!(line.contains("\"type\":\"hello_ok\""), "{line}");
+    assert!(line.contains("\"ping\":true"), "{line}");
+    std::thread::sleep(Duration::from_millis(1200));
+    writeln!(old.get_mut(), "{{\"type\":\"board\",\"req\":7}}").unwrap();
+    line.clear();
+    old.read_line(&mut line).unwrap();
+    assert!(line.contains("\"type\":\"board\""), "{line}");
+
+    // An older coordinator: hello_ok without `ping`. The daemon sends none
+    // and stays on the silent link.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let coord = format!("127.0.0.1:{port}");
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &coord,
+            "--host-id",
+            "host-c",
+            "--socket",
+            rig.p("c.sock").to_str().unwrap(),
+            "--data",
+            rig.p("c.log").to_str().unwrap(),
+            "--link-pace-ms",
+            "100",
+        ],
+        "daemon-c.out",
+    );
+    let (link, _) = listener.accept().unwrap();
+    link.set_read_timeout(Some(Duration::from_millis(1200)))
+        .unwrap();
+    let mut link = BufReader::new(link);
+    line.clear();
+    link.read_line(&mut line).unwrap();
+    assert!(line.contains("\"type\":\"hello\""), "{line}");
+    writeln!(link.get_mut(), "{{\"type\":\"hello_ok\"}}").unwrap();
+    line.clear();
+    let silent = link.read_line(&mut line);
+    assert!(
+        silent.is_err() && line.is_empty(),
+        "expected nothing from the daemon, saw {line:?}"
+    );
+    assert!(!read(&rig.p("daemon-c.out.err")).contains("upstream"));
 }
