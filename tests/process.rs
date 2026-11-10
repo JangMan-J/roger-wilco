@@ -4449,11 +4449,14 @@ fn a_host_daemon_gone_silent_is_given_up_and_its_sessions_read_disconnected() {
     );
 }
 
-/// The other direction: a coordinator that goes silent is given up by its
-/// host daemons, which reconnect when it runs again. Mail accepted before is
-/// delivered then.
+/// The other direction has no bound. A coordinator that is stopped and not
+/// gone still holds its links and every line on them, so a host daemon that
+/// dialed a second link meanwhile would have that link's lines applied before
+/// the first one's leftovers. The daemon stays on its link through the
+/// silence, and when the coordinator runs again everything goes on over the
+/// same link: no reconnect, the session still connected, Mail delivered.
 #[test]
-fn a_coordinator_gone_silent_is_given_up_and_found_again() {
+fn a_coordinator_gone_silent_and_not_gone_keeps_its_links() {
     let mut rig = Rig::new("silent-coordinator");
     let pace: Vec<String> = ["--link-pace-ms", "150"].map(String::from).to_vec();
     rig.coord_extra = pace.clone();
@@ -4461,18 +4464,24 @@ fn a_coordinator_gone_silent_is_given_up_and_found_again() {
     rig.start_stack();
     rig.start_recipient("recipient.out", false);
     signal(&rig, rig.coord_idx, "-STOP");
-    wait_for_text(
-        &rig.p("daemon-b.out.err"),
-        "upstream error: expected a line from the peer within 450 ms, saw none",
-        Duration::from_secs(10),
-    );
+    // Several times the bound the coordinator holds a host daemon to.
+    std::thread::sleep(Duration::from_millis(2000));
     signal(&rig, rig.coord_idx, "-CONT");
-    wait_connected(&rig, "a.sock", true);
-    rig.send("found", "after the silence");
+    rig.send("after", "over the same link");
     wait_for_text(
         &rig.p("recipient.out"),
-        "DELIVERED mail=found",
+        "DELIVERED mail=after",
         Duration::from_secs(10),
+    );
+    assert!(presence(&rig, "a.sock", None).0);
+    for daemon in ["daemon-a.out.err", "daemon-b.out.err"] {
+        let err = read(&rig.p(daemon));
+        assert!(!err.contains("upstream"), "{daemon} left its link: {err}");
+    }
+    let coord = read(&rig.p("coord.out.err"));
+    assert!(
+        !coord.contains("connection ended"),
+        "the coordinator ended a link: {coord}"
     );
 }
 

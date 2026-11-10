@@ -159,16 +159,24 @@ pub fn writer(w: Box<dyn Write + Send>) -> Writer {
     Arc::new(Out::Direct(Mutex::new(w)))
 }
 
-/// A queued writer on `w`, with the thread that writes for it. `hangup` must
-/// end the connection `w` writes to (a socket's `shutdown`).
-pub fn queued(mut w: Box<dyn Write + Send>, hangup: Box<dyn Fn() + Send + Sync>) -> Writer {
+/// A queued writer on `stream`, with the thread that writes for it. `hangup`
+/// must end the connection (a socket's `shutdown`). The thread and the hangup
+/// share the one handle given here, so a queued connection costs no more
+/// descriptors than a direct one.
+pub fn queued<S>(stream: Arc<S>, hangup: fn(&S)) -> Writer
+where
+    S: Send + Sync + 'static,
+    for<'a> &'a S: Write,
+{
+    let ending = Arc::clone(&stream);
     let shared = Arc::new(Shared {
         pending: Mutex::new(Pending::default()),
         more: Condvar::new(),
-        hangup,
+        hangup: Box::new(move || hangup(&ending)),
     });
     let work = Arc::clone(&shared);
     std::thread::spawn(move || {
+        let mut w = &*stream;
         loop {
             let line = {
                 let mut pending = work.pending.lock().unwrap();
@@ -387,18 +395,26 @@ mod tests {
         assert!(endless.next().unwrap().is_err());
     }
 
-    /// A stream whose every write waits until the test lets it through.
+    /// A stream whose every write waits until the test lets it through, and
+    /// which reports each hangup.
     struct Gated {
-        open: mpsc::Receiver<()>,
-        wrote: mpsc::Sender<String>,
+        open: Mutex<mpsc::Receiver<()>>,
+        wrote: Mutex<mpsc::Sender<String>>,
+        hung: Mutex<mpsc::Sender<()>>,
     }
 
-    impl Write for Gated {
+    impl Write for &Gated {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.open
+                .lock()
+                .unwrap()
                 .recv()
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "gate gone"))?;
-            let _ = self.wrote.send(String::from_utf8_lossy(buf).to_string());
+            let _ = self
+                .wrote
+                .lock()
+                .unwrap()
+                .send(String::from_utf8_lossy(buf).to_string());
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -415,12 +431,15 @@ mod tests {
         let (open, gate) = mpsc::channel();
         let (wrote, seen) = mpsc::channel();
         let (hung, hangups) = mpsc::channel();
-        let hung = Mutex::new(hung);
         let w = queued(
-            Box::new(Gated { open: gate, wrote }),
-            Box::new(move || {
-                let _ = hung.lock().unwrap().send(());
+            Arc::new(Gated {
+                open: Mutex::new(gate),
+                wrote: Mutex::new(wrote),
+                hung: Mutex::new(hung),
             }),
+            |g| {
+                let _ = g.hung.lock().unwrap().send(());
+            },
         );
         (w, open, seen, hangups)
     }
@@ -451,6 +470,8 @@ mod tests {
         assert_eq!(seen.recv().unwrap(), "{\"n\":1}\n");
         assert_eq!(seen.recv().unwrap(), "{\"n\":2}\n");
         hangups.recv().unwrap();
+        // The stream lives as long as a handle on the queue does.
+        drop(w);
         assert!(seen.recv().is_err(), "nothing follows the drained lines");
     }
 
@@ -464,8 +485,11 @@ mod tests {
         // The hangup comes from the closing call itself, under the waiting write.
         hangups.recv().unwrap();
         assert!(send(&w, &obj(vec![("n", Value::Int(11))])).is_err());
-        // At most the one line already handed to the stream gets out.
+        // At most the one line already handed to the stream gets out. The
+        // stream lives as long as a handle on the queue does, so the last
+        // handle goes first.
         drop(open);
+        drop(w);
         let written: Vec<String> = seen.iter().collect();
         assert!(written.len() <= 1, "{written:?}");
     }

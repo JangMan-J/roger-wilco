@@ -458,6 +458,9 @@ fn audit_live_locked_logs_are_read_only() {
         )
     );
     assert!(send("live-2").status.success());
+    // End the processes while the Tracer's stdout is still open: live-2 can
+    // reach it before this returns, and a print to a closed pipe is a panic.
+    drop(processes);
 }
 
 /// The brief's fixture: a coordinator log of every line generation with a
