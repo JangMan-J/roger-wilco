@@ -5,6 +5,7 @@
 //! tools, and gives the face no semantics of its own: every tool is one
 //! request the socket protocol already has.
 
+use crate::durlog::Policy;
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use crate::session::{self, Face, McpHooks};
@@ -33,6 +34,10 @@ pub struct Config {
     pub store: PathBuf,
     /// True when the Store path was not given, so it is this server's to remove.
     pub store_is_default: bool,
+    /// When the Store rotates (`--rotate-bytes`) and whether a rotation
+    /// culls (`--cull`).
+    pub policy: Policy,
+    pub cull: bool,
     pub label: Option<String>,
     pub declared: Option<String>,
 }
@@ -107,11 +112,14 @@ pub fn resolve(
             )
         }
     };
+    let (policy, cull) = session::rotation(args)?;
     Ok(Config {
         socket,
         address,
         store,
         store_is_default,
+        policy,
+        cull,
         label: flag(args, "--label"),
         declared: flag(args, "--declare"),
     })
@@ -661,6 +669,13 @@ impl Inbox {
         self.arrived.notify_all();
     }
 
+    /// The Record id returned through, as a rotation asks for it. A read that
+    /// is under way finishes first; a read that moves past it later only
+    /// means the rotation culled less than it could have.
+    fn position(&self) -> Option<String> {
+        self.consumed.lock().unwrap().clone()
+    }
+
     /// Up to `limit` entries after the read position. With none and `wait` above
     /// zero, waits up to `wait` for the next Store write. Unless `peek`, the
     /// read position moves past what is returned and is durable before this returns.
@@ -707,9 +722,14 @@ fn position_path(store: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Every complete entry in the Store, oldest first. A trailing fragment with
-/// no newline (a write in progress) is not an entry yet.
-fn entries(store: &Path) -> io::Result<Vec<Value>> {
+/// Every complete line of the Store that parses, oldest first. A trailing
+/// fragment with no newline (a write in progress) is not a line yet. The
+/// path names one whole file at every instant: the Store as it was, or the
+/// fresh file a rotation put in its place, which restates every entry and
+/// tombstone before anything is appended to it. A read sees one or the
+/// other, and the inbox finds its place in either by Record id, never by
+/// size or offset.
+fn lines(store: &Path) -> io::Result<Vec<Value>> {
     let bytes = match std::fs::read(store) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -724,14 +744,29 @@ fn entries(store: &Path) -> io::Result<Vec<Value>> {
     Ok(String::from_utf8_lossy(&bytes[..end])
         .lines()
         .filter_map(|l| json::parse(l).ok())
+        .collect())
+}
+
+/// Every entry and tombstone in the Store, oldest first: the lines that
+/// carry a Record id. A rotation's snapshot lines carry none.
+fn entries(store: &Path) -> io::Result<Vec<Value>> {
+    Ok(lines(store)?
+        .into_iter()
         .filter(|e| e.get("record").is_some())
         .collect())
 }
 
+/// A tombstone: an entry a rotation culled to its Record id and Mail id.
+fn culled(e: &Value) -> bool {
+    e.get("culled") == Some(&Value::Bool(true))
+}
+
 /// The entries after the one named `consumed`, at most `limit`, shaped as the
-/// inbox returns them. A read position that names no entry (a Store that was
-/// replaced) starts from the first. A `kind` or `headers` the entry lacks is
-/// left out, never guessed.
+/// inbox returns them. The read position is found among entries and
+/// tombstones alike, so one a rotation culled keeps its place; a tombstone is
+/// never returned. A read position that names nothing in the Store (a Store
+/// that was replaced) starts from the first. A `kind` or `headers` the entry
+/// lacks is left out, never guessed.
 fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
     let start = consumed
         .and_then(|c| {
@@ -741,6 +776,7 @@ fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
         .map_or(0, |i| i + 1);
     all[start..]
         .iter()
+        .filter(|e| !culled(e))
         .take(limit)
         .map(|e| {
             Value::Obj(
@@ -823,9 +859,18 @@ pub fn run(args: &[String]) -> io::Result<()> {
             let ctx = Arc::clone(&ctx);
             move || ctx.inbox.notify()
         }),
+        position: Box::new({
+            let ctx = Arc::clone(&ctx);
+            move || ctx.inbox.position()
+        }),
         gate: Arc::clone(&gate),
     };
-    let (socket, address, store) = (cfg.socket.clone(), cfg.address.clone(), cfg.store.clone());
+    let (socket, address) = (cfg.socket.clone(), cfg.address.clone());
+    let store = session::Store {
+        path: cfg.store.clone(),
+        policy: cfg.policy,
+        cull: cfg.cull,
+    };
     let (label, declared) = (cfg.label.clone(), cfg.declared.clone());
     std::thread::spawn(move || {
         let ended = session::serve(socket, address, label, store, declared, Face::Mcp(hooks));
@@ -916,20 +961,54 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
     }
 }
 
-/// Leave. With a daemon writer, unregister first. A default Store with no
-/// entries is removed with its position file: the gate is held so a delivery
-/// cannot be written to a file about to go.
+/// Leave. With a daemon writer, unregister first. A default Store that has
+/// never held anything is removed with its position file: the gate is held
+/// so a delivery or a rotation cannot touch a file about to go.
 fn finish(cfg: &Config, gate: &Mutex<bool>, daemon: Option<&net::Writer>, code: i32) -> ! {
     let mut closing = gate.lock().unwrap();
     *closing = true;
     if let Some(w) = daemon {
         let _ = net::send(w, &obj(vec![("type", s("unregister"))]));
     }
-    if cfg.store_is_default && entries(&cfg.store).is_ok_and(|e| e.is_empty()) {
+    if cfg.store_is_default && never_held(&cfg.store) {
         let _ = std::fs::remove_file(&cfg.store);
         let _ = std::fs::remove_file(position_path(&cfg.store));
     }
     std::process::exit(code)
+}
+
+/// True when a Store has held nothing: no entry or tombstone, no snapshot
+/// block, and no archive (`<store>.<n>`) beside it. Anything it cannot read
+/// counts as held.
+fn never_held(store: &Path) -> bool {
+    let empty = lines(store).is_ok_and(|all| {
+        all.iter().all(|v| {
+            ["record", "snapshot", "snapshot_end"]
+                .iter()
+                .all(|k| v.get(k).is_none())
+        })
+    });
+    // Archives lie beside the file itself, not beside a link that names it.
+    let store = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
+    let (Some(dir), Some(name)) = (store.parent(), store.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    // `<store>.<n>`, also with a further suffix such as `.gz`.
+    let archived = |files: std::fs::ReadDir| {
+        files.filter_map(Result::ok).any(|f| {
+            f.file_name()
+                .to_str()
+                .and_then(|f| f.strip_prefix(name)?.strip_prefix('.')?.split('.').next())
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+    };
+    empty && std::fs::read_dir(dir).is_ok_and(|files| !archived(files))
 }
 
 #[cfg(test)]
@@ -1144,6 +1223,77 @@ mod tests {
         assert!(first.get("kind").is_none() && first.get("headers").is_none());
         let second = &after(&all, Some("r-1"), 1)[0];
         assert_eq!(second.get("kind"), Some(&s("directed")));
+    }
+
+    #[test]
+    fn a_tombstone_holds_the_read_position_in_place_and_is_never_returned() {
+        let tomb = |r: &str| {
+            obj(vec![
+                ("record", s(r)),
+                ("mail", s(&format!("m-{r}"))),
+                ("culled", Value::Bool(true)),
+            ])
+        };
+        let all = vec![
+            tomb("r-1"),
+            tomb("r-2"),
+            entry("r-3", true),
+            tomb("r-4"),
+            entry("r-5", true),
+        ];
+        let rec = |v: Vec<Value>| -> Vec<String> {
+            v.iter()
+                .map(|e| e.get("record").unwrap().as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(rec(after(&all, Some("r-2"), 50)), ["r-3", "r-5"]);
+        assert_eq!(rec(after(&all, Some("r-1"), 1)), ["r-3"]);
+        assert_eq!(rec(after(&all, Some("r-3"), 50)), ["r-5"]);
+        assert_eq!(rec(after(&all, None, 50)), ["r-3", "r-5"]);
+        assert!(after(&all, Some("r-5"), 50).is_empty());
+    }
+
+    #[test]
+    fn snapshot_lines_are_no_entries_and_a_store_that_rotated_is_never_removed() {
+        let dir = std::env::temp_dir().join(format!("roger-mcp-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("x.store");
+        assert!(never_held(&store), "an absent Store");
+        std::fs::write(&store, "\n").unwrap();
+        std::fs::write(dir.join("x.store.cursor"), "r-1\n").unwrap();
+        assert!(never_held(&store), "an empty one, a position beside it");
+        let block =
+            "{\"snapshot\":1,\"prior\":\"x.store.1\",\"next_record\":3}\n{\"snapshot_end\":1}\n";
+        std::fs::write(&store, block).unwrap();
+        assert!(entries(&store).unwrap().is_empty());
+        assert!(!never_held(&store), "an empty snapshot block");
+        std::fs::write(
+            &store,
+            format!(
+                "{}\n{block}{}\n",
+                json::stringify(&entry("r-1", true)),
+                json::stringify(&entry("r-2", false))
+            ),
+        )
+        .unwrap();
+        let recs: Vec<String> = entries(&store)
+            .unwrap()
+            .iter()
+            .map(|e| e.get("record").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(recs, ["r-1", "r-2"], "the snapshot lines are skipped");
+        std::fs::write(&store, "").unwrap();
+        std::fs::write(dir.join("x.store.12.gz"), "archived\n").unwrap();
+        assert!(!never_held(&store), "a compressed archive beside it");
+        std::fs::remove_file(dir.join("x.store.12.gz")).unwrap();
+        std::fs::write(dir.join("x.store.12"), "archived\n").unwrap();
+        assert!(!never_held(&store), "an archive beside it");
+        // Through a link, the archives beside the file it names count.
+        let link = dir.join("named.store");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        assert!(!never_held(&link), "an archive beside the linked file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

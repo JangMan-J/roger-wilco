@@ -8,7 +8,7 @@
 //! Nothing here scans on a timer.
 
 use crate::claims::{Change, Claims, Held, Op};
-use crate::durlog::DurLog;
+use crate::durlog::{DurLog, Policy};
 use crate::headers;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
@@ -51,16 +51,37 @@ struct Receipt {
     at: Option<i64>,
 }
 
-/// A body's length and a hash of it, kept in memory only and never written:
-/// enough to tell a resend of a Mail from a different Mail under the same id
-/// after the body itself has been dropped.
+/// A body's length and a hash of it: enough to tell a resend of a Mail from a
+/// different Mail under the same id after the body itself has been dropped
+/// from memory, and after a rotation has left it out of the log.
 type BodyMark = (usize, u64);
 
+/// FNV-1a over the body's bytes: the same value in every build, since a
+/// rotation writes it into the log for a body it no longer restates.
 fn mark_of(body: &str) -> BodyMark {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut h);
-    (body.len(), h.finish())
+    let hash = body.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (body.len(), hash)
+}
+
+/// A mark as a rotation restates it, beside an emptied body.
+fn settled_field(mark: BodyMark) -> Value {
+    obj(vec![
+        (
+            "bytes",
+            Value::Int(i64::try_from(mark.0).unwrap_or(i64::MAX)),
+        ),
+        ("mark", s(&format!("{:016x}", mark.1))),
+    ])
+}
+
+/// The mark a restated line carries for the body it left out, when it has one.
+fn settled_mark(v: &Value) -> Option<BodyMark> {
+    let settled = v.get("settled")?;
+    let bytes = usize::try_from(settled.get("bytes")?.as_i64()?).ok()?;
+    let mark = u64::from_str_radix(settled.get("mark")?.as_str()?, 16).ok()?;
+    Some((bytes, mark))
 }
 
 /// What a second send under an existing Mail id differs in, if anything. A
@@ -151,6 +172,11 @@ struct State {
     /// Broadcasts already committed, each with its sender and body mark, so a
     /// resent broadcast fans out once and a different one under its id is refused.
     broadcasts: HashMap<String, (String, BodyMark)>,
+    /// Mail ids whose Mail a rotation culled: receipted longer ago than
+    /// `--cull-after-ms`. Only the id is kept, so it is never accepted again.
+    culled: HashSet<String>,
+    /// When the log rotates and what a rotation may cull.
+    policy: Policy,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
     notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
@@ -159,8 +185,10 @@ struct State {
 
 impl State {
     /// Nothing registered, accepted or claimed yet: what a replay starts from.
-    fn new(log: DurLog, unregister_after_ms: i64) -> State {
+    fn new(log: DurLog, unregister_after_ms: i64, policy: Policy) -> State {
         State {
+            policy,
+            culled: HashSet::new(),
             log,
             sessions: HashMap::new(),
             started: now_ms(),
@@ -201,9 +229,19 @@ pub fn run(
     data: PathBuf,
     token: String,
     unregister_after_ms: i64,
+    policy: Policy,
 ) -> io::Result<()> {
+    // A rotation restates every Mail it does not cull. With no bound that is
+    // every Mail ever accepted, rewritten at each rotation while nothing else
+    // is answered, for longer each time: not offered.
+    if policy.rotate_bytes > 0 && policy.cull_after_ms.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected --cull-after-ms with --rotate-bytes on a coordinator (a rotation restates all Mail it does not cull, so without a bound it grows with every Mail ever accepted), saw none",
+        ));
+    }
     let (log, prior) = DurLog::open(&data)?;
-    let mut state = State::new(log, unregister_after_ms);
+    let mut state = State::new(log, unregister_after_ms, policy);
     // The replay drops a crash-truncated tail, so every line here was
     // appended whole, and it hands them over one at a time. A line that is
     // not JSON is skipped as before; a claim event that parses but lacks a
@@ -213,6 +251,7 @@ pub fn run(
             apply(&mut state, &v)?;
         }
     }
+    rotate_if_due(&mut state);
     let state = Arc::new(Mutex::new(state));
 
     let listener = TcpListener::bind(bind)?;
@@ -322,6 +361,10 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                 net::field(v, "to"),
                 net::field(v, "body"),
             ) {
+                // A build that does not know culled ids may have accepted
+                // one again: the log then holds a Mail under it, and a Mail
+                // on the log is never dropped for an id's sake.
+                state.culled.remove(mail);
                 let seq = state.next_seq;
                 state.next_seq += 1;
                 state.pending.insert(seq, mail.to_string());
@@ -331,9 +374,16 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                         from: from.into(),
                         to: to.into(),
                         body: Some(body.into()),
-                        mark: mark_of(body),
+                        // A rotation restates a receipted Mail without its
+                        // body, with the mark of the body it had.
+                        mark: settled_mark(v).unwrap_or_else(|| mark_of(body)),
                         seq,
-                        kind: net::DIRECTED,
+                        // A rotation restates a Broadcast copy as its own
+                        // line and says so; every other `mail` line is directed.
+                        kind: match v.get("kind").and_then(|k| k.as_str()) {
+                            Some(net::BROADCAST) => net::BROADCAST,
+                            _ => net::DIRECTED,
+                        },
                         // An event written before headers existed has none.
                         headers: net::headers_of(v),
                         accepted_at: stamp_of(v, "accepted_at_ms"),
@@ -362,7 +412,20 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                     (mail, from, body, &headers),
                     &to,
                     stamp_of(v, "accepted_at_ms"),
+                    settled_mark(v),
                 );
+            }
+        }
+        // Only its id is left of this Mail: it is never accepted again. A
+        // Mail still awaiting its Receipt is never culled, whatever a line
+        // says: it stays, whole.
+        Some("culled") => {
+            if let Ok(mail) = net::field(v, "mail") {
+                let awaiting = state.mails.get(mail).is_some_and(|m| m.receipt.is_none());
+                if !awaiting {
+                    state.mails.remove(mail);
+                    state.culled.insert(mail.to_string());
+                }
             }
         }
         Some("receipt") => {
@@ -414,7 +477,146 @@ fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
 /// session event takes, so replay and live state agree.
 fn commit(state: &mut State, ev: Value) -> io::Result<()> {
     state.log.append(&json::stringify(&ev))?;
-    apply(state, &ev)
+    apply(state, &ev)?;
+    rotate_if_due(state);
+    Ok(())
+}
+
+/// What a fresh log has to restate for this coordinator to go on as it is,
+/// and the ids of the Mail it culls instead: receipted longer ago than
+/// `cull_after_ms` at `now`, or receipted by a line too old to carry a stamp.
+///
+/// Every line is in the log's ordinary vocabulary, so `apply` replays it as it
+/// replays any other, and a build from before rotation reads it too: it sees
+/// each receipted Mail as a Mail with an empty body and its Receipt.
+fn snapshot(st: &State, now: i64) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut put = |ev: Value| lines.push(json::stringify(&ev));
+
+    let mut sessions: Vec<(&String, &Session)> = st.sessions.iter().collect();
+    sessions.sort_by_key(|(a, _)| *a);
+    for (address, row) in sessions {
+        put(obj(vec![
+            ("ev", s("session")),
+            ("session", s(address)),
+            ("host", s(&row.host)),
+        ]));
+        if !row.label.is_empty() {
+            put(obj(vec![
+                ("ev", s("label")),
+                ("session", s(address)),
+                ("label", s(&row.label)),
+            ]));
+        }
+        if let Some(declared) = &row.declared {
+            put(obj(vec![
+                ("ev", s("declared")),
+                ("session", s(address)),
+                ("declared", s(declared)),
+            ]));
+        }
+    }
+    let mut takeovers: Vec<(&String, &Value)> = st.takeovers.iter().collect();
+    takeovers.sort_by_key(|(registration, _)| *registration);
+    for (_, event) in takeovers {
+        put(event.clone());
+    }
+    // A claim past its deadline is not live and the next acquire writes over
+    // it: leaving it out changes no answer.
+    for (key, held) in st.claims.active(now) {
+        put(Change::Grant(held.clone()).to_event(key));
+    }
+    let mut broadcasts: Vec<(&String, &(String, BodyMark))> = st.broadcasts.iter().collect();
+    broadcasts.sort_by_key(|(mail, _)| *mail);
+    for (mail, (from, mark)) in broadcasts {
+        put(obj(vec![
+            ("ev", s("broadcast")),
+            ("mail", s(mail)),
+            ("from", s(from)),
+            ("body", s("")),
+            ("to", Value::Arr(Vec::new())),
+            ("settled", settled_field(*mark)),
+        ]));
+    }
+
+    let mut mails: Vec<(&String, &Mail)> = st.mails.iter().collect();
+    mails.sort_by_key(|(_, m)| m.seq);
+    let mut culled = Vec::new();
+    for (mail, m) in mails {
+        let old = |at: Option<i64>| match (st.policy.cull_after_ms, at) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(after), Some(at)) => now.saturating_sub(at) >= after,
+        };
+        if m.receipt.as_ref().is_some_and(|r| old(r.at)) {
+            culled.push(mail.clone());
+            continue;
+        }
+        let mut pairs = vec![
+            ("ev", s("mail")),
+            ("mail", s(mail)),
+            ("from", s(&m.from)),
+            ("to", s(&m.to)),
+            ("body", s(m.body.as_deref().unwrap_or(""))),
+            ("headers", m.headers.clone()),
+        ];
+        if let Some(at) = m.accepted_at {
+            pairs.push(("accepted_at_ms", Value::Int(at)));
+        }
+        if m.kind == net::BROADCAST {
+            pairs.push(("kind", s(net::BROADCAST)));
+        }
+        if m.body.is_none() {
+            pairs.push(("settled", settled_field(m.mark)));
+        }
+        put(obj(pairs));
+        if let Some(r) = &m.receipt {
+            let mut pairs = vec![
+                ("ev", s("receipt")),
+                ("mail", s(mail)),
+                ("session", s(&m.to)),
+                ("record", s(&r.record)),
+            ];
+            if let Some(at) = r.at {
+                pairs.push(("receipted_at_ms", Value::Int(at)));
+            }
+            put(obj(pairs));
+        }
+    }
+    let mut ids: Vec<&String> = st.culled.iter().chain(&culled).collect();
+    ids.sort();
+    for mail in ids {
+        put(obj(vec![("ev", s("culled")), ("mail", s(mail))]));
+    }
+    (lines, culled)
+}
+
+/// Rotate the log once it is due (see `DurLog::due`). Nothing is removed: the
+/// file as it was stays beside the fresh one. Memory changes only by what the
+/// rotation culled, so it holds what a replay of the fresh file would.
+fn rotate_if_due(st: &mut State) {
+    if !st.log.due(&st.policy) {
+        return;
+    }
+    let now = now_ms();
+    let (lines, culled) = snapshot(st, now);
+    match st.log.rotate(vec![("at_ms", Value::Int(now))], &lines) {
+        Ok(seq) => {
+            eprintln!(
+                "coordinator log rotated: archive {seq}, {} lines kept, {} Mail culled",
+                lines.len(),
+                culled.len()
+            );
+            for mail in culled {
+                st.mails.remove(&mail);
+                st.culled.insert(mail);
+            }
+            // The fresh log restates live claims only.
+            st.claims.forget_expired(now);
+        }
+        // The old log is still the log; the next attempt waits for more growth.
+        Err(e) => eprintln!("coordinator log not rotated: {e}"),
+    }
 }
 
 /// End one session's registration: it leaves the Board and every later
@@ -740,6 +942,10 @@ fn serve_link(
                                 None
                             }
                         }
+                    } else if st.culled.contains(&mail) {
+                        // Only the id is left: there is nothing to compare a
+                        // resend with, and nothing is committed under it again.
+                        None
                     } else if let Some(m) = st.mails.get(&mail) {
                         resend_differs((&m.from, Some(&m.to), m.mark), (from, Some(to), body))
                     } else {
@@ -851,7 +1057,8 @@ fn serve_link(
                         stamp(&mut st, &session);
                     }
                     match st.mails.get(&mail) {
-                        None => None,
+                        // A culled Mail was receipted before it was culled.
+                        None => st.culled.contains(&mail).then_some(true),
                         Some(m) => {
                             let already = m.receipt.is_some();
                             if !already {
@@ -1063,6 +1270,7 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     if let Some(change) = &d.change {
         st.log.append(&json::stringify(&change.to_event(&key)))?;
         st.claims.apply(&key, change);
+        rotate_if_due(st);
     }
     let mut pairs = vec![
         ("type", s("claim_result")),
@@ -1138,11 +1346,18 @@ fn receipt(st: &State, v: &Value) -> io::Result<Value> {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let mail = net::field(v, "mail")?;
     let Some(m) = st.mails.get(mail) else {
+        let reason = if st.culled.contains(mail) {
+            format!(
+                "culled mail {mail}: expected its Receipt in this log, saw only its id kept; the Receipt is in an archived log"
+            )
+        } else {
+            format!("unknown mail {mail}")
+        };
         return Ok(obj(vec![
             ("type", s("error")),
             ("req", Value::Int(req)),
             ("mail", s(mail)),
-            ("reason", s(&format!("unknown mail {mail}"))),
+            ("reason", s(&reason)),
         ]));
     };
     let mut pairs = vec![
@@ -1180,11 +1395,12 @@ fn fan_out(
     (mail, from, body, headers): (&str, &str, &str, &Value),
     to: &[String],
     accepted_at: Option<i64>,
+    restated: Option<BodyMark>,
 ) {
     if st.broadcasts.contains_key(mail) {
         return;
     }
-    let mark = mark_of(body);
+    let mark = restated.unwrap_or_else(|| mark_of(body));
     st.broadcasts
         .insert(mail.to_string(), (from.to_string(), mark));
     for addr in to {
@@ -1269,7 +1485,7 @@ mod tests {
         let (log, mut prior) = DurLog::open(&path).unwrap();
         assert!(prior.next().is_none());
         let _ = std::fs::remove_file(&path);
-        let mut state = State::new(log, UNREGISTER_AFTER_MS);
+        let mut state = State::new(log, UNREGISTER_AFTER_MS, Policy::default());
         for line in lines {
             apply(&mut state, &json::parse(line).unwrap()).unwrap();
         }
@@ -1320,6 +1536,178 @@ mod tests {
             json::stringify(&reply),
             r#"{"type":"receipt","req":3,"mail":"m1","to":"b","from":"a","kind":"directed","headers":{"k":"v"},"accepted_at_ms":5,"record":"r-1","receipted_at_ms":9}"#
         );
+    }
+
+    /// Everything a client can observe of a state, as text.
+    fn observed(st: &State, now: i64) -> Vec<String> {
+        let mut out = vec![
+            json::stringify(&board(st, &json::parse(r#"{"req":0}"#).unwrap()))
+                .split(",\"now_ms\"")
+                .next()
+                .unwrap()
+                .to_string(),
+        ];
+        let mut ids: Vec<&String> = st.mails.keys().chain(st.culled.iter()).collect();
+        ids.sort();
+        for id in ids {
+            let ask = obj(vec![("req", Value::Int(0)), ("mail", s(id))]);
+            out.push(json::stringify(&receipt(st, &ask).unwrap()));
+            if let Some(m) = st.mails.get(id) {
+                out.push(format!("{id} mark {:?} kind {}", m.mark, m.kind));
+            }
+        }
+        out.push(format!("pushed {:?}", pushed(st, "h", None)));
+        let mut broadcasts: Vec<String> = st
+            .broadcasts
+            .iter()
+            .map(|(id, (from, mark))| format!("broadcast {id} {from} {mark:?}"))
+            .collect();
+        broadcasts.sort();
+        out.extend(broadcasts);
+        out.push(format!("claims {:?}", st.claims.active(now)));
+        let mut takeovers: Vec<String> = st.takeovers.values().map(json::stringify).collect();
+        takeovers.sort();
+        out.extend(takeovers);
+        out
+    }
+
+    const HISTORY: &[&str] = &[
+        r#"{"ev":"session","session":"b","host":"h","at_ms":1}"#,
+        r#"{"ev":"label","session":"b","label":"the b","at_ms":1}"#,
+        r#"{"ev":"declared","session":"b","declared":"{\"x\":1}","at_ms":1}"#,
+        r#"{"ev":"session","session":"c","host":"h"}"#,
+        r#"{"ev":"session","session":"gone","host":"h"}"#,
+        r#"{"ev":"unregister","session":"gone","at_ms":2}"#,
+        r#"{"ev":"takeover","session":"b","old_host":"g","host":"h","at_ms":3,"registration":"reg-1"}"#,
+        r#"{"ev":"claim","key":"held","owner":"b","expires_ms":9000}"#,
+        r#"{"ev":"claim","key":"lapsed","owner":"b","expires_ms":10}"#,
+        r#"{"ev":"claim","key":"freed","owner":"c","expires_ms":9000}"#,
+        r#"{"ev":"release","key":"freed"}"#,
+        r#"{"ev":"mail","mail":"old","from":"a","to":"b","body":"one","headers":{"k":"v"},"accepted_at_ms":100}"#,
+        r#"{"ev":"mail","mail":"unstamped","from":"a","to":"b","body":"two"}"#,
+        r#"{"ev":"mail","mail":"waiting","from":"a","to":"c","body":"three","headers":{},"accepted_at_ms":300}"#,
+        r#"{"ev":"broadcast","mail":"all","from":"a","body":"four","to":["b","c"],"headers":{"h":"1"},"accepted_at_ms":400}"#,
+        r#"{"ev":"mail","mail":"recent","from":"a","to":"b","body":"five","headers":{},"accepted_at_ms":500}"#,
+        r#"{"ev":"receipt","mail":"old","session":"b","record":"r-1","receipted_at_ms":150}"#,
+        r#"{"ev":"receipt","mail":"unstamped","session":"b","record":"r-2"}"#,
+        r#"{"ev":"receipt","mail":"all/b","session":"b","record":"r-3","receipted_at_ms":450}"#,
+        r#"{"ev":"receipt","mail":"recent","session":"b","record":"r-4","receipted_at_ms":950}"#,
+    ];
+
+    #[test]
+    fn a_snapshot_replays_to_the_state_it_was_taken_from() {
+        let now = 1000;
+        let st = replayed("snapshot", HISTORY);
+        let (lines, culled) = snapshot(&st, now);
+        assert!(culled.is_empty(), "nothing is culled without a bound");
+        assert_eq!(
+            lines,
+            [
+                r#"{"ev":"session","session":"b","host":"h"}"#,
+                r#"{"ev":"label","session":"b","label":"the b"}"#,
+                r#"{"ev":"declared","session":"b","declared":"{\"x\":1}"}"#,
+                r#"{"ev":"session","session":"c","host":"h"}"#,
+                r#"{"ev":"takeover","session":"b","old_host":"g","host":"h","at_ms":3,"registration":"reg-1"}"#,
+                r#"{"ev":"claim","key":"held","owner":"b","expires_ms":9000}"#,
+                r#"{"ev":"broadcast","mail":"all","from":"a","body":"","to":[],"settled":{"bytes":4,"mark":"dd33fe790c41dde5"}}"#,
+                r#"{"ev":"mail","mail":"old","from":"a","to":"b","body":"","headers":{"k":"v"},"accepted_at_ms":100,"settled":{"bytes":3,"mark":"1a08aa1921ca5caf"}}"#,
+                r#"{"ev":"receipt","mail":"old","session":"b","record":"r-1","receipted_at_ms":150}"#,
+                r#"{"ev":"mail","mail":"unstamped","from":"a","to":"b","body":"","headers":{},"settled":{"bytes":3,"mark":"5714d319447c9709"}}"#,
+                r#"{"ev":"receipt","mail":"unstamped","session":"b","record":"r-2"}"#,
+                r#"{"ev":"mail","mail":"waiting","from":"a","to":"c","body":"three","headers":{},"accepted_at_ms":300}"#,
+                r#"{"ev":"mail","mail":"all/b","from":"a","to":"b","body":"","headers":{"h":"1"},"accepted_at_ms":400,"kind":"broadcast","settled":{"bytes":4,"mark":"dd33fe790c41dde5"}}"#,
+                r#"{"ev":"receipt","mail":"all/b","session":"b","record":"r-3","receipted_at_ms":450}"#,
+                r#"{"ev":"mail","mail":"all/c","from":"a","to":"c","body":"four","headers":{"h":"1"},"accepted_at_ms":400,"kind":"broadcast"}"#,
+                r#"{"ev":"mail","mail":"recent","from":"a","to":"b","body":"","headers":{},"accepted_at_ms":500,"settled":{"bytes":4,"mark":"aa851578efea8575"}}"#,
+                r#"{"ev":"receipt","mail":"recent","session":"b","record":"r-4","receipted_at_ms":950}"#,
+            ]
+        );
+        let again: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let back = replayed("snapshot-back", &again);
+        assert_eq!(observed(&back, now), observed(&st, now));
+        // What still awaits a Receipt is pushed, in commit order, body intact.
+        assert_eq!(pushed(&back, "h", None), ["waiting", "all/c"]);
+        assert_eq!(back.mails["all/c"].body.as_deref(), Some("four"));
+        // A snapshot of the replayed state is the same snapshot.
+        assert_eq!(snapshot(&back, now).0, lines);
+        // A resend is still told from a different Mail by the restated mark.
+        let m = &back.mails["old"];
+        let was = (m.from.as_str(), Some(m.to.as_str()), m.mark);
+        assert_eq!(resend_differs(was, ("a", Some("b"), "one")), None);
+        assert_eq!(
+            resend_differs(was, ("a", Some("b"), "won")).as_deref(),
+            Some("body")
+        );
+        let (from, mark) = &back.broadcasts["all"];
+        assert_eq!(
+            resend_differs((from, None, *mark), ("a", None, "four")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rotation_culls_what_was_receipted_before_the_bound_and_keeps_its_id() {
+        let now = 1000;
+        let mut st = replayed("cull", HISTORY);
+        st.policy = Policy {
+            rotate_bytes: 1,
+            cull_after_ms: Some(100),
+        };
+        let (lines, culled) = snapshot(&st, now);
+        // Receipted 850 ms ago, receipted with no stamp, receipted 550 ms ago.
+        // `recent` (50 ms ago) and everything unreceipted stay.
+        assert_eq!(culled, ["old", "unstamped", "all/b"]);
+        let tail: Vec<&str> = lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                r#"{"ev":"culled","mail":"all/b"}"#,
+                r#"{"ev":"culled","mail":"old"}"#,
+                r#"{"ev":"culled","mail":"unstamped"}"#,
+            ]
+        );
+        for kept in ["waiting", "all/c", "recent"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("\"mail\":\"{kept}\""))),
+                "{kept}"
+            );
+        }
+        for gone in [
+            "\"mail\":\"old\",\"from\"",
+            "\"mail\":\"unstamped\",\"from\"",
+        ] {
+            assert!(!lines.iter().any(|l| l.contains(gone)), "{gone}");
+        }
+        let again: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut back = replayed("cull-back", &again);
+        back.policy = st.policy;
+        assert_eq!(back.culled.len(), 3);
+        assert!(!back.mails.contains_key("old"));
+        assert_eq!(pushed(&back, "h", None), ["waiting", "all/c"]);
+        // The id is held: its Receipt reads culled, never unknown.
+        let ask = |mail: &str| {
+            let v = obj(vec![("req", Value::Int(1)), ("mail", s(mail))]);
+            json::stringify(&receipt(&back, &v).unwrap())
+        };
+        assert_eq!(
+            ask("old"),
+            r#"{"type":"error","req":1,"mail":"old","reason":"culled mail old: expected its Receipt in this log, saw only its id kept; the Receipt is in an archived log"}"#
+        );
+        assert!(ask("never-sent").contains("unknown mail never-sent"));
+        assert!(ask("recent").contains("\"record\":\"r-4\""));
+        // Culled ids are restated by every later snapshot, and nothing new is
+        // culled twice.
+        let (later, culled) = snapshot(&back, now);
+        assert!(culled.is_empty());
+        assert_eq!(later, lines);
     }
 
     #[test]

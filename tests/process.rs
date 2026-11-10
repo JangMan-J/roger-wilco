@@ -4550,3 +4550,581 @@ fn a_peer_that_does_not_ping_is_not_held_to_the_silence_bound() {
     );
     assert!(!read(&rig.p("daemon-c.out.err")).contains("upstream"));
 }
+
+/// The pace for rotation tests: a log is due after about ten short Mail.
+const ROTATE: [&str; 2] = ["--rotate-bytes", "3000"];
+
+/// The same for a coordinator, which rotates only with a cull bound: ten
+/// years, so these tests cull nothing.
+const ROTATE_KEEPING: [&str; 4] = ["--rotate-bytes", "3000", "--cull-after-ms", "315360000000"];
+
+/// A coordinator does not rotate without a cull bound: every rotation would
+/// restate all Mail ever accepted. It says so and does not start.
+#[test]
+fn a_coordinator_refuses_to_rotate_without_a_cull_bound() {
+    let rig = Rig::new("rotate-needs-cull");
+    let out = Command::new(BIN)
+        .args(["coordinator", "--bind", "127.0.0.1:0", "--data"])
+        .arg(rig.p("coord.log"))
+        .args(ROTATE)
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("expected --cull-after-ms with --rotate-bytes on a coordinator"),
+        "{out:?}"
+    );
+    assert!(!rig.p("coord.log").exists());
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| s.to_string()).collect()
+}
+
+/// Send Mail `<tag>0`, `<tag>1`, ... to RECIPIENT until `done` holds, at most
+/// 300 of them; returns how many were sent. A send that fails is not an
+/// error here: the callers stop a process on purpose.
+fn send_until(rig: &Rig, tag: &str, mut done: impl FnMut() -> bool) -> usize {
+    for n in 0..300 {
+        if done() {
+            return n;
+        }
+        let _ = send_as(
+            rig,
+            "a.sock",
+            (SENDER, RECIPIENT),
+            &format!("{tag}{n}"),
+            &format!("body of {tag}{n} {}", "x".repeat(150)),
+        );
+    }
+    panic!("300 Mail sent and the condition never held");
+}
+
+/// A coordinator started with `--rotate-bytes` rotates its log and goes on
+/// exactly as before. The file as it was stays whole beside the fresh one,
+/// which starts with a snapshot. Receipts read the same, a resend is still
+/// told from a different Mail, the claim is still held, the label and the
+/// declared text are still on the Board, and Mail that awaited a session
+/// across the rotation, and across a restart after it, reaches that session
+/// once.
+#[test]
+fn a_rotated_coordinator_log_keeps_everything_and_the_old_file_whole() {
+    let mut rig = Rig::new("rotate-coordinator");
+    rig.coord_extra = strings(&ROTATE_KEEPING);
+    rig.start_stack();
+    rig.start_recipient_with("recipient.out", false, Some("kept label"));
+    let later = "66666666-6666-4666-8666-666666666666";
+    let held = send_as(
+        &rig,
+        "a.sock",
+        (SENDER, later),
+        "held",
+        "for a session not here yet",
+    );
+    assert!(held.status.success(), "{held:?}");
+    assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 600_000).0, 0);
+    rig.send("first", "the first body");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=first",
+        Duration::from_secs(10),
+    );
+    let before = receipt_line(&rig, "first");
+    assert!(before.starts_with("RECEIPT mail=first"), "{before}");
+
+    let sent = send_until(&rig, "m", || rig.p("coord.log.2").exists());
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=m{}", sent - 1),
+        Duration::from_secs(20),
+    );
+    // The first archive is the log as it was: it starts with the first event
+    // ever committed and holds the first Mail with its body.
+    let archive = read(&rig.p("coord.log.1"));
+    assert!(archive.starts_with("{\"ev\":\"session\""), "{archive}");
+    assert!(archive.contains("\"mail\":\"first\""), "{archive}");
+    assert!(archive.contains("\"body\":\"the first body\""), "{archive}");
+    assert!(!archive.contains("\"snapshot\""), "{archive}");
+    // The live file starts with a snapshot that names the archive before it,
+    // restates the held Mail with its body, and the first Mail without.
+    let live = read(&rig.p("coord.log"));
+    assert!(
+        live.starts_with("{\"snapshot\":2,\"prior\":\"coord.log.2\",\"at_ms\":"),
+        "{live}"
+    );
+    assert!(
+        live.contains("\"body\":\"for a session not here yet\""),
+        "{live}"
+    );
+    assert!(!live.contains("the first body"), "{live}");
+    assert!(read(&rig.p("coord.log.2")).starts_with("{\"snapshot\":1,\"prior\":\"coord.log.1\""));
+    assert!(read(&rig.p("coord.out.err")).contains("coordinator log rotated: archive 1"));
+
+    let check = |rig: &Rig| {
+        assert_eq!(receipt_line(rig, "first"), before);
+        let again = send_as(
+            rig,
+            "a.sock",
+            (SENDER, RECIPIENT),
+            "first",
+            "the first body",
+        );
+        assert!(again.status.success(), "{again:?}");
+        let other = send_as(rig, "a.sock", (SENDER, RECIPIENT), "first", "another body");
+        assert!(
+            String::from_utf8_lossy(&other.stderr).contains("saw a different body"),
+            "{other:?}"
+        );
+        let shown = board(rig, "a.sock");
+        assert!(shown.contains("label=kept label"), "{shown}");
+        assert!(
+            shown.contains(&format!("CLAIM holder={RECIPIENT} ")),
+            "{shown}"
+        );
+        assert!(receipt_line(rig, "held").starts_with("PENDING mail=held"));
+    };
+    check(&rig);
+    // The audit reads the archives and the live file as one history, and the
+    // live file alone as what the last rotation kept: the same Mail either
+    // way, one of them still awaiting its Receipt.
+    let whole = audit_summary(&rig, &["coord.log.1", "coord.log.2", "coord.log"]);
+    let mails = sent + 2;
+    assert!(
+        whole.contains(&format!(
+            " mails={mails} receipted={} unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0 snapshots=2 culled=0",
+            mails - 1
+        )),
+        "{whole}"
+    );
+    let alone = audit_summary(&rig, &["coord.log"]);
+    assert!(
+        alone.contains(&format!(
+            " mails={mails} receipted={} unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0 snapshots=1 culled=0",
+            mails - 1
+        )),
+        "{alone}"
+    );
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    wait_connected(&rig, "a.sock", true);
+    check(&rig);
+    start_session(&mut rig, "a.sock", later, "later.store", "later.out");
+    wait_for_text(
+        &rig.p("later.out"),
+        "DELIVERED mail=held",
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        read(&rig.p("later.store"))
+            .matches("for a session not here yet")
+            .count(),
+        1
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("recipient.store")), "\"mail\":\"first\""),
+        1
+    );
+}
+
+/// The `AUDIT` summary line of `roger audit` over these coordinator files, in order.
+fn audit_summary(rig: &Rig, files: &[&str]) -> String {
+    let mut cmd = Command::new(BIN);
+    cmd.arg("audit");
+    for file in files {
+        cmd.arg("--coordinator-log").arg(rig.p(file));
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// With `--cull-after-ms`, a rotation leaves only the id of Mail receipted
+/// longer ago than that. The id is still held: its Receipt reads culled, not
+/// unknown, a send under it is accepted and commits nothing, and that holds
+/// after a restart. Mail awaiting its Receipt is never culled. Without the
+/// flag nothing is ever culled (the test above).
+#[test]
+fn a_rotation_with_a_cull_bound_keeps_only_the_id_of_old_receipted_mail() {
+    let mut rig = Rig::new("cull-coordinator");
+    rig.coord_extra = strings(&["--rotate-bytes", "3000", "--cull-after-ms", "1"]);
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let later = "66666666-6666-4666-8666-666666666666";
+    let held = send_as(
+        &rig,
+        "a.sock",
+        (SENDER, later),
+        "held",
+        "never culled while it waits",
+    );
+    assert!(held.status.success(), "{held:?}");
+    rig.send("first", "the first body");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=first",
+        Duration::from_secs(10),
+    );
+    let sent = send_until(&rig, "m", || rig.p("coord.log.2").exists());
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=m{}", sent - 1),
+        Duration::from_secs(20),
+    );
+    let check = |rig: &Rig| {
+        let out = Command::new(BIN)
+            .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+            .args(["--mail", "first"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "culled mail first: expected its Receipt in this log, saw only its id kept"
+            ),
+            "{out:?}"
+        );
+        // Under a culled id nothing is compared and nothing is committed.
+        let again = send_as(
+            rig,
+            "a.sock",
+            (SENDER, RECIPIENT),
+            "first",
+            "a different body",
+        );
+        assert!(again.status.success(), "{again:?}");
+        assert!(receipt_line(rig, "held").starts_with("PENDING mail=held"));
+    };
+    check(&rig);
+    let live = read(&rig.p("coord.log"));
+    assert!(
+        live.contains("{\"ev\":\"culled\",\"mail\":\"first\"}"),
+        "{live}"
+    );
+    assert!(
+        live.contains("\"body\":\"never culled while it waits\""),
+        "{live}"
+    );
+    // The live file alone: what was culled is listed as culled and is not
+    // awaiting anything; only the held Mail is.
+    let alone = audit_summary(&rig, &["coord.log"]);
+    assert!(alone.contains(" unreceipted=1 "), "{alone}");
+    assert!(!alone.contains(" culled=0"), "{alone}");
+    // With its archives the history is whole again, culled Mail included.
+    let whole = audit_summary(&rig, &["coord.log.1", "coord.log.2", "coord.log"]);
+    assert!(
+        whole.contains(&format!(
+            " mails={} receipted={} unreceipted=1 ",
+            sent + 2,
+            sent + 1
+        )),
+        "{whole}"
+    );
+    // The archive still holds the whole Mail and its Receipt.
+    let archive = read(&rig.p("coord.log.1"));
+    assert!(archive.contains("\"body\":\"the first body\""), "{archive}");
+    assert!(
+        archive.contains("{\"ev\":\"receipt\",\"mail\":\"first\""),
+        "{archive}"
+    );
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    check(&rig);
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(count_lines_with(&store, "\"mail\":\"first\""), 1, "{store}");
+    assert!(!store.contains("a different body"), "{store}");
+}
+
+/// The coordinator stops, as in a crash, at each step of a rotation: with the
+/// fresh file written and not in place, with the old file also under its
+/// archive name, and with the fresh file in place. Restarted, it has every
+/// Mail it accepted: each is stored once, each has its Receipt, and the next
+/// rotation completes under the archive name the stopped one chose.
+#[test]
+fn a_coordinator_stopped_at_any_step_of_a_rotation_restarts_with_everything() {
+    for step in ["written", "linked", "renamed"] {
+        let mut rig = Rig::new(&format!("rotate-crash-{step}"));
+        rig.coord_extra = strings(&ROTATE_KEEPING);
+        rig.coord_extra
+            .extend(strings(&["--crash-at-rotate", step]));
+        rig.start_stack();
+        rig.start_recipient("recipient.out", false);
+        let coord = rig.children[rig.coord_idx].id();
+        let sent = send_until(&rig, "c", || exited(coord));
+        assert!(sent > 3, "{step}: stopped after {sent}");
+        assert_eq!(
+            rig.p("coord.log.1").exists(),
+            step != "written",
+            "{step}: archive name"
+        );
+        assert_eq!(
+            read(&rig.p("coord.log")).starts_with("{\"snapshot\":1,"),
+            step == "renamed",
+            "{step}: which file the path names"
+        );
+        rig.coord_unreachable = true;
+        rig.coord_extra = strings(&ROTATE_KEEPING);
+        rig.restart_coordinator();
+        wait_until_board_reaches_both(&rig);
+        wait_connected(&rig, "a.sock", true);
+        // Every id again, as a sender that lost its answer would: a resend of
+        // what was committed, a first send of what was not.
+        for n in 0..sent {
+            let out = send_as(
+                &rig,
+                "a.sock",
+                (SENDER, RECIPIENT),
+                &format!("c{n}"),
+                &format!("body of c{n} {}", "x".repeat(150)),
+            );
+            assert!(out.status.success(), "{step} c{n}: {out:?}");
+        }
+        rig.send("last", "after the restart");
+        wait_for_text(
+            &rig.p("recipient.out"),
+            "DELIVERED mail=last",
+            Duration::from_secs(20),
+        );
+        let store = read(&rig.p("recipient.store"));
+        for n in 0..sent {
+            assert_eq!(
+                count_lines_with(&store, &format!("\"mail\":\"c{n}\"")),
+                1,
+                "{step}: c{n} in the Store"
+            );
+            assert!(
+                receipt_line(&rig, &format!("c{n}")).starts_with("RECEIPT"),
+                "{step}: c{n}"
+            );
+        }
+        assert!(rig.p("coord.log.1").exists(), "{step}");
+        assert!(!rig.p("coord.log.next").exists(), "{step}");
+        assert!(
+            read(&rig.p("coord.log.1")).starts_with("{\"ev\":\"session\""),
+            "{step}: the archive is the log as it was"
+        );
+    }
+}
+
+/// A host daemon started with `--rotate-bytes` rotates its log too. Mail it
+/// holds for a session that is not connected is restated and reaches that
+/// session after a daemon restart with the coordinator down; the receipt
+/// then waits, across the coordinator's return, and arrives.
+#[test]
+fn a_rotated_host_daemon_log_keeps_the_mail_it_holds() {
+    let mut rig = Rig::new("rotate-daemon");
+    rig.daemon_extra = strings(&ROTATE);
+    rig.start_stack();
+    let absent = "66666666-6666-4666-8666-666666666666";
+    // Registered on host-b and gone again: its Mail is routed to that host.
+    let idx = start_session(&mut rig, "b.sock", absent, "absent.store", "absent1.out");
+    rig.kill(idx);
+    wait_until(|| {
+        !board(&rig, "a.sock").contains(&format!("address={absent} host=host-b connected=true"))
+    });
+    let held = send_as(
+        &rig,
+        "a.sock",
+        (SENDER, absent),
+        "held",
+        "kept by the host daemon",
+    );
+    assert!(held.status.success(), "{held:?}");
+    wait_for_text(
+        &rig.p("b.log"),
+        "\"mail\":\"held\"",
+        Duration::from_secs(10),
+    );
+
+    rig.start_recipient("recipient.out", false);
+    let sent = send_until(&rig, "d", || rig.p("b.log.2").exists());
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=d{}", sent - 1),
+        Duration::from_secs(20),
+    );
+    assert!(read(&rig.p("daemon-b.out.err")).contains("host daemon log rotated: archive 1"));
+    let archive = read(&rig.p("b.log.1"));
+    assert!(archive.contains("\"mail\":\"held\""), "{archive}");
+    assert!(!archive.contains("\"snapshot\""), "{archive}");
+    let live = read(&rig.p("b.log"));
+    assert!(
+        live.starts_with("{\"snapshot\":2,\"prior\":\"b.log.2\"}"),
+        "{live}"
+    );
+    assert!(
+        live.contains("\"body\":\"kept by the host daemon\""),
+        "{live}"
+    );
+    // What is acked here and receipted there is not restated.
+    assert!(!live.contains("\"mail\":\"d0\""), "{live}");
+
+    rig.kill(rig.coord_idx);
+    rig.restart_recipient_daemon();
+    start_session(&mut rig, "b.sock", absent, "absent.store", "absent2.out");
+    wait_for_text(
+        &rig.p("absent2.out"),
+        "STORED mail=held",
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        read(&rig.p("absent.store"))
+            .matches("kept by the host daemon")
+            .count(),
+        1
+    );
+    rig.restart_coordinator();
+    let start = Instant::now();
+    while !receipt_output(&rig, "held").starts_with("RECEIPT mail=held") {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the receipt never reached the coordinator: {}",
+            receipt_output(&rig, "held")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// True once the process `pid` has ended, reaped or not.
+fn exited(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        // The state follows the command name, which ends at the last `)`.
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .is_none_or(|rest| rest.trim_start().starts_with('Z')),
+    }
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !condition() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the condition never held"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `roger receipt` through host-a, stdout or the failure text.
+fn receipt_output(rig: &Rig, mail: &str) -> String {
+    let output = Command::new(BIN)
+        .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--mail", mail])
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+/// A build from before rotation existed reads a rotated coordinator log. It
+/// knows nothing of the snapshot lines and skips them; the lines between them
+/// are in the vocabulary it has always read. So after a roll back, Mail that
+/// awaited its Receipt is still delivered, and receipted Mail still reads
+/// receipted and is not accepted again as new.
+#[test]
+fn a_build_from_before_rotation_reads_a_rotated_coordinator_log() {
+    // A tree exported without its history has no earlier build to run.
+    if !Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.git")).exists() {
+        eprintln!("not run: this tree has no history to build an earlier roger from");
+        return;
+    }
+    // The last commit before rotation, queued writers and the rest.
+    let built = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/legacy-roger"))
+        .arg("692d461cefb04c136e5e8d8756734d45e9c50f51")
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let earlier = String::from_utf8_lossy(&built.stdout).trim().to_string();
+
+    let mut rig = Rig::new("rotate-rollback");
+    rig.coord_extra = strings(&ROTATE_KEEPING);
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let later = "66666666-6666-4666-8666-666666666666";
+    let held = send_as(
+        &rig,
+        "a.sock",
+        (SENDER, later),
+        "held",
+        "across the roll back",
+    );
+    assert!(held.status.success(), "{held:?}");
+    rig.send("first", "the first body");
+    let sent = send_until(&rig, "m", || rig.p("coord.log.1").exists());
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail=m{}", sent - 1),
+        Duration::from_secs(20),
+    );
+    assert!(read(&rig.p("coord.log")).starts_with("{\"snapshot\":1,"));
+
+    // The earlier coordinator, on the same port and the same live file.
+    rig.kill(rig.coord_idx);
+    let bind = format!("127.0.0.1:{}", rig.coord_port);
+    let port_file = rig.p("earlier.port");
+    let start = Instant::now();
+    loop {
+        let out = fs::File::create(rig.p("earlier.out")).unwrap();
+        let err = fs::File::create(rig.p("earlier.err")).unwrap();
+        let mut child = Command::new(&earlier)
+            .args(["coordinator", "--bind", &bind, "--port-file"])
+            .arg(&port_file)
+            .arg("--data")
+            .arg(rig.p("coord.log"))
+            .env("ROGER_TOKEN", TOKEN)
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline && !port_file.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if port_file.exists() {
+            rig.children.push(child);
+            break;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the earlier coordinator never bound {bind}: {}",
+            read(&rig.p("earlier.err"))
+        );
+    }
+    rig.coord_unreachable = false;
+    wait_until_board_reaches_both(&rig);
+    wait_connected(&rig, "a.sock", true);
+    assert!(receipt_line(&rig, "first").starts_with("RECEIPT mail=first"));
+    let again = send_as(
+        &rig,
+        "a.sock",
+        (SENDER, RECIPIENT),
+        "first",
+        "the first body",
+    );
+    assert!(again.status.success(), "{again:?}");
+    start_session(&mut rig, "a.sock", later, "later.store", "later.out");
+    wait_for_text(
+        &rig.p("later.out"),
+        "DELIVERED mail=held",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(count_lines_with(&store, "\"mail\":\"first\""), 1, "{store}");
+}

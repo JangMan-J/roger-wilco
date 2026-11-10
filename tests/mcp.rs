@@ -924,6 +924,294 @@ fn sigkill_between_the_store_write_and_the_ack_loses_nothing_and_stores_once() {
     );
 }
 
+// ---- rotation of the Store ----
+
+fn tombstone(record: &str, mail: &str) -> String {
+    format!(r#"{{"record":"{record}","mail":"{mail}","culled":true}}"#)
+}
+
+#[test]
+fn with_cull_a_rotation_spares_what_the_inbox_has_not_returned_and_the_position_keeps_its_place() {
+    let rig = Rig::new("cull");
+    let mut a = rig.session("a", A1, &[]);
+    let flags = ["--rotate-bytes", "2000", "--cull"];
+    let mut b = rig.session("b", A2, &flags);
+    let send = |a: &mut Mcp, m: &str, body: &str| {
+        a.ok(
+            "roger_send",
+            &format!(r#"{{"to":"{A2}","mail":"{m}","body":"{body}"}}"#),
+        );
+        until(&format!("{m} acked"), 10, || {
+            rig.receipt_line(m).starts_with("RECEIPT").then_some(())
+        });
+    };
+    for m in ["q1", "q2", "q3"] {
+        send(&mut a, m, m);
+    }
+    let r = b.ok("roger_inbox", r#"{"limit":2}"#);
+    assert_eq!(mails(&r), ["q1", "q2"]);
+    assert_eq!(s(&r, "cursor"), "r-2");
+    let read = |name: &str| fs::read_to_string(rig.p(name)).unwrap_or_default();
+
+    // q4 makes the Store due while the server runs. A rotation is done
+    // before its Ack, and the first restates every entry as it was.
+    let before = read("b.store");
+    send(&mut a, "q4", &"4".repeat(3000));
+    let archive = read("b.store.1");
+    assert!(archive.starts_with(&before), "{archive}");
+    let old: Vec<&str> = archive.lines().collect();
+    assert_eq!(old.len(), 4, "{archive}");
+    let first = format!(
+        "{{\"snapshot\":1,\"prior\":\"b.store.1\",\"next_record\":5}}\n{archive}{{\"snapshot_end\":1}}\n"
+    );
+    assert_eq!(read("b.store"), first);
+
+    // q5 makes it due again. The second culls what the first restated and
+    // the inbox has returned (q1, q2), and keeps q3 and q4, which it has not,
+    // and q5, which came after the block.
+    send(&mut a, "q5", &"5".repeat(4000));
+    let archive = read("b.store.2");
+    let q5 = archive
+        .strip_prefix(&first)
+        .unwrap_or_else(|| panic!("archive 2 is the file as it was: {archive}"));
+    assert_eq!(q5.lines().count(), 1, "{archive}");
+    assert_eq!(
+        read("b.store"),
+        format!(
+            "{{\"snapshot\":2,\"prior\":\"b.store.2\",\"next_record\":6}}\n{}\n{}\n{}\n{}\n{q5}{{\"snapshot_end\":2}}\n",
+            tombstone("r-1", "q1"),
+            tombstone("r-2", "q2"),
+            old[2],
+            old[3]
+        ),
+        "what the inbox returned is culled, what it has not is kept as it was"
+    );
+
+    // The position, now on a tombstone, keeps its place, here and after a
+    // restart; a tombstone is never an inbox item.
+    let peeked = b.ok("roger_inbox", r#"{"peek":true,"wait_seconds":0}"#);
+    assert_eq!(mails(&peeked), ["q3", "q4", "q5"]);
+    b.close_stdin();
+    assert_eq!(b.wait_exit().code(), Some(0));
+    let mut b = rig.session("b", A2, &flags);
+    let r = b.ok("roger_inbox", r#"{"wait_seconds":0}"#);
+    assert_eq!(mails(&r), ["q3", "q4", "q5"]);
+    assert_eq!(s(&r, "cursor"), "r-5");
+    assert_eq!(s(&arr(&r, "mail")[1], "body").len(), 3000);
+    assert!(mails(&b.ok("roger_inbox", r#"{"wait_seconds":0}"#)).is_empty());
+}
+
+#[test]
+fn with_cull_nothing_is_culled_before_the_read_position_names_a_record() {
+    let rig = Rig::new("cull-unread");
+    let entry = |r: &str, m: &str, body: &str| {
+        format!(
+            r#"{{"record":"{r}","mail":"{m}","from":"{A1}","body":"{body}","kind":"directed","headers":{{}}}}"#
+        )
+    };
+    let (n1, n2, n3) = (
+        entry("r-1", "n1", "one"),
+        entry("r-2", "n2", "two"),
+        entry("r-3", "n3", &"3".repeat(600)),
+    );
+    let lines = format!("{n1}\n{n2}\n{n3}\n");
+    // No read position, then one that names no record in this Store.
+    for (name, cursor) in [("c", None), ("d", Some("r-99"))] {
+        // A Store rotated once, then grown by more than its block: due at start.
+        fs::write(rig.p(&format!("{name}.store.1")), format!("{n1}\n{n2}\n")).unwrap();
+        fs::write(
+            rig.p(&format!("{name}.store")),
+            format!(
+                "{{\"snapshot\":1,\"prior\":\"{name}.store.1\",\"next_record\":3}}\n{n1}\n{n2}\n{{\"snapshot_end\":1}}\n{n3}\n"
+            ),
+        )
+        .unwrap();
+        if let Some(c) = cursor {
+            fs::write(rig.p(&format!("{name}.store.cursor")), format!("{c}\n")).unwrap();
+        }
+        let address = if name == "c" { A1 } else { A2 };
+        let mut m = rig.session(name, address, &["--rotate-bytes", "64", "--cull"]);
+        assert_eq!(
+            fs::read_to_string(rig.p(&format!("{name}.store"))).unwrap(),
+            format!(
+                "{{\"snapshot\":2,\"prior\":\"{name}.store.2\",\"next_record\":4}}\n{lines}{{\"snapshot_end\":2}}\n"
+            ),
+            "{name}: the rotation kept every entry whole"
+        );
+        let r = m.ok("roger_inbox", r#"{"wait_seconds":0}"#);
+        assert_eq!(mails(&r), ["n1", "n2", "n3"], "{name}");
+    }
+}
+
+#[test]
+fn a_read_position_on_a_tombstone_keeps_its_place_past_an_entry_before_it() {
+    let rig = Rig::new("tombstone-position");
+    let entry = |r: &str, m: &str| {
+        format!(
+            r#"{{"record":"{r}","mail":"{m}","from":"{A1}","body":"{m}","kind":"directed","headers":{{}}}}"#
+        )
+    };
+    // No rotation here leaves an entry before a culled read position; a Store
+    // written or edited another way may, and the inbox still starts after
+    // the position, never again from the first entry.
+    fs::write(
+        rig.p("b.store"),
+        format!(
+            "{}\n{}\n{}\n",
+            entry("r-1", "v1"),
+            tombstone("r-2", "v2"),
+            entry("r-3", "v3")
+        ),
+    )
+    .unwrap();
+    fs::write(rig.p("b.store.cursor"), "r-2\n").unwrap();
+    let mut b = rig.session("b", A2, &[]);
+    let r = b.ok("roger_inbox", r#"{"wait_seconds":0}"#);
+    assert_eq!(mails(&r), ["v3"]);
+    assert_eq!(s(&r, "cursor"), "r-3");
+}
+
+#[test]
+fn a_waiting_inbox_read_ends_at_a_delivery_that_rotates_the_store() {
+    let rig = Rig::new("rotate-wait");
+    let mut a = rig.session("a", A1, &[]);
+    let mut b = rig.session("b", A2, &["--rotate-bytes", "2000"]);
+    for m in ["w1", "w2"] {
+        a.ok(
+            "roger_send",
+            &format!(r#"{{"to":"{A2}","mail":"{m}","body":"{m}"}}"#),
+        );
+    }
+    until("w2 in the Store", 10, || {
+        (store_lines(&rig.p("b.store"), r#""mail":"w2""#) == 1).then_some(())
+    });
+    assert_eq!(mails(&b.ok("roger_inbox", "{}")), ["w1", "w2"]);
+
+    // A read waits; the delivery that ends the wait also rotates the Store.
+    let waiting = b.request_tool("roger_inbox", r#"{"wait_seconds":30}"#);
+    let big = "3".repeat(3000);
+    a.ok(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"w3","body":"{big}"}}"#),
+    );
+    let (err, text) = Mcp::result_of(&b.response(waiting, 15));
+    assert!(!err, "{text}");
+    let r = json::parse(&text).unwrap();
+    assert_eq!(mails(&r), ["w3"]);
+    assert_eq!(s(&r, "cursor"), "r-3");
+    let archive = fs::read_to_string(rig.p("b.store.1")).unwrap();
+    assert_eq!(archive.lines().count(), 3, "{archive}");
+
+    // The next delivery follows the snapshot block and is read in its place.
+    a.ok(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"w4","body":"w4"}}"#),
+    );
+    let r = b.ok("roger_inbox", r#"{"wait_seconds":10}"#);
+    assert_eq!(mails(&r), ["w4"]);
+    assert_eq!(s(&r, "cursor"), "r-4");
+    let store = fs::read_to_string(rig.p("b.store")).unwrap();
+    let block = format!(
+        "{{\"snapshot\":1,\"prior\":\"b.store.1\",\"next_record\":4}}\n{archive}{{\"snapshot_end\":1}}\n"
+    );
+    let after = store
+        .strip_prefix(&block)
+        .unwrap_or_else(|| panic!("expected the snapshot block, saw {store}"));
+    assert!(
+        after.starts_with(r#"{"record":"r-4","mail":"w4","#),
+        "{store}"
+    );
+    assert_eq!(after.lines().count(), 1, "{store}");
+}
+
+#[test]
+fn the_inbox_skips_snapshot_lines_and_tombstones_and_a_culled_mail_keeps_its_record() {
+    let rig = Rig::new("tombstones");
+    let mut a = rig.session("a", A1, &[]);
+    let entry = |r: &str, m: &str, body: &str| {
+        format!(
+            r#"{{"record":"{r}","mail":"{m}","from":"{A1}","body":"{body}","kind":"directed","headers":{{}}}}"#
+        )
+    };
+    let seeded = format!(
+        "{{\"snapshot\":2,\"prior\":\"b.store.2\",\"next_record\":4}}\n{}\n{}\n{}\n{{\"snapshot_end\":2}}\n{}\n",
+        tombstone("r-1", "t1"),
+        entry("r-2", "t2", "kept"),
+        tombstone("r-3", "t3"),
+        entry("r-4", "t4", "after")
+    );
+    fs::write(rig.p("b.store"), &seeded).unwrap();
+    let mut b = rig.session("b", A2, &[]);
+    let r = b.ok("roger_inbox", r#"{"wait_seconds":0}"#);
+    assert_eq!(mails(&r), ["t2", "t4"]);
+    assert!(
+        arr(&r, "mail").iter().all(|m| m.get("culled").is_none()),
+        "{r:?}"
+    );
+    assert_eq!(s(&r, "cursor"), "r-4");
+
+    // A culled Mail delivered again is acked with its own Record id; nothing
+    // is stored.
+    a.ok(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"t3","body":"again"}}"#),
+    );
+    until("the receipt of t3", 10, || {
+        rig.receipt_line("t3")
+            .starts_with("RECEIPT")
+            .then(|| rig.receipt_line("t3"))
+    });
+    assert!(
+        rig.receipt_line("t3").contains(" record=r-3 "),
+        "{}",
+        rig.receipt_line("t3")
+    );
+    assert_eq!(fs::read_to_string(rig.p("b.store")).unwrap(), seeded);
+
+    // New Mail numbers on from the snapshot: four, one entry after it, then this.
+    a.ok(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"t5","body":"new"}}"#),
+    );
+    let r = b.ok("roger_inbox", r#"{"wait_seconds":10}"#);
+    assert_eq!(mails(&r), ["t5"]);
+    assert_eq!(s(&arr(&r, "mail")[0], "record"), "r-5");
+}
+
+#[test]
+fn a_default_store_with_a_snapshot_or_an_archive_is_kept_at_exit() {
+    let rig = Rig::new("default-rotated");
+    let state = rig.p("state");
+    let dir = state.join("roger/mcp");
+    fs::create_dir_all(&dir).unwrap();
+    // A snapshot block that restates nothing, and an empty Store with an
+    // archive beside it: neither holds an entry, both have held Mail.
+    let block =
+        "{\"snapshot\":1,\"prior\":\"snap.store.1\",\"next_record\":3}\n{\"snapshot_end\":1}\n";
+    fs::write(dir.join("snap.store"), block).unwrap();
+    fs::write(dir.join("arch.store"), "").unwrap();
+    fs::write(
+        dir.join("arch.store.1"),
+        format!(
+            "{{\"record\":\"r-1\",\"mail\":\"x\",\"from\":\"{A1}\",\"body\":\"b\",\"kind\":\"directed\",\"headers\":{{}}}}\n"
+        ),
+    )
+    .unwrap();
+    for id in ["snap", "arch"] {
+        let mut m = rig.mcp(
+            id,
+            &["--id", id],
+            &[("XDG_STATE_HOME", state.to_str().unwrap())],
+        );
+        m.initialize();
+        m.close_stdin();
+        assert_eq!(m.wait_exit().code(), Some(0), "{}", m.stderr());
+        assert!(dir.join(format!("{id}.store")).exists(), "{id}");
+    }
+    assert_eq!(fs::read_to_string(dir.join("snap.store")).unwrap(), block);
+    assert!(dir.join("arch.store.1").exists());
+}
+
 // ---- board, label, claims ----
 
 #[test]

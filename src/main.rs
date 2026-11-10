@@ -50,13 +50,20 @@ const USAGE: &str = "Usage: roger <command> [flags]
 Commands:
   coordinator --bind <address:port> --data <log>
               [--port-file <path>] [--unregister-after-ms <ms>]
+              [--rotate-bytes <n> --cull-after-ms <ms>]
+                 (rotate the log after n bytes of growth, keeping only the id of Mail receipted
+                  longer ago than ms; the old file is kept whole; one flag needs the other)
   daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
+              [--rotate-bytes <n>]
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+              [--rotate-bytes <n> [--cull]]   (with --cull a rotation keeps only the ids of Mail the one before it restated)
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+              [--rotate-bytes <n> [--cull]]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
               [--superseded]   (also emit replacement notices on stdout; stderr always warns)
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
               [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
+              [--rotate-bytes <n> [--cull]]
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
               [--header <key=value>]...
   claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
@@ -65,7 +72,7 @@ Commands:
   board       --socket <path> [--from <address>]
   label       --socket <path> --from <address> --label <text>
   receipt     --socket <path> --mail <id>
-  audit       [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
+  audit       [--coordinator-log <file>]... [--daemon-log <file>]... [--store <file>]...
               [--address <address>] [--bodies] [--json]   (read-only; no lock, no write)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
@@ -82,6 +89,10 @@ fn main() -> io::Result<()> {
     #[cfg(feature = "test-hooks")]
     if let Some(ms) = arg(&args, "--link-pace-ms").and_then(|ms| ms.parse().ok()) {
         let _ = net::LINK_PACE.set(std::time::Duration::from_millis(ms));
+    }
+    #[cfg(feature = "test-hooks")]
+    if let Some(step) = arg(&args, "--crash-at-rotate") {
+        let _ = durlog::CRASH_AT_ROTATE.set(step);
     }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     if matches!(cmd, "--help" | "-h" | "help") {
@@ -103,6 +114,7 @@ fn main() -> io::Result<()> {
                 })?,
                 None => coordinator::UNREGISTER_AFTER_MS,
             },
+            durlog::Policy::from_args(&args)?,
         ),
         "daemon" => daemon::run(daemon::Config {
             coordinator: need(&args, "--coordinator")?,
@@ -110,6 +122,7 @@ fn main() -> io::Result<()> {
             host_id: need(&args, "--host-id")?,
             socket: PathBuf::from(need(&args, "--socket")?),
             data: PathBuf::from(need(&args, "--data")?),
+            policy: durlog::Policy::from_args(&args)?,
         }),
         "session" => session::run(
             PathBuf::from(need(&args, "--socket")?),
@@ -118,7 +131,7 @@ fn main() -> io::Result<()> {
                 None => session::gen_uuid()?,
             },
             arg(&args, "--label"),
-            PathBuf::from(need(&args, "--store")?),
+            session::Store::from_args(PathBuf::from(need(&args, "--store")?), &args)?,
             arg(&args, "--declare"),
         ),
         "adapter" => session::adapter(
@@ -128,7 +141,7 @@ fn main() -> io::Result<()> {
                 None => session::gen_uuid()?,
             },
             arg(&args, "--label"),
-            PathBuf::from(need(&args, "--store")?),
+            session::Store::from_args(PathBuf::from(need(&args, "--store")?), &args)?,
             arg(&args, "--declare"),
             args.iter().any(|a| a == "--registered"),
             args.iter().any(|a| a == "--superseded"),

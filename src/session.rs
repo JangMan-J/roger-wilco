@@ -3,14 +3,56 @@
 //! Store record. It knows nothing about the core beyond the socket.
 
 use crate::claims::Op;
-use crate::durlog::DurLog;
+use crate::durlog::{DurLog, Policy};
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write};
+use std::io::{self, BufRead, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// A session's Store: the file it writes each delivery to, when that file
+/// rotates (`--rotate-bytes`), and whether a rotation culls (`--cull`).
+pub struct Store {
+    pub path: PathBuf,
+    pub policy: Policy,
+    pub cull: bool,
+}
+
+impl Store {
+    /// The Store at `path` with the rotation flags on a session's command
+    /// line: `--rotate-bytes <n>`, and `--cull`, which needs it. A Store has
+    /// no clock, so the coordinator's `--cull-after-ms` is refused here.
+    pub fn from_args(path: PathBuf, args: &[String]) -> io::Result<Store> {
+        let (policy, cull) = rotation(args)?;
+        Ok(Store { path, policy, cull })
+    }
+}
+
+/// `--rotate-bytes <n>` and `--cull` from a session's command line.
+pub fn rotation(args: &[String]) -> io::Result<(Policy, bool)> {
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
+    if args.iter().any(|a| a == "--cull-after-ms") {
+        return Err(bad(
+            "expected --cull to cull a Store at its rotations (a Store has no clock; --cull-after-ms is the coordinator's), saw --cull-after-ms"
+                .into(),
+        ));
+    }
+    let policy = Policy::from_args(args)?;
+    let cull = args.iter().any(|a| a == "--cull");
+    if cull && policy.rotate_bytes == 0 {
+        let saw = if args.iter().any(|a| a == "--rotate-bytes") {
+            "--rotate-bytes 0"
+        } else {
+            "none"
+        };
+        return Err(bad(format!(
+            "expected --rotate-bytes above 0 with --cull (culling happens when a Store rotates), saw {saw}"
+        )));
+    }
+    Ok((policy, cull))
+}
 
 /// Test hook (feature `test-hooks` only): when set, the first delivery is
 /// written to the Store, the marker file is created, and the session parks
@@ -27,8 +69,12 @@ pub struct McpHooks {
     pub registered: Option<Box<dyn FnOnce(net::Writer) + Send>>,
     /// Called after each delivery has reached the Store, never before.
     pub stored: Box<dyn Fn() + Send>,
-    /// Held across a Store write; true once the face is closing, after which
-    /// a delivery is left unstored and unacked so it stays pending.
+    /// The Record id the inbox has returned through, None before it has
+    /// returned any. Asked when the Store rotates: no entry after it is culled.
+    pub position: Box<dyn Fn() -> Option<String> + Send>,
+    /// Held across a Store write and a rotation; true once the face is
+    /// closing, after which a delivery is left unstored and unacked so it
+    /// stays pending.
     pub gate: Arc<Mutex<bool>>,
 }
 
@@ -46,10 +92,10 @@ pub fn run(
     socket: PathBuf,
     id: String,
     label: Option<String>,
-    store_path: PathBuf,
+    store: Store,
     declared: Option<String>,
 ) -> io::Result<()> {
-    serve(socket, id, label, store_path, declared, Face::Tracer)
+    serve(socket, id, label, store, declared, Face::Tracer)
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
@@ -73,7 +119,7 @@ pub fn adapter(
     socket: PathBuf,
     id: String,
     label: Option<String>,
-    store_path: PathBuf,
+    store: Store,
     declared: Option<String>,
     confirm: bool,
     superseded: bool,
@@ -83,7 +129,7 @@ pub fn adapter(
         socket,
         id,
         label,
-        store_path,
+        store,
         declared,
         Face::Adapter(out, confirm, superseded),
     )
@@ -193,7 +239,7 @@ pub fn serve(
     socket: PathBuf,
     id: String,
     label: Option<String>,
-    store_path: PathBuf,
+    store: Store,
     declared: Option<String>,
     face: Face,
 ) -> io::Result<()> {
@@ -203,16 +249,13 @@ pub fn serve(
         Face::Mcp(h) => (None, Some(h), true, true),
     };
     let tracer = client.is_none() && mcp.is_none();
-    let (mut store, prior) = DurLog::open(&store_path)?;
+    let (mut log, prior) = DurLog::open(&store.path)?;
     let mut records: HashMap<String, String> = HashMap::new(); // mail -> record
-    for line in prior {
-        if let Ok(v) = json::parse(&line?) {
-            if let (Ok(mail), Ok(record)) = (net::field(&v, "mail"), net::field(&v, "record")) {
-                records.insert(mail.to_string(), record.to_string());
-            }
-        }
+    let mut next_record = replay(prior, &mut records)?;
+    {
+        let _held = mcp.as_ref().map(|h| h.gate.lock().unwrap());
+        rotate_if_due(&mut log, &store, next_record, &records, mcp.as_ref());
     }
-    let mut next_record = records.len() as u64 + 1;
 
     let conn = UnixStream::connect(&socket).map_err(|e| {
         io::Error::new(
@@ -278,8 +321,9 @@ pub fn serve(
                             ("kind", s(&net::kind_of(&v))),
                             ("headers", net::headers_of(&v)),
                         ]);
-                        store.append(&json::stringify(&entry))?;
+                        log.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
+                        rotate_if_due(&mut log, &store, next_record, &records, mcp.as_ref());
                         drop(held);
                         if let Some(h) = &mcp {
                             (h.stored)();
@@ -376,6 +420,200 @@ pub fn serve(
         }
     }
     Ok(())
+}
+
+/// Read a Store's replay into `records` (Mail id to Record id, from entries
+/// and tombstones alike) and return the next Record number. A file that a
+/// rotation started holds a snapshot block whose `snapshot` line carries
+/// `next_record`, the number that was next when it was written; the entries
+/// appended after its `snapshot_end` each took one more. A file with no
+/// snapshot numbers from 1, one per entry. The lines inside a snapshot block
+/// are never counted: a cull or a hand edit may have left fewer of them than
+/// the Record ids they once took. And the next number is always past the
+/// highest `r-<n>` the file shows anywhere, so a block that lost its
+/// `snapshot_end`, or a `next_record` that was lowered, brings no id back.
+fn replay(
+    prior: impl Iterator<Item = io::Result<String>>,
+    records: &mut HashMap<String, String>,
+) -> io::Result<u64> {
+    let mut snapshot_next: Option<u64> = None;
+    let mut inside = false;
+    let mut since = 0u64;
+    let mut highest = 0u64;
+    for line in prior {
+        let Ok(v) = json::parse(&line?) else {
+            continue;
+        };
+        if v.get("snapshot").is_some() {
+            let next = v
+                .get("next_record")
+                .and_then(Value::as_i64)
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "expected the Store's snapshot line to carry next_record, a whole number from 1, saw {}",
+                            json::stringify(&v)
+                        ),
+                    )
+                })?;
+            snapshot_next = Some(next);
+            inside = true;
+            since = 0;
+            continue;
+        }
+        if v.get("snapshot_end").is_some() {
+            inside = false;
+            continue;
+        }
+        if let (Ok(mail), Ok(record)) = (net::field(&v, "mail"), net::field(&v, "record")) {
+            let fresh = records
+                .insert(mail.to_string(), record.to_string())
+                .is_none();
+            if fresh && !inside {
+                since += 1;
+            }
+            // This session's own ids: `r-` and the number it counted to.
+            if let Some(n) = record
+                .strip_prefix("r-")
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                highest = highest.max(n);
+            }
+        }
+    }
+    Ok((snapshot_next.unwrap_or(1) + since).max(highest.saturating_add(1)))
+}
+
+/// Rotate the Store once it is due under its policy: a fresh file restates
+/// the current one (see `restate`), its `snapshot` line carrying
+/// `next_record`, and the current file stays whole beside it. With `--cull`,
+/// an entry an earlier rotation restated is culled, so a Store keeps its
+/// most recent Mail whole through one rotation. On the MCP face (`mcp`) an
+/// entry the inbox has not returned is never culled, so with no read
+/// position, or one this Store does not hold, nothing is. A rotation that
+/// fails leaves the Store on its old file; the failure goes to stderr and the
+/// session carries on.
+fn rotate_if_due(
+    log: &mut DurLog,
+    store: &Store,
+    next_record: u64,
+    records: &HashMap<String, String>,
+    mcp: Option<&McpHooks>,
+) {
+    if !log.due(&store.policy) {
+        return;
+    }
+    let (cull, through) = match mcp.map(|h| (h.position)()) {
+        None => (store.cull, None),
+        Some(Some(p)) if records.values().any(|r| *r == p) => (store.cull, Some(p)),
+        Some(_) => (false, None),
+    };
+    let lines = std::fs::File::open(&store.path)
+        .and_then(|f| restate(io::BufReader::new(f), cull, through.as_deref()));
+    let rotated = match lines {
+        Ok(lines) => log
+            .rotate(
+                vec![(
+                    "next_record",
+                    Value::Int(i64::try_from(next_record).unwrap_or(i64::MAX)),
+                )],
+                &lines,
+            )
+            .map(|_| ()),
+        // Not tried again on every append: only after more growth.
+        Err(e) => {
+            log.put_off();
+            Err(e)
+        }
+    };
+    if let Err(e) = rotated {
+        eprintln!(
+            "Store {} not rotated, kept on its current file: {e}",
+            store.path.display()
+        );
+    }
+}
+
+/// The lines a rotation restates, read from the Store file in order: each
+/// tombstone as it is, and each entry as it is unless it is culled. With
+/// `cull`, an entry inside the file's snapshot block, which an earlier
+/// rotation already restated, becomes a tombstone that keeps its Record id
+/// and Mail id; an entry after the block, or in a file with no block, is
+/// kept. `through` is the Record id a reader has returned through: no entry
+/// after it is culled. Snapshot lines and anything that is neither an entry
+/// nor a tombstone are left to the archive.
+fn restate(mut file: impl BufRead, cull: bool, through: Option<&str>) -> io::Result<Vec<String>> {
+    /// One entry or tombstone of the file.
+    struct Held {
+        line: String,
+        record: String,
+        mail: String,
+        tombstone: bool,
+        inside: bool,
+    }
+    let mut held: Vec<Held> = Vec::new();
+    let mut inside = false;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Only complete lines: a fragment at the end is no entry yet.
+        if file.read_until(b'\n', &mut buf)? == 0 || buf.last() != Some(&b'\n') {
+            break;
+        }
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        // Read as the replay reads it, so a line the session counts is a
+        // line this restates: bytes that are not UTF-8 do not lose the line.
+        let line = String::from_utf8_lossy(&buf).into_owned();
+        let Ok(v) = json::parse(&line) else {
+            continue;
+        };
+        if v.get("snapshot").is_some() {
+            inside = true;
+            continue;
+        }
+        if v.get("snapshot_end").is_some() {
+            inside = false;
+            continue;
+        }
+        let (Ok(record), Ok(mail)) = (net::field(&v, "record"), net::field(&v, "mail")) else {
+            continue;
+        };
+        held.push(Held {
+            record: record.to_string(),
+            mail: mail.to_string(),
+            tombstone: v.get("culled") == Some(&Value::Bool(true)),
+            inside,
+            line,
+        });
+    }
+    // Nothing is culled from a file that does not say plainly what an
+    // earlier rotation restated: a block with no `snapshot_end` may run into
+    // entries written since. Nor when the reader's position is not among the
+    // lines: then nothing says which entries it has been given.
+    let known = through.is_none_or(|t| held.iter().any(|h| h.record == t));
+    let mut reach = cull && !inside && known;
+    let mut kept = Vec::with_capacity(held.len());
+    for h in held {
+        if reach && h.inside && !h.tombstone {
+            kept.push(json::stringify(&obj(vec![
+                ("record", s(&h.record)),
+                ("mail", s(&h.mail)),
+                ("culled", Value::Bool(true)),
+            ])));
+        } else {
+            kept.push(h.line);
+        }
+        if through == Some(h.record.as_str()) {
+            reach = false;
+        }
+    }
+    Ok(kept)
 }
 
 /// The client: one send, reporting acceptance on stdout.
@@ -615,4 +853,216 @@ pub fn gen_uuid() -> io::Result<String> {
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
         b[14], b[15]
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replayed(text: &str) -> io::Result<(u64, HashMap<String, String>)> {
+        let mut records = HashMap::new();
+        let next = replay(text.lines().map(|l| Ok(l.to_string())), &mut records)?;
+        Ok((next, records))
+    }
+
+    #[test]
+    fn the_next_record_is_past_every_record_the_file_shows_whatever_its_block_says() {
+        // A block that lost its end line: the two entries after it still count.
+        let (next, records) = replayed(concat!(
+            "{\"snapshot\":1,\"prior\":\"s.1\",\"next_record\":3}\n",
+            "{\"record\":\"r-1\",\"mail\":\"a\",\"from\":\"x\",\"body\":\"\"}\n",
+            "{\"record\":\"r-2\",\"mail\":\"b\",\"culled\":true}\n",
+            "{\"record\":\"r-3\",\"mail\":\"c\",\"from\":\"x\",\"body\":\"\"}\n",
+            "{\"record\":\"r-4\",\"mail\":\"d\",\"from\":\"x\",\"body\":\"\"}\n",
+        ))
+        .unwrap();
+        assert_eq!(next, 5);
+        assert_eq!(records.len(), 4);
+        // A `next_record` lowered by hand below what the file holds.
+        let (next, _) = replayed(concat!(
+            "{\"snapshot\":1,\"prior\":\"s.1\",\"next_record\":1}\n",
+            "{\"record\":\"r-7\",\"mail\":\"a\",\"culled\":true}\n",
+            "{\"snapshot_end\":1}\n",
+        ))
+        .unwrap();
+        assert_eq!(next, 8);
+    }
+
+    fn restated(text: &[u8], cull: bool, through: Option<&str>) -> Vec<String> {
+        restate(io::Cursor::new(text.to_vec()), cull, through).unwrap()
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_restated_as_the_replay_reads_it() {
+        let mut file = b"{\"record\":\"r-1\",\"mail\":\"a\",\"from\":\"x\",\"body\":\"".to_vec();
+        file.extend_from_slice(b"\xff\"}\n");
+        file.extend_from_slice(
+            b"{\"record\":\"r-2\",\"mail\":\"b\",\"from\":\"x\",\"body\":\"ok\"}\n",
+        );
+        let kept = restated(&file, true, None);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(
+            kept[0].starts_with("{\"record\":\"r-1\",\"mail\":\"a\""),
+            "{kept:?}"
+        );
+        // The same two Mail the replay of that file knows.
+        let (next, records) = replayed(&String::from_utf8_lossy(&file)).unwrap();
+        assert_eq!((next, records.len()), (3, 2));
+    }
+
+    #[test]
+    fn nothing_is_culled_from_a_block_with_no_end_or_past_a_position_the_file_lacks() {
+        let entry = |n: u32| {
+            format!("{{\"record\":\"r-{n}\",\"mail\":\"m{n}\",\"from\":\"x\",\"body\":\"b\"}}\n")
+        };
+        let head = "{\"snapshot\":1,\"prior\":\"s.1\",\"next_record\":3}\n";
+        let closed = format!(
+            "{head}{}{}{{\"snapshot_end\":1}}\n{}",
+            entry(1),
+            entry(2),
+            entry(3)
+        );
+        let open = format!("{head}{}{}{}", entry(1), entry(2), entry(3));
+        let culled = |kept: &[String]| {
+            kept.iter()
+                .filter(|l| l.contains("\"culled\":true"))
+                .count()
+        };
+        // The ordinary case: what the block restated is culled, the rest kept.
+        assert_eq!(culled(&restated(closed.as_bytes(), true, None)), 2);
+        // No end line: the block may run into entries written since.
+        let kept = restated(open.as_bytes(), true, None);
+        assert_eq!((kept.len(), culled(&kept)), (3, 0));
+        // A reader's position that names no line of the file.
+        let kept = restated(closed.as_bytes(), true, Some("r-9"));
+        assert_eq!((kept.len(), culled(&kept)), (3, 0));
+        // A position inside the block: only up to it.
+        assert_eq!(culled(&restated(closed.as_bytes(), true, Some("r-1"))), 1);
+    }
+
+    #[test]
+    fn the_next_record_counts_entries_only_after_a_snapshot_block() {
+        // No snapshot: one Record number per entry, as before rotation.
+        let (next, records) =
+            replayed("{\"record\":\"r-1\",\"mail\":\"a\"}\n{\"record\":\"r-2\",\"mail\":\"b\"}")
+                .unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(records["b"], "r-2");
+        // A block that holds fewer lines than its next_record implies, then
+        // two entries appended after it.
+        let (next, records) = replayed(concat!(
+            "{\"snapshot\":2,\"prior\":\"x.store.2\",\"next_record\":9}\n",
+            "{\"record\":\"r-4\",\"mail\":\"a\",\"culled\":true}\n",
+            "{\"record\":\"r-7\",\"mail\":\"b\",\"from\":\"f\",\"body\":\"x\"}\n",
+            "{\"snapshot_end\":2}\n",
+            "{\"record\":\"r-9\",\"mail\":\"c\"}\n",
+            "{\"record\":\"r-10\",\"mail\":\"d\"}",
+        ))
+        .unwrap();
+        assert_eq!(next, 11);
+        assert_eq!(records["a"], "r-4", "a tombstone keeps its Record id");
+        assert_eq!(records.len(), 4);
+        let (next, _) =
+            replayed("{\"snapshot\":1,\"prior\":\"x.1\",\"next_record\":5}\n{\"snapshot_end\":1}")
+                .unwrap();
+        assert_eq!(next, 5);
+        // A snapshot line without its high-water mark is refused, not guessed.
+        for bad in [
+            "{\"snapshot\":1,\"prior\":\"x.1\"}",
+            "{\"snapshot\":1,\"prior\":\"x.1\",\"next_record\":0}",
+        ] {
+            let e = replayed(bad).unwrap_err().to_string();
+            assert!(e.contains("expected") && e.contains("saw"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_rotation_culls_what_an_earlier_one_restated_and_keeps_what_came_after() {
+        let text = concat!(
+            "{\"snapshot\":2,\"prior\":\"s.2\",\"next_record\":5}\n",
+            "{\"record\":\"r-1\",\"mail\":\"a\",\"culled\":true}\n",
+            "{\"record\":\"r-2\",\"mail\":\"b\",\"from\":\"f\",\"body\":\"restated once\"}\n",
+            "not a line of JSON\n",
+            "{\"record\":\"r-3\",\"mail\":\"c\",\"from\":\"f\",\"body\":\"restated once\"}\n",
+            "{\"note\":\"neither an entry nor a tombstone\"}\n",
+            "{\"record\":\"r-4\",\"mail\":\"d\",\"from\":\"f\",\"body\":\"restated once\"}\n",
+            "{\"snapshot_end\":2}\n",
+            "{\"record\":\"r-5\",\"mail\":\"e\",\"from\":\"f\",\"body\":\"since\"}\n",
+            "{\"record\":\"r-6\",\"mail\":\"f\",\"body\":\"torn",
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let tomb =
+            |r: &str, m: &str| format!("{{\"record\":\"{r}\",\"mail\":\"{m}\",\"culled\":true}}");
+        let restated =
+            |cull, through| restate(text.as_bytes(), cull, through).expect("an in-memory read");
+        assert_eq!(
+            restated(false, None),
+            [lines[1], lines[2], lines[4], lines[6], lines[8]],
+            "without a cull every entry and tombstone, verbatim"
+        );
+        assert_eq!(
+            restated(true, None),
+            [
+                lines[1].to_string(),
+                tomb("r-2", "b"),
+                tomb("r-3", "c"),
+                tomb("r-4", "d"),
+                lines[8].to_string()
+            ],
+            "the block's entries are culled, the entry after it is kept"
+        );
+        assert_eq!(
+            restated(true, Some("r-3")),
+            [
+                lines[1].to_string(),
+                tomb("r-2", "b"),
+                tomb("r-3", "c"),
+                lines[6].to_string(),
+                lines[8].to_string()
+            ],
+            "nothing after the read position is culled"
+        );
+        // A file no rotation started has no block: its first rotation culls nothing.
+        let first = concat!(
+            "{\"record\":\"r-1\",\"mail\":\"a\",\"from\":\"f\",\"body\":\"x\"}\n",
+            "{\"record\":\"r-2\",\"mail\":\"b\",\"from\":\"f\",\"body\":\"y\"}\n",
+        );
+        assert_eq!(
+            restate(first.as_bytes(), true, None).unwrap(),
+            first.lines().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_store_culls_on_a_switch_that_needs_rotation_and_has_no_clock() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let (policy, cull) = rotation(&args(&[])).unwrap();
+        assert_eq!((policy.rotate_bytes, cull), (0, false));
+        let (policy, cull) = rotation(&args(&["--rotate-bytes", "9", "--cull"])).unwrap();
+        assert_eq!(
+            (policy.rotate_bytes, policy.cull_after_ms, cull),
+            (9, None, true)
+        );
+        for (bad, says) in [
+            (
+                &["--cull"][..],
+                "expected --rotate-bytes above 0 with --cull (culling happens when a Store rotates), saw none",
+            ),
+            (
+                &["--cull", "--rotate-bytes", "0"][..],
+                "saw --rotate-bytes 0",
+            ),
+            (
+                &["--rotate-bytes", "9", "--cull-after-ms", "5"][..],
+                "expected --cull to cull a Store at its rotations (a Store has no clock; --cull-after-ms is the coordinator's), saw --cull-after-ms",
+            ),
+            (
+                &["--rotate-bytes", "lots"][..],
+                "--rotate-bytes expects a whole number, saw lots",
+            ),
+        ] {
+            let e = rotation(&args(bad)).unwrap_err().to_string();
+            assert!(e.contains(says), "{bad:?}: {e}");
+        }
+    }
 }

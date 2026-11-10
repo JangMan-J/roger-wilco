@@ -71,14 +71,14 @@ environment, never from argv, which `ps` shows to every user.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
-| `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
-| `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
-| `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session`, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
+| `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>] [--rotate-bytes <n> --cull-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
+| `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log> [--rotate-bytes <n>]` | one per host; local inbox; serves sessions on the socket |
+| `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>] [--rotate-bytes <n> [--cull]]` | the Tracer: a session with no harness that reports on stdout; the last two flags rotate its Store (see Rotation and culling) |
+| `adapter` | same as `session`, rotation flags included, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
-| `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
+| `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>] [--rotate-bytes <n> [--cull]]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
-| `audit` | `[--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
+| `audit` | `[--coordinator-log <file>]... [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
 | `release` | `--socket --owner <address> --key <text>` | give a Claim up |
@@ -160,7 +160,7 @@ lines do not show it. The core reports these numbers and does nothing else with 
 ## Audit
 
 ```
-roger audit [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
+roger audit [--coordinator-log <file>]... [--daemon-log <file>]... [--store <file>]...
             [--address <address>] [--bodies] [--json]
 ```
 
@@ -172,13 +172,37 @@ reported and ignored. Findings do not fail the command; unreadable inputs do.
 
 The default output is one `WORD key=value ...` record per line, free text last.
 `--json` gives one object per line with `type` equal to WORD and the same fields;
-`line` and counts are integers, `absent` is `null`. Use JSON for unambiguous text
+`line` and counts are integers, `absent` is `null`, `read` is a boolean. Use JSON for unambiguous text
 with spaces or newlines. Header and body tails become `headers` and `body` fields;
 `mails` on a duplicate finding is an array rather than comma-separated text.
 
 Sources appear in argument order, followed by the coordinator timeline, each daemon
 log, each Store, then findings and the summary. Timeline order is file order, never
 a sort by timestamp. `line` is the original 1-based complete-line number.
+
+A rotated log (see Rotation and culling) is its archives `<name>.<n>` and the file at its
+path, which opens with a snapshot block restating what its owner still needs. Pass every
+archive, oldest first, then the live file. Every `--coordinator-log` joins one coordinator
+timeline in argument order, so a Receipt in the live file joins its Mail in an archive. With
+more than one, each coordinator record that has `line=` gains `path=` just before it, and
+`MAIL` gains `receipt_path=` just before `receipt_line=`; with one, the output is as it
+always was. Each block yields a `SNAPSHOT` record at its marker. A coordinator block is
+skipped (`read=false`) when an earlier coordinator input is its archive: the file of that
+name beside it, or any input with that file name wherever it lives. A host daemon log or
+Store block is skipped when its archive, read beside it, is another input of the same kind
+(every host's log has the same name, so a name alone does not say whose archive it is). A
+block that is not skipped is read (`read=true`), and lists only what its source has not
+already listed, so a moved, renamed or left-out archive never lists a Mail twice; the live
+file alone still gives a history, of what the last rotation kept: a receipted `mail` line
+reports `body_bytes` from `settled.bytes` and has no `BODY`, and `"kind":"broadcast"` marks
+a Broadcast copy. Leaving out an archive from the middle makes the block after it read: what
+it restates that earlier files already show is not listed again, and what only the left-out
+archive held (Mail, Receipts, sessions) is listed from the block's lines; the `SNAPSHOT
+read=true` record shows where. An input that is the same file as an earlier input of its
+kind is listed as a `SOURCE` and read once. `{"ev":"culled"}` yields `CULLED`:
+that Mail is settled, never `UNRECEIPTED`, and a Receipt naming it is no `STRAY_RECEIPT`. A
+Store tombstone yields `STORE_CULLED` and is record evidence for its Mail as an entry is. A
+block runs to its `snapshot_end`, the next `snapshot`, or the end of the file.
 
 | WORD | Fields, in text order |
 | --- | --- |
@@ -199,10 +223,13 @@ a sort by timestamp. `line` is the original 1-based complete-line number.
 | `DAEMON_DELIVER` | `path= mail= kind= from= to= line=` |
 | `DAEMON_RECEIPT` | `path= mail= session= record= line=` |
 | `STORE` | `path= record= mail= from= kind= line=` |
+| `STORE_CULLED` | `path= record= mail= line=` (a Store tombstone: the record and Mail ids of an entry whose body was culled) |
+| `SNAPSHOT` | `path= seq= prior= at_ms= next_record= lines= read=` (a snapshot block's marker; `lines` inside it; `read=false` when its archive is an input) |
+| `CULLED` | `mail= line=` (a Mail the coordinator kept only by id at a rotation; settled) |
 | `UNRECEIPTED` | `mail= kind= from= to= accepted_at_ms= line=` |
 | `DUPLICATE_RECORD` | `path= record= mails=` (distinct Mail ids, comma-separated) |
 | `RECORD_MISMATCH` | `mail= coordinator= daemon= store=` (record ids, or absent) |
-| `AUDIT` | `sources= registers= unregisters= mails= receipted= unreceipted= duplicates= mismatches= torn= skipped=` |
+| `AUDIT` | `sources= registers= unregisters= mails= receipted= unreceipted= duplicates= mismatches= torn= skipped= snapshots= culled=` |
 
 Each Broadcast yields one `MAIL` per recipient with id `<mail>/<address>` and kind
 `broadcast`. Its acceptance stamp is the Broadcast's; the first Receipt for each id
@@ -213,12 +240,15 @@ kinds use the existing compatibility reader; a Store without either kind field r
 `absent`. Missing header sets read `HEADERS mail=... absent` (JSON `headers:null`);
 an explicitly empty set emits no HEADERS line. Nonempty sets retain key order.
 
+`SNAPSHOT` is listed for any Address. `CULLED` names no Address: it is listed without
+`--address`, or when supplied records identify that sender or recipient for its Mail.
 `--address` matches whole Addresses: session events, sender or recipient of Mail and
 delivery, each Broadcast copy, receipt sessions, and claim owners. Receipt-only evidence
 is also kept when supplied Mail, delivery or Store records identify that sender or
 recipient. A release follows the key's last claim owner. Stores have no recipient
 Address and are always listed in full: pass the desired Address's own Store. Counts
-cover the listed records. Duplicate records are scoped to one input, and to a session
+cover the listed records. Duplicate records are scoped to one input (the coordinator
+timeline counts as one), and to a session
 within coordinator and daemon logs. Mismatches compare Record ids for the same Mail
 across supplied inputs, preserving every distinct id from repeated daemon receipts and
 Store entries; the coordinator MAIL join still uses its first Receipt. A mismatch requires evidence
@@ -311,6 +341,89 @@ keeps a Mail's body in memory until its Receipt and a host daemon until its Ack;
 each keeps the Mail's id and record and the body stays only on the log. Nothing is removed
 from a log.
 
+## Rotation and culling
+
+Without `--rotate-bytes` a log only ever grows, and everything below is off.
+
+With `--rotate-bytes <n>` a log rotates once it has grown by `n` bytes since its last
+snapshot, and by at least the size of that snapshot (so a large snapshot is not rewritten for
+a small gain). The check runs after the replay at start and after each append; no timer is
+involved. A rotation writes a fresh file that restates what the process still needs, between
+a `{"snapshot":<n>,"prior":"<file>"}` line and a `{"snapshot_end":<n>}` line, and puts it
+under the log's path in one rename. The file as it was stays beside it, whole and unchanged,
+as `<path>.<n>` (`coordinator.log.1`, `coordinator.log.2`, ...): nothing a log ever held is
+removed by `roger`. The path names a complete log at every instant, the old one or the new
+one, so a crash at any step loses nothing; a rotation that fails before its rename leaves the
+old log in use and is tried again after more growth. Archives are never read again by the
+coordinator or a host daemon. Keeping, compressing, moving or deleting them is the
+operator's choice, and `roger audit` reads them with the live file as one history.
+
+What a rotation restates, in the log's ordinary lines:
+
+- The coordinator: each registered session with its label and declared text; each live
+  claim; each replacement event; each Broadcast id; every Mail awaiting its Receipt, whole,
+  in commit order; and every receipted Mail without its body (`"body":""`, with
+  `"settled":{"bytes":<n>,"mark":"<hex>"}` for the body it had), followed by its Receipt.
+  Receipts, resends and the Board answer exactly as before the rotation.
+- A host daemon: each Mail awaiting its Ack, and each receipt the coordinator has not yet
+  confirmed. Mail that is acked there and receipted at the coordinator is settled on both
+  sides and is not restated.
+- A session's Store (`session`, `adapter`, `mcp`): every entry and tombstone, in order. Its
+  `snapshot` line also carries `next_record`, the number the next Record id would have
+  taken. At open the next Record id is that number plus the entries appended after the
+  block, or one past the entries of a Store that never rotated. Lines inside a block are
+  never counted, so a Record id is never taken twice, even if tombstones are removed by hand.
+
+A build from before rotation reads a rotated log: it skips the two snapshot lines and reads
+the rest as it always has, with one difference, that a Broadcast copy still awaiting its
+Receipt is delivered as `directed`. That holds for a log rotated without culling; see below
+for one that was culled.
+
+Archive numbers only go up: the next is one past the highest ever used, which the live
+file's own snapshot line carries, so compressing, moving or removing archives never makes a
+number come round again. A log given through a symbolic link is rotated where the file
+really is, and the link goes on naming it.
+
+A coordinator rotates only with a cull bound: `--rotate-bytes` without `--cull-after-ms` is
+refused at start. A rotation restates every Mail it does not cull, and the coordinator
+answers nothing while it writes one, so with no bound each rotation would rewrite the id,
+sender, recipient, headers, stamps and Receipt of every Mail ever accepted, and take longer
+each time (about half a second for the 15 MB that 18,700 Mail came to on the fleet this was
+measured on). With a bound a snapshot holds the Mail awaiting a Receipt, the Mail receipted
+within the bound, and one short line per older Mail. A coordinator started with neither flag
+never rotates and never culls: its log only grows, as it always has.
+
+With `--cull-after-ms <n>` on the coordinator (the two flags go together), a rotation leaves
+out every Mail whose Receipt is older than `n`
+milliseconds on the coordinator's clock, or was written before Receipts were stamped, and
+restates only its id, as `{"ev":"culled","mail":"<id>"}`. The id is kept for good, so it is
+never accepted as a new Mail: a send under it is answered `ACCEPTED` and commits nothing,
+and a late Ack for it is confirmed. `receipt --mail <id>` then fails with `culled mail <id>:
+expected its Receipt in this log, saw only its id kept; the Receipt is in an archived log`.
+Mail awaiting its Receipt is never culled, whatever its age. Nothing is removed from disk:
+the archives still hold every culled Mail whole.
+
+A build from before rotation does not know culled ids. Run on a culled log, it treats a send
+under a culled id as a new Mail and delivers it (a Store that still holds that Mail stores
+nothing new), and it answers a late Ack for one with `unknown mail`. Culling is therefore
+the one setting here that a roll back to such a build does not fully undo; the archives
+still hold everything.
+
+A Store has no clock and culls by rotation instead. With `--cull` on `session`, `adapter` or
+`mcp` (it needs `--rotate-bytes`), a rotation restates each entry inside the file's snapshot
+block, which the rotation before it already restated, as
+`{"record":"r-N","mail":"<id>","culled":true}`, and keeps every entry written since, whole.
+The first rotation of a Store culls nothing. So a culled Store keeps between one and two
+rotations' worth of its most recent Mail whole, and the bodies of older Mail stay in its
+archives. A tombstone keeps the Mail's identity: a redelivery of that Mail is acked with its
+original Record id and stores nothing. On `roger mcp` an entry the inbox has not yet
+returned is never culled, wherever it sits, and nothing is culled before the inbox has
+returned a Mail. `--cull-after-ms` is the coordinator's; a session face refuses it. Without
+`--cull` a Store culls nothing, and its rotation then saves nothing: every entry is restated
+whole and the old file is kept as well. An entry is written exactly as before: a Store that is never
+rotated is byte for byte what it always was. A `roger mcp` build from before rotation, run
+on a culled Store, would return its tombstones as inbox items with no body.
+
 ## Links and peers
 
 The coordinator and each host daemon write to a peer through that peer's own queue, with one
@@ -368,6 +481,11 @@ a client has shown its program is not durable. If the adapter died before its Ac
 redelivers and the Store reuses the same record, so a restarted client is told again; Mail
 already acked is not replayed.
 
+With `--rotate-bytes` the adapter's Store rotates as described in Rotation and culling, and
+the client sees no difference: the `mail` line is unchanged, and a Mail whose entry was
+culled, if delivered again, is acked with its original Record id and reaches the client
+again with that `record`.
+
 `--declare` is opaque text a session states about itself at Register; the core stores it and
 returns it on the Board, and reads none of it.
 
@@ -415,6 +533,7 @@ field is `confirm_register`; the host daemon does not forward it upstream.
 ```
 roger mcp [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
           [--label <text>] [--declare <text>]
+          [--rotate-bytes <n> [--cull]]
 ```
 
 To register it with an MCP client, give the client the command line `roger mcp` with any of
@@ -432,8 +551,10 @@ It writes each delivery to its Store, then acks naming that Record id, exactly a
 does; the Ack waits for no reader and for nothing a tool call does. stdout carries only
 protocol messages; everything else goes to stderr. When stdin closes it unregisters and exits
 0. If the host daemon connection is lost it exits 1 with the reason on stderr (it does not
-reconnect). At exit, a Store at the default path that holds no entries is removed with its
-`.cursor` file, so a health check leaves nothing; an explicit `--store` is never removed.
+reconnect). At exit, a Store at the default path that has never held anything (no entry, no
+tombstone, no snapshot block, and no `<store>.<n>` archive beside it, compressed or not) is
+removed with its `.cursor` file, so a health check leaves nothing; an explicit `--store` is
+never removed.
 `--hold-before-ack <marker>` (feature `test-hooks`) works here as for `session`.
 
 The protocol is newline-delimited JSON-RPC 2.0, one message per line. `initialize` answers
@@ -468,6 +589,12 @@ returned is not returned again, an entry stored before the process died is retur
 before kinds and headers existed shows neither. Which sessions count as present on the Board
 is the reader's choice, made here by `all` and `window_seconds`; nothing compares an Address,
 a label or a token.
+
+The inbox reads the Store's current file. A rotation's snapshot lines are not entries and a
+tombstone is never returned. The read position is found among entries and tombstones by
+Record id, so a position on a culled entry keeps its place, and a rotation during a waiting
+read changes nothing the reader sees. With `--cull`, a rotation culls only entries the inbox
+has already returned.
 
 ## Checks
 
@@ -527,12 +654,13 @@ core log grows while nobody asks.
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
-| `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
+| `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail; rotation into a snapshot and an archive |
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing, per-peer outgoing queues and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
 | `tests/process.rs` | process seam, including the SIGKILL window |
 | `tests/audit.rs` | exact history fixtures, filtering, findings, JSON, live read-only audit |
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
+| `tests/store.rs` | a session's Store across rotations, culls, restarts and crashes mid-rotation |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |

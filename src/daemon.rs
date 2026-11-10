@@ -5,7 +5,7 @@
 //! forwarded upstream. Pending mail is pushed on registration, never by
 //! a timer.
 
-use crate::durlog::DurLog;
+use crate::durlog::{DurLog, Policy};
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -72,12 +72,15 @@ struct State {
     upstream: Option<Writer>,
     next_req: i64,
     waiters: HashMap<i64, mpsc::Sender<Value>>,
+    /// When the log rotates.
+    policy: Policy,
 }
 
 impl State {
     /// Nothing delivered or acked yet: what a replay starts from.
-    fn new(log: DurLog) -> State {
+    fn new(log: DurLog, policy: Policy) -> State {
         State {
+            policy,
             log,
             inbox: HashMap::new(),
             pending: BTreeMap::new(),
@@ -105,16 +108,18 @@ pub struct Config {
     pub host_id: String,
     pub socket: PathBuf,
     pub data: PathBuf,
+    pub policy: Policy,
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
     let (log, prior) = DurLog::open(&cfg.data)?;
-    let mut state = State::new(log);
+    let mut state = State::new(log, cfg.policy);
     for line in prior {
         if let Ok(v) = json::parse(&line?) {
             apply(&mut state, &v);
         }
     }
+    rotate_if_due(&mut state);
     // Bind before dialing upstream: a daemon refused its socket must not
     // have joined the coordinator first.
     let listener = bind_socket(&cfg.socket)?;
@@ -246,6 +251,58 @@ fn hold(
         }
     });
     state.inbox.insert(mail.to_string(), held);
+}
+
+/// The committed `deliver` event for a held Mail: the line `handle_deliver`
+/// appends, and the line a rotation restates.
+fn deliver_event(mail: &str, m: &Mail) -> Value {
+    obj(vec![
+        ("ev", s("deliver")),
+        ("mail", s(mail)),
+        ("from", s(&m.from)),
+        ("to", s(&m.to)),
+        ("body", s(&m.body)),
+        ("kind", s(&m.kind)),
+        ("headers", m.headers.clone()),
+    ])
+}
+
+/// Rotate the log once it is due. The fresh file restates what this host
+/// daemon still needs: each Mail awaiting its Ack, in arrival order, and each
+/// receipt the coordinator has not confirmed. Everything else the log held is
+/// settled on both sides (acked here, receipted there), so the coordinator
+/// never pushes it again, and it stays whole in the archived file. After the
+/// rotation memory holds what a replay of the fresh file would.
+fn rotate_if_due(st: &mut State) {
+    if !st.log.due(&st.policy) {
+        return;
+    }
+    let mut lines: Vec<String> = st
+        .pending
+        .values()
+        .filter_map(|id| Some((id, st.inbox.get(id)?.as_ref()?)))
+        .map(|(id, m)| json::stringify(&deliver_event(id, m)))
+        .collect();
+    lines.extend(st.receipts.iter().map(|r| {
+        json::stringify(&obj(vec![
+            ("ev", s("receipt")),
+            ("mail", s(&r.mail)),
+            ("session", s(&r.session)),
+            ("record", s(&r.record)),
+        ]))
+    }));
+    match st.log.rotate(Vec::new(), &lines) {
+        Ok(seq) => {
+            st.inbox.retain(|_, held| held.is_some());
+            st.acked = st.receipts.iter().map(|r| r.mail.clone()).collect();
+            eprintln!(
+                "host daemon log rotated: archive {seq}, {} lines kept",
+                lines.len()
+            );
+        }
+        // The old log is still the log; the next attempt waits for more growth.
+        Err(e) => eprintln!("host daemon log not rotated: {e}"),
+    }
 }
 
 /// The Ack for `mail` is on the log: drop the Mail, keep its id.
@@ -535,6 +592,7 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
             ]);
             st.log.append(&json::stringify(&ev))?;
             hold(&mut st, &mail_id, (from, to, body), kind, headers);
+            rotate_if_due(&mut st);
         }
         // Held means not yet acked.
         if let Some(Some(m)) = st.inbox.get(&mail_id) {
@@ -818,6 +876,7 @@ fn local_loop(
                             session: session.clone(),
                             record: record.clone(),
                         });
+                        rotate_if_due(&mut st);
                     }
                 }
                 // Forwarding is retryable, not part of the ack: the Receipt is
@@ -877,13 +936,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_rotation_restates_what_awaits_an_ack_and_what_the_coordinator_has_not_confirmed() {
+        let dir = std::env::temp_dir().join(format!("roger-daemon-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("d.log");
+        let lines = [
+            r#"{"ev":"deliver","mail":"m1","from":"a","to":"b","body":"one","kind":"directed","headers":{}}"#,
+            r#"{"ev":"deliver","mail":"m2","from":"a","to":"b","body":"two","kind":"directed","headers":{"k":"v"}}"#,
+            r#"{"ev":"deliver","mail":"m3","from":"a","to":"c","body":"three","kind":"broadcast","headers":{}}"#,
+            r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-1"}"#,
+            r#"{"ev":"receipt","mail":"m3","session":"c","record":"r-1"}"#,
+        ];
+        let (mut log, mut prior) = DurLog::open(&path).unwrap();
+        assert!(prior.next().is_none());
+        for line in lines {
+            log.append(line).unwrap();
+        }
+        let mut st = State::new(
+            log,
+            Policy {
+                rotate_bytes: 1,
+                cull_after_ms: None,
+            },
+        );
+        for line in lines {
+            apply(&mut st, &json::parse(line).unwrap());
+        }
+        // The coordinator has confirmed m1's receipt and not m3's.
+        st.receipts.retain(|r| r.mail != "m1");
+        rotate_if_due(&mut st);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("d.log.1")).unwrap(),
+            lines.join("\n") + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            [
+                r#"{"snapshot":1,"prior":"d.log.1"}"#,
+                lines[1],
+                r#"{"ev":"receipt","mail":"m3","session":"c","record":"r-1"}"#,
+                r#"{"snapshot_end":1}"#,
+                "",
+            ]
+            .join("\n")
+        );
+        // Memory is what a replay of the fresh file gives.
+        let known = |st: &State| {
+            let mut inbox: Vec<(String, bool)> = st
+                .inbox
+                .iter()
+                .map(|(k, v)| (k.clone(), v.is_some()))
+                .collect();
+            inbox.sort();
+            let mut acked: Vec<String> = st.acked.iter().cloned().collect();
+            acked.sort();
+            let waiting: Vec<String> = st.pending.values().cloned().collect();
+            let receipts: Vec<String> = st.receipts.iter().map(|r| r.mail.clone()).collect();
+            (inbox, acked, waiting, receipts)
+        };
+        let after = known(&st);
+        drop(st);
+        let (log, prior) = DurLog::open(&path).unwrap();
+        let mut back = State::new(log, Policy::default());
+        for line in prior {
+            if let Ok(v) = json::parse(&line.unwrap()) {
+                apply(&mut back, &v);
+            }
+        }
+        assert_eq!(known(&back), after);
+        assert_eq!(
+            after,
+            (
+                vec![("m2".to_string(), true)],
+                vec!["m3".to_string()],
+                vec!["m2".to_string()],
+                vec!["m3".to_string()],
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_ack_drops_the_mail_and_keeps_its_id() {
         let path = std::env::temp_dir().join(format!("roger-daemon-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let (log, mut prior) = DurLog::open(&path).unwrap();
         assert!(prior.next().is_none());
         let _ = std::fs::remove_file(&path);
-        let mut st = State::new(log);
+        let mut st = State::new(log, Policy::default());
         for line in [
             r#"{"ev":"deliver","mail":"m1","from":"a","to":"b","body":"one","kind":"directed","headers":{}}"#,
             r#"{"ev":"deliver","mail":"m2","from":"a","to":"b","body":"two","kind":"directed","headers":{}}"#,

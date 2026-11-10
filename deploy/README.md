@@ -68,6 +68,10 @@ host:
 | `roger-coordinator.service` | `roger coordinator --bind $ROGER_COORDINATOR` | `~/.local/share/roger/coordinator.log` |
 | `roger-daemon.service` | `roger daemon --coordinator $ROGER_COORDINATOR --host-id $ROGER_HOST_ID` | `~/.local/share/roger/daemon.log` |
 
+Neither unit rotates its log: rotation is off unless `--rotate-bytes` is added to a unit's
+command line (see Rotation and culling in the main README, and its cost without culling,
+before adding it to the coordinator).
+
 Both are systemd user units with `Restart=always` (3 s) and no start limit; the daemon
 reconnects to the coordinator on its own. Units start at boot only with lingering enabled
 (`loginctl enable-linger`). Deploy ends by printing each unit's state and the user's

@@ -174,6 +174,13 @@ impl Claims {
         }
     }
 
+    /// Drop every claim whose deadline has passed at `now`. Nothing answers
+    /// differently for it at `now` or later; a rotation does this so memory
+    /// holds what its fresh log restates.
+    pub fn forget_expired(&mut self, now: i64) {
+        self.held.retain(|_, h| now < h.expires_ms);
+    }
+
     /// Every live claim at `now`, in key order.
     pub fn active(&self, now: i64) -> Vec<(&str, &Held)> {
         self.held
@@ -279,6 +286,32 @@ mod tests {
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{line}");
             assert!(e.to_string().contains("saw log line {"), "{line}: {e}");
         }
+    }
+
+    #[test]
+    fn forgetting_expired_claims_leaves_the_live_ones_and_changes_no_answer() {
+        let mut c = Claims::default();
+        c.apply(
+            "gone",
+            &Change::Grant(Held {
+                owner: "a".into(),
+                expires_ms: 100,
+            }),
+        );
+        c.apply(
+            "held",
+            &Change::Grant(Held {
+                owner: "b".into(),
+                expires_ms: 900,
+            }),
+        );
+        let before = (c.active(500), c.decide(&Op::Acquire, "gone", "z", 10, 500));
+        let before = (format!("{:?}", before.0), before.1);
+        c.forget_expired(500);
+        assert_eq!(format!("{:?}", c.active(500)), before.0);
+        assert_eq!(c.decide(&Op::Acquire, "gone", "z", 10, 500), before.1);
+        assert_eq!(c.held.len(), 1);
+        assert!(c.live("held", 500).is_some());
     }
 
     #[test]

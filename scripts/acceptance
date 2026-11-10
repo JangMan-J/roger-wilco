@@ -469,7 +469,9 @@ broadcast() {
 # on a timer (scripts/check-no-poll finds only the daemon's reconnect backoff,
 # the daemon's bounded wait for one upstream reply, the Store lock's single
 # try, and the link's liveness ping with its silence bound, which carries no
-# Mail and commits nothing). A sweep added later must take a switch that this check switches off; the
+# Mail and commits nothing). A log rotation follows the append that makes it
+# due and happens only with --rotate-bytes, which this check never passes.
+# A sweep added later must take a switch that this check switches off; the
 # quiet windows below fail while one runs, since they require that nothing is
 # committed while nobody asks.
 #
@@ -1106,9 +1108,10 @@ for t in ['REGISTER', 'LABEL', 'DECLARED', 'UNDECLARED', 'UNREGISTER', 'MAIL', '
         text(v) for v in of(t) if v.get('mail') != 'audit-after'
     ], t
 assert live[-1] == ('AUDIT sources=3 registers=4 unregisters=1 mails=5 receipted=4 '
-    'unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0')
+    'unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0 snapshots=0 culled=0')
 assert of('AUDIT') == [dict(type='AUDIT', sources=3, registers=4, unregisters=1, mails=6,
-    receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)]
+    receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0,
+    snapshots=0, culled=0)]
 assert of('TORN') == [dict(type='TORN', path=str(w/'c.copy'), bytes=6)]
 for t in ['REGISTER','LABEL','DECLARED','UNDECLARED','UNREGISTER']:
     assert of(t) and all(isinstance(v['at_ms'], int) for v in of(t)), t
@@ -1136,7 +1139,8 @@ assert all(v['address']==b for v in f if v['type'] in ['REGISTER','LABEL','DECLA
 assert of('STORE',f) == of('STORE')
 assert [v['mail'] for v in of('MAIL',f)] == ['audit-1','audit-2','audit-b/'+b,'audit-held','audit-after']
 assert of('AUDIT',f)[0] == dict(type='AUDIT', sources=3, registers=2, unregisters=0, mails=5,
-    receipted=4, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)
+    receipted=4, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0,
+    snapshots=0, culled=0)
 old = rows('old-json')
 assert of('REGISTER',old)[0]['at_ms'] is None
 assert all(of('MAIL',old)[0][k] is None for k in ['accepted_at_ms','receipted_at_ms','latency_ms'])
