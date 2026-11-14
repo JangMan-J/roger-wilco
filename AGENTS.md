@@ -69,9 +69,14 @@ KERNEL.md and INVARIANTS.md win over this one.
    own code may have such words; this repository may not. `scripts/check-vocabulary` is the check. A
    line that must name the old wire field (a reader of logs written before `kind`) carries
    `legacy-wire:` and a reason; nothing writes the field.
-7. **Opaque headers stay opaque.** Nothing in `src/` or `modules/` compares, branches on, ranks, or
-   names a header key or value; they pass through byte-identical, bounded, with a refusal that names
-   what was expected and what was seen.
+7. **Opaque headers stay opaque.** Header keys and values carry no meaning for Roger. Nothing in
+   `src/` compares, branches on, routes, ranks, or names a header key or value; they pass through
+   byte-identical, bounded, with a refusal that names what was expected and what was seen. An
+   Optional module may read named fields only to check mechanically that recorded data matches
+   (a signature, a body hash, sequence continuity) and to report match or mismatch; such a module
+   only reads records and has no path to delivery (no socket, listener, spawned process, or file
+   write), and no module infers meaning from a header or changes delivery by one.
+   `scripts/acceptance headers` (its source search) is the check.
 8. **Faces are equal and additive.** The socket protocol, the `roger adapter` stream, `roger mcp`,
    and any face exposed or bridged by an Optional module give a session the same Mail, Store, Ack,
    Board, claim, and receipt semantics. A Core face adds no crate; an Optional module under

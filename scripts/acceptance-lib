@@ -52,7 +52,7 @@ loopback_stack() {
   (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
   bin="$ROOT/target/release/roger"
   local h
-  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
   trap cleanup EXIT

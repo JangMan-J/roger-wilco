@@ -148,3 +148,8 @@ Where the page is silent, this module takes the most literal reading:
 Nothing here changes what the core does. The core still carries every header and
 declared text byte-identical and checks none of them. This module is one consumer's
 reader of those fields, as CONVENTIONS.md invites.
+
+Invariant `I3` permits exactly this: a module may read named header fields only to check
+that recorded data matches and to report match or mismatch, and a module that names a
+header key has no path to delivery (no socket, listener, spawned process, or file write).
+The source search in `scripts/acceptance headers` fails if this module gains one.

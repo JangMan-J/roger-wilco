@@ -29,7 +29,7 @@ two_host_stack() {
   bin="$ROOT/target/release/roger"
 
   local token
-  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
   remote_work="/tmp/roger-accept.$$"
   local_host_id="$(hostname)"
   remote_host_id="$(ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" hostname)" || fail "ssh hostname on $REMOTE_HOST"
@@ -494,7 +494,7 @@ no_poll() {
   "$ROOT/scripts/check-no-poll" >/dev/null || fail "scripts/check-no-poll found an unmarked timed wait in src"
   (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
   bin="$ROOT/target/release/roger"
-  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   export ROGER_TOKEN="$token"
   trap cleanup EXIT
@@ -697,8 +697,43 @@ json_obj() { # json_obj key=value...: the headers as one JSON object, keys in th
   printf '{%s}' "$out"
 }
 
+# Invariant 3 source search for headers: header keys and values carry no meaning for Roger.
+# A hit is code that names a header key: a provenance field of docs/CONVENTIONS.md as a
+# string literal, or a literal key looked up in a Mail's header set. The core may have
+# none. An Optional module may have hits only when it reads records and reports, with no
+# path to delivery: no socket, listener, async runtime or network crate, spawned process,
+# or file write in its source or manifest. Keys of the HTTP transport itself (a gateway's
+# own request headers) are not Mail headers and are passed over. Unit tests are fixtures
+# and skipped. Usage: header_source_search [root] (prints hits, fails on any).
+header_source_search() {
+  local root="${1:-$ROOT}" m f hits="" mod_hits path_hits
+  local key='"(sig|kid|seq|sent_at_ms|body_sha256)"|HEADERS[])]*(\.(get|get_mut|contains_key|remove)\(|\[)[[:space:]]*"|HEADERS[])]*\.and_then\([^;]*\.(get|contains_key)\([[:space:]]*"|(^|[^.[:alnum:]_])headers\b[^;]*\.(get|get_mut|contains_key|remove)\([[:space:]]*"'
+  local transport='\.get\([[:space:]]*"(mcp-session-id|last-event-id|authorization|content-length|content-type|accept|host|upgrade|connection|origin|sec-websocket-[a-z-]+)"'
+  local delivery='\b(TcpStream|TcpListener|UnixStream|UnixListener|UdpSocket|Command::new|File::create|OpenOptions|fs::write|fs::rename|fs::remove_file|fs::create_dir|tokio|hyper|axum|tungstenite|reqwest|mio)\b'
+  src_of() { # non-test source lines as path:line:text, the literal "headers" folded to HEADERS
+    local f
+    for f in "$@"; do
+      case "$f" in */tests.rs | */tests/*) continue ;; esac
+      awk -v f="${f#"$root"/}" '/^#\[cfg\(test\)\]/{exit} {gsub(/"headers"/, "HEADERS"); print f":"NR":"$0}' "$f"
+    done
+  }
+  mod_hits="$(src_of "$root"/src/*.rs | grep -E "$key" | grep -vE "$transport" || true)"
+  [[ -z "$mod_hits" ]] || hits+="core names a header key:"$'\n'"$mod_hits"$'\n'
+  for m in "$root"/modules/*/; do
+    m="${m%/}"
+    [[ -f "$m/Cargo.toml" && -d "$m/src" ]] || continue
+    mapfile -t files < <(find "$m/src" -name '*.rs' | sort)
+    mod_hits="$(src_of "${files[@]}" | grep -E "$key" | grep -vE "$transport" || true)"
+    [[ -n "$mod_hits" ]] || continue
+    path_hits="$({ src_of "${files[@]}"; grep -nE "^[[:space:]]*($delivery)" "$m/Cargo.toml" | sed "s|^|${m#"$root"/}Cargo.toml:|"; } | grep -E "$delivery" || true)"
+    [[ -z "$path_hits" ]] || hits+="${m#"$root"/} names a header key and has a path to delivery:"$'\n'"$mod_hits"$'\n'"path:"$'\n'"$path_hits"$'\n'
+  done
+  [[ -z "$hits" ]] || fail "$hits"
+}
+
 headers() {
   command -v jq >/dev/null || fail "jq required to build the expected headers"
+  header_source_search
   loopback_stack
   local daemon_b_pid="${pids[1]}" out held="$work/held.marker"
 
@@ -831,7 +866,7 @@ headers() {
   rc="$("$bin" receipt --socket "$old/d.sock" --mail old-c2)"
   [[ "$rc" == RECEIPT*" kind=directed" ]] || fail "old coordinator mail receipt: $rc"
 
-  echo "PASS headers: kinds and headers (non-ASCII, empty, quotes, backslashes, newlines, order, the largest set) arrived byte-identical in the Store and the receipt across a recipient SIGKILL between Store and Ack and a restart of the coordinator and host daemon; every refused set committed nothing; old coordinator and host daemon logs and an old Store replayed with the right kinds"
+  echo "PASS headers: kinds and headers (non-ASCII, empty, quotes, backslashes, newlines, order, the largest set) arrived byte-identical in the Store and the receipt across a recipient SIGKILL between Store and Ack and a restart of the coordinator and host daemon; every refused set committed nothing; old coordinator and host daemon logs and an old Store replayed with the right kinds; no core code names a header key, and no Optional module that names one has a path to delivery"
 }
 
 # Proof K8 (loopback, no model): `roger mcp` is a session. A small MCP client in bash + jq
