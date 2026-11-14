@@ -5178,3 +5178,188 @@ fn tcp_daemon_and_client_cli_validation_and_pre_join_bind_failure() {
         "daemon must not join the coordinator when --listen fails to bind"
     );
 }
+
+/// Wait for a `board_event` line naming `event` and holding every `parts`
+/// substring in `out`, and return it.
+fn watch_event(rig: &Rig, out: &str, event: &str, parts: &[&str]) -> String {
+    let start = Instant::now();
+    loop {
+        let text = read(&rig.p(out));
+        if let Some(line) = text.lines().find(|l| {
+            l.contains("\"type\":\"board_event\"")
+                && l.contains(&format!("\"event\":\"{event}\""))
+                && parts.iter().all(|p| l.contains(p))
+        }) {
+            return line.to_string();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "expected a {event} board_event with {parts:?} in {out}: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A watch-only connection (`roger watch`) and an adapter started with
+/// `--watch` see every committed Board change: register, relabel,
+/// declared, unregister, and claim acquire, renew, release and expiry with
+/// key, owner and deadline. A connection that did not ask sees none.
+#[test]
+fn watchers_see_committed_board_changes_and_others_see_none() {
+    let mut rig = Rig::new("watchers");
+    rig.start_stack();
+    let watch_args = ["watch", "--socket", rig.p("b.sock").to_str().unwrap()].map(String::from);
+    let refs: Vec<&str> = watch_args.iter().map(|s| s.as_str()).collect();
+    rig.spawn(&refs, "watch.out");
+    wait_for_text(&rig.p("watch.out"), "WATCHING", Duration::from_secs(10));
+
+    // An adapter that asked; one that did not; a Tracer, which never asks.
+    let (_, _watching) = rig.start_adapter(
+        "a.sock",
+        RECIPIENT,
+        "watching.store",
+        "watching.out",
+        &["--watch", "--declare", "observer"],
+    );
+    let (_, plain) = rig.start_adapter("b.sock", THIRD, "plain.store", "plain.out", &[]);
+    let line = watch_event(
+        &rig,
+        "watch.out",
+        "register",
+        &[
+            &format!("\"session\":\"{RECIPIENT}\""),
+            "\"host\":\"host-a\"",
+        ],
+    );
+    assert!(line.contains("\"at_ms\":"), "{line}");
+    watch_event(
+        &rig,
+        "watch.out",
+        "declared",
+        &[
+            &format!("\"session\":\"{RECIPIENT}\""),
+            "\"declared\":\"observer\"",
+        ],
+    );
+    watch_event(
+        &rig,
+        "watch.out",
+        "register",
+        &[&format!("\"session\":\"{THIRD}\"")],
+    );
+    rig.register("a.sock", SENDER);
+    for out in ["watch.out", "watching.out"] {
+        watch_event(
+            &rig,
+            out,
+            "register",
+            &[&format!("\"session\":\"{SENDER}\"")],
+        );
+    }
+
+    let output = Command::new(BIN)
+        .args([
+            "label",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--from",
+            SENDER,
+            "--label",
+            "night shift",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    for out in ["watch.out", "watching.out"] {
+        watch_event(
+            &rig,
+            out,
+            "relabel",
+            &[
+                &format!("\"session\":\"{SENDER}\""),
+                "\"label\":\"night shift\"",
+            ],
+        );
+    }
+
+    let key = json::stringify(&json::Value::Str(KEY.into()));
+    let key = format!("\"key\":{key}");
+    let owner = format!("\"owner\":\"{SENDER}\"");
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
+    let acquired = watch_event(
+        &rig,
+        "watch.out",
+        "acquire",
+        &[&key, &owner, "\"expires_ms\":"],
+    );
+    assert_eq!(claim_cmd(&rig, "b.sock", "renew", SENDER, 120_000).0, 0);
+    let renewed = watch_event(&rig, "watch.out", "renew", &[&key, &owner]);
+    let deadline = |l: &str| {
+        json::parse(l.trim_start_matches("EVENT "))
+            .unwrap()
+            .get("expires_ms")
+            .unwrap()
+            .as_i64()
+            .unwrap()
+    };
+    assert!(
+        deadline(&renewed) > deadline(&acquired),
+        "{acquired} {renewed}"
+    );
+    // A refused request commits nothing and shows nothing.
+    assert_eq!(claim_cmd(&rig, "b.sock", "release", RECIPIENT, 0).0, 3);
+    assert_eq!(claim_cmd(&rig, "a.sock", "release", SENDER, 0).0, 0);
+    let released = watch_event(&rig, "watch.out", "release", &[&key, &owner]);
+    assert_eq!(deadline(&released), deadline(&renewed), "{released}");
+
+    // Expiry has no line of its own: it shows once, with the change that
+    // commits over it.
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 100).0, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", RECIPIENT, 60_000).0, 0);
+    watch_event(&rig, "watch.out", "expired", &[&key, &owner]);
+    watch_event(
+        &rig,
+        "watching.out",
+        "acquire",
+        &[&key, &format!("\"owner\":\"{RECIPIENT}\"")],
+    );
+
+    // The plain adapter's stdin closes: it unregisters.
+    drop(plain);
+    for out in ["watch.out", "watching.out"] {
+        watch_event(
+            &rig,
+            out,
+            "unregister",
+            &[&format!("\"session\":\"{THIRD}\"")],
+        );
+    }
+
+    let watched = read(&rig.p("watch.out"));
+    assert_eq!(
+        count_lines_with(&watched, "\"event\":\"release\""),
+        1,
+        "{watched}"
+    );
+    assert_eq!(
+        count_lines_with(&watched, "\"event\":\"expired\""),
+        1,
+        "{watched}"
+    );
+    assert_eq!(
+        count_lines_with(&watched, "\"event\":\"renew\""),
+        1,
+        "{watched}"
+    );
+    for line in watched.lines() {
+        assert!(
+            line == "WATCHING" || line.starts_with("EVENT {\"type\":\"board_event\","),
+            "{line}"
+        );
+    }
+    for out in ["plain.out", "session-a-1111.out"] {
+        let text = read(&rig.p(out));
+        assert!(!text.contains("board_event"), "{out}: {text}");
+    }
+}

@@ -16,7 +16,7 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 ```
 
 - `--bind <address:port>`: TCP listener serving both HTTP/1.1 and HTTP/2 (`h2c`).
-- `--socket <path|tcp://address:port>`: host `roger daemon` Unix socket path (Linux/macOS) or `tcp://<host:port>` endpoint (Linux, macOS, Windows; dialed with `TCP_NODELAY`).
+- `--socket <path|tcp://address:port>`: host `roger daemon` Unix socket path (Linux/macOS) or `tcp://<host:port>` endpoint (Linux, macOS, Windows; dialed with `TCP_NODELAY`). When `ROGER_CLIENT_TOKEN` is set and non-empty, every `tcp://` connection first sends `{"type":"auth","token":"<value>"}`; Unix socket connections never do.
 - `--store-dir <dir>`: directory holding per-Address append-only Store files (`<hex_sha256_of_address>.store`) and atomic read cursors (`<hex_sha256_of_address>.store.cursor`).
 - `--port-file <path>`: optional path atomically populated (`<path>.tmp` -> `fsync` -> `rename`) with the bound TCP port immediately after `bind`.
 - `--endpoint <path>`: MCP HTTP endpoint path (default `"/mcp"`). `GET /healthz` is always served (`200 OK` `{"ok":true}`).
@@ -42,6 +42,7 @@ Allowed without `Mcp-Session-Id` (request body limit: 16 MiB). Session parameter
 - **Address**: `X-Roger-Address` header -> URL query `id` or `address` (percent-decoded UTF-8) -> `params._meta.roger_address` -> generated UUIDv4.
 - **Label**: `X-Roger-Label` header -> URL query `label` -> `params._meta.roger_label`.
 - **Declaration**: `X-Roger-Declare` header -> URL query `declare` -> `params._meta.roger_declare`.
+- **Board watch** (opt-in, default off): `X-Roger-Watch: 1` header -> URL query `watch=1` -> `params._meta.roger_watch` (`true` or `1`). `0`/`false` leave it off; any other value is `400` naming what was expected. Opted-in sessions register with `"watch":true`, so the host daemon forwards committed Board changes (see `## Watching the Board` in the root README).
 
 Response (`200 OK`) returns `Mcp-Session-Id: <uuid>` and `X-Roger-Address: <address>` headers with the JSON-RPC `initialize` result. Any Store entries after `.cursor` are seeded into the session's SSE log at startup.
 
@@ -69,6 +70,7 @@ Push notification payloads:
 - `{"jsonrpc":"2.0","method":"notifications/roger/mail","params":{"record":"r-1","mail":"...","from":"...","body":"...","kind":"directed","headers":{...}}}`
 - `{"jsonrpc":"2.0","method":"notifications/roger/registered","params":{"session":"..."}}`
 - `{"jsonrpc":"2.0","method":"notifications/roger/superseded","params":{"session":"...","host":"...","at_ms":...}}`
+- Only for a session that opted in to Board watch: `{"jsonrpc":"2.0","method":"notifications/roger/board","params":{"event":"register|unregister|relabel|declared|acquire|renew|release|expired",...}}`, the host daemon's `board_event` line without its `type`, field order kept (`session`, `host`, `label`, `declared`, `key`, `owner`, `expires_ms`, `at_ms` as the event carries them). These are best-effort observations, not Mail: never written to the Store, never acked, and not replayed across a gateway restart.
 
 Resumption rules:
 

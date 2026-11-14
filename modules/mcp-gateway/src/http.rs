@@ -647,11 +647,41 @@ fn extract_init_params(
         },
     };
 
+    let watch = match header_utf8(headers, "x-roger-watch")? {
+        Some(w) => watch_flag(&w, "X-Roger-Watch")?,
+        None => match query_param(query, "watch")? {
+            Some(w) => watch_flag(&w, "query watch")?,
+            None => match params.get("_meta").and_then(|m| m.get("roger_watch")) {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(w)) => watch_flag(w, "_meta.roger_watch")?,
+                Some(Value::Number(n)) => watch_flag(&n.to_string(), "_meta.roger_watch")?,
+                Some(other) => {
+                    return Err(format!(
+                        "expected _meta.roger_watch to be true, false, 1 or 0, saw {other}"
+                    ))
+                }
+            },
+        },
+    };
+
     Ok(InitParams {
         address,
         label,
         declared,
+        watch,
     })
+}
+
+/// The `board_event` opt-in: `1` or `true` asks, `0` or `false` does not.
+fn watch_flag(raw: &str, from: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(format!(
+            "expected {from} to be 1, 0, true or false, saw {other:?}"
+        )),
+    }
 }
 
 fn json_value_response(
@@ -752,6 +782,34 @@ mod tests {
         assert_eq!(p.address.as_deref(), Some("from-hdr"));
         assert_eq!(p.label.as_deref(), Some("hdr-l"));
         assert_eq!(p.declared.as_deref(), Some("hdr-d"));
+        assert!(!p.watch);
+    }
+
+    #[test]
+    fn watch_opt_in_is_header_then_query_then_meta() {
+        let mut headers = HeaderMap::new();
+        let none = Value::Object(serde_json::Map::new());
+        assert!(!extract_init_params(&headers, None, &none).unwrap().watch);
+        let meta = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":true}}"#).unwrap();
+        assert!(extract_init_params(&headers, None, &meta).unwrap().watch);
+        let meta1 = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":1}}"#).unwrap();
+        assert!(extract_init_params(&headers, None, &meta1).unwrap().watch);
+        assert!(
+            !extract_init_params(&headers, Some("watch=0"), &meta)
+                .unwrap()
+                .watch
+        );
+        headers.insert("x-roger-watch", HeaderValue::from_static("1"));
+        assert!(
+            extract_init_params(&headers, Some("watch=0"), &none)
+                .unwrap()
+                .watch
+        );
+        headers.insert("x-roger-watch", HeaderValue::from_static("yes"));
+        let err = extract_init_params(&headers, None, &none).err().unwrap();
+        assert!(err.contains("saw \"yes\""), "{err}");
+        let bad = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":[1]}}"#).unwrap();
+        assert!(extract_init_params(&HeaderMap::new(), None, &bad).is_err());
     }
 
     #[test]

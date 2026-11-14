@@ -77,7 +77,7 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
 | `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session`, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
+| `adapter` | same as `session`, plus `[--registered] [--superseded] [--watch]` (also send `{"type":"registered"}`, see Faces; `board_event` lines, see Watching the Board) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
@@ -86,6 +86,7 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
 | `release` | `--socket --owner <address> --key <text>` | give a Claim up |
 | `board` | `--socket [--from <address>]` | one Board read; `--from` counts as that session's activity |
+| `watch` | `--socket` | prints `WATCHING`, then `EVENT <board_event JSON>` per committed Board change until the connection ends (see Watching the Board) |
 
 A session's Address is `--id`, or a fresh UUID. An Address is an opaque string: a UUID, or the
 whole composite `[[<token>:<label>:<token>]]<uuid>` (the label may hold spaces; a token is lowercase base 36, `0-9a-z`, no leading zeros). Every
@@ -300,6 +301,41 @@ than before. Only the live holder can renew or release; a session that lost a ke
 cannot renew it back. One failed log append stops the coordinator rather than letting memory
 and disk diverge; a restart replays the log.
 
+## Watching the Board
+
+The Board and Claims can be read (`board`) or watched. A connection to a host daemon opts in
+with `{"type":"watch","req":<n>}`, answered `{"type":"watching","req":<n>}`; it need not be a
+session. A session's `register` line may instead carry `"watch":true` (no answer). From then
+until that connection closes it receives one line per committed change:
+
+```
+{"type":"board_event","event":"register","session":"<address>","host":"<host>","at_ms":<n>}
+{"type":"board_event","event":"unregister","session":"<address>","at_ms":<n>}
+{"type":"board_event","event":"relabel","session":"<address>","label":"<text>","at_ms":<n>}
+{"type":"board_event","event":"declared","session":"<address>","declared":"<text>","at_ms":<n>}
+{"type":"board_event","event":"acquire|renew|release|expired","key":"<key>","owner":"<address>","expires_ms":<n>,"at_ms":<n>}
+```
+
+Each is sent when the coordinator commits the matching log line (`session`, `unregister`,
+`label`, `declared`, `claim`, `release`), never by a timer; `at_ms` is the coordinator clock.
+A Register commits its lines in order, so it may show as `register`, then `relabel`, then
+`declared` (without `declared` when the text was cleared). `expires_ms` is the grant's absolute
+deadline; on `release` it is the deadline the released grant held. Expiry has no log line of its
+own: a watcher knows the deadline from `expires_ms`, and the `expired` event is sent once, just
+before the change that the coordinator commits over the expired grant (the next acquire of
+that key). A refused request commits nothing and shows nothing.
+
+Events are best-effort observations, not Mail: nothing stores or acks them, and a watcher whose
+connection or host daemon link was down misses what was committed meanwhile; it reads the Board
+to catch up. Only a connection that asked receives `board_event`: a host daemon asks the
+coordinator with `"board_events":true` in its hello, and forwards only to its own opted-in
+connections. An older coordinator ignores the field and sends none; an older host daemon never
+asks and refuses `watch` as an unknown type. Faces: `roger adapter --watch` passes each line to
+its client on stdout unchanged (never without the flag); `roger watch` prints them; `roger mcp`
+does not offer them, since its stdout carries no unsolicited notification (see Faces). The
+`modules/mcp-gateway` module forwards them over SSE as `notifications/roger/board` to a session
+that opted in at `initialize`.
+
 ## Durability and locks
 
 Every durable log (a Store, the daemon and coordinator logs) is append-only and fsynced per
@@ -383,7 +419,8 @@ that speaks one needs nothing more from the core.
 
 - **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket or TCP
   listener (`--listen <addr:port>`, dialed as `tcp://<addr:port>`): `register`,
-  `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`
+  `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`, `watch`
+  (see Watching the Board). The `session`
   Tracer and the one-shot subcommands above are clients of it. A `register` line may carry
   `"confirm_register":true`; the host daemon then sends `{"type":"registered","session":"<address>"}`
   once, when the coordinator holds that Register. Without the field no such line is ever sent.

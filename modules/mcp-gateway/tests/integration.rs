@@ -1849,3 +1849,198 @@ async fn cli_flags_custom_endpoint_limits_tool_errors_and_daemon_eof_behave_clea
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+// ---- Test 6: Board watch opt-in forwards committed Board changes over SSE ----
+
+async fn init_session(port: u16, headers: &[(&str, &str)], params: Value) -> String {
+    let (st, hdrs, body) = h1_request(
+        port,
+        Method::POST,
+        "/mcp",
+        headers,
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    hdrs.get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn call(port: u16, sid: &str, name: &str, args: Value) -> Value {
+    let (_, _, body) = h1_request(
+        port,
+        Method::POST,
+        "/mcp",
+        &[("mcp-session-id", sid)],
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": name, "arguments": args }
+        }))
+        .unwrap(),
+    )
+    .await;
+    parse_tool_payload(&body)
+}
+
+/// The next `notifications/roger/board` frame whose `event` is `event`,
+/// skipping every other frame.
+async fn next_board(sse: &mut SseReader, event: &str) -> Value {
+    next_board_of(sse, event, None).await
+}
+
+/// As `next_board`, for one session's change only when `session` is given.
+async fn next_board_of(sse: &mut SseReader, event: &str, session: Option<&str>) -> Value {
+    loop {
+        let e = sse.next_event().await.expect("SSE stream ended");
+        let p = &e.data["params"];
+        if e.data["method"] == "notifications/roger/board"
+            && p["event"] == event
+            && session.is_none_or(|s| p["session"] == s)
+        {
+            assert!(
+                e.raw_data.contains(r#""params":{"event":"#),
+                "{}",
+                e.raw_data
+            );
+            return p.clone();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn board_watch_opt_in_forwards_committed_changes_and_others_see_none() {
+    let mut rig = TestRig::start("board-watch").await;
+    let (_, gw_port) = rig.spawn_gateway(&[], &[]).await;
+
+    // Opted in by header, by _meta, and not at all.
+    let watcher = init_session(
+        gw_port,
+        &[("x-roger-address", ADDR_1), ("x-roger-watch", "1")],
+        json!({}),
+    )
+    .await;
+    let meta_watcher = init_session(
+        gw_port,
+        &[("x-roger-address", ADDR_COMPOSITE)],
+        json!({"_meta": {"roger_watch": true}}),
+    )
+    .await;
+    let (_, _, mut sse) = h1_open_sse(gw_port, "/mcp", &[("mcp-session-id", &watcher)]).await;
+    let (_, _, mut meta_sse) =
+        h1_open_sse(gw_port, "/mcp", &[("mcp-session-id", &meta_watcher)]).await;
+    let plain = init_session(
+        gw_port,
+        &[("x-roger-address", ADDR_2), ("x-roger-label", "desk 4")],
+        json!({}),
+    )
+    .await;
+    let (_, _, mut plain_sse) = h1_open_sse(gw_port, "/mcp", &[("mcp-session-id", &plain)]).await;
+
+    for s in [&mut sse, &mut meta_sse] {
+        let reg = next_board_of(s, "register", Some(ADDR_2)).await;
+        assert_eq!(reg["session"], ADDR_2, "{reg}");
+        assert!(reg["at_ms"].is_i64(), "{reg}");
+        assert!(reg.get("type").is_none(), "{reg}");
+        let label = next_board(s, "relabel").await;
+        assert_eq!(
+            (&label["session"], &label["label"]),
+            (&json!(ADDR_2), &json!("desk 4"))
+        );
+    }
+
+    let claimed = call(
+        gw_port,
+        &plain,
+        "roger_claim",
+        json!({"key": "desk-4", "ttl_seconds": 60}),
+    )
+    .await;
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    let acquired = next_board(&mut sse, "acquire").await;
+    assert_eq!(
+        (&acquired["key"], &acquired["owner"]),
+        (&json!("desk-4"), &json!(ADDR_2))
+    );
+    assert!(acquired["expires_ms"].is_i64(), "{acquired}");
+    call(
+        gw_port,
+        &plain,
+        "roger_renew",
+        json!({"key": "desk-4", "ttl_seconds": 120}),
+    )
+    .await;
+    let renewed = next_board(&mut sse, "renew").await;
+    assert!(renewed["expires_ms"].as_i64() > acquired["expires_ms"].as_i64());
+    call(gw_port, &plain, "roger_release", json!({"key": "desk-4"})).await;
+    let released = next_board(&mut sse, "release").await;
+    assert_eq!(
+        (&released["key"], &released["owner"]),
+        (&json!("desk-4"), &json!(ADDR_2))
+    );
+
+    // The session that did not ask sees no Board change: a Mail sent after
+    // all of them arrives with none ahead of it.
+    let out = Command::new(roger_bin())
+        .args([
+            "send",
+            "--socket",
+            rig.daemon_sock().to_str().unwrap(),
+            "--from",
+            ADDR_1,
+            "--to",
+            ADDR_2,
+            "--mail",
+            "after-board",
+            "--body",
+            "b",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    loop {
+        let e = plain_sse.next_event().await.expect("SSE stream ended");
+        assert_ne!(
+            e.data["method"], "notifications/roger/board",
+            "{}",
+            e.raw_data
+        );
+        if e.data["method"] == "notifications/roger/mail" {
+            assert_eq!(e.data["params"]["mail"], "after-board");
+            break;
+        }
+    }
+
+    // Unregister on DELETE shows too.
+    let (st, _, _) = h1_request(
+        gw_port,
+        Method::DELETE,
+        "/mcp",
+        &[("mcp-session-id", &plain)],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let gone = next_board(&mut sse, "unregister").await;
+    assert_eq!(gone["session"], ADDR_2, "{gone}");
+
+    // A bad opt-in value is refused, naming what was expected.
+    let (st, _, body) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &[("x-roger-watch", "yes")],
+        serde_json::to_vec(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("expected X-Roger-Watch"));
+}
