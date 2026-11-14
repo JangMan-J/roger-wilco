@@ -5382,6 +5382,9 @@ fn watchers_see_committed_board_changes_and_others_see_none() {
     let refs: Vec<&str> = watch_args.iter().map(|s| s.as_str()).collect();
     rig.spawn(&refs, "watch.out");
     wait_for_text(&rig.p("watch.out"), "WATCHING", Duration::from_secs(10));
+    // A raw socket session that never asks: the daemon itself sends it nothing.
+    let raw_silent = "[[0:FLEET:0]]77777777-7777-4777-8777-777777777777";
+    let mut raw = takeover_socket(&rig, "b.sock", raw_silent, false);
 
     // An adapter that asked; one that did not; a Tracer, which never asks.
     let (_, _watching) = rig.start_adapter(
@@ -5532,4 +5535,13 @@ fn watchers_see_committed_board_changes_and_others_see_none() {
         let text = read(&rig.p(out));
         assert!(!text.contains("board_event"), "{out}: {text}");
     }
+    raw.get_ref()
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut seen = String::new();
+    while {
+        use std::io::BufRead;
+        matches!(raw.read_line(&mut seen), Ok(n) if n > 0)
+    } {}
+    assert!(!seen.contains("board_event"), "{seen}");
 }
