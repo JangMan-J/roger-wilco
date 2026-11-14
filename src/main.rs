@@ -50,7 +50,7 @@ const USAGE: &str = "Usage: roger <command> [flags]
 Commands:
   coordinator --bind <address:port> --data <log>
               [--port-file <path>] [--unregister-after-ms <ms>]
-  daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
+  daemon      --coordinator <address:port> --host-id <host> [--socket <path>] [--listen <address:port>] [--port-file <path>] --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
@@ -69,6 +69,7 @@ Commands:
               [--address <address>] [--bodies] [--json]   (read-only; no lock, no write)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
+Client --socket accepts a Unix socket path or tcp://<address:port>.
 Session addresses and mail IDs are generated when omitted.
 Claim refusal exits with status 3; an unknown command exits with status 2.
 Use --help or -h for this help.";
@@ -104,13 +105,35 @@ fn main() -> io::Result<()> {
                 None => coordinator::UNREGISTER_AFTER_MS,
             },
         ),
-        "daemon" => daemon::run(daemon::Config {
-            coordinator: need(&args, "--coordinator")?,
-            token: token()?,
-            host_id: need(&args, "--host-id")?,
-            socket: PathBuf::from(need(&args, "--socket")?),
-            data: PathBuf::from(need(&args, "--data")?),
-        }),
+        "daemon" => {
+            let coordinator = need(&args, "--coordinator")?;
+            let token = token()?;
+            let host_id = need(&args, "--host-id")?;
+            let socket = arg(&args, "--socket").map(PathBuf::from);
+            let listen = arg(&args, "--listen");
+            let port_file = arg(&args, "--port-file").map(PathBuf::from);
+            if socket.is_none() && listen.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing --socket",
+                ));
+            }
+            if port_file.is_some() && listen.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected --listen with --port-file, saw none",
+                ));
+            }
+            daemon::run(daemon::Config {
+                coordinator,
+                token,
+                host_id,
+                socket,
+                listen,
+                port_file,
+                data: PathBuf::from(need(&args, "--data")?),
+            })
+        }
         "session" => session::run(
             PathBuf::from(need(&args, "--socket")?),
             match arg(&args, "--id") {

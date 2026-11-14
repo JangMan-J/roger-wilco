@@ -1,16 +1,16 @@
 //! The host daemon: one per host. Connects outbound to the coordinator,
 //! holds the durable local inbox for sessions on this host, and serves
-//! them over a Unix socket. Deliveries are committed to the local log
-//! before they are pushed to a session; acks are committed locally, then
-//! forwarded upstream. Pending mail is pushed on registration, never by
-//! a timer.
+//! them over a Unix socket, a TCP listener, or both. Deliveries are committed
+//! to the local log before they are pushed to a session; acks are committed
+//! locally, then forwarded upstream. Pending mail is pushed on registration,
+//! never by a timer.
 
 use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -103,11 +103,25 @@ pub struct Config {
     pub coordinator: String,
     pub token: String,
     pub host_id: String,
-    pub socket: PathBuf,
+    pub socket: Option<PathBuf>,
+    pub listen: Option<String>,
+    pub port_file: Option<PathBuf>,
     pub data: PathBuf,
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
+    if cfg.socket.is_none() && cfg.listen.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing --socket",
+        ));
+    }
+    if cfg.port_file.is_some() && cfg.listen.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected --listen with --port-file, saw none",
+        ));
+    }
     let (log, prior) = DurLog::open(&cfg.data)?;
     let mut state = State::new(log);
     for line in prior {
@@ -115,9 +129,37 @@ pub fn run(cfg: Config) -> io::Result<()> {
             apply(&mut state, &v);
         }
     }
-    // Bind before dialing upstream: a daemon refused its socket must not
-    // have joined the coordinator first.
-    let listener = bind_socket(&cfg.socket)?;
+    // Bind before dialing upstream: a daemon refused its socket or TCP address
+    // must not have joined the coordinator first.
+    let unix_listener = match &cfg.socket {
+        Some(path) => Some(bind_socket(path)?),
+        None => None,
+    };
+    let tcp_listener = match &cfg.listen {
+        Some(addr) => match TcpListener::bind(addr) {
+            Ok(tcp) => {
+                if let Some(pf) = &cfg.port_file {
+                    if let Err(e) = tcp
+                        .local_addr()
+                        .and_then(|local| net::publish_port(pf, local.port()))
+                    {
+                        if let Some(path) = &cfg.socket {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return Err(e);
+                    }
+                }
+                Some(tcp)
+            }
+            Err(e) => {
+                if let Some(path) = &cfg.socket {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(e);
+            }
+        },
+        None => None,
+    };
     let state = Arc::new(Mutex::new(state));
     let cfg = Arc::new(cfg);
 
@@ -127,12 +169,48 @@ pub fn run(cfg: Config) -> io::Result<()> {
         std::thread::spawn(move || upstream_loop(cfg, state));
     }
 
-    eprintln!("host daemon listening on {}", cfg.socket.display());
+    if let Some(path) = &cfg.socket {
+        eprintln!("host daemon listening on {}", path.display());
+    }
+    if let Some(tcp) = &tcp_listener {
+        eprintln!("host daemon listening on {}", tcp.local_addr()?);
+    }
+
+    match (unix_listener, tcp_listener) {
+        (Some(unix), Some(tcp)) => {
+            let tcp_state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                if let Err(e) = accept_tcp(tcp, tcp_state) {
+                    eprintln!("tcp listener ended: {e}");
+                }
+            });
+            accept_unix(unix, state)
+        }
+        (Some(unix), None) => accept_unix(unix, state),
+        (None, Some(tcp)) => accept_tcp(tcp, state),
+        (None, None) => unreachable!("validated at start of run"),
+    }
+}
+
+fn accept_unix(listener: UnixListener, state: Arc<Mutex<State>>) -> io::Result<()> {
     for conn in listener.incoming() {
         let conn = conn?;
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
-            if let Err(e) = serve_local(conn, state) {
+            if let Err(e) = serve_unix(conn, state) {
+                eprintln!("local connection ended: {e}");
+            }
+        });
+    }
+    Ok(())
+}
+
+fn accept_tcp(listener: TcpListener, state: Arc<Mutex<State>>) -> io::Result<()> {
+    for conn in listener.incoming() {
+        let conn = conn?;
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            if let Err(e) = serve_tcp(conn, state) {
                 eprintln!("local connection ended: {e}");
             }
         });
@@ -591,15 +669,29 @@ fn with_req(mut v: Value, req: i64) -> Value {
     v
 }
 
-/// One local connection, from accept to its end. Every line for the session
-/// goes through its queue, so a session that stops reading delays only its
-/// own lines: the Mail it has not taken stays in the inbox, unacked.
-fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
+fn serve_unix(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
+    let lines = net::lines(Box::new(conn.try_clone()?));
     let conn = Arc::new(conn);
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
     });
+    serve_local(writer, lines, state)
+}
+
+fn serve_tcp(conn: TcpStream, state: Arc<Mutex<State>>) -> io::Result<()> {
+    conn.set_nodelay(true)?;
     let lines = net::lines(Box::new(conn.try_clone()?));
+    let conn = Arc::new(conn);
+    let writer = net::queued(Arc::clone(&conn), |c| {
+        let _ = c.shutdown(Shutdown::Both);
+    });
+    serve_local(writer, lines, state)
+}
+
+/// One local connection, from accept to its end. Every line for the session
+/// goes through its queue, so a session that stops reading delays only its
+/// own lines: the Mail it has not taken stays in the inbox, unacked.
+fn serve_local(writer: Writer, lines: net::Lines, state: Arc<Mutex<State>>) -> io::Result<()> {
     let mut session_id: Option<String> = None;
     let result = local_loop(&writer, lines, &state, &mut session_id);
     // Whatever ended the connection, a dead Writer must not stay registered:

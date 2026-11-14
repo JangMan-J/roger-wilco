@@ -15,6 +15,11 @@ every host including that one. What the core guarantees is in the
 - The coordinator link is plain TCP: the token and every Mail body cross it unencrypted.
   Bind the coordinator to a private network all hosts can reach, such as a VPN, never to a
   public interface.
+- When serving containerized or cross-machine clients directly over TCP (`roger daemon
+  --listen <private-addr:port>`, dialed with `--socket tcp://<private-addr:port>` or
+  `ROGER_SOCKET=tcp://<private-addr:port>`), bind `--listen` only to a private container
+  bridge or VPN, never to a public interface: the daemon's client protocol is unencrypted
+  and carries no token of its own.
 
 ## Install
 

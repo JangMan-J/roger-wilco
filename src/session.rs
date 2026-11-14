@@ -8,9 +8,45 @@ use crate::json::{self, obj, s, Value};
 use crate::net;
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Dial a host daemon over a Unix socket path or `tcp://<address:port>`.
+pub fn connect(target: &Path) -> io::Result<(net::Writer, net::Lines)> {
+    match target.to_str().and_then(|s| s.strip_prefix("tcp://")) {
+        Some("") => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected tcp://<address:port>, saw tcp://",
+        )),
+        Some(addr) => {
+            let conn = TcpStream::connect(addr).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("expected a host daemon at {}, saw {e}", target.display()),
+                )
+            })?;
+            conn.set_nodelay(true)?;
+            Ok((
+                net::writer(Box::new(conn.try_clone()?)),
+                net::lines(Box::new(conn)),
+            ))
+        }
+        None => {
+            let conn = UnixStream::connect(target).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("expected a host daemon at {}, saw {e}", target.display()),
+                )
+            })?;
+            Ok((
+                net::writer(Box::new(conn.try_clone()?)),
+                net::lines(Box::new(conn)),
+            ))
+        }
+    }
+}
 
 /// Test hook (feature `test-hooks` only): when set, the first delivery is
 /// written to the Store, the marker file is created, and the session parks
@@ -121,7 +157,7 @@ fn client_io(socket: PathBuf, me: String, to_client: net::Writer, daemon: net::W
     });
 }
 
-fn client_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
+fn client_request(socket: &Path, me: &str, v: &Value) -> io::Result<Value> {
     match net::field(v, "type")? {
         "send" => client_send(socket, me, v),
         "board" => request(
@@ -165,7 +201,7 @@ fn client_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
     }
 }
 
-fn client_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
+fn client_send(socket: &Path, from: &str, v: &Value) -> io::Result<Value> {
     // A missing mail id is generated; a present one of the wrong type is a
     // malformed send, not a request to pick another id.
     let mail = match v.get("mail") {
@@ -214,14 +250,7 @@ pub fn serve(
     }
     let mut next_record = records.len() as u64 + 1;
 
-    let conn = UnixStream::connect(&socket).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("expected a host daemon at {}, saw {e}", socket.display()),
-        )
-    })?;
-    let writer = net::writer(Box::new(conn.try_clone()?));
-    let lines = net::lines(Box::new(conn));
+    let (writer, lines) = connect(&socket)?;
     let mut register = vec![("type", s("register")), ("session", s(&id))];
     if let Some(label) = &label {
         register.push(("label", s(label)));
@@ -408,16 +437,14 @@ pub fn relabel(socket: PathBuf, session: String, label: String) -> io::Result<()
 }
 
 pub fn send_mail(
-    socket: &PathBuf,
+    socket: &Path,
     from: &str,
     to: &str,
     mail: &str,
     body: &str,
     headers: Option<&Value>,
 ) -> io::Result<String> {
-    let conn = UnixStream::connect(socket)?;
-    let writer = net::writer(Box::new(conn.try_clone()?));
-    let mut lines = net::lines(Box::new(conn));
+    let (writer, mut lines) = connect(socket)?;
     let mut ask = vec![
         ("type", s("send")),
         ("req", Value::Int(1)),
@@ -458,11 +485,10 @@ fn print_headers(mail: &str, headers: &Value) {
 }
 
 /// One request to the host daemon, answered by exactly one line.
-pub fn request(socket: &PathBuf, v: &Value) -> io::Result<Value> {
-    let conn = UnixStream::connect(socket)?;
-    let writer = net::writer(Box::new(conn.try_clone()?));
+pub fn request(socket: &Path, v: &Value) -> io::Result<Value> {
+    let (writer, mut lines) = connect(socket)?;
     net::send(&writer, v)?;
-    let reply = net::lines(Box::new(conn)).next().ok_or_else(|| {
+    let reply = lines.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!("expected one reply line from {}, saw EOF", socket.display()),

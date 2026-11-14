@@ -779,7 +779,7 @@ enum Event {
 
 pub fn run(args: &[String]) -> io::Result<()> {
     let cfg = resolve(args, &|n| std::env::var(n).ok(), &session::gen_uuid)?;
-    if !cfg.socket.exists() {
+    if !cfg.socket.to_str().is_some_and(|s| s.starts_with("tcp://")) && !cfg.socket.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -788,6 +788,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             ),
         ));
     }
+    let store_existed = cfg.store.exists();
     let ctx = Arc::new(Ctx {
         socket: cfg.socket.clone(),
         me: cfg.address.clone(),
@@ -834,7 +835,15 @@ pub fn run(args: &[String]) -> io::Result<()> {
 
     let daemon = match rx.recv() {
         Ok(Event::Registered(w)) => w,
-        Ok(Event::Ended(Err(e))) => return Err(e),
+        Ok(Event::Ended(Err(e))) => {
+            if cfg.store_is_default
+                && !store_existed
+                && entries(&cfg.store).is_ok_and(|x| x.is_empty())
+            {
+                let _ = std::fs::remove_file(&cfg.store);
+            }
+            return Err(e);
+        }
         Ok(Event::Ended(Ok(()))) | Err(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1009,6 +1018,25 @@ mod tests {
         assert!(!cfg.store_is_default);
         let cfg = resolved(&["--store", "/f.store"], &[("ROGER_SOCKET", "/s")]).unwrap();
         assert_eq!(cfg.store, PathBuf::from("/f.store"));
+        let cfg = resolved(
+            &[],
+            &[("ROGER_SOCKET", "tcp://127.0.0.1:7478"), ("HOME", "/h")],
+        )
+        .unwrap();
+        assert_eq!(cfg.socket, PathBuf::from("tcp://127.0.0.1:7478"));
+        assert_eq!(
+            cfg.store,
+            PathBuf::from("/h/.local/state/roger/mcp/fresh-uuid.store")
+        );
+        assert!(cfg.store_is_default);
+        let cfg = resolved(
+            &["--socket", "tcp://127.0.0.1:7478"],
+            &[("XDG_STATE_HOME", "/st")],
+        )
+        .unwrap();
+        assert_eq!(cfg.socket, PathBuf::from("tcp://127.0.0.1:7478"));
+        assert_eq!(cfg.store, PathBuf::from("/st/roger/mcp/fresh-uuid.store"));
+        assert!(cfg.store_is_default);
     }
 
     #[test]

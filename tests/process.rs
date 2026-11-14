@@ -4550,3 +4550,629 @@ fn a_peer_that_does_not_ping_is_not_held_to_the_silence_bound() {
     );
     assert!(!read(&rig.p("daemon-c.out.err")).contains("upstream"));
 }
+
+fn wait_for_tcp(addr: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for a daemon to accept TCP on {addr}");
+}
+
+fn wait_for_board_target(target: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let out = Command::new(BIN)
+            .args(["board", "--socket", target])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for board on {target}");
+}
+
+#[test]
+fn tcp_and_dual_listener_daemons_serve_sessions_adapters_claims_broadcast_and_receipts() {
+    let mut rig = Rig::new("tcp-dual-and-pure");
+    let coord_port_file = rig.p("coord.port");
+    let coord_args = rig.coordinator_args("127.0.0.1:0", &coord_port_file, &rig.p("coord.log"));
+    let coord_refs: Vec<&str> = coord_args.iter().map(|s| s.as_str()).collect();
+    rig.spawn(&coord_refs, "coord.out");
+    wait_for_port(&coord_port_file, Duration::from_secs(10));
+    let coord = format!("127.0.0.1:{}", read(&coord_port_file).trim());
+
+    // Host A: dual-listener daemon (--socket + --listen + --port-file).
+    let a_sock = rig.p("a.sock");
+    let a_port_file = rig.p("a.port");
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &coord,
+            "--host-id",
+            "host-dual",
+            "--socket",
+            a_sock.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            a_port_file.to_str().unwrap(),
+            "--data",
+            rig.p("a.log").to_str().unwrap(),
+        ],
+        "daemon-a.out",
+    );
+    wait_for_port(&a_port_file, Duration::from_secs(10));
+    wait_for_socket(&a_sock, Duration::from_secs(10));
+    let a_tcp_raw = format!("127.0.0.1:{}", read(&a_port_file).trim());
+    wait_for_tcp(&a_tcp_raw, Duration::from_secs(10));
+    let a_tcp = format!("tcp://{a_tcp_raw}");
+
+    // Host B: pure-TCP daemon (--listen + --port-file, no --socket).
+    let b_port_file = rig.p("b.port");
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &coord,
+            "--host-id",
+            "host-tcp",
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            b_port_file.to_str().unwrap(),
+            "--data",
+            rig.p("b.log").to_str().unwrap(),
+        ],
+        "daemon-b.out",
+    );
+    wait_for_port(&b_port_file, Duration::from_secs(10));
+    let b_tcp_raw = format!("127.0.0.1:{}", read(&b_port_file).trim());
+    wait_for_tcp(&b_tcp_raw, Duration::from_secs(10));
+    let b_tcp = format!("tcp://{b_tcp_raw}");
+
+    wait_for_board_target(&a_tcp, Duration::from_secs(10));
+    wait_for_board_target(&b_tcp, Duration::from_secs(10));
+    wait_for_text(
+        &rig.p("daemon-a.out.err"),
+        &format!("host daemon listening on {}", a_sock.display()),
+        Duration::from_secs(5),
+    );
+    wait_for_text(
+        &rig.p("daemon-a.out.err"),
+        &format!("host daemon listening on {a_tcp_raw}"),
+        Duration::from_secs(5),
+    );
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        &format!("host daemon listening on {b_tcp_raw}"),
+        Duration::from_secs(5),
+    );
+
+    let u_addr = "[[0:FLEET:0]]11111111-1111-4111-8111-111111111111";
+    let t_addr = "[[153:Meteor Shower:7]]22222222-2222-4222-8222-222222222222";
+    let a_addr = "[[153:Meteor Shower:7]]33333333-3333-4333-8333-333333333333";
+
+    // Unix Tracer on host-dual.
+    rig.spawn(
+        &[
+            "session",
+            "--socket",
+            a_sock.to_str().unwrap(),
+            "--id",
+            u_addr,
+            "--store",
+            rig.p("u.store").to_str().unwrap(),
+            "--label",
+            "unix-peer",
+        ],
+        "u.out",
+    );
+    rig.await_registered("u.out");
+
+    // Pure-TCP Tracer on host-tcp.
+    rig.spawn(
+        &[
+            "session",
+            "--socket",
+            &b_tcp,
+            "--id",
+            t_addr,
+            "--store",
+            rig.p("t.store").to_str().unwrap(),
+            "--label",
+            "container-peer",
+            "--declare",
+            "role=worker",
+        ],
+        "t.out",
+    );
+    rig.await_registered("t.out");
+
+    // TCP adapter (--registered --superseded) on host-dual's TCP listener.
+    let mut adapter_child = Command::new(BIN)
+        .args([
+            "adapter",
+            "--socket",
+            &a_tcp,
+            "--id",
+            a_addr,
+            "--store",
+            rig.p("a.store").to_str().unwrap(),
+            "--registered",
+            "--superseded",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(fs::File::create(rig.p("a.out")).unwrap()))
+        .stderr(Stdio::from(fs::File::create(rig.p("a.out.err")).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut adapter_in = adapter_child.stdin.take().unwrap();
+    rig.children.push(adapter_child);
+    wait_for_text(
+        &rig.p("a.out"),
+        "\"type\":\"registered\"",
+        Duration::from_secs(10),
+    );
+
+    // Directed Mail from pure-TCP CLI client to TCP adapter with non-ASCII headers & composite Reference.
+    let send_out = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            &b_tcp,
+            "--from",
+            t_addr,
+            "--to",
+            a_addr,
+            "--mail",
+            "m-tcp-1",
+            "--body",
+            "bonjour ✓ [[153:Meteor Shower:7]]",
+            "--header",
+            "x-note=café✓",
+            "--header",
+            "x-ref=[[153:Meteor Shower:7]]",
+        ])
+        .output()
+        .unwrap();
+    assert!(send_out.status.success(), "{send_out:?}");
+    assert!(String::from_utf8_lossy(&send_out.stdout).contains("ACCEPTED mail=m-tcp-1"));
+
+    wait_for_text(
+        &rig.p("a.out"),
+        "\"mail\":\"m-tcp-1\"",
+        Duration::from_secs(10),
+    );
+    let a_lines = read(&rig.p("a.out"));
+    let delivered = a_lines
+        .lines()
+        .map(|l| json::parse(l).unwrap())
+        .find(|v| v.get("type").and_then(|x| x.as_str()) == Some("mail"))
+        .unwrap();
+    assert_eq!(delivered.get("from").and_then(|x| x.as_str()), Some(t_addr));
+    assert_eq!(
+        delivered.get("body").and_then(|x| x.as_str()),
+        Some("bonjour ✓ [[153:Meteor Shower:7]]")
+    );
+    assert_eq!(
+        delivered.get("kind").and_then(|x| x.as_str()),
+        Some("directed")
+    );
+    assert_eq!(
+        delivered.get("record").and_then(|x| x.as_str()),
+        Some("r-1")
+    );
+    assert_eq!(
+        delivered
+            .get("headers")
+            .and_then(|h| h.get("x-note"))
+            .and_then(|x| x.as_str()),
+        Some("café✓")
+    );
+
+    // Wait for receipt over pure-TCP client.
+    let start = Instant::now();
+    let rcpt_text = loop {
+        let out = Command::new(BIN)
+            .args(["receipt", "--socket", &b_tcp, "--mail", "m-tcp-1"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if text.starts_with("RECEIPT ") {
+            break text;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "receipt: {text}");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        rcpt_text.contains(&format!("to={a_addr} record=r-1"))
+            && rcpt_text.contains("kind=directed")
+            && rcpt_text.contains(
+                "HEADERS mail=m-tcp-1 {\"x-note\":\"café✓\",\"x-ref\":\"[[153:Meteor Shower:7]]\"}"
+            ),
+        "{rcpt_text}"
+    );
+
+    // Directed Mail from TCP adapter back to pure-TCP Tracer.
+    writeln!(
+        adapter_in,
+        "{{\"type\":\"send\",\"to\":\"{t_addr}\",\"mail\":\"m-tcp-2\",\"body\":\"reply Δ\",\"headers\":{{\"k\":\"λ\"}}}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("a.out"),
+        "\"type\":\"accepted\"",
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("t.out"),
+        "DELIVERED mail=m-tcp-2 record=r-1",
+        Duration::from_secs(10),
+    );
+    assert!(read(&rig.p("t.out")).contains("HEADERS mail=m-tcp-2 {\"k\":\"λ\"}"));
+
+    // Broadcast over TCP reaches Unix session, TCP adapter, and pure-TCP session.
+    let bc_out = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            &a_tcp,
+            "--from",
+            u_addr,
+            "--to",
+            "*",
+            "--mail",
+            "bc-tcp",
+            "--body",
+            "broadcast ✓",
+            "--header",
+            "scope=fleet",
+        ])
+        .output()
+        .unwrap();
+    assert!(bc_out.status.success(), "{bc_out:?}");
+    wait_for_text(
+        &rig.p("u.out"),
+        &format!("DELIVERED mail=bc-tcp/{u_addr} record=r-1"),
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("t.out"),
+        &format!("DELIVERED mail=bc-tcp/{t_addr} record=r-2"),
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("a.out"),
+        &format!("\"mail\":\"bc-tcp/{a_addr}\""),
+        Duration::from_secs(10),
+    );
+
+    // Claims, contention (exit 3), renew, relabel, board, and release over TCP.
+    let claim_ok = Command::new(BIN)
+        .args([
+            "claim", "--socket", &b_tcp, "--owner", t_addr, "--key", "job-tcp", "--ttl-ms", "30000",
+        ])
+        .output()
+        .unwrap();
+    assert!(claim_ok.status.success(), "{claim_ok:?}");
+    assert!(String::from_utf8_lossy(&claim_ok.stdout).starts_with("CLAIMED "));
+
+    let claim_refused = Command::new(BIN)
+        .args([
+            "claim", "--socket", &a_tcp, "--owner", u_addr, "--key", "job-tcp", "--ttl-ms", "30000",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(claim_refused.status.code(), Some(3), "{claim_refused:?}");
+    let refused_stdout = String::from_utf8_lossy(&claim_refused.stdout);
+    assert!(
+        refused_stdout.starts_with("REFUSED ")
+            && refused_stdout.contains(&format!("holder={t_addr}")),
+        "{refused_stdout}"
+    );
+
+    let renew_ok = Command::new(BIN)
+        .args([
+            "renew", "--socket", &b_tcp, "--owner", t_addr, "--key", "job-tcp", "--ttl-ms", "60000",
+        ])
+        .output()
+        .unwrap();
+    assert!(renew_ok.status.success(), "{renew_ok:?}");
+    assert!(String::from_utf8_lossy(&renew_ok.stdout).starts_with("RENEWED "));
+
+    let label_ok = Command::new(BIN)
+        .args([
+            "label",
+            "--socket",
+            &b_tcp,
+            "--from",
+            t_addr,
+            "--label",
+            "relabeled-container ✓",
+        ])
+        .output()
+        .unwrap();
+    assert!(label_ok.status.success(), "{label_ok:?}");
+    assert!(String::from_utf8_lossy(&label_ok.stdout).starts_with("RELABELED "));
+
+    let board_out = Command::new(BIN)
+        .args(["board", "--socket", &b_tcp, "--from", t_addr])
+        .output()
+        .unwrap();
+    assert!(board_out.status.success(), "{board_out:?}");
+    let board_text = String::from_utf8_lossy(&board_out.stdout);
+    assert!(
+        board_text.contains(&format!(
+            "SESSION address={t_addr} host=host-tcp connected=true"
+        )) && board_text.contains("label=relabeled-container ✓")
+            && board_text.contains(&format!("DECLARED address={t_addr} declared=role=worker"))
+            && board_text.contains(&format!("CLAIM holder={t_addr} "))
+            && board_text.contains("BOARD sessions=3 claims=1"),
+        "{board_text}"
+    );
+
+    let release_ok = Command::new(BIN)
+        .args([
+            "release", "--socket", &b_tcp, "--owner", t_addr, "--key", "job-tcp",
+        ])
+        .output()
+        .unwrap();
+    assert!(release_ok.status.success(), "{release_ok:?}");
+    assert!(String::from_utf8_lossy(&release_ok.stdout).starts_with("RELEASED "));
+
+    // Replacement notice reaches the TCP adapter when superseded from the pure-TCP daemon.
+    let mut replacement = Command::new(BIN)
+        .args([
+            "adapter",
+            "--socket",
+            &b_tcp,
+            "--id",
+            a_addr,
+            "--store",
+            rig.p("a2.store").to_str().unwrap(),
+            "--registered",
+            "--superseded",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(fs::File::create(rig.p("a2.out")).unwrap()))
+        .stderr(Stdio::from(fs::File::create(rig.p("a2.out.err")).unwrap()))
+        .spawn()
+        .unwrap();
+    let _replacement_in = replacement.stdin.take().unwrap();
+    rig.children.push(replacement);
+    wait_for_text(
+        &rig.p("a.out"),
+        "\"type\":\"superseded\"",
+        Duration::from_secs(10),
+    );
+    assert!(read(&rig.p("a.out")).contains("\"host\":\"host-tcp\""));
+}
+
+#[test]
+fn tcp_session_sigkill_between_store_write_and_ack_stores_once_and_names_r1() {
+    let mut rig = Rig::new("tcp-sigkill");
+    let coord_port_file = rig.p("coord.port");
+    let coord_args = rig.coordinator_args("127.0.0.1:0", &coord_port_file, &rig.p("coord.log"));
+    let coord_refs: Vec<&str> = coord_args.iter().map(|s| s.as_str()).collect();
+    rig.spawn(&coord_refs, "coord.out");
+    wait_for_port(&coord_port_file, Duration::from_secs(10));
+    let coord = format!("127.0.0.1:{}", read(&coord_port_file).trim());
+
+    let mut targets = Vec::new();
+    for (host, port_name, log_name, out_name) in [
+        ("host-a", "a.port", "a.log", "daemon-a.out"),
+        ("host-b", "b.port", "b.log", "daemon-b.out"),
+    ] {
+        let pf = rig.p(port_name);
+        rig.spawn(
+            &[
+                "daemon",
+                "--coordinator",
+                &coord,
+                "--host-id",
+                host,
+                "--listen",
+                "127.0.0.1:0",
+                "--port-file",
+                pf.to_str().unwrap(),
+                "--data",
+                rig.p(log_name).to_str().unwrap(),
+            ],
+            out_name,
+        );
+        wait_for_port(&pf, Duration::from_secs(10));
+        let raw = format!("127.0.0.1:{}", read(&pf).trim());
+        wait_for_tcp(&raw, Duration::from_secs(10));
+        let tcp = format!("tcp://{raw}");
+        wait_for_board_target(&tcp, Duration::from_secs(10));
+        targets.push(tcp);
+    }
+    let (a_tcp, b_tcp) = (&targets[0], &targets[1]);
+
+    let marker = rig.p("held.marker");
+    let store = rig.p("recipient.store");
+    let recipient1 = rig.spawn(
+        &[
+            "session",
+            "--socket",
+            b_tcp,
+            "--id",
+            RECIPIENT,
+            "--store",
+            store.to_str().unwrap(),
+            "--hold-before-ack",
+            marker.to_str().unwrap(),
+        ],
+        "recipient1.out",
+    );
+    rig.await_registered("recipient1.out");
+
+    let body = "crash durable over tcp [[153:Meteor Shower:7]]";
+    let sent = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            a_tcp,
+            "--from",
+            SENDER,
+            "--to",
+            RECIPIENT,
+            "--mail",
+            "m-tcp-crash",
+            "--body",
+            body,
+        ])
+        .output()
+        .unwrap();
+    assert!(sent.status.success(), "{sent:?}");
+
+    wait_for_file(&marker, Duration::from_secs(10));
+    rig.kill(recipient1);
+
+    let pending = Command::new(BIN)
+        .args(["receipt", "--socket", a_tcp, "--mail", "m-tcp-crash"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&pending.stdout).starts_with("PENDING "),
+        "{pending:?}"
+    );
+    assert_eq!(
+        count_lines_with(&read(&store), "\"mail\":\"m-tcp-crash\""),
+        1
+    );
+
+    // Restart over tcp://; the marker exists so it acks naming the existing Store record r-1.
+    rig.spawn(
+        &[
+            "session",
+            "--socket",
+            b_tcp,
+            "--id",
+            RECIPIENT,
+            "--store",
+            store.to_str().unwrap(),
+            "--hold-before-ack",
+            marker.to_str().unwrap(),
+        ],
+        "recipient2.out",
+    );
+    wait_for_text(
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-tcp-crash record=r-1",
+        Duration::from_secs(10),
+    );
+    let store_text = read(&store);
+    assert_eq!(store_text.lines().count(), 1, "{store_text}");
+    assert!(store_text.contains(body), "{store_text}");
+
+    let rcpt = Command::new(BIN)
+        .args(["receipt", "--socket", a_tcp, "--mail", "m-tcp-crash"])
+        .output()
+        .unwrap();
+    let rcpt_line = String::from_utf8_lossy(&rcpt.stdout);
+    assert!(
+        rcpt_line.starts_with("RECEIPT ") && rcpt_line.contains("record=r-1"),
+        "{rcpt_line}"
+    );
+}
+
+#[test]
+fn tcp_daemon_and_client_cli_validation_and_pre_join_bind_failure() {
+    let rig = Rig::new("tcp-validation");
+
+    // --port-file without --listen is refused with expected/seen wording.
+    let out = Command::new(BIN)
+        .args([
+            "daemon",
+            "--coordinator",
+            "127.0.0.1:1",
+            "--host-id",
+            "h",
+            "--socket",
+            rig.p("s.sock").to_str().unwrap(),
+            "--port-file",
+            rig.p("s.port").to_str().unwrap(),
+            "--data",
+            rig.p("s.log").to_str().unwrap(),
+        ])
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("expected --listen with --port-file, saw none"),
+        "{err}"
+    );
+
+    // Empty tcp:// target is refused across client faces and one-shot commands.
+    for args in [
+        vec![
+            "session",
+            "--socket",
+            "tcp://",
+            "--store",
+            rig.p("c.store").to_str().unwrap(),
+        ],
+        vec![
+            "send", "--socket", "tcp://", "--from", SENDER, "--to", RECIPIENT, "--body", "x",
+        ],
+        vec!["board", "--socket", "tcp://"],
+        vec![
+            "mcp",
+            "--socket",
+            "tcp://",
+            "--store",
+            rig.p("m.store").to_str().unwrap(),
+        ],
+    ] {
+        let out = Command::new(BIN)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("expected tcp://<address:port>, saw tcp://"),
+            "{args:?}: {err}"
+        );
+    }
+
+    // Bind failure on --listen exits before dialing the coordinator and leaves no socket file.
+    let mock_coord = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    mock_coord.set_nonblocking(true).unwrap();
+    let coord_addr = mock_coord.local_addr().unwrap().to_string();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = occupied.local_addr().unwrap().to_string();
+    let sock_path = rig.p("unborn.sock");
+    let out = Command::new(BIN)
+        .args([
+            "daemon",
+            "--coordinator",
+            &coord_addr,
+            "--host-id",
+            "h-fail",
+            "--socket",
+            sock_path.to_str().unwrap(),
+            "--listen",
+            &taken_addr,
+            "--data",
+            rig.p("fail.log").to_str().unwrap(),
+        ])
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!sock_path.exists());
+    assert!(
+        mock_coord.accept().is_err(),
+        "daemon must not join the coordinator when --listen fails to bind"
+    );
+}

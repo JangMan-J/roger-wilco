@@ -7,9 +7,10 @@ knows sessions, not the programs behind them. It routes and stores. It does not 
 assign tasks, or interpret what it carries.
 
 The core is one Rust binary, `roger`, with no external crates. One coordinator holds the
-durable state, one host daemon per machine serves local sessions on a Unix socket, and
-anything else (a command-line client, a test session, an adapter for a particular agent
-program) sits on top of that socket.
+durable state, one host daemon per machine serves sessions on a Unix socket, a TCP listener,
+or both, and anything else (a command-line client, a test session, an adapter for a particular
+agent program) connects through that listener. Optional modules may live under `modules/`
+outside the standalone `roger` binary; no client needs one to reach `roger`.
 
 This README describes the core contract, commands and checks. For development, follow the
 coding standards and review rules in [AGENTS.md](AGENTS.md#coding-standards); for installation
@@ -67,12 +68,13 @@ once its Ack is recorded. Stop the processes with `kill %1 %2 %3 %4`.
 
 `roger <subcommand> [flags]`. No command has a default socket, data or log path: each comes
 from its flags. `coordinator` and `daemon` read the fleet token from `ROGER_TOKEN` in their
-environment, never from argv, which `ps` shows to every user.
+environment, never from argv, which `ps` shows to every user. Every client `--socket` flag
+(and `ROGER_SOCKET` for `mcp`) accepts either a Unix socket path or `tcp://<addr:port>`.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
-| `daemon` | `--coordinator <addr:port> --host-id <id> --socket <path> --data <log>` | one per host; local inbox; serves sessions on the socket |
+| `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session`, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
@@ -303,8 +305,9 @@ Every durable log (a Store, the daemon and coordinator logs) is append-only and 
 append, and replay drops a tail a crash left half-written. Each is held under an exclusive OS
 lock while open: a second process on the same file fails at start, naming the file, and exits
 nonzero. A host daemon likewise refuses a `--socket` path that a live process still answers
-on, naming the path, and replaces only a stale socket file; a coordinator refuses a `--bind`
-address already in use.
+on, naming the path, replaces only a stale socket file, and refuses a `--listen` address
+already in use before joining the coordinator; a coordinator refuses a `--bind` address
+already in use.
 
 Opening a log replays it one line at a time, never the whole file at once. The coordinator
 keeps a Mail's body in memory until its Receipt and a host daemon until its Ack; after that
@@ -377,7 +380,8 @@ A Face is one complete way a client reaches the core as a session. All three giv
 same Mail, Store, Ack, Board, Claim and Receipt semantics and add none of their own; a client
 that speaks one needs nothing more from the core.
 
-- **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket: `register`,
+- **The socket protocol.** Line-delimited JSON over the host daemon's Unix socket or TCP
+  listener (`--listen <addr:port>`, dialed as `tcp://<addr:port>`): `register`,
   `deliver`/`ack`, `send`, `board`, `claim`, `relabel`, `receipt`, `unregister`. The `session`
   Tracer and the one-shot subcommands above are clients of it. A `register` line may carry
   `"confirm_register":true`; the host daemon then sends `{"type":"registered","session":"<address>"}`
@@ -389,6 +393,13 @@ that speaks one needs nothing more from the core.
   stdout, for a client (see Adapters).
 - **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
   that can register an MCP server needs no client code.
+
+Containerized or cross-machine clients without a shared Unix socket directory can connect
+directly to `roger daemon --listen <addr:port>` by passing `--socket tcp://<addr:port>` (or
+`ROGER_SOCKET=tcp://<addr:port>` to `roger mcp`), with no optional module required. TCP client
+connections run the same protocol, per-peer queues, `TCP_NODELAY`, Store durability, and Ack
+semantics as Unix socket connections. Because the daemon's client protocol carries no token,
+bind `--listen` only to a private container bridge or VPN.
 
 Replacement notices on the other faces use the same payload:
 - The adapter always requests socket notices and prints an actionable `SUPERSEDED` warning
@@ -425,7 +436,7 @@ closing its stdin.
 | Setting | Order |
 | --- | --- |
 | Address | `--id`; else the variable named by `--id-env NAME` (so a client's own registration can hand the server a stable per-session id; unset or empty falls through); else `ROGER_ADDRESS`; else a fresh UUID. Used verbatim, never parsed. |
-| Socket | `--socket`; else `ROGER_SOCKET`; else `$XDG_RUNTIME_DIR/roger/daemon.sock`. A missing socket, or none of these set, is an error naming what was expected and what was seen. |
+| Socket | `--socket`; else `ROGER_SOCKET` (either a Unix socket path or `tcp://<addr:port>`); else `$XDG_RUNTIME_DIR/roger/daemon.sock`. A missing socket, or none of these set, is an error naming what was expected and what was seen. |
 | Store | `--store`; else `ROGER_STORE`; else `${XDG_STATE_HOME:-~/.local/state}/roger/mcp/<address>.store`. |
 
 It writes each delivery to its Store, then acks naming that Record id, exactly as the adapter
@@ -524,7 +535,7 @@ core log grows while nobody asks.
 | `src/audit.rs` | read-only record history and findings |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
-| `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
+| `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket or TCP listener |
 | `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |

@@ -1228,3 +1228,129 @@ fn roger_registered_is_false_during_an_outage_and_true_after_the_restart() {
     let e = a.fails("roger_registered", r#"{"wait_seconds":-1}"#);
     assert!(e.contains("wait_seconds"), "{e}");
 }
+
+#[test]
+fn mcp_serves_over_tcp_via_roger_socket_env_and_default_store() {
+    let mut rig = Rig::new("tcp-daemon");
+    let coord = format!("127.0.0.1:{}", rig.port);
+    let tcp_port_file = rig.p("tcp-daemon.port");
+    rig.spawn(&[
+        "daemon",
+        "--coordinator",
+        &coord,
+        "--host-id",
+        "h-tcp",
+        "--listen",
+        "127.0.0.1:0",
+        "--port-file",
+        tcp_port_file.to_str().unwrap(),
+        "--data",
+        rig.p("tcp-daemon.log").to_str().unwrap(),
+    ]);
+    let port = until("the TCP daemon port", 10, || {
+        fs::read_to_string(&tcp_port_file)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    });
+    let raw = format!("127.0.0.1:{port}");
+    until("the TCP daemon to accept", 10, || {
+        std::net::TcpStream::connect(&raw).ok().map(drop)
+    });
+    let target = format!("tcp://{raw}");
+    let state_dir = rig.p("tcp-state");
+
+    // Session A uses ROGER_SOCKET=tcp://... and default Store resolution (no --socket, no --store).
+    let mut cmd_a = Command::new(BIN);
+    cmd_a
+        .args(["mcp", "--id", A1])
+        .env_remove("ROGER_ADDRESS")
+        .env_remove("ROGER_STORE")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("ROGER_SOCKET", &target)
+        .env("XDG_STATE_HOME", &state_dir);
+    let mut a = Mcp::start(cmd_a, &rig.p("tcp-a.err"));
+    let init = a.initialize();
+    assert_eq!(
+        s(init.get("result").unwrap(), "protocolVersion"),
+        "2025-06-18"
+    );
+    assert_eq!(
+        a.ok("roger_registered", r#"{"wait_seconds":20}"#)
+            .get("registered"),
+        Some(&Value::Bool(true))
+    );
+
+    // Session B uses --socket tcp://... with a composite Reference Address and default Store.
+    let mut cmd_b = Command::new(BIN);
+    cmd_b
+        .args(["mcp", "--socket", &target, "--id", COMPOSITE])
+        .env_remove("ROGER_ADDRESS")
+        .env_remove("ROGER_SOCKET")
+        .env_remove("ROGER_STORE")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("XDG_STATE_HOME", &state_dir);
+    let mut b = Mcp::start(cmd_b, &rig.p("tcp-b.err"));
+    b.initialize();
+    assert_eq!(
+        b.ok("roger_registered", r#"{"wait_seconds":20}"#)
+            .get("registered"),
+        Some(&Value::Bool(true))
+    );
+
+    let store_a = state_dir.join(format!("roger/mcp/{A1}.store"));
+    let store_b = state_dir.join(format!("roger/mcp/{COMPOSITE}.store"));
+    assert!(store_a.exists() && store_b.exists());
+
+    // Mail with headers, inbox, receipt, claim, and board over TCP.
+    let sent = a.ok(
+        "roger_send",
+        &format!(
+            r#"{{"to":"{COMPOSITE}","mail":"m-mcp-tcp","body":"over tcp ✓","headers":{{"x-net":"bridge"}}}}"#
+        ),
+    );
+    assert_eq!(s(&sent, "mail"), "m-mcp-tcp");
+
+    let inbox = b.ok("roger_inbox", r#"{"wait_seconds":10}"#);
+    let item = &arr(&inbox, "mail")[0];
+    assert_eq!(s(item, "mail"), "m-mcp-tcp");
+    assert_eq!(s(item, "from"), A1);
+    assert_eq!(s(item, "body"), "over tcp ✓");
+    assert_eq!(s(item, "kind"), "directed");
+    assert_eq!(s(item, "record"), "r-1");
+    assert_eq!(
+        item.get("headers").and_then(|h| h.get("x-net")),
+        Some(&json::s("bridge"))
+    );
+
+    let receipt = until("the TCP receipt", 10, || {
+        let r = a.ok("roger_receipt", r#"{"mail":"m-mcp-tcp"}"#);
+        r.get("record").is_some().then_some(r)
+    });
+    assert_eq!(s(&receipt, "record"), "r-1");
+    assert_eq!(s(&receipt, "to"), COMPOSITE);
+    assert_eq!(s(&receipt, "from"), A1);
+
+    let claim_a = a.ok("roger_claim", r#"{"key":"tcp-lock","ttl_seconds":60}"#);
+    assert_eq!(claim_a.get("ok"), Some(&Value::Bool(true)));
+    let claim_b = b.ok("roger_claim", r#"{"key":"tcp-lock"}"#);
+    assert_eq!(claim_b.get("ok"), Some(&Value::Bool(false)));
+    assert_eq!(s(&claim_b, "holder"), A1);
+
+    let board = b.ok("roger_board", "{}");
+    assert_eq!(s(&board, "me"), COMPOSITE);
+    let who: Vec<String> = arr(&board, "sessions")
+        .iter()
+        .map(|r| s(r, "session"))
+        .collect();
+    assert!(who.contains(&A1.to_string()) && who.contains(&COMPOSITE.to_string()));
+    assert_eq!(arr(&board, "claims").len(), 1);
+
+    // Closing A's stdin unregisters it and removes its empty default Store; B keeps its Store.
+    a.close_stdin();
+    assert_eq!(a.wait_exit().code(), Some(0));
+    assert!(!store_a.exists());
+    b.close_stdin();
+    assert_eq!(b.wait_exit().code(), Some(0));
+    assert!(store_b.exists());
+}

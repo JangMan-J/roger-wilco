@@ -3,6 +3,7 @@
 use crate::json::{self, obj, s, Value};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Where one peer's lines go.
@@ -347,6 +348,32 @@ pub fn field<'a>(v: &'a Value, key: &str) -> io::Result<&'a str> {
     v.get(key)
         .and_then(|x| x.as_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))
+}
+
+/// Publish the bound port at `path` whole: write it beside the file, flush it,
+/// then rename it into place, so a reader that sees `path` reads a port and
+/// never an empty file.
+pub fn publish_port(path: &Path, port: u16) -> io::Result<()> {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".tmp");
+    let aside = PathBuf::from(aside);
+    let wrote = (|| {
+        let mut f = std::fs::File::create(&aside)?;
+        f.write_all(port.to_string().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&aside, path)
+    })();
+    wrote.map_err(|e| {
+        let _ = std::fs::remove_file(&aside);
+        io::Error::new(
+            e.kind(),
+            format!(
+                "expected to publish port {port} at {} through {}, saw {e}",
+                path.display(),
+                aside.display()
+            ),
+        )
+    })
 }
 
 #[cfg(test)]

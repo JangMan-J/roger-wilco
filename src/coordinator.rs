@@ -13,7 +13,7 @@ use crate::headers;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -217,7 +217,7 @@ pub fn run(
 
     let listener = TcpListener::bind(bind)?;
     if let Some(pf) = &port_file {
-        publish_port(pf, listener.local_addr()?.port())?;
+        net::publish_port(pf, listener.local_addr()?.port())?;
     }
     eprintln!("coordinator listening on {}", listener.local_addr()?);
 
@@ -239,32 +239,6 @@ pub fn run(
         });
     }
     Ok(())
-}
-
-/// Publish the bound port at `path` whole: write it beside the file, flush it,
-/// then rename it into place, so a reader that sees `path` reads a port and
-/// never an empty file.
-fn publish_port(path: &std::path::Path, port: u16) -> io::Result<()> {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(".tmp");
-    let aside = PathBuf::from(aside);
-    let wrote = (|| {
-        let mut f = std::fs::File::create(&aside)?;
-        f.write_all(port.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&aside, path)
-    })();
-    wrote.map_err(|e| {
-        let _ = std::fs::remove_file(&aside);
-        io::Error::new(
-            e.kind(),
-            format!(
-                "expected to publish port {port} at {} through {}, saw {e}",
-                path.display(),
-                aside.display()
-            ),
-        )
-    })
 }
 
 /// Replay one committed event. Claim events must be whole: a `claim` or
