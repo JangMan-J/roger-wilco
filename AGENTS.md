@@ -8,66 +8,100 @@ The sealed documents name no harness or model; provenance frontmatter (`agent:`,
 - "my vision is this to be a ruthlessly efficient foundation that any sort of adapter can be placed on top of. modular" (2026-10-22)
 - "It was never a goal to turn delivery into turns, 'turns and wakes' shouldn't actually be present in roger-wilco's vocabulary... its foundational layer should be as suitable to use for an office call center as for an autonomous agent team. However, on our side of things, turns and wakes are important - it's just a matter of separating boundaries and what transports implement them/the shape of the wire information." (2026-10-29; supersedes the 2026-10-22 directive "Wake (proof 5) is landed and is not a focus": wake leaves Roger, and its behavior belongs to the consumer's side)
 - "I think MCP alongside socket connections is fine... It's just the decisions of what to place where that matter most and how to reduce the amount of adapters that other potential clients 'need' in order to use the service. Redundancy is not inefficiency." (2026-10-29)
+- "minimal requirement, as currently stated already, permissively optional modules" / "reword the invariants to fit optional modules not tailored to cheat an invariant" (2026-11-14)
 
 ## Coding standards
 
-The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
-`scripts/check-harness-free`, `scripts/check-vocabulary`, and `scripts/check-no-poll`. It names no harness.
-`scripts/check-all` runs it, then `scripts/check-seal`
+The Core (`Cargo.toml` and `src/`, building the `roger` binary) stays at its minimal requirement:
+one standalone binary using the Rust standard library only (`[dependencies]` empty in root
+`Cargo.toml`), satisfying every proof on its own without any Optional module. Optional modules
+(`modules/<name>/`) are standalone packages in the repository — each carrying its own `[workspace]`
+table in `modules/<name>/Cargo.toml` so root `Cargo.toml` stays standalone and `--offline`
+clean-HOME builds of `roger` never depend on them — that may link external crates to expose or
+bridge faces over network transports or read records.
+
+The offline core gate is `scripts/check`: fmt, clippy with warnings denied (`-D warnings`), the core
+test suite, `scripts/check-harness-free`, `scripts/check-vocabulary`, and `scripts/check-no-poll`.
+It names no harness. `scripts/check-modules` checks every standalone Optional module
+(`modules/*/Cargo.toml`: workspace isolation, fmt, clippy `-D warnings`, tests, and the invariant
+checks) when modules exist, and must also pass before changes touching `modules/` land on `main`.
+`scripts/check-all` runs `scripts/check`, then `scripts/check-seal`
 (the director's seal on the sealed documents is intact; it passes quietly where no seal exists).
-Nothing lands on main until
-`scripts/check-all` exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
+Nothing lands on `main` until `scripts/check-all` (and `scripts/check-modules` when `modules/` is
+touched) exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
 those warnings into errors.
 
 ### Review rules
 
-These are INVARIANTS.md read as rules for a diff. KERNEL.md and INVARIANTS.md win over this one.
+These are INVARIANTS.md read as rules for a diff across the Core and every Optional module.
+KERNEL.md and INVARIANTS.md win over this one.
 
-1. **No loss, no duplicate.** Any path that touches a Mail between Accepted and the
-   recipient's Ack keeps the body durable across coordinator restart, daemon restart,
-   and recipient SIGKILL, and the Store holds each body once. A change here extends
-   `tests/process.rs` and keeps `scripts/acceptance cross-host` green.
-2. **Event-driven only.** No fixed-interval scan on the correctness path. Mail,
-   receipts, and claim expiry follow committed events or a Register. A sweep may
-   exist only as cleanup that can be disabled without losing or duplicating work.
-   `scripts/check-no-poll` is the check; a non-correctness timed wait carries
-   `// no-poll: <reason>`.
-3. **Opaque tokens stay opaque.** Nothing in `src/` compares, branches on, ranks,
-   looks up by, or names the tokens in a Reference or on a session. They pass
-   through byte-identical. `scripts/acceptance references` is the check.
-4. **No harness in the core.** The core names no harness or model, reads no harness store,
-   and `[dependencies]` stays empty. The core ships no per-client code. The core is every
-   file in the checkout, tracked or untracked but not ignored, outside `VECTORS/` and
-   `docs/reviews/` (historical review evidence): source, tests, scripts, deploy units, and
-   docs (`README.md` and `deploy/README.md` included). Exempt are markdown frontmatter
-   (`agent:`, `session:` record who wrote a file), `scripts/acceptance`, since proof 2 runs a real
-   outside program by definition, and `scripts/check-harness-free`, which holds the
-   list of names. `scripts/check-harness-free` is the check.
-5. **No workflow.** The core stores and routes; it never decides what work exists or
-   who takes it.
-6. **No vocabulary of what a session does with its Mail.** No turn, wake, idle, or busy
-   state, request, field, flag, or doc exists in the core; a delivery carries
-   its `kind` (`directed` or `broadcast`) and the sender's opaque `headers`, and what a
-   consumer does on arrival is the consumer's. A client's own code may have such words; the core
-   may not. `scripts/check-vocabulary` is the check. A line that must name the old wire field (a reader of logs
-   written before `kind`) carries `legacy-wire:` and a reason; nothing writes the field.
-7. **Opaque headers stay opaque.** Nothing in `src/` compares, branches on, ranks, or
-   names a header key or value; they pass through byte-identical, bounded, with a refusal
-   that names what was expected and what was seen.
-8. **Faces are equal and additive.** The socket protocol, the `roger adapter` stream, and
-   `roger mcp` give a session the same Mail, Store, Ack, Board, claim and receipt
-   semantics. A new face adds no semantics of its own and no crate.
+1. **No loss, no duplicate.** Any path in the Core or an Optional module that touches a Mail between
+   Accepted and the recipient's Ack keeps the body durable (Store-before-Ack) across coordinator
+   restart, daemon restart, module restart, and recipient SIGKILL, and the Store holds each body
+   once. A change here extends `tests/process.rs` (and the module's tests when in `modules/`) and
+   keeps `scripts/acceptance cross-host` green.
+2. **Event-driven only.** No fixed-interval scan on the correctness path in `src/` or
+   `modules/*/src/`. Mail, receipts, and claim expiry follow committed events or a Register. A sweep
+   may exist only as cleanup that can be disabled without losing or duplicating work.
+   `scripts/check-no-poll` is the check across `src` and `modules/*/src`; a non-correctness timed
+   wait carries `// no-poll: <reason>`.
+3. **Opaque tokens stay opaque.** Nothing in `src/` or `modules/` compares, branches on, ranks,
+   looks up by, or names the tokens in a Reference or Address or on a session. They pass through
+   byte-identical. `scripts/acceptance references` is the check.
+4. **No harness in the repository.** Neither the Core nor any Optional module names a harness or
+   model, reads a harness store, links a harness SDK (in `Cargo.toml`, `modules/*/Cargo.toml`, or
+   `modules/*/Cargo.lock`), or ships per-client code; root `Cargo.toml` keeps `[dependencies]`,
+   `[dev-dependencies]`, and `[build-dependencies]` empty. This rule covers every file in the
+   checkout, tracked or untracked but not ignored (`modules/` included), outside `VECTORS/` and
+   `docs/reviews/` (historical review evidence): source, module manifests and lockfiles, tests,
+   scripts, deploy units, and docs (`README.md` and `deploy/README.md` included). Exempt are
+   markdown frontmatter (`agent:`, `session:` record who wrote a file), `scripts/acceptance`, since
+   proof 2 runs a real outside program by definition, and `scripts/check-harness-free`, which holds
+   the list of names. `scripts/check-harness-free` is the check.
+5. **No workflow.** Neither the Core nor any Optional module decides what work exists or who takes
+   it; the Core stores and routes, and Optional modules expose or bridge faces or read records
+   without adding workflow.
+6. **No vocabulary of what a session does with its Mail.** No turn, wake, idle, or busy state,
+   request, field, flag, or doc exists in the Core or any Optional module (`modules/` manifests,
+   source, tests, and docs included); a delivery carries its `kind` (`directed` or `broadcast`) and
+   the sender's opaque `headers`, and what a consumer does on arrival is the consumer's. A client's
+   own code may have such words; this repository may not. `scripts/check-vocabulary` is the check. A
+   line that must name the old wire field (a reader of logs written before `kind`) carries
+   `legacy-wire:` and a reason; nothing writes the field.
+7. **Opaque headers stay opaque.** Nothing in `src/` or `modules/` compares, branches on, ranks, or
+   names a header key or value; they pass through byte-identical, bounded, with a refusal that names
+   what was expected and what was seen.
+8. **Faces are equal and additive.** The socket protocol, the `roger adapter` stream, `roger mcp`,
+   and any face exposed or bridged by an Optional module give a session the same Mail, Store, Ack,
+   Board, claim, and receipt semantics. A Core face adds no crate; an Optional module under
+   `modules/<name>/` may link external crates for its transport and adds no message semantics of its
+   own.
+9. **Optional modules never evade invariants.** Moving work into `modules/<name>/` exempts nothing.
+   Every Optional module obeys Rules 1–8 without exception: Store-before-Ack durability (Rule 1),
+   event-driven operation under `scripts/check-no-poll` with `// no-poll: <reason>` for
+   non-correctness waits (Rule 2), opaque Reference and Address tokens (Rule 3), no harness or model
+   names, store reads, SDKs in `modules/*/Cargo.toml` or `modules/*/Cargo.lock`, or per-client code
+   (Rule 4), no workflow (Rule 5), no turn/wake/idle/busy or retired vocabulary (Rule 6), opaque
+   bounded headers (Rule 7), and equal face semantics with no added message semantics (Rule 8). Each
+   module carries its own `[workspace]` table in `modules/<name>/Cargo.toml`, and the Core satisfies
+   every proof on its own without any Optional module.
 
 ### Code
 
-- One binary, standard library only. Prefer a plain function over a trait and a
-  small struct over a builder.
+- Core (`Cargo.toml` + `src/`): one standalone binary (`roger`), Rust standard library only
+  (`[dependencies]` empty in root `Cargo.toml`), satisfying every proof on its own without any
+  Optional module. Prefer a plain function over a trait and a small struct over a builder.
+- Optional modules (`modules/<name>/`): standalone packages carrying `[workspace]` in
+  `modules/<name>/Cargo.toml` so root `Cargo.toml` stays isolated and `--offline` clean-HOME builds
+  of `roger` never depend on them; external crates are allowed only in `modules/<name>/Cargo.toml`
+  (never harness or model SDKs) and never relax Rules 1–9.
 - Tests per proof: each KERNEL.md proof has a `scripts/acceptance <name>` subcommand
   that exercises real processes, plus the narrowest unit or process test that would
   catch a regression. Match test depth to the risk the proof names.
 - Errors are `io::Result`; a failure names what was expected and what was seen.
 - Claim deadlines are read on the coordinator's wall clock (`now_ms`), and nothing in
-  `src/` reads another clock for a claim. Why, and what a clock step does: README.md
+  `src/` or `modules/` reads another clock for a claim. Why, and what a clock step does: README.md
   `## Claims`.
 - Keep `src/main.rs` dispatch flat: add an arm, do not restructure.
 - Test-only hooks live behind the `test-hooks` feature and never reach a deploy build.

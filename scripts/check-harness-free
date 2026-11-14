@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# Invariant check: the core never learns which harness runs a session.
-# Coordinator, host daemon, client, and adapter name no harness, read no
-# harness store, and link no harness SDK.
+# Invariant check: neither the core nor any optional module learns which harness runs a session.
+# Coordinator, host daemon, client, adapter, and optional modules under modules/ name no
+# harness or model, read no harness store, and link no harness or model SDK. Root Cargo.toml
+# also keeps [dependencies], [dev-dependencies], and [build-dependencies] empty; optional
+# modules under modules/<name>/ may link non-harness external crates, and both their
+# Cargo.toml and Cargo.lock are scanned here against the harness and model list.
 #
-# The core is every file in the checkout (tracked or untracked, minus
-# .gitignore) outside VECTORS/ and docs/reviews/: source, tests, scripts, deploy
+# Scanned: every file in the checkout (tracked or untracked, minus .gitignore and Cargo target/
+# build directories) outside VECTORS/ and docs/reviews/: core source, optional modules
+# (modules/*/Cargo.toml, modules/*/Cargo.lock, source, tests, docs), tests, scripts, deploy
 # units, and docs, README.md included. The sealed documents (purpose, proofs, invariants,
 # terms) live outside the repo and were scanned with this check before they were sealed. A model
 # name counts as a harness name. Exempt:
 #   frontmatter         a leading YAML block (--- ... ---) in a markdown file
 #                       records who wrote the file (agent:, session:), not
-#                       what the core is
+#                       what the core or an optional module is
 #   VECTORS/            the record of what was tried
-#   docs/reviews/       historical review evidence, not core docs
+#   docs/reviews/       historical review evidence, not project docs
 #   scripts/acceptance  proofs 2 and 5 run real harnesses by definition
 #   scripts/check-harness-free  this list of names
 #
-# Usage: scripts/check-harness-free [path ...]   (default: the whole core)
+# Usage: scripts/check-harness-free [path ...]   (default: whole checkout, core and optional modules)
 set -euo pipefail
-if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole core)"; exit 0; fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole checkout, core and optional modules)"; exit 0; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -38,9 +42,9 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+  grep -vE '^(VECTORS|\.slice)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
-((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
+((${#files[@]})) || { echo "FAIL: no core or optional-module files under ${*:-.}" >&2; exit 1; }
 
 status=0
 # Markdown frontmatter lines are blanked, not dropped, so line numbers hold. A
@@ -57,19 +61,24 @@ hits="$(for f in "${files[@]}"; do
   fi
 done)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: harness or model named in the core:" >&2
+  echo "FAIL: harness or model name or SDK in core or optional modules:" >&2
   echo "$hits" >&2
   status=1
 fi
 
-deps="$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/{print}' Cargo.toml)"
+deps="$(awk '
+  /^\[[[:space:]]*(dev-|build-)?dependencies[[:space:]]*\][[:space:]]*(#.*)?$/ { f = 1; next }
+  /^\[[[:space:]]*((dev-|build-)?dependencies\.|target\..*\.(dev-|build-)?dependencies(\.|\]))/ { print; f = 1; next }
+  /^\[/ { f = 0 }
+  f && /^[[:space:]]*[^#[:space:]]/ { print }
+' Cargo.toml)"
 if [[ -n "$deps" ]]; then
-  echo "FAIL: core links external crates (a harness SDK is one of the risks):" >&2
+  echo "FAIL: root Cargo.toml links external crates ([dependencies], [dev-dependencies], and [build-dependencies] must stay empty):" >&2
   echo "$deps" >&2
   status=1
 fi
 
 if [[ "$status" == 0 ]]; then
-  echo "PASS harness-free: no harness or model name in ${#files[@]} core files under ${*:-.}, no external crate dependencies"
+  echo "PASS harness-free: no harness or model name or SDK in ${#files[@]} core and optional-module files under ${*:-.}; root Cargo.toml links no external crates"
 fi
 exit "$status"

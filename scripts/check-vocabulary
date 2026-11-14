@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
-# Invariant check: the core never speaks of what a session is doing with its Mail.
-# No turn, wake, idle, or busy state or request exists in the core, its wire, or its
-# documents, so the same core serves a call center and an agent team. What a consumer
-# does when Mail arrives is the consumer's.
+# Invariant check: neither the core nor any optional module speaks of what a session is
+# doing with its Mail. No turn, wake, idle, or busy state or request exists in the core,
+# optional modules under modules/, wire formats, or documents, so the same foundation
+# serves a call center and an autonomous team. What a consumer does when Mail arrives is
+# the consumer's.
 #
-# The core is every file in the checkout (tracked or untracked, minus .gitignore)
-# outside VECTORS/ and docs/reviews/, as for scripts/check-harness-free.
+# Scanned: every file in the checkout (tracked or untracked, minus .gitignore and Cargo target/
+# build directories) outside VECTORS/ and docs/reviews/, including modules/*/Cargo.toml and all
+# modules/ source, tests, scripts, and docs.
 # Exempt:
-#   frontmatter         a leading YAML block in a markdown file
+#   frontmatter             a leading YAML block in a markdown file
 #   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
-#   VECTORS/            the record of what was tried
-#   docs/reviews/       historical review evidence
-#   AGENTS.md           the director's file; it quotes dated directives verbatim
+#   VECTORS/                the record of what was tried
+#   docs/reviews/           historical review evidence
+#   AGENTS.md               the director's file; it quotes dated directives verbatim
 #   scripts/check-vocabulary  this list of words
+#   modules/*/Cargo.lock    third-party transitive crate metadata in lockfiles is upstream
+#                           package metadata, not project vocabulary (modules/*/Cargo.toml
+#                           and all modules/ source, tests, scripts, and docs ARE scanned)
 #   a line carrying `legacy-wire:` and a reason, for the old wire field that a
-#                       reader of logs written before `kind` still needs
+#                           reader of logs written before `kind` still needs
 #
 # The same files may not use the retired terms `shim`, `shims`, or `agent session(s)`:
 # session and client are the words.
 #
-# Usage: scripts/check-vocabulary [path ...]   (default: the whole core)
+# Usage: scripts/check-vocabulary [path ...]   (default: whole checkout, core and optional modules)
 set -euo pipefail
-if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole core)"; exit 0; fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole checkout, core and optional modules)"; exit 0; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -39,12 +44,14 @@ list_files() {
     find "$@" -type f -not -path '*/target/*' -not -path '*/.git/*' | sed 's#^\./##'
   fi
 }
+# Third-party transitive crate metadata in modules/*/Cargo.lock is not project vocabulary,
+# whereas modules/*/Cargo.toml and all modules/ source, tests, scripts, and docs ARE scanned.
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(VECTORS|\.slice)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$' | sort -u |
+  grep -vE '^(VECTORS|\.slice)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$|^modules/[^/]+/Cargo\.lock$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
-((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
+((${#files[@]})) || { echo "FAIL: no core or optional-module files under ${*:-.}" >&2; exit 1; }
 
-# scan <regex>: every line of every core file that matches, frontmatter blanked.
+# scan <regex>: every line of every scanned file that matches, frontmatter blanked.
 scan() {
   local f
   for f in "${files[@]}"; do
@@ -62,7 +69,7 @@ scan() {
 
 hits="$(scan "$WORDS" | grep -v 'legacy-wire:' || true)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: turn, wake, idle, or busy vocabulary in the core:" >&2
+  echo "FAIL: turn, wake, idle, or busy vocabulary in core or optional modules:" >&2
   echo "$hits" >&2
   exit 1
 fi
@@ -72,4 +79,4 @@ if [[ -n "$hits" ]]; then
   echo "$hits" >&2
   exit 1
 fi
-echo "PASS vocabulary: no turn, wake, idle, busy, or retired vocabulary in ${#files[@]} core files under ${*:-.}"
+echo "PASS vocabulary: no turn, wake, idle, busy, or retired vocabulary in ${#files[@]} core and optional-module files under ${*:-.}"

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Invariant check: no fixed-interval scan on the correctness path. Mail,
-# receipts, and claim expiry follow committed events, so core source carries
-# no sleep, timed wait, interval, elapsed-time sweep, or try-and-retry spin.
+# receipts, and claim expiry follow committed events, so core source (src) and
+# optional-module source (modules/*/src) carry no unmarked sleep, timed wait,
+# interval, elapsed-time sweep, or try-and-retry spin.
 #
 # A legitimate non-correctness use (reconnect backoff, a bounded wait that
 # converts a silent peer into an error) is allowed only when the matching line,
 # or the line directly above it, carries a marker with a reason:
 #   // no-poll: <why this is not on the correctness path>
 #
-# Usage: scripts/check-no-poll [subdir ...]   (default: src)
+# Usage: scripts/check-no-poll [subdir ...]   (default: src and any modules/*/src)
 set -euo pipefail
-if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [subdir ...] (default: src)"; exit 0; fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [subdir ...] (default: src and any modules/*/src)"; exit 0; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -25,7 +26,13 @@ cd "$ROOT"
 PATTERN='sleep|_timeout|Instant|\.elapsed\(|[Ii]nterval|try_recv|try_lock|yield_now|spin_loop'
 MARKER='//[[:space:]]*no-poll:[[:space:]]*[^[:space:]]'
 
-dirs=("${@:-src}")
+if (( $# == 0 )); then
+  shopt -s nullglob
+  dirs=(src modules/*/src)
+  shopt -u nullglob
+else
+  dirs=("$@")
+fi
 mapfile -t files < <(find "${dirs[@]}" -name '*.rs' -type f | sort)
 
 hits=""
@@ -44,7 +51,7 @@ if ((${#files[@]})); then
 fi
 
 if [[ -n "$hits" ]]; then
-  echo "FAIL: polling or timed wait in core source (mark a non-correctness use with '// no-poll: <reason>'):" >&2
+  echo "FAIL: polling or timed wait in core or optional-module source (mark a non-correctness use with '// no-poll: <reason>'):" >&2
   echo "$hits" >&2
   exit 1
 fi

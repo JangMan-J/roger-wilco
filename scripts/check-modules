@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Optional-modules gate: checks every standalone package under modules/<name>/
+# (workspace isolation, fmt, clippy -D warnings, tests) and runs the repository
+# invariant checks so no optional module evades any rule.
+# Usage: scripts/check-modules
+set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the optional-modules gate)"; exit 0; fi
+[[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+step() { echo "== $*"; "$@"; }
+
+shopt -s nullglob
+raw_manifests=(modules/*/Cargo.toml)
+shopt -u nullglob
+if (( ${#raw_manifests[@]} == 0 )); then
+  echo "PASS check-modules: no optional modules"
+  exit 0
+fi
+
+mapfile -t manifests < <(printf '%s\n' "${raw_manifests[@]}" | LC_ALL=C sort)
+
+for m in "${manifests[@]}"; do
+  echo "== workspace check $m"
+  if ! grep -Eq '^[[:space:]]*\[workspace([[:space:]]*\]|\.)' "$m"; then
+    echo "FAIL check-modules: $m must declare a [workspace] table so root Cargo.toml stays isolated" >&2
+    exit 1
+  fi
+  step cargo fmt --manifest-path "$m" --check
+  step cargo clippy --manifest-path "$m" --all-targets -- -D warnings
+  step cargo test --manifest-path "$m"
+done
+
+step scripts/check-harness-free
+step scripts/check-vocabulary
+step scripts/check-no-poll
+echo "PASS check-modules"
