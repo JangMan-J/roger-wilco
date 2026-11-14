@@ -27,9 +27,14 @@ for m in "${manifests[@]}"; do
     echo "FAIL check-modules: $m must declare a [workspace] table so root Cargo.toml stays isolated" >&2
     exit 1
   fi
+  feat=()
+  if grep -Eq '^[[:space:]]*test-hooks[[:space:]]*=' "$m"; then
+    feat=(--features test-hooks)
+  fi
   step cargo fmt --manifest-path "$m" --check
-  step cargo clippy --manifest-path "$m" --all-targets -- -D warnings
-  step cargo test --manifest-path "$m"
+  step cargo clippy --manifest-path "$m" --bins -- -D warnings
+  step cargo clippy --manifest-path "$m" --all-targets "${feat[@]}" -- -D warnings
+  step cargo test --manifest-path "$m" "${feat[@]}"
 done
 
 step scripts/check-harness-free

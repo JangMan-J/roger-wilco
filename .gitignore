@@ -1,3 +1,4 @@
 .pad/
 .proto/
 /target
+/modules/*/target

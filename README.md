@@ -489,7 +489,8 @@ Nothing lands on main until `scripts/check-all` exits 0; what each gate runs and
 rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 ```sh
-scripts/check                     # the core gate
+scripts/check                     # the offline core gate
+scripts/check-modules             # standalone optional modules under modules/ + invariant checks
 scripts/check-all                 # the core gate, then the seal guard
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
 scripts/check-seal                # verifies document integrity when a seal is present; skips otherwise
@@ -545,6 +546,7 @@ core log grows while nobody asks.
 | `tests/audit.rs` | exact history fixtures, filtering, findings, JSON, live read-only audit |
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
+| `modules/mcp-gateway/` | optional multi-session MCP Streamable HTTP and SSE push gateway ([modules/mcp-gateway/README.md](modules/mcp-gateway/README.md)) |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |

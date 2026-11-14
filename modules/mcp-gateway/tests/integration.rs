@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::TcpStream;
 
 const GATEWAY_BIN: &str = env!("CARGO_BIN_EXE_roger-mcp-gateway");
 const FLEET_TOKEN: &str = "fleet-integration-token";
@@ -106,6 +106,7 @@ async fn wait_until<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) 
 struct TestRig {
     dir: PathBuf,
     coord_port: u16,
+    daemon_tcp_port: u16,
     processes: Vec<ChildGuard>,
     seq: usize,
 }
@@ -120,6 +121,7 @@ impl TestRig {
         let mut rig = Self {
             dir,
             coord_port: 0,
+            daemon_tcp_port: 0,
             processes: Vec::new(),
             seq: 0,
         };
@@ -148,6 +150,7 @@ impl TestRig {
         let coord_addr = format!("127.0.0.1:{}", rig.coord_port);
         let sock = rig.daemon_sock();
         let dlog = rig.daemon_log();
+        let dport_file = rig.path("daemon.port");
         rig.spawn_roger(&[
             "daemon",
             "--coordinator",
@@ -156,9 +159,22 @@ impl TestRig {
             "host-a",
             "--socket",
             sock.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            dport_file.to_str().unwrap(),
             "--data",
             dlog.to_str().unwrap(),
         ]);
+
+        let dport_str = wait_until("daemon port file", 10, || {
+            fs::read_to_string(&dport_file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .await;
+        rig.daemon_tcp_port = dport_str.parse().unwrap();
 
         wait_until("daemon unix socket ready", 10, || {
             std::os::unix::net::UnixStream::connect(&sock)
@@ -491,22 +507,8 @@ fn parse_tool_payload(rpc_body: &[u8]) -> Value {
 async fn multi_client_concurrent_push_over_h1_and_h2c_preserves_headers_and_broadcasts() {
     let mut rig = TestRig::start("multi-push").await;
 
-    // Also verify `--socket tcp://<host:port>` dialing with TCP_NODELAY via a loopback TCP relay!
-    let tcp_bridge = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bridge_port = tcp_bridge.local_addr().unwrap().port();
-    let unix_sock = rig.daemon_sock();
-    tokio::spawn(async move {
-        while let Ok((mut tcp_conn, _)) = tcp_bridge.accept().await {
-            let path = unix_sock.clone();
-            tokio::spawn(async move {
-                if let Ok(mut u_conn) = UnixStream::connect(path).await {
-                    let _ = tokio::io::copy_bidirectional(&mut tcp_conn, &mut u_conn).await;
-                }
-            });
-        }
-    });
-
-    let tcp_target = format!("tcp://127.0.0.1:{bridge_port}");
+    // Connect both `roger-mcp-gateway` and a `roger session` Tracer directly to native `roger daemon --listen` over TCP!
+    let tcp_target = format!("tcp://127.0.0.1:{}", rig.daemon_tcp_port);
     let store_dir = rig.store_dir();
     let (_, gw_port) = rig
         .spawn_gateway_with_socket(&tcp_target, &store_dir, &[], &[])
@@ -517,12 +519,12 @@ async fn multi_client_concurrent_push_over_h1_and_h2c_preserves_headers_and_broa
     assert_eq!(st, StatusCode::OK);
     assert_eq!(&hbody[..], br#"{"ok":true}"#);
 
-    // Start a real `roger session` Tracer alongside the 3 MCP gateway sessions!
+    // Start a real `roger session` Tracer over `tcp://` alongside the 3 MCP gateway sessions!
     let tracer_store = rig.path("tracer.store");
     rig.spawn_roger(&[
         "session",
         "--socket",
-        rig.daemon_sock().to_str().unwrap(),
+        &tcp_target,
         "--store",
         tracer_store.to_str().unwrap(),
         "--id",
