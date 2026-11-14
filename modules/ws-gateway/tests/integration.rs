@@ -844,3 +844,70 @@ async fn resume_after_record_replays_store_in_line_order_then_goes_live() {
     assert_eq!(raw_store.lines().count(), 5, "{raw_store}");
     b.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_token_reaches_a_guarded_daemon_over_tcp() {
+    let mut rig = TestRig::start("client-token").await;
+    let coord_addr = format!("127.0.0.1:{}", rig.coord_port);
+    let gport_file = rig.path("guarded.port");
+    let glog = rig.path("guarded.log");
+    // The rig sets ROGER_TOKEN on roger processes; the guarded daemon reuses it as its client token.
+    rig.spawn_roger(&[
+        "daemon",
+        "--coordinator",
+        &coord_addr,
+        "--host-id",
+        "host-guarded",
+        "--listen",
+        "127.0.0.1:0",
+        "--port-file",
+        gport_file.to_str().unwrap(),
+        "--client-token-env",
+        "ROGER_TOKEN",
+        "--data",
+        glog.to_str().unwrap(),
+    ]);
+    let gport = wait_until("guarded daemon port file", 10, || {
+        fs::read_to_string(&gport_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .await;
+    let target = format!("tcp://127.0.0.1:{gport}");
+
+    let ok_dir = rig.path("stores-ok");
+    let (_, port_ok) = rig
+        .spawn_gateway_with_socket(
+            &target,
+            &ok_dir,
+            &[],
+            &[("ROGER_CLIENT_TOKEN", FLEET_TOKEN)],
+        )
+        .await;
+    let mut a = ws_open(port_ok, &format!("id={ADDR_A}&registered=1"), None)
+        .await
+        .unwrap();
+    a.expect_ready(ADDR_A, true).await;
+
+    let bad_dir = rig.path("stores-bad");
+    let (_, port_bad) = rig
+        .spawn_gateway_with_socket(&target, &bad_dir, &[], &[("ROGER_CLIENT_TOKEN", "wrong")])
+        .await;
+    if let Ok(mut b) = ws_open(port_bad, &format!("id={ADDR_B}&registered=1"), None).await {
+        // The daemon closes the link after the refused auth line: no Register follows.
+        while let Some((v, raw)) = b.read_frame().await {
+            assert_ne!(v["type"], "registered", "{raw}");
+        }
+    }
+    let sock = rig.daemon_sock();
+    let board = roger(&["board", "--socket", sock.to_str().unwrap()]);
+    assert!(
+        board.contains(&format!("SESSION address={ADDR_A} ")),
+        "{board}"
+    );
+    assert!(
+        !board.contains(&format!("SESSION address={ADDR_B} ")),
+        "{board}"
+    );
+}
