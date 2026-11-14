@@ -1,0 +1,32 @@
+[package]
+name = "roger-ws-gateway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Optional WebSocket face for Roger-Wilco carrying the adapter JSON-line protocol"
+readme = "README.md"
+
+[workspace]
+
+[[bin]]
+name = "roger-ws-gateway"
+path = "src/main.rs"
+
+[features]
+# Test-only hooks (--hold-before-ack); release and deploy builds leave them out.
+test-hooks = []
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake", "connect"] }
+
+[lints.clippy]
+all = "warn"
