@@ -11,8 +11,11 @@ use crate::net::{self, Writer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,10 +134,21 @@ pub fn run(cfg: Config) -> io::Result<()> {
     }
     // Bind before dialing upstream: a daemon refused its socket or TCP address
     // must not have joined the coordinator first.
+    #[cfg(unix)]
     let unix_listener = match &cfg.socket {
         Some(path) => Some(bind_socket(path)?),
         None => None,
     };
+    #[cfg(not(unix))]
+    if let Some(path) = &cfg.socket {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "expected --listen <address:port> on this platform, saw --socket {}",
+                path.display()
+            ),
+        ));
+    }
     let tcp_listener = match &cfg.listen {
         Some(addr) => match TcpListener::bind(addr) {
             Ok(tcp) => {
@@ -176,7 +190,8 @@ pub fn run(cfg: Config) -> io::Result<()> {
         eprintln!("host daemon listening on {}", tcp.local_addr()?);
     }
 
-    match (unix_listener, tcp_listener) {
+    #[cfg(unix)]
+    return match (unix_listener, tcp_listener) {
         (Some(unix), Some(tcp)) => {
             let tcp_state = Arc::clone(&state);
             std::thread::spawn(move || {
@@ -189,9 +204,15 @@ pub fn run(cfg: Config) -> io::Result<()> {
         (Some(unix), None) => accept_unix(unix, state),
         (None, Some(tcp)) => accept_tcp(tcp, state),
         (None, None) => unreachable!("validated at start of run"),
+    };
+    #[cfg(not(unix))]
+    match tcp_listener {
+        Some(tcp) => accept_tcp(tcp, state),
+        None => unreachable!("validated at start of run"),
     }
 }
 
+#[cfg(unix)]
 fn accept_unix(listener: UnixListener, state: Arc<Mutex<State>>) -> io::Result<()> {
     for conn in listener.incoming() {
         let conn = conn?;
@@ -223,6 +244,7 @@ fn accept_tcp(listener: TcpListener, state: Arc<Mutex<State>>) -> io::Result<()>
 /// the same path (a test, a copy of the project) cannot silently take over
 /// the live daemon's clients. Anything at the path that is not a socket is
 /// refused too, rather than deleted.
+#[cfg(unix)]
 fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
@@ -669,6 +691,7 @@ fn with_req(mut v: Value, req: i64) -> Value {
     v
 }
 
+#[cfg(unix)]
 fn serve_unix(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     let lines = net::lines(Box::new(conn.try_clone()?));
     let conn = Arc::new(conn);

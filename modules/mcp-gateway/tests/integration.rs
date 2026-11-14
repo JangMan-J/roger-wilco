@@ -54,7 +54,9 @@ fn roger_bin() -> &'static Path {
             .status()
             .expect("failed to invoke cargo build for roger");
         assert!(status.success(), "building roger binary failed");
-        let bin = target_dir.join("debug").join("roger");
+        let bin = target_dir
+            .join("debug")
+            .join(format!("roger{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.exists(), "expected built roger at {}", bin.display());
         bin
     })
@@ -148,9 +150,11 @@ impl TestRig {
         rig.coord_port = port_str.parse().unwrap();
 
         let coord_addr = format!("127.0.0.1:{}", rig.coord_port);
-        let sock = rig.daemon_sock();
         let dlog = rig.daemon_log();
         let dport_file = rig.path("daemon.port");
+        #[cfg(unix)]
+        let sock_path = rig.path("daemon.sock");
+        #[cfg(unix)]
         rig.spawn_roger(&[
             "daemon",
             "--coordinator",
@@ -158,7 +162,21 @@ impl TestRig {
             "--host-id",
             "host-a",
             "--socket",
-            sock.to_str().unwrap(),
+            sock_path.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            dport_file.to_str().unwrap(),
+            "--data",
+            dlog.to_str().unwrap(),
+        ]);
+        #[cfg(not(unix))]
+        rig.spawn_roger(&[
+            "daemon",
+            "--coordinator",
+            &coord_addr,
+            "--host-id",
+            "host-a",
             "--listen",
             "127.0.0.1:0",
             "--port-file",
@@ -176,8 +194,9 @@ impl TestRig {
         .await;
         rig.daemon_tcp_port = dport_str.parse().unwrap();
 
+        #[cfg(unix)]
         wait_until("daemon unix socket ready", 10, || {
-            std::os::unix::net::UnixStream::connect(&sock)
+            std::os::unix::net::UnixStream::connect(&sock_path)
                 .ok()
                 .map(drop)
         })
@@ -199,7 +218,14 @@ impl TestRig {
     }
 
     fn daemon_sock(&self) -> PathBuf {
-        self.path("daemon.sock")
+        #[cfg(unix)]
+        {
+            self.path("daemon.sock")
+        }
+        #[cfg(not(unix))]
+        {
+            PathBuf::from(format!("tcp://127.0.0.1:{}", self.daemon_tcp_port))
+        }
     }
 
     fn store_dir(&self) -> PathBuf {
@@ -1322,7 +1348,7 @@ async fn all_nine_tools_bearer_auth_container_restart_store_lock_and_delete_unre
         )
         .await;
 
-    let d2_sock = rig.path("daemon2.sock");
+    let d2_port_file = rig.path("daemon2.port");
     let d2_log = rig.path("daemon2.log");
     let coord_addr = format!("127.0.0.1:{}", rig.coord_port);
     rig.spawn_roger(&[
@@ -1331,23 +1357,27 @@ async fn all_nine_tools_bearer_auth_container_restart_store_lock_and_delete_unre
         &coord_addr,
         "--host-id",
         "host-b",
-        "--socket",
-        d2_sock.to_str().unwrap(),
+        "--listen",
+        "127.0.0.1:0",
+        "--port-file",
+        d2_port_file.to_str().unwrap(),
         "--data",
         d2_log.to_str().unwrap(),
     ]);
-    wait_until("second daemon socket", 10, || {
-        std::os::unix::net::UnixStream::connect(&d2_sock)
+    let d2_port = wait_until("second daemon port file", 10, || {
+        fs::read_to_string(&d2_port_file)
             .ok()
-            .map(drop)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     })
     .await;
+    let d2_target = format!("tcp://127.0.0.1:{d2_port}");
 
     let takeover_store = rig.path("takeover.store");
     rig.spawn_roger(&[
         "session",
         "--socket",
-        d2_sock.to_str().unwrap(),
+        &d2_target,
         "--store",
         takeover_store.to_str().unwrap(),
         "--id",

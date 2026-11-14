@@ -26,8 +26,9 @@ landing changes on main (see [Checks](#checks)).
 
 ## Requirements
 
-- Linux (Unix sockets; deploy uses systemd user units)
-- Rust 1.89 or later (the code uses `File::try_lock`); no crates are fetched
+- Linux, macOS, or Windows (Unix sockets and `tcp://` on Linux and macOS; `tcp://` on Windows;
+  `deploy/` uses systemd user units on Linux)
+- Rust 1.89 or later; no crates are fetched for `roger`
 - For a fleet of several hosts: SSH between them and a private network the coordinator can
   listen on (see [deploy/README.md](deploy/README.md))
 
@@ -437,7 +438,7 @@ closing its stdin.
 | --- | --- |
 | Address | `--id`; else the variable named by `--id-env NAME` (so a client's own registration can hand the server a stable per-session id; unset or empty falls through); else `ROGER_ADDRESS`; else a fresh UUID. Used verbatim, never parsed. |
 | Socket | `--socket`; else `ROGER_SOCKET` (either a Unix socket path or `tcp://<addr:port>`); else `$XDG_RUNTIME_DIR/roger/daemon.sock`. A missing socket, or none of these set, is an error naming what was expected and what was seen. |
-| Store | `--store`; else `ROGER_STORE`; else `${XDG_STATE_HOME:-~/.local/state}/roger/mcp/<address>.store`. |
+| Store | `--store`; else `ROGER_STORE`; else `XDG_STATE_HOME`, `LOCALAPPDATA`, `HOME/.local/state`, or `USERPROFILE/.local/state` under `roger/mcp/<address>.store`. |
 
 It writes each delivery to its Store, then acks naming that Record id, exactly as the adapter
 does; the Ack waits for no reader and for nothing a tool call does. stdout carries only

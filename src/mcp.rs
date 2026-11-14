@@ -79,12 +79,12 @@ pub fn resolve(
     {
         Some(p) => (PathBuf::from(p), false),
         None => {
-            let state = match set(env, "XDG_STATE_HOME") {
+            let state = match set(env, "XDG_STATE_HOME").or_else(|| set(env, "LOCALAPPDATA")) {
                 Some(dir) => PathBuf::from(dir),
-                None => match set(env, "HOME") {
+                None => match set(env, "HOME").or_else(|| set(env, "USERPROFILE")) {
                     Some(home) => PathBuf::from(home).join(".local").join("state"),
                     None => return Err(bad(
-                        "expected --store, ROGER_STORE, XDG_STATE_HOME, or HOME, saw none of them"
+                        "expected --store, ROGER_STORE, XDG_STATE_HOME, LOCALAPPDATA, HOME, or USERPROFILE, saw none of them"
                             .into(),
                     )),
                 },
@@ -92,7 +92,7 @@ pub fn resolve(
             if address.is_empty()
                 || address == "."
                 || address == ".."
-                || address.contains(['/', '\0'])
+                || address.contains(['/', '\\', '\0'])
             {
                 return Err(bad(format!(
                     "expected an Address usable as a file name for the default Store, saw {address:?}; pass --store"
@@ -102,7 +102,7 @@ pub fn resolve(
                 state
                     .join("roger")
                     .join("mcp")
-                    .join(format!("{address}.store")),
+                    .join(format!("{}.store", store_stem(&address))),
                 true,
             )
         }
@@ -700,6 +700,35 @@ impl Inbox {
     }
 }
 
+/// Platform-safe file stem for the default MCP Store. On Unix the Address is
+/// used directly; on Windows characters illegal in NTFS file names (such as `:`
+/// in composite Addresses) are percent-encoded byte-for-byte without parsing
+/// the Address.
+fn store_stem(address: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        address.to_string()
+    }
+    #[cfg(windows)]
+    {
+        encode_ntfs_stem(address)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn encode_ntfs_stem(address: &str) -> String {
+    let mut out = String::with_capacity(address.len());
+    for b in address.bytes() {
+        if b < 0x20 || matches!(b, b'%' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|') {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 /// The file beside a Store that holds how far its reader has consumed.
 fn position_path(store: &Path) -> PathBuf {
     let mut p = store.as_os_str().to_owned();
@@ -765,7 +794,7 @@ fn save_position(file: &Path, record: &str) -> io::Result<()> {
     f.sync_all()?;
     std::fs::rename(&tmp, file)?;
     if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
+        crate::durlog::sync_dir(dir)?;
     }
     Ok(())
 }
@@ -994,7 +1023,12 @@ mod tests {
         assert_eq!(cfg.address, c);
         assert_eq!(
             cfg.store,
-            PathBuf::from(format!("/h/.local/state/roger/mcp/{c}.store"))
+            PathBuf::from("/h")
+                .join(".local")
+                .join("state")
+                .join("roger")
+                .join("mcp")
+                .join(format!("{}.store", store_stem(c)))
         );
         assert!(cfg.store_is_default);
     }
@@ -1006,8 +1040,17 @@ mod tests {
             &[("XDG_RUNTIME_DIR", "/run/u"), ("XDG_STATE_HOME", "/st")],
         )
         .unwrap();
-        assert_eq!(cfg.socket, PathBuf::from("/run/u/roger/daemon.sock"));
-        assert_eq!(cfg.store, PathBuf::from("/st/roger/mcp/fresh-uuid.store"));
+        assert_eq!(
+            cfg.socket,
+            PathBuf::from("/run/u").join("roger").join("daemon.sock")
+        );
+        assert_eq!(
+            cfg.store,
+            PathBuf::from("/st")
+                .join("roger")
+                .join("mcp")
+                .join("fresh-uuid.store")
+        );
         let cfg = resolved(
             &["--socket", "/f.sock"],
             &[("ROGER_SOCKET", "/v.sock"), ("ROGER_STORE", "/v.store")],
@@ -1026,7 +1069,12 @@ mod tests {
         assert_eq!(cfg.socket, PathBuf::from("tcp://127.0.0.1:7478"));
         assert_eq!(
             cfg.store,
-            PathBuf::from("/h/.local/state/roger/mcp/fresh-uuid.store")
+            PathBuf::from("/h")
+                .join(".local")
+                .join("state")
+                .join("roger")
+                .join("mcp")
+                .join("fresh-uuid.store")
         );
         assert!(cfg.store_is_default);
         let cfg = resolved(
@@ -1035,8 +1083,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.socket, PathBuf::from("tcp://127.0.0.1:7478"));
-        assert_eq!(cfg.store, PathBuf::from("/st/roger/mcp/fresh-uuid.store"));
+        assert_eq!(
+            cfg.store,
+            PathBuf::from("/st")
+                .join("roger")
+                .join("mcp")
+                .join("fresh-uuid.store")
+        );
         assert!(cfg.store_is_default);
+        let cfg = resolved(
+            &["--socket", "tcp://127.0.0.1:7478"],
+            &[("LOCALAPPDATA", "/appdata")],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.store,
+            PathBuf::from("/appdata")
+                .join("roger")
+                .join("mcp")
+                .join("fresh-uuid.store")
+        );
+        let cfg = resolved(
+            &["--socket", "tcp://127.0.0.1:7478"],
+            &[("USERPROFILE", "/users/alice")],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.store,
+            PathBuf::from("/users/alice")
+                .join(".local")
+                .join("state")
+                .join("roger")
+                .join("mcp")
+                .join("fresh-uuid.store")
+        );
+        assert_eq!(
+            encode_ntfs_stem("[[1a:FLEET:zz]]22222222-2222-4222-8222-222222222222"),
+            "[[1a%3AFLEET%3Azz]]22222222-2222-4222-8222-222222222222"
+        );
     }
 
     #[test]

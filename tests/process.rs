@@ -2,6 +2,8 @@
 //! loopback. Expected values are the literals chosen here, per proof 1.
 //! The SIGKILL window needs the session's `--hold-before-ack` test hook.
 
+#![cfg(unix)]
+
 #[cfg(not(feature = "test-hooks"))]
 compile_error!("tests/process.rs needs the test hooks: cargo test --features test-hooks");
 

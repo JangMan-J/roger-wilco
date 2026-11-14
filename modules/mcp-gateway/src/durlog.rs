@@ -6,7 +6,7 @@
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read as _, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -95,14 +95,23 @@ impl Iterator for Replay {
     }
 }
 
-impl DurLog {
-    pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let existed = path.exists();
+/// Flush a directory entry on Unix; on non-Unix platforms opening a directory
+/// with `File::open` is unsupported and metadata follows the file flush.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+fn open_exclusive(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -119,10 +128,46 @@ impl DurLog {
                 ),
             )
         })?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .share_mode(1)
+            .open(path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(32) {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "expected {} unlocked, saw it held by another process: {e}",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })
+    }
+}
+
+impl DurLog {
+    pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let existed = path.exists();
+        let file = open_exclusive(path)?;
         if !existed {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    File::open(parent)?.sync_all()?;
+                    sync_dir(parent)?;
                 }
             }
         }
@@ -188,7 +233,7 @@ pub fn save_cursor(pos_file: &Path, record: &str) -> io::Result<()> {
     f.sync_all()?;
     std::fs::rename(&tmp, pos_file)?;
     if let Some(dir) = pos_file.parent().filter(|d| !d.as_os_str().is_empty()) {
-        File::open(dir)?.sync_all()?;
+        sync_dir(dir)?;
     }
     Ok(())
 }
@@ -239,10 +284,38 @@ pub fn shape_mail_entry(entry: &Value) -> Value {
     Value::Object(out)
 }
 
-/// Generate a fresh RFC 4122 UUIDv4 from `/dev/urandom`.
+fn fill_random(b: &mut [u8; 16]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        File::open("/dev/urandom")?.read_exact(b)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt", kind = "raw-dylib")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                algorithm: *mut std::ffi::c_void,
+                buffer: *mut u8,
+                bytes: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), 16, 2) };
+        if status < 0 {
+            Err(io::Error::other(format!(
+                "expected BCryptGenRandom to succeed, saw NTSTATUS {status:#x}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Generate a fresh RFC 4122 UUIDv4 using the OS cryptographic RNG.
 pub fn gen_uuid() -> io::Result<String> {
     let mut b = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut b)?;
+    fill_random(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     Ok(format!(

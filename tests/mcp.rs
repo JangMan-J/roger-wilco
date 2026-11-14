@@ -2,6 +2,8 @@
 //! MCP server on loopback, driven over stdio by the small JSON-RPC client
 //! below. The expected values are the literals chosen here.
 
+#![cfg(unix)]
+
 #[cfg(not(feature = "test-hooks"))]
 compile_error!("tests/mcp.rs needs the test hooks: cargo test --features test-hooks");
 

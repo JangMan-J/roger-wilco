@@ -1298,14 +1298,19 @@ mod tests {
 
     #[test]
     fn a_sender_that_cannot_be_answered_does_not_keep_the_mail_from_its_recipient() {
-        use std::os::unix::net::UnixStream;
-        let hangup = |s: &UnixStream| {
+        fn tcp_pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (b, _) = listener.accept().unwrap();
+            (a, b)
+        }
+        let hangup = |s: &TcpStream| {
             let _ = s.shutdown(Shutdown::Both);
         };
-        let (gone, _) = UnixStream::pair().unwrap();
+        let (gone, _) = tcp_pair();
         let sender = net::queued(Arc::new(gone), hangup);
         net::close(&sender, false);
-        let (near, far) = UnixStream::pair().unwrap();
+        let (near, far) = tcp_pair();
         let recipient = net::queued(Arc::new(near), hangup);
         let deliver = net::deliver_msg("m1", "a", "b", "one", net::DIRECTED, &obj(vec![]));
         let answered = answer_then_push(

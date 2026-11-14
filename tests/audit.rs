@@ -404,19 +404,27 @@ fn audit_live_locked_logs_are_read_only() {
     ]);
     wait_until(|| fs::read_to_string(&port).is_ok());
     let addr = format!("127.0.0.1:{}", fs::read_to_string(&port).unwrap().trim());
+    let dport = dir.0.join("dport").to_str().unwrap().to_string();
     let _daemon = processes.spawn(&[
         "daemon",
         "--coordinator",
         &addr,
         "--host-id",
         "host",
-        "--socket",
-        &sock,
+        "--listen",
+        "127.0.0.1:0",
+        "--port-file",
+        &dport,
         "--data",
         &d,
     ]);
-    wait_until(|| std::path::Path::new(&sock).exists());
-    let mut tracer = processes.spawn(&["session", "--socket", &sock, "--id", A, "--store", &s]);
+    let _ = &sock;
+    wait_until(|| fs::read_to_string(&dport).is_ok());
+    let target = format!(
+        "tcp://127.0.0.1:{}",
+        fs::read_to_string(&dport).unwrap().trim()
+    );
+    let mut tracer = processes.spawn(&["session", "--socket", &target, "--id", A, "--store", &s]);
     let mut line = String::new();
     loop {
         line.clear();
@@ -428,7 +436,7 @@ fn audit_live_locked_logs_are_read_only() {
     let send = |id: &str| {
         Command::new(BIN)
             .args([
-                "send", "--socket", &sock, "--from", B, "--to", A, "--mail", id, "--body", "hi",
+                "send", "--socket", &target, "--from", B, "--to", A, "--mail", id, "--body", "hi",
             ])
             .output()
             .unwrap()

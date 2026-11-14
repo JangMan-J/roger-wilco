@@ -7,8 +7,9 @@ use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,7 @@ pub fn connect(target: &Path) -> io::Result<(net::Writer, net::Lines)> {
                 net::lines(Box::new(conn)),
             ))
         }
+        #[cfg(unix)]
         None => {
             let conn = UnixStream::connect(target).map_err(|e| {
                 io::Error::new(
@@ -45,6 +47,14 @@ pub fn connect(target: &Path) -> io::Result<(net::Writer, net::Lines)> {
                 net::lines(Box::new(conn)),
             ))
         }
+        #[cfg(not(unix))]
+        None => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "expected tcp://<address:port> on this platform, saw {}",
+                target.display()
+            ),
+        )),
     }
 }
 
@@ -631,9 +641,38 @@ pub fn board(socket: PathBuf, from: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
+fn fill_random(b: &mut [u8; 16]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")?.read_exact(b)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt", kind = "raw-dylib")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                algorithm: *mut std::ffi::c_void,
+                buffer: *mut u8,
+                bytes: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), 16, 2) };
+        if status < 0 {
+            Err(io::Error::other(format!(
+                "expected BCryptGenRandom to succeed, saw NTSTATUS {status:#x}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub fn gen_uuid() -> io::Result<String> {
     let mut b = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    fill_random(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     Ok(format!(

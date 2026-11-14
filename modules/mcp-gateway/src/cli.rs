@@ -201,7 +201,7 @@ pub fn write_port_file(path: &Path, port: u16) -> io::Result<()> {
     file.sync_all()?;
     std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
+        crate::durlog::sync_dir(parent)?;
     }
     Ok(())
 }

@@ -16,7 +16,7 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 ```
 
 - `--bind <address:port>`: TCP listener serving both HTTP/1.1 and HTTP/2 (`h2c`).
-- `--socket <path|tcp://address:port>`: host `roger daemon` Unix socket path or `tcp://<host:port>` endpoint (dialed with `TCP_NODELAY`).
+- `--socket <path|tcp://address:port>`: host `roger daemon` Unix socket path (Linux/macOS) or `tcp://<host:port>` endpoint (Linux, macOS, Windows; dialed with `TCP_NODELAY`).
 - `--store-dir <dir>`: directory holding per-Address append-only Store files (`<hex_sha256_of_address>.store`) and atomic read cursors (`<hex_sha256_of_address>.store.cursor`).
 - `--port-file <path>`: optional path atomically populated (`<path>.tmp` -> `fsync` -> `rename`) with the bound TCP port immediately after `bind`.
 - `--endpoint <path>`: MCP HTTP endpoint path (default `"/mcp"`). `GET /healthz` is always served (`200 OK` `{"ok":true}`).

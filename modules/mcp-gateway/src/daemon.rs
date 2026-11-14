@@ -4,7 +4,9 @@ use crate::cli::DaemonSocket;
 use serde_json::{Map, Value};
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 pub struct DaemonReader {
@@ -19,6 +21,7 @@ pub struct DaemonWriter {
 /// Dial `target` (`Unix` socket or `TcpStream` with `TCP_NODELAY`) and split into reader/writer.
 pub async fn connect(target: &DaemonSocket) -> io::Result<(DaemonReader, DaemonWriter)> {
     match target {
+        #[cfg(unix)]
         DaemonSocket::Unix(path) => {
             let stream = UnixStream::connect(path).await.map_err(|e| {
                 io::Error::new(
@@ -37,6 +40,14 @@ pub async fn connect(target: &DaemonSocket) -> io::Result<(DaemonReader, DaemonW
                 },
             ))
         }
+        #[cfg(not(unix))]
+        DaemonSocket::Unix(path) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "expected --socket tcp://<address:port> on this platform, saw {}",
+                path.display()
+            ),
+        )),
         DaemonSocket::Tcp(addr) => {
             let stream = TcpStream::connect(addr).await.map_err(|e| {
                 io::Error::new(

@@ -76,14 +76,23 @@ impl Iterator for Replay {
     }
 }
 
-impl DurLog {
-    pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let existed = path.exists();
+/// Flush a directory entry on Unix; on non-Unix platforms opening a directory
+/// with `File::open` is unsupported and metadata follows the file flush.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+fn open_exclusive(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -99,11 +108,50 @@ impl DurLog {
                 ),
             )
         })?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ (1) only: refuses a second writer at open while still
+        // letting read-only callers (`roger mcp` inbox, `roger audit`) read the
+        // file without hitting a mandatory byte-range lock violation.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .share_mode(1)
+            .open(path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(32) {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "expected {} unlocked, saw it held by another process: {e}",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })
+    }
+}
+
+impl DurLog {
+    pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let existed = path.exists();
+        let file = open_exclusive(path)?;
         if !existed {
             // Make the new file itself durable.
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    File::open(parent)?.sync_all()?;
+                    sync_dir(parent)?;
                 }
             }
         }
