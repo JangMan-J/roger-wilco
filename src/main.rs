@@ -56,6 +56,7 @@ Commands:
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
               [--superseded]   (also emit replacement notices on stdout; stderr always warns)
+              [--watch]        (also emit committed Board changes as board_event lines)
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
               [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
   send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
@@ -64,6 +65,7 @@ Commands:
   renew       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   release     --socket <path> --owner <address> --key <text>
   board       --socket <path> [--from <address>]
+  watch       --socket <path>   (prints committed Board changes until the connection ends)
   label       --socket <path> --from <address> --label <text>
   receipt     --socket <path> --mail <id>
   audit       [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
@@ -170,8 +172,11 @@ fn main() -> io::Result<()> {
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--declare"),
-            args.iter().any(|a| a == "--registered"),
-            args.iter().any(|a| a == "--superseded"),
+            (
+                args.iter().any(|a| a == "--registered"),
+                args.iter().any(|a| a == "--superseded"),
+                args.iter().any(|a| a == "--watch"),
+            ),
         ),
         "mcp" => mcp::run(&args),
         "send" => session::send(
@@ -222,6 +227,7 @@ fn main() -> io::Result<()> {
             need(&args, "--from")?,
             need(&args, "--label")?,
         ),
+        "watch" => session::watch(PathBuf::from(need(&args, "--socket")?)),
         "audit" => audit::run(&args[2..]),
         _ => {
             eprintln!("{USAGE}");

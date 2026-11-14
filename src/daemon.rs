@@ -75,6 +75,9 @@ struct State {
     upstream: Option<Writer>,
     next_req: i64,
     waiters: HashMap<i64, mpsc::Sender<Value>>,
+    /// Local connections that asked for `board_event` lines (`watch`, or
+    /// `"watch":true` on a Register), until they close.
+    watchers: Vec<Writer>,
 }
 
 impl State {
@@ -95,6 +98,7 @@ impl State {
             upstream: None,
             next_req: 1,
             waiters: HashMap::new(),
+            watchers: Vec::new(),
         }
     }
 }
@@ -419,6 +423,9 @@ fn upstream_link(
             ("type", s("hello")),
             ("token", s(&cfg.token)),
             ("host", s(&cfg.host_id)),
+            // Ask for committed Board changes; an older coordinator ignores
+            // the field and never sends one.
+            ("board_events", Value::Bool(true)),
         ]),
     )?;
     let resp = lines
@@ -518,6 +525,14 @@ fn upstream_link(
             "deliver" => handle_deliver(state, &v)?,
             // The answer to a ping: its arrival is all it says.
             "pong" => {}
+            // A committed Board change, passed on as it came to the local
+            // connections that asked for it, and to no other.
+            "board_event" => {
+                let st = state.lock().unwrap();
+                for w in &st.watchers {
+                    let _ = net::send(w, &v);
+                }
+            }
             // The coordinator holds a Register. Not a reply to any request.
             "registered" | "superseded" | "replacement_recorded" => {
                 let mut st = state.lock().unwrap();
@@ -781,6 +796,11 @@ fn serve_local(writer: Writer, lines: net::Lines, state: Arc<Mutex<State>>) -> i
     if let Some(id) = session_id {
         release(&state, &writer, &id, "disconnect");
     }
+    state
+        .lock()
+        .unwrap()
+        .watchers
+        .retain(|w| !Arc::ptr_eq(w, &writer));
     // What is already queued is written before the connection ends: a
     // client may still be reading the answers to what it asked.
     net::close(&writer, true);
@@ -824,6 +844,13 @@ fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
     }
 }
 
+/// Add one local connection to those sent `board_event` lines, once.
+fn watch(st: &mut State, writer: &Writer) {
+    if !st.watchers.iter().any(|w| Arc::ptr_eq(w, writer)) {
+        st.watchers.push(Arc::clone(writer));
+    }
+}
+
 fn local_loop(
     writer: &Writer,
     lines: net::Lines,
@@ -840,6 +867,9 @@ fn local_loop(
                 let declared = net::declared_of(&v);
                 let pending = {
                     let mut st = state.lock().unwrap();
+                    if v.get("watch") == Some(&Value::Bool(true)) {
+                        watch(&mut st, writer);
+                    }
                     let registration = if st
                         .sessions
                         .get(&session)
@@ -913,6 +943,16 @@ fn local_loop(
                 for p in pending {
                     let _ = net::send(writer, &p);
                 }
+            }
+            // Board changes as the coordinator commits them, on this
+            // connection, which need not be a session's.
+            "watch" => {
+                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                watch(&mut state.lock().unwrap(), writer);
+                net::send(
+                    writer,
+                    &obj(vec![("type", s("watching")), ("req", Value::Int(req))]),
+                )?;
             }
             // The session is leaving on purpose: no disconnect follows.
             "unregister" => {

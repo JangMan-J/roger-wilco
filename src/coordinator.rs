@@ -154,6 +154,9 @@ struct State {
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
     notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
+    /// Host links whose hello asked for `board_event` lines, by connection
+    /// id: each committed session or claim change is offered to them once.
+    watchers: HashMap<u64, Writer>,
     claims: Claims,
 }
 
@@ -176,6 +179,7 @@ impl State {
             hosts: HashMap::new(),
             next_conn: 1,
             notice_writers: HashMap::new(),
+            watchers: HashMap::new(),
             claims: Claims::default(),
         }
     }
@@ -388,7 +392,46 @@ fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
 /// session event takes, so replay and live state agree.
 fn commit(state: &mut State, ev: Value) -> io::Result<()> {
     state.log.append(&json::stringify(&ev))?;
-    apply(state, &ev)
+    apply(state, &ev)?;
+    if let Some(event) = board_event_of(&ev) {
+        observe(state, event);
+    }
+    Ok(())
+}
+
+/// The `board_event` a committed session line is shown to watchers as, if
+/// any: `register`, `unregister`, `relabel`, `declared`. Mail, receipts and
+/// takeovers are not Board changes and show nothing.
+fn board_event_of(ev: &Value) -> Option<Vec<(&'static str, Value)>> {
+    let name = match ev.get("ev").and_then(|x| x.as_str())? {
+        "session" => "register",
+        "unregister" => "unregister",
+        "label" => "relabel",
+        "declared" => "declared",
+        _ => return None,
+    };
+    let mut pairs = vec![("event", s(name))];
+    for key in ["session", "host", "label", "declared", "at_ms"] {
+        if let Some(v) = ev.get(key) {
+            pairs.push((key, v.clone()));
+        }
+    }
+    Some(pairs)
+}
+
+/// Offer one committed change to every host link that asked for them. Best
+/// effort: an observation, not Mail, so nothing is stored or acked, and a
+/// link that is gone simply misses it.
+fn observe(st: &State, pairs: Vec<(&str, Value)>) {
+    if st.watchers.is_empty() {
+        return;
+    }
+    let mut all = vec![("type", s("board_event"))];
+    all.extend(pairs);
+    let event = obj(all);
+    for w in st.watchers.values() {
+        let _ = net::send(w, &event);
+    }
 }
 
 /// End one session's registration: it leaves the Board and every later
@@ -517,6 +560,10 @@ fn serve_link(
             }
         });
         st.notice_writers.insert(id, tx);
+        // A host daemon that never asks is never sent a `board_event`.
+        if hello.get("board_events") == Some(&Value::Bool(true)) {
+            st.watchers.insert(id, Arc::clone(&writer));
+        }
         id
     };
     // However this connection ends (EOF, error, or a `?` below), the link drop
@@ -956,6 +1003,7 @@ impl Drop for HostLink {
             return;
         };
         st.notice_writers.remove(&self.conn_id);
+        st.watchers.remove(&self.conn_id);
         // Only this connection may take the slot: a host that reconnected
         // while this thread was finishing already owns it, and its
         // re-registration has already marked its live sessions connected.
@@ -1035,8 +1083,33 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     let now = now_ms();
     let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
     if let Some(change) = &d.change {
+        // The grant this change replaces, live or not: every committed
+        // deadline lies after i64::MIN, so this reads the stored entry.
+        let before = st.claims.live(&key, i64::MIN).cloned();
         st.log.append(&json::stringify(&change.to_event(&key)))?;
         st.claims.apply(&key, change);
+        let claim_event = |name: &str, h: &Held| {
+            vec![
+                ("event", s(name)),
+                ("key", s(&key)),
+                ("owner", s(&h.owner)),
+                ("expires_ms", Value::Int(h.expires_ms)),
+                ("at_ms", Value::Int(now)),
+            ]
+        };
+        // An expired grant has no line of its own; it is shown once, when
+        // the change committed over it is.
+        if let Some(old) = before.as_ref().filter(|h| h.expires_ms <= now) {
+            observe(st, claim_event("expired", old));
+        }
+        match change {
+            Change::Grant(h) => observe(st, claim_event(op.name(), h)),
+            Change::Release => {
+                if let Some(old) = &before {
+                    observe(st, claim_event("release", old));
+                }
+            }
+        }
     }
     let mut pairs = vec![
         ("type", s("claim_result")),

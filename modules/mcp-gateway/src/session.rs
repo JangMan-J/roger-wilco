@@ -273,6 +273,9 @@ pub struct InitParams {
     pub address: Option<String>,
     pub label: Option<String>,
     pub declared: Option<String>,
+    /// Ask the host daemon for committed Board changes, forwarded over SSE
+    /// as `notifications/roger/board`.
+    pub watch: bool,
 }
 
 impl SessionManager {
@@ -383,6 +386,9 @@ impl SessionManager {
         }
         reg_msg.insert("confirm_register".into(), Value::Bool(true));
         reg_msg.insert("notify_superseded".into(), Value::Bool(true));
+        if params.watch {
+            reg_msg.insert("watch".into(), Value::Bool(true));
+        }
         daemon_writer.send(&Value::Object(reg_msg)).await?;
 
         let session = Arc::new(GatewaySession {
@@ -595,6 +601,18 @@ async fn reader_loop(
                     "notifications/roger/superseded",
                     Value::Object(sse_params),
                 );
+                session.event_log.lock().unwrap().push(notif);
+                session.event_notify.notify_waiters();
+            }
+            // A committed Board change; the host daemon sends it only because
+            // this session asked. An observation, not Mail: no Store, no Ack.
+            "board_event" => {
+                let mut params = match v {
+                    Value::Object(map) => map,
+                    _ => continue,
+                };
+                params.shift_remove("type");
+                let notif = format_notification("notifications/roger/board", Value::Object(params));
                 session.event_log.lock().unwrap().push(notif);
                 session.event_notify.notify_waiters();
             }

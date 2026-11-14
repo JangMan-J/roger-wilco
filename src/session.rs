@@ -83,8 +83,9 @@ pub struct McpHooks {
 /// client stream, or the MCP server's hooks.
 pub enum Face {
     Tracer,
-    /// The client stream, and independent `registered` / `superseded` opt-ins.
-    Adapter(net::Writer, bool, bool),
+    /// The client stream, and independent `registered` / `superseded` /
+    /// `board_event` opt-ins.
+    Adapter(net::Writer, bool, bool, bool),
     Mcp(McpHooks),
 }
 
@@ -115,6 +116,9 @@ pub fn run(
 /// `{"type":"registered","session"}` once, after `ready`, when the coordinator
 /// holds the Register; without it that line is never sent. `superseded`
 /// independently enables replacement notices on stdout; stderr always warns.
+/// `watch` (the `--watch` flag) asks for committed Board changes and passes
+/// each on as the `board_event` line the host daemon sent; without it that
+/// line is never sent.
 /// When the client's stdin closes, the session unregisters and the process exits.
 pub fn adapter(
     socket: PathBuf,
@@ -122,8 +126,7 @@ pub fn adapter(
     label: Option<String>,
     store_path: PathBuf,
     declared: Option<String>,
-    confirm: bool,
-    superseded: bool,
+    (confirm, superseded, watch): (bool, bool, bool),
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
     serve(
@@ -132,7 +135,7 @@ pub fn adapter(
         label,
         store_path,
         declared,
-        Face::Adapter(out, confirm, superseded),
+        Face::Adapter(out, confirm, superseded, watch),
     )
 }
 
@@ -244,10 +247,10 @@ pub fn serve(
     declared: Option<String>,
     face: Face,
 ) -> io::Result<()> {
-    let (client, mut mcp, confirm, superseded) = match face {
-        Face::Tracer => (None, None, true, true),
-        Face::Adapter(w, c, n) => (Some(w), None, c, n),
-        Face::Mcp(h) => (None, Some(h), true, true),
+    let (client, mut mcp, confirm, superseded, watch) = match face {
+        Face::Tracer => (None, None, true, true, false),
+        Face::Adapter(w, c, n, b) => (Some(w), None, c, n, b),
+        Face::Mcp(h) => (None, Some(h), true, true, false),
     };
     let tracer = client.is_none() && mcp.is_none();
     let (mut store, prior) = DurLog::open(&store_path)?;
@@ -273,6 +276,9 @@ pub fn serve(
         register.push(("confirm_register", Value::Bool(true)));
     }
     register.push(("notify_superseded", Value::Bool(true)));
+    if watch {
+        register.push(("watch", Value::Bool(true)));
+    }
     net::send(&writer, &obj(register))?;
     match &client {
         Some(w) => {
@@ -404,6 +410,11 @@ pub fn serve(
                     io::stdout().flush()?;
                 }
             }
+            "board_event" if watch => {
+                if let Some(w) = &client {
+                    let _ = net::send(w, &v);
+                }
+            }
             "acked" if tracer => {
                 println!(
                     "DELIVERED mail={} record={}",
@@ -429,6 +440,34 @@ pub fn send(
 ) -> io::Result<()> {
     let mail = send_mail(&socket, &from, &to, &mail, &body, headers.as_ref())?;
     println!("ACCEPTED mail={mail}");
+    Ok(())
+}
+
+/// The client: watch committed Board changes on a connection that is no
+/// session. Prints `WATCHING` once the host daemon has taken the request,
+/// then `EVENT <json>` per `board_event` line, until the connection ends.
+pub fn watch(socket: PathBuf) -> io::Result<()> {
+    let (writer, lines) = connect(&socket)?;
+    net::send(
+        &writer,
+        &obj(vec![("type", s("watch")), ("req", Value::Int(1))]),
+    )?;
+    let mut out = io::stdout().lock();
+    for line in lines {
+        let v = line?;
+        match net::field(&v, "type")? {
+            "watching" => writeln!(out, "WATCHING")?,
+            "board_event" => writeln!(out, "EVENT {}", json::stringify(&v))?,
+            "error" => {
+                return Err(io::Error::other(format!(
+                    "expected watching, saw error: {}",
+                    net::field(&v, "reason").unwrap_or("unexplained")
+                )))
+            }
+            _ => continue,
+        }
+        out.flush()?;
+    }
     Ok(())
 }
 
