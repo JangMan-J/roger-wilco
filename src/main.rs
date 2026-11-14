@@ -50,7 +50,8 @@ const USAGE: &str = "Usage: roger <command> [flags]
 Commands:
   coordinator --bind <address:port> --data <log>
               [--port-file <path>] [--unregister-after-ms <ms>]
-  daemon      --coordinator <address:port> --host-id <host> [--socket <path>] [--listen <address:port>] [--port-file <path>] --data <log>
+  daemon      --coordinator <address:port> --host-id <host> [--socket <path>] [--listen <address:port>] [--port-file <path>]
+              [--client-token-env <NAME>] --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
@@ -69,7 +70,8 @@ Commands:
               [--address <address>] [--bodies] [--json]   (read-only; no lock, no write)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
-Client --socket accepts a Unix socket path or tcp://<address:port>.
+Client --socket accepts a Unix socket path or tcp://<address:port>; over tcp:// a
+client sends ROGER_CLIENT_TOKEN first when set (required by --client-token-env).
 Session addresses and mail IDs are generated when omitted.
 Claim refusal exits with status 3; an unknown command exits with status 2.
 Use --help or -h for this help.";
@@ -112,6 +114,20 @@ fn main() -> io::Result<()> {
             let socket = arg(&args, "--socket").map(PathBuf::from);
             let listen = arg(&args, "--listen");
             let port_file = arg(&args, "--port-file").map(PathBuf::from);
+            let client_token = match arg(&args, "--client-token-env") {
+                Some(name) => Some(
+                    std::env::var(&name)
+                        .ok()
+                        .filter(|t| !t.is_empty())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("expected a non-empty token in ${name} (--client-token-env), saw none"),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             if socket.is_none() && listen.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -131,6 +147,7 @@ fn main() -> io::Result<()> {
                 socket,
                 listen,
                 port_file,
+                client_token,
                 data: PathBuf::from(need(&args, "--data")?),
             })
         }

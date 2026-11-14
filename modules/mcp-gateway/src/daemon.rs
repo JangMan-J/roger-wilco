@@ -57,14 +57,24 @@ pub async fn connect(target: &DaemonSocket) -> io::Result<(DaemonReader, DaemonW
             })?;
             stream.set_nodelay(true)?;
             let (r, w) = stream.into_split();
+            let writer = DaemonWriter {
+                inner: Mutex::new(Box::new(w)),
+            };
+            // A daemon started with --client-token-env requires this first line over TCP.
+            if let Some(token) = std::env::var("ROGER_CLIENT_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+            {
+                writer
+                    .send(&serde_json::json!({"type": "auth", "token": token}))
+                    .await?;
+            }
             Ok((
                 DaemonReader {
                     lines: BufReader::new(Box::new(r)),
                     buf: Vec::new(),
                 },
-                DaemonWriter {
-                    inner: Mutex::new(Box::new(w)),
-                },
+                writer,
             ))
         }
     }

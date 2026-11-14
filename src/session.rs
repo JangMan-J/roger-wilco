@@ -29,10 +29,11 @@ pub fn connect(target: &Path) -> io::Result<(net::Writer, net::Lines)> {
                 )
             })?;
             conn.set_nodelay(true)?;
-            Ok((
-                net::writer(Box::new(conn.try_clone()?)),
-                net::lines(Box::new(conn)),
-            ))
+            let writer = net::writer(Box::new(conn.try_clone()?));
+            if let Some(auth) = net::client_auth_line() {
+                net::send(&writer, &auth)?;
+            }
+            Ok((writer, net::lines(Box::new(conn))))
         }
         #[cfg(unix)]
         None => {

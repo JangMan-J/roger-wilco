@@ -344,6 +344,29 @@ impl Iterator for Lines {
     }
 }
 
+/// The longest first line a TCP peer may send before it has shown its token.
+pub const HELLO_MAX: usize = 64 * 1024;
+
+/// Compare two secrets without stopping at the first differing byte.
+pub fn same_secret(seen: &str, expected: &str) -> bool {
+    let (a, b) = (seen.as_bytes(), expected.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The first line a client sends a host daemon over TCP when
+/// `ROGER_CLIENT_TOKEN` is set; `None` when it is unset or empty.
+pub fn client_auth_line() -> Option<Value> {
+    std::env::var("ROGER_CLIENT_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            crate::json::obj(vec![
+                ("type", crate::json::s("auth")),
+                ("token", crate::json::s(&t)),
+            ])
+        })
+}
+
 pub fn field<'a>(v: &'a Value, key: &str) -> io::Result<&'a str> {
     v.get(key)
         .and_then(|x| x.as_str())

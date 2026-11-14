@@ -18,8 +18,10 @@ every host including that one. What the core guarantees is in the
 - When serving containerized or cross-machine clients directly over TCP (`roger daemon
   --listen <private-addr:port>`, dialed with `--socket tcp://<private-addr:port>` or
   `ROGER_SOCKET=tcp://<private-addr:port>`), bind `--listen` only to a private container
-  bridge or VPN, never to a public interface: the daemon's client protocol is unencrypted
-  and carries no token of its own.
+  bridge or VPN, never to a public interface: the daemon's client protocol is unencrypted.
+  Add `--client-token-env ROGER_CLIENT_TOKEN` (and set `ROGER_CLIENT_TOKEN` for the daemon and
+  every TCP client) so a peer on that network must present the client token before it can
+  act as a session.
 
 ## Install
 

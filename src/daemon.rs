@@ -109,6 +109,9 @@ pub struct Config {
     pub socket: Option<PathBuf>,
     pub listen: Option<String>,
     pub port_file: Option<PathBuf>,
+    /// When set, every TCP client must send `{"type":"auth","token":...}`
+    /// with this value as its first line. Unix-socket clients never do.
+    pub client_token: Option<String>,
     pub data: PathBuf,
 }
 
@@ -123,6 +126,12 @@ pub fn run(cfg: Config) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected --listen with --port-file, saw none",
+        ));
+    }
+    if cfg.client_token.is_some() && cfg.listen.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected --listen with --client-token-env, saw none",
         ));
     }
     let (log, prior) = DurLog::open(&cfg.data)?;
@@ -175,6 +184,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         None => None,
     };
     let state = Arc::new(Mutex::new(state));
+    let client_token: Option<Arc<str>> = cfg.client_token.as_deref().map(Arc::from);
     let cfg = Arc::new(cfg);
 
     {
@@ -195,19 +205,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
         (Some(unix), Some(tcp)) => {
             let tcp_state = Arc::clone(&state);
             std::thread::spawn(move || {
-                if let Err(e) = accept_tcp(tcp, tcp_state) {
+                if let Err(e) = accept_tcp(tcp, tcp_state, client_token) {
                     eprintln!("tcp listener ended: {e}");
                 }
             });
             accept_unix(unix, state)
         }
         (Some(unix), None) => accept_unix(unix, state),
-        (None, Some(tcp)) => accept_tcp(tcp, state),
+        (None, Some(tcp)) => accept_tcp(tcp, state, client_token),
         (None, None) => unreachable!("validated at start of run"),
     };
     #[cfg(not(unix))]
     match tcp_listener {
-        Some(tcp) => accept_tcp(tcp, state),
+        Some(tcp) => accept_tcp(tcp, state, client_token),
         None => unreachable!("validated at start of run"),
     }
 }
@@ -226,12 +236,17 @@ fn accept_unix(listener: UnixListener, state: Arc<Mutex<State>>) -> io::Result<(
     Ok(())
 }
 
-fn accept_tcp(listener: TcpListener, state: Arc<Mutex<State>>) -> io::Result<()> {
+fn accept_tcp(
+    listener: TcpListener,
+    state: Arc<Mutex<State>>,
+    client_token: Option<Arc<str>>,
+) -> io::Result<()> {
     for conn in listener.incoming() {
         let conn = conn?;
         let state = Arc::clone(&state);
+        let client_token = client_token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve_tcp(conn, state) {
+            if let Err(e) = serve_tcp(conn, state, client_token.as_deref()) {
                 eprintln!("local connection ended: {e}");
             }
         });
@@ -701,14 +716,56 @@ fn serve_unix(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     serve_local(writer, lines, state)
 }
 
-fn serve_tcp(conn: TcpStream, state: Arc<Mutex<State>>) -> io::Result<()> {
+fn serve_tcp(
+    conn: TcpStream,
+    state: Arc<Mutex<State>>,
+    client_token: Option<&str>,
+) -> io::Result<()> {
     conn.set_nodelay(true)?;
-    let lines = net::lines(Box::new(conn.try_clone()?));
+    let mut lines = net::lines(Box::new(conn.try_clone()?));
     let conn = Arc::new(conn);
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
     });
+    if let Some(expected) = client_token {
+        if let Err(e) = client_auth(&mut lines, expected) {
+            let _ = net::send(
+                &writer,
+                &obj(vec![("type", s("error")), ("error", s(&e.to_string()))]),
+            );
+            net::close(&writer, true);
+            return Err(e);
+        }
+    }
     serve_local(writer, lines, state)
+}
+
+/// Until the client token is seen the peer is anyone who can reach the port:
+/// its first line is bounded, and it must be the auth line.
+fn client_auth(lines: &mut net::Lines, expected: &str) -> io::Result<()> {
+    lines.set_cap(net::HELLO_MAX);
+    let first = lines.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "expected an auth line, saw end of stream",
+        )
+    })??;
+    let ty = net::field(&first, "type").unwrap_or("");
+    if ty != "auth" {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("expected a first line of type auth, saw type {ty:?}"),
+        ));
+    }
+    let seen = net::field(&first, "token").unwrap_or("");
+    if !net::same_secret(seen, expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "expected the client token, saw a different one",
+        ));
+    }
+    lines.set_cap(usize::MAX);
+    Ok(())
 }
 
 /// One local connection, from accept to its end. Every line for the session

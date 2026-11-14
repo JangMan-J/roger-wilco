@@ -1849,3 +1849,114 @@ async fn cli_flags_custom_endpoint_limits_tool_errors_and_daemon_eof_behave_clea
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_sends_the_client_token_to_a_guarded_daemon_over_tcp() {
+    let mut rig = TestRig::start("client-token").await;
+    let coord_addr = format!("127.0.0.1:{}", rig.coord_port);
+    let gport_file = rig.path("guarded.port");
+    let glog = rig.path("guarded.log");
+    // The rig sets ROGER_TOKEN on roger processes; the guarded daemon reuses it as its client token.
+    rig.spawn_roger(&[
+        "daemon",
+        "--coordinator",
+        &coord_addr,
+        "--host-id",
+        "host-guarded",
+        "--listen",
+        "127.0.0.1:0",
+        "--port-file",
+        gport_file.to_str().unwrap(),
+        "--client-token-env",
+        "ROGER_TOKEN",
+        "--data",
+        glog.to_str().unwrap(),
+    ]);
+    let gport = wait_until("guarded daemon port file", 10, || {
+        fs::read_to_string(&gport_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .await;
+    let target = format!("tcp://127.0.0.1:{gport}");
+
+    let init = |addr: &'static str| {
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "_meta": { "roger_address": addr } }
+        }))
+        .unwrap()
+    };
+    let registered = |sid: String, port: u16| async move {
+        let (st, _, b) = h1_request(
+            port,
+            Method::POST,
+            "/mcp",
+            &[("mcp-session-id", &sid)],
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "roger_registered", "arguments": { "wait_seconds": 3 } }
+            }))
+            .unwrap(),
+        )
+        .await;
+        (st, b)
+    };
+
+    // With the token the gateway's session registers through the guarded daemon.
+    let store_ok = rig.path("stores-ok");
+    let (_, port_ok) = rig
+        .spawn_gateway_with_socket(
+            &target,
+            &store_ok,
+            &[],
+            &[("ROGER_CLIENT_TOKEN", FLEET_TOKEN)],
+        )
+        .await;
+    let (st, hdrs, _) = h1_request(port_ok, Method::POST, "/mcp", &[], init(ADDR_1)).await;
+    assert_eq!(st, StatusCode::OK);
+    let sid = hdrs
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (st, b) = registered(sid, port_ok).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(parse_tool_payload(&b)["registered"], Value::Bool(true));
+
+    // With a wrong token the session never registers.
+    let store_bad = rig.path("stores-bad");
+    let (_, port_bad) = rig
+        .spawn_gateway_with_socket(&target, &store_bad, &[], &[("ROGER_CLIENT_TOKEN", "wrong")])
+        .await;
+    // With a wrong token the session never registers: the daemon closes the link.
+    let (st, hdrs, _) = h1_request(port_bad, Method::POST, "/mcp", &[], init(ADDR_2)).await;
+    if st == StatusCode::OK {
+        let sid = hdrs
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = registered(sid, port_bad).await;
+    }
+    let board = Command::new(roger_bin())
+        .args(["board", "--socket", rig.daemon_sock().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let board = String::from_utf8_lossy(&board.stdout);
+    assert!(
+        board.contains(&format!("SESSION address={ADDR_1} ")),
+        "{board}"
+    );
+    assert!(
+        !board.contains(&format!("SESSION address={ADDR_2} ")),
+        "{board}"
+    );
+}

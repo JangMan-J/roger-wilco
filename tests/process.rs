@@ -5178,3 +5178,173 @@ fn tcp_daemon_and_client_cli_validation_and_pre_join_bind_failure() {
         "daemon must not join the coordinator when --listen fails to bind"
     );
 }
+
+fn client_with_token(args: &[&str], token: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args).env_remove("ROGER_CLIENT_TOKEN");
+    if let Some(t) = token {
+        cmd.env("ROGER_CLIENT_TOKEN", t);
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn client_token_guards_tcp_clients_and_leaves_the_unix_socket_alone() {
+    let mut rig = Rig::new("client-token");
+    // --client-token-env without --listen, and naming an unset variable, are refused.
+    let no_listen = Command::new(BIN)
+        .args(["daemon", "--coordinator", "127.0.0.1:1", "--host-id", "h"])
+        .args(["--socket", rig.p("x.sock").to_str().unwrap()])
+        .args(["--client-token-env", "ROGER_TOKEN", "--data"])
+        .arg(rig.p("x.log"))
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    assert!(!no_listen.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_listen.stderr)
+            .contains("expected --listen with --client-token-env"),
+        "{no_listen:?}"
+    );
+    let unset = Command::new(BIN)
+        .args(["daemon", "--coordinator", "127.0.0.1:1", "--host-id", "h"])
+        .args(["--listen", "127.0.0.1:0"])
+        .args([
+            "--client-token-env",
+            "ROGER_TEST_UNSET_CLIENT_TOKEN",
+            "--data",
+        ])
+        .arg(rig.p("y.log"))
+        .env("ROGER_TOKEN", TOKEN)
+        .env_remove("ROGER_TEST_UNSET_CLIENT_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!unset.status.success());
+    assert!(
+        String::from_utf8_lossy(&unset.stderr).contains("ROGER_TEST_UNSET_CLIENT_TOKEN"),
+        "{unset:?}"
+    );
+
+    let coord_port_file = rig.p("coord.port");
+    let coord_args = rig.coordinator_args("127.0.0.1:0", &coord_port_file, &rig.p("coord.log"));
+    let coord_refs: Vec<&str> = coord_args.iter().map(|s| s.as_str()).collect();
+    rig.spawn(&coord_refs, "coord.out");
+    wait_for_port(&coord_port_file, Duration::from_secs(10));
+    let coord = format!("127.0.0.1:{}", read(&coord_port_file).trim());
+    let sock = rig.p("d.sock");
+    let port_file = rig.p("d.port");
+    // The rig sets ROGER_TOKEN; the test reuses it as the client token's variable.
+    rig.spawn(
+        &[
+            "daemon",
+            "--coordinator",
+            &coord,
+            "--host-id",
+            "host-guarded",
+            "--socket",
+            sock.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            port_file.to_str().unwrap(),
+            "--client-token-env",
+            "ROGER_TOKEN",
+            "--data",
+            rig.p("d.log").to_str().unwrap(),
+        ],
+        "daemon.out",
+    );
+    wait_for_port(&port_file, Duration::from_secs(10));
+    wait_for_socket(&sock, Duration::from_secs(10));
+    let raw = format!("127.0.0.1:{}", read(&port_file).trim());
+    wait_for_tcp(&raw, Duration::from_secs(10));
+    let tcp = format!("tcp://{raw}");
+
+    // The Unix socket needs no token.
+    let unix_board = client_with_token(&["board", "--socket", sock.to_str().unwrap()], None);
+    assert!(unix_board.status.success(), "{unix_board:?}");
+    // TCP without a token, or with a wrong one, is refused.
+    for token in [None, Some("not-the-token"), Some("process-test-tokeN")] {
+        let out = client_with_token(&["board", "--socket", &tcp], token);
+        assert!(!out.status.success(), "{token:?}: {out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("BOARD"),
+            "{out:?}"
+        );
+    }
+    // TCP with the token is served.
+    let ok = client_with_token(&["board", "--socket", &tcp], Some(TOKEN));
+    assert!(ok.status.success(), "{ok:?}");
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("BOARD"),
+        "{ok:?}"
+    );
+
+    // A raw peer that sends a request before auth is told why and closed;
+    // one that sends an oversized first line is cut off at the bound.
+    {
+        use std::io::BufRead;
+        let mut conn = std::net::TcpStream::connect(&raw).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(conn, "{{\"type\":\"board\"}}").unwrap();
+        let mut reader = std::io::BufReader::new(conn);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            line.contains("\"type\":\"error\"") && line.contains("auth"),
+            "{line}"
+        );
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line}");
+        assert!(!line.contains(TOKEN));
+    }
+    {
+        let mut conn = std::net::TcpStream::connect(&raw).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let big = vec![b'x'; 70 * 1024];
+        let _ = conn.write_all(&big);
+        let mut rest = Vec::new();
+        let _ = conn.read_to_end(&mut rest);
+        assert!(!String::from_utf8_lossy(&rest).contains("BOARD"));
+    }
+
+    // A session over authenticated TCP receives Mail sent over the Unix socket.
+    let recipient = "[[0:FLEET:0]]55555555-5555-4555-8555-555555555555";
+    let out = fs::File::create(rig.p("t.out")).unwrap();
+    let child = Command::new(BIN)
+        .args(["session", "--socket", &tcp, "--id", recipient, "--store"])
+        .arg(rig.p("t.store"))
+        .env("ROGER_CLIENT_TOKEN", TOKEN)
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(fs::File::create(rig.p("t.out.err")).unwrap()))
+        .spawn()
+        .unwrap();
+    rig.children.push(child);
+    rig.await_registered("t.out");
+    let sent = client_with_token(
+        &[
+            "send",
+            "--socket",
+            sock.to_str().unwrap(),
+            "--from",
+            "[[0:FLEET:0]]66666666-6666-4666-8666-666666666666",
+            "--to",
+            recipient,
+            "--body",
+            "over-guarded-tcp",
+            "--mail",
+            "guarded-1",
+        ],
+        None,
+    );
+    assert!(sent.status.success(), "{sent:?}");
+    wait_for_text(
+        &rig.p("t.store"),
+        "over-guarded-tcp",
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("t.store")), "over-guarded-tcp"),
+        1
+    );
+}

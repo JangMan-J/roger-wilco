@@ -75,7 +75,7 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 | Subcommand | Flags | Does |
 | --- | --- | --- |
 | `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
-| `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically) |
+| `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] [--client-token-env <NAME>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically; `--client-token-env` requires TCP clients to present `ROGER_CLIENT_TOKEN`) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session`, plus `[--registered] [--superseded]` (also send `{"type":"registered"}`, see Faces) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
@@ -399,8 +399,19 @@ Containerized or cross-machine clients without a shared Unix socket directory ca
 directly to `roger daemon --listen <addr:port>` by passing `--socket tcp://<addr:port>` (or
 `ROGER_SOCKET=tcp://<addr:port>` to `roger mcp`), with no optional module required. TCP client
 connections run the same protocol, per-peer queues, `TCP_NODELAY`, Store durability, and Ack
-semantics as Unix socket connections. Because the daemon's client protocol carries no token,
-bind `--listen` only to a private container bridge or VPN.
+semantics as Unix socket connections.
+
+`roger daemon --client-token-env <NAME>` (requires `--listen`) reads a client token from the
+environment variable `NAME` and requires it on every TCP connection: the client's first line
+must be `{"type":"auth","token":"<token>"}`, read under the same 64 KiB pre-auth bound as the
+coordinator's hello. Nothing is answered on success; anything else gets one
+`{"type":"error","error":"..."}` line naming what was expected (never the token) and the
+connection is closed. Every core client (`session`, `adapter`, `mcp`, `send`, `claim`, `renew`,
+`release`, `board`, `label`, `receipt`) and `roger-mcp-gateway` send that line over `tcp://`
+when `ROGER_CLIENT_TOKEN` is set and non-empty; Unix socket connections never send it and are
+never asked for it (file permissions guard the socket). The token stops strangers on a shared
+network from acting as sessions; it does not encrypt the link, so Mail bodies and the token
+still cross in the clear: bind `--listen` to a private network or put TLS in front of it.
 
 Replacement notices on the other faces use the same payload:
 - The adapter always requests socket notices and prints an actionable `SUPERSEDED` warning
