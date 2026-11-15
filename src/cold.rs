@@ -108,8 +108,10 @@ impl ColdIndex {
             for path in entries {
                 if let Some(day) = parse_day_filename(&path) {
                     let records = read_cold_file(&path)?;
-                    let filter =
-                        ColdFilter::build(records.iter().map(|r| r.mail_id.as_str()), records.len());
+                    let filter = ColdFilter::build(
+                        records.iter().map(|r| r.mail_id.as_str()),
+                        records.len(),
+                    );
                     map.insert(
                         day,
                         ColdDayEntry {
@@ -300,7 +302,10 @@ pub fn read_cold_file(path: &Path) -> io::Result<Vec<ColdRecord>> {
     let trimmed = raw.strip_suffix('\n').ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected trailing newline in {}, saw truncated file", path.display()),
+            format!(
+                "expected trailing newline in {}, saw truncated file",
+                path.display()
+            ),
         )
     })?;
     let (body_part, last_line) = match trimmed.rsplit_once('\n') {
@@ -380,7 +385,7 @@ fn encode_record(r: &ColdRecord) -> Value {
             },
         ),
         ("body", s(&r.body)),
-        ("body_sha256", s(&r.body_sha256)),
+        ("digest", s(&r.body_sha256)),
         (
             "accepted_at_ms",
             match r.accepted_at_ms {
@@ -395,7 +400,10 @@ fn req_str<'a>(v: &'a Value, key: &str, path: &Path) -> io::Result<&'a str> {
     v.get(key).and_then(|x| x.as_str()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected string field {key} in {}, saw missing", path.display()),
+            format!(
+                "expected string field {key} in {}, saw missing",
+                path.display()
+            ),
         )
     })
 }
@@ -406,7 +414,10 @@ fn decode_record(v: &Value, path: &Path) -> io::Result<ColdRecord> {
     let article_num = v.get("article").and_then(|x| x.as_i64()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected integer article in {}, saw missing", path.display()),
+            format!(
+                "expected integer article in {}, saw missing",
+                path.display()
+            ),
         )
     })?;
     let kind = req_str(v, "kind", path)?.to_string();
@@ -423,14 +434,17 @@ fn decode_record(v: &Value, path: &Path) -> io::Result<ColdRecord> {
         }
     };
     let body = req_str(v, "body", path)?.to_string();
-    let body_sha256 = req_str(v, "body_sha256", path)?.to_string();
+    let body_sha256 = req_str(v, "digest", path)?.to_string();
     let accepted_at_ms = match v.get("accepted_at_ms") {
         Some(Value::Int(ts)) => Some(*ts),
         Some(Value::Null) | None => None,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected integer or null accepted_at_ms in {}", path.display()),
+                format!(
+                    "expected integer or null accepted_at_ms in {}",
+                    path.display()
+                ),
             ))
         }
     };
