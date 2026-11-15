@@ -387,11 +387,15 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10)); // no-poll: bounded test observation, not delivery
     }
 }
+/// A live coordinator, host daemon and Tracer hold their records open while
+/// audits read them: one audit changes no byte, then 8 concurrent
+/// `--bodies --json` audits run while a writer sends Mail, every one
+/// complete and error-free. Works whether the records are logs or SQLite.
 #[test]
 fn audit_live_locked_logs_are_read_only() {
     let dir = Dir::new("live");
     let p = |name: &str| dir.0.join(name).to_str().unwrap().to_owned();
-    let (c, d, s, port, sock) = (p("c"), p("d"), p("s"), p("port"), p("sock"));
+    let (c, d, s, port) = (p("c"), p("d"), p("s"), p("port"));
     let mut processes = Processes(Vec::new());
     let _coord = processes.spawn(&[
         "coordinator",
@@ -404,7 +408,7 @@ fn audit_live_locked_logs_are_read_only() {
     ]);
     wait_until(|| fs::read_to_string(&port).is_ok());
     let addr = format!("127.0.0.1:{}", fs::read_to_string(&port).unwrap().trim());
-    let dport = dir.0.join("dport").to_str().unwrap().to_string();
+    let dport = p("dport");
     let _daemon = processes.spawn(&[
         "daemon",
         "--coordinator",
@@ -418,7 +422,6 @@ fn audit_live_locked_logs_are_read_only() {
         "--data",
         &d,
     ]);
-    let _ = &sock;
     wait_until(|| fs::read_to_string(&dport).is_ok());
     let target = format!(
         "tcp://127.0.0.1:{}",
@@ -441,34 +444,103 @@ fn audit_live_locked_logs_are_read_only() {
             .output()
             .unwrap()
     };
+    let inputs = ["--coordinator-log", &c, "--daemon-log", &d, "--store", &s];
     assert!(send("live-1").status.success());
     wait_until(|| {
-        fs::read_to_string(&c)
-            .unwrap()
-            .contains("\"ev\":\"receipt\"")
+        let out = Command::new(BIN)
+            .args(["receipt", "--socket", &target, "--mail", "live-1"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).starts_with("RECEIPT mail=live-1 ")
     });
-    let before = (
-        fs::read(&c).unwrap(),
-        fs::read(&d).unwrap(),
-        fs::read(&s).unwrap(),
-    );
-    let out = audit_ok(&["--coordinator-log", &c, "--daemon-log", &d, "--store", &s]);
+    let receipted = |out: &str, id: &str| {
+        out.lines()
+            .any(|l| l.starts_with(&format!("MAIL mail={id} ")) && !l.contains(" record=pending "))
+    };
+    wait_until(|| receipted(&audit_ok(&inputs), "live-1"));
+    // Logs are plain files; SQLite records live beside these paths.
+    let bytes = || (fs::read(&c).ok(), fs::read(&d).ok(), fs::read(&s).unwrap());
+    let before = bytes();
+    let out = audit_ok(&inputs);
     assert!(out.contains(&format!("REGISTER address={A} host=host at_ms=")));
     assert!(out
         .lines()
         .any(|l| l.starts_with("MAIL mail=live-1 ") && l.contains(" record=r-1 ")));
-    assert_eq!(
-        before,
-        (
-            fs::read(&c).unwrap(),
-            fs::read(&d).unwrap(),
-            fs::read(&s).unwrap()
-        )
+    assert_eq!(before, bytes(), "audit changed a live input");
+
+    let sent = 20;
+    let writing = std::sync::atomic::AtomicBool::new(true);
+    let failures = std::sync::Mutex::new(Vec::new());
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let auditors: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| loop {
+                    let last = !writing.load(std::sync::atomic::Ordering::SeqCst);
+                    let out = audit(&[
+                        "--coordinator",
+                        &c,
+                        "--daemon",
+                        &d,
+                        "--store",
+                        &s,
+                        "--bodies",
+                        "--json",
+                    ]);
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let rows: Vec<_> = text.lines().map(json::parse).collect();
+                    let complete = out.status.success()
+                        && rows.iter().all(Result::is_ok)
+                        && text.contains(r#""type":"MAIL","mail":"live-1""#)
+                        && rows.last().and_then(|r| r.as_ref().ok()).and_then(|r| {
+                            r.get("type").and_then(Value::as_str).map(str::to_string)
+                        }) == Some("AUDIT".to_string());
+                    if !complete {
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}\n{text}", String::from_utf8_lossy(&out.stderr)));
+                    }
+                    if last {
+                        break;
+                    }
+                })
+            })
+            .collect();
+        for i in 0..sent {
+            assert!(send(&format!("live-w-{i}")).status.success());
+        }
+        writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        for auditor in auditors {
+            auditor.join().unwrap();
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(
+        failures.is_empty(),
+        "concurrent audits failed: {failures:?}"
     );
-    assert!(send("live-2").status.success());
-    // End the processes while the Tracer's stdout is still open: live-2 can
+    assert!(runs.into_inner() >= 16);
+    wait_until(|| {
+        let out = audit_ok(&inputs);
+        (0..sent).all(|i| receipted(&out, &format!("live-w-{i}")))
+    });
+    // End the processes while the Tracer's stdout is still open: Mail can
     // reach it before this returns, and a print to a closed pipe is a panic.
     drop(processes);
+}
+
+#[test]
+fn audit_short_input_flags_are_aliases() {
+    let dir = Dir::new("aliases");
+    let (c, d, s) = fixture(&dir);
+    assert_eq!(
+        audit_ok(&["--coordinator", &c, "--daemon", &d, "--store", &s]),
+        audit_ok(&["--coordinator-log", &c, "--daemon-log", &d, "--store", &s])
+    );
+    let twice = audit(&["--coordinator", &c, "--coordinator-log", &c]);
+    assert!(!twice.status.success());
 }
 
 /// The brief's fixture: a coordinator log of every line generation with a

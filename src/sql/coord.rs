@@ -1,0 +1,2054 @@
+//! Coordinator slice databases: one `hot.sqlite` (WAL, synchronous FULL) per
+//! slice, one writer thread per slice that commits every queued command of a
+//! wakeup in one `BEGIN IMMEDIATE ... COMMIT` (group commit), and an
+//! off-send-path sweep that seals old bodies into cold day files.
+//!
+//! Streams shard by `hash_pair(stream)`, Mail-id records (`seen_ids`,
+//! `broadcasts`) by `hash_pair(mail_id)`; Addresses and Group names are hashed
+//! as opaque bytes, never read (#I3). A caller hears back only after the
+//! transaction holding its write has committed.
+//!
+//! Writes that span two slices commit the envelope first and the Mail-id
+//! record second. The envelope insert is idempotent for a repeat of the same
+//! Mail, so a resend after a failure between the two commits completes the
+//! second one instead of losing or doubling the Mail.
+
+use super::*;
+use crate::cold::{ColdIndex, ColdRecord};
+use crate::json::{self, Value};
+use crate::sha256::{hash_pair, hex_digest};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+
+type Finish = Box<dyn FnOnce(Result<(), String>) + Send>;
+type Job = Box<dyn FnOnce(&Connection) -> (bool, Finish) + Send>;
+
+fn sq(e: rusqlite::Error) -> io::Error {
+    io::Error::other(e)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn resend_refusal(mail: &str, what: &str) -> String {
+    format!(
+        "mail {mail}: expected a resend to repeat the Mail already accepted under this id, saw a different {what}"
+    )
+}
+
+#[derive(Default)]
+struct QueueState {
+    jobs: Vec<Job>,
+    closed: bool,
+}
+
+type Queue = (Mutex<QueueState>, Condvar);
+
+/// One slice's writer thread and its command queue.
+struct SliceWriter {
+    queue: Arc<Queue>,
+    commits: Arc<AtomicU64>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// A queued command's answer, available once its transaction has committed.
+struct Pending<R>(Receiver<io::Result<R>>);
+
+impl<R> Pending<R> {
+    fn wait(self) -> io::Result<R> {
+        self.0.recv().map_err(|_| {
+            io::Error::other("expected a slice transaction to commit, saw it abandoned")
+        })?
+    }
+}
+
+impl SliceWriter {
+    fn spawn(conn: Connection, idx: usize) -> io::Result<Self> {
+        let queue: Arc<Queue> = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
+        let commits = Arc::new(AtomicU64::new(0));
+        let (q, c) = (Arc::clone(&queue), Arc::clone(&commits));
+        let thread = std::thread::Builder::new()
+            .name(format!("roger-slice-{idx:02}"))
+            .spawn(move || writer_loop(conn, &q, &c))?;
+        Ok(Self {
+            queue,
+            commits,
+            thread: Some(thread),
+        })
+    }
+
+    fn submit<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+    ) -> io::Result<Pending<R>> {
+        let (tx, rx) = sync_channel(1);
+        let job: Job = Box::new(move |c| {
+            let r = f(c);
+            let ok = r.is_ok();
+            let fin: Finish = Box::new(move |commit| {
+                let out = match commit {
+                    Err(e) => Err(io::Error::other(e)),
+                    Ok(()) => r.map_err(sq),
+                };
+                let _ = tx.send(out);
+            });
+            (ok, fin)
+        });
+        let (m, cv) = &*self.queue;
+        let mut g = m.lock().unwrap();
+        if g.closed {
+            return Err(io::Error::other(
+                "expected an open slice writer, saw it closed",
+            ));
+        }
+        g.jobs.push(job);
+        cv.notify_all();
+        Ok(Pending(rx))
+    }
+
+    fn exec<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+    ) -> io::Result<R> {
+        self.submit(f)?.wait()
+    }
+
+    /// Block until at least `n` commands wait in the queue (signalled by each push).
+    #[cfg(test)]
+    fn wait_queued(&self, n: usize) {
+        let (m, cv) = &*self.queue;
+        let mut g = m.lock().unwrap();
+        while g.jobs.len() < n {
+            g = cv.wait(g).unwrap();
+        }
+    }
+}
+
+impl Drop for SliceWriter {
+    fn drop(&mut self) {
+        {
+            let (m, cv) = &*self.queue;
+            m.lock().unwrap().closed = true;
+            cv.notify_all();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn writer_loop(mut conn: Connection, queue: &Queue, commits: &AtomicU64) {
+    loop {
+        let batch = {
+            let (m, cv) = queue;
+            let mut g = m.lock().unwrap();
+            while g.jobs.is_empty() && !g.closed {
+                g = cv.wait(g).unwrap();
+            }
+            if g.jobs.is_empty() {
+                return;
+            }
+            std::mem::take(&mut g.jobs)
+        };
+        run_batch(&mut conn, batch);
+        commits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Run every command of one wakeup in one transaction, each inside its own
+/// savepoint so a failing command rolls back alone; answer all after COMMIT.
+fn run_batch(conn: &mut Connection, batch: Vec<Job>) {
+    // A failed BEGIN drops the commands, which answers each caller with an error.
+    let Ok(mut tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate) else {
+        return;
+    };
+    let mut fins = Vec::with_capacity(batch.len());
+    for job in batch {
+        let Ok(sp) = tx.savepoint() else { continue };
+        let (ok, fin) = job(&sp);
+        let release = if ok {
+            sp.commit().map_err(|e| e.to_string())
+        } else {
+            drop(sp);
+            Ok(())
+        };
+        fins.push((fin, release));
+    }
+    let res = tx.commit().map_err(|e| e.to_string());
+    for (fin, release) in fins {
+        fin(res.clone().and(release));
+    }
+}
+
+fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
+    let c = Connection::open(path).map_err(sq)?;
+    c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+        .map_err(sq)?;
+    c.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")
+        .map_err(sq)?;
+    if schema {
+        c.execute_batch(COORD_SLICE_SCHEMA).map_err(sq)?;
+    }
+    Ok(c)
+}
+
+fn meta(c: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row("SELECT val FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()
+}
+
+struct Slice {
+    cold_dir: PathBuf,
+    cold: Arc<ColdIndex>,
+    read: Mutex<Connection>,
+    writer: SliceWriter,
+}
+
+struct Inner {
+    cfg: CoordOpenConfig,
+    slices: Vec<Slice>,
+    next_seq: AtomicI64,
+    in_flight: (Mutex<HashSet<String>>, Condvar),
+    last_swept_day: AtomicI64,
+    sweep_lock: Mutex<()>,
+    sweeps: Mutex<Vec<JoinHandle<()>>>,
+    _lock: File,
+}
+
+pub struct CoordinatorStore {
+    inner: Arc<Inner>,
+}
+
+/// Holds one Mail id against a concurrent send under the same id.
+struct Flight<'a> {
+    inner: &'a Inner,
+    id: String,
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let (m, cv) = &self.inner.in_flight;
+        m.lock().unwrap().remove(&self.id);
+        cv.notify_all();
+    }
+}
+
+struct SeenRow {
+    kind: String,
+    sender: String,
+    target: Option<String>,
+    body_len: i64,
+    body_sha256: String,
+    article_num: i64,
+}
+
+impl SeenRow {
+    /// What a send under this id differs in, if anything.
+    fn differs(
+        &self,
+        kind: &str,
+        sender: &str,
+        target: Option<&str>,
+        len: i64,
+        sha: &str,
+    ) -> Option<String> {
+        let mut what = Vec::new();
+        if self.sender != sender {
+            what.push("sender");
+        }
+        if self.kind != kind || self.target.as_deref() != target {
+            what.push("recipient");
+        }
+        if self.body_len != len || self.body_sha256 != sha {
+            what.push("body");
+        }
+        (!what.is_empty()).then(|| what.join(", "))
+    }
+}
+
+struct NewEnvelope {
+    seq: i64,
+    mail_id: String,
+    stream: String,
+    stream_kind: &'static str,
+    kind: &'static str,
+    sender: String,
+    recipient: String,
+    headers_json: Option<String>,
+    body: String,
+    body_sha256: String,
+    accepted_at_ms: Option<i64>,
+    day_bucket: i64,
+    reader: Option<String>,
+}
+
+struct NewSeen {
+    mail_id: String,
+    kind: &'static str,
+    sender: String,
+    target: Option<String>,
+    body_len: i64,
+    body_sha256: String,
+}
+
+/// Insert one envelope and its body, assigning the stream's next article.
+/// A repeat of the same Mail returns its article; a different Mail under an
+/// existing id returns what differs.
+fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<Result<i64, String>> {
+    let existing = c
+        .query_row(
+            "SELECT article_num, sender, recipient, body_len, body_sha256 FROM envelopes WHERE mail_id = ?1",
+            [&e.mail_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((art, sender, recipient, len, sha)) = existing {
+        let mut what = Vec::new();
+        if sender != e.sender {
+            what.push("sender");
+        }
+        if recipient != e.recipient {
+            what.push("recipient");
+        }
+        if len != e.body.len() as i64 || sha != e.body_sha256 {
+            what.push("body");
+        }
+        return Ok(if what.is_empty() {
+            Ok(art)
+        } else {
+            Err(what.join(", "))
+        });
+    }
+    c.execute(
+        "INSERT OR IGNORE INTO streams (stream, kind, next_article) VALUES (?1, ?2, 1)",
+        params![e.stream, e.stream_kind],
+    )?;
+    let art: i64 = c.query_row(
+        "SELECT next_article FROM streams WHERE stream = ?1",
+        [&e.stream],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "UPDATE streams SET next_article = ?2 WHERE stream = ?1",
+        params![e.stream, art + 1],
+    )?;
+    c.execute(
+        "INSERT INTO envelopes (seq, mail_id, stream, article_num, kind, sender, recipient, headers_json, body_len, body_sha256, accepted_at_ms, day_bucket, in_cold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+        params![
+            e.seq,
+            e.mail_id,
+            e.stream,
+            art,
+            e.kind,
+            e.sender,
+            e.recipient,
+            e.headers_json,
+            e.body.len() as i64,
+            e.body_sha256,
+            e.accepted_at_ms,
+            e.day_bucket
+        ],
+    )?;
+    c.execute(
+        "INSERT INTO hot_bodies (mail_id, body) VALUES (?1, ?2)",
+        params![e.mail_id, e.body],
+    )?;
+    if let Some(reader) = &e.reader {
+        c.execute(
+            "INSERT OR IGNORE INTO positions (stream, reader, subscribed, position, updated_at_ms) VALUES (?1, ?2, 1, 0, ?3)",
+            params![e.stream, reader, e.accepted_at_ms],
+        )?;
+    }
+    Ok(Ok(art))
+}
+
+fn insert_seen(c: &Connection, s: &NewSeen, article_num: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![s.mail_id, s.kind, s.sender, s.target, s.body_len, s.body_sha256, article_num],
+    )?;
+    Ok(())
+}
+
+fn subscribers_of(c: &Connection, stream: &str) -> rusqlite::Result<Vec<String>> {
+    let mut st = c.prepare(
+        "SELECT reader FROM positions WHERE stream = ?1 AND subscribed = 1 ORDER BY reader",
+    )?;
+    let rows = st.query_map([stream], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// Move `reader`'s position on `stream` forward across every contiguous receipted article.
+fn advance_position(c: &Connection, stream: &str, reader: &str, now: i64) -> rusqlite::Result<()> {
+    let pos: i64 = c.query_row(
+        "SELECT position FROM positions WHERE stream = ?1 AND reader = ?2",
+        params![stream, reader],
+        |r| r.get(0),
+    )?;
+    let mut st = c.prepare(
+        "SELECT article_num, record_id, receipted_at_ms FROM receipts
+         WHERE stream = ?1 AND reader = ?2 AND article_num > ?3 ORDER BY article_num",
+    )?;
+    let mut rows = st.query(params![stream, reader, pos])?;
+    let mut cur = pos;
+    let mut last: Option<(String, Option<i64>)> = None;
+    while let Some(r) = rows.next()? {
+        let art: i64 = r.get(0)?;
+        if art != cur + 1 {
+            break;
+        }
+        cur = art;
+        last = Some((r.get(1)?, r.get(2)?));
+    }
+    if let Some((record_id, at)) = last {
+        c.execute(
+            "UPDATE positions SET position = ?3, record_id = ?4, receipted_at_ms = ?5, updated_at_ms = ?6
+             WHERE stream = ?1 AND reader = ?2",
+            params![stream, reader, cur, record_id, at, now],
+        )?;
+    }
+    Ok(())
+}
+
+const PENDING_COLS: &str = "e.seq, e.mail_id, e.sender, e.recipient, e.article_num, e.kind, e.headers_json, e.day_bucket, e.in_cold, h.body";
+
+struct RawPending {
+    seq: i64,
+    mail_id: String,
+    sender: String,
+    recipient: String,
+    article_num: i64,
+    kind: String,
+    headers_json: Option<String>,
+    day_bucket: i64,
+    in_cold: bool,
+    body: Option<String>,
+}
+
+fn raw_pending(r: &Row) -> rusqlite::Result<RawPending> {
+    Ok(RawPending {
+        seq: r.get(0)?,
+        mail_id: r.get(1)?,
+        sender: r.get(2)?,
+        recipient: r.get(3)?,
+        article_num: r.get(4)?,
+        kind: r.get(5)?,
+        headers_json: r.get(6)?,
+        day_bucket: r.get(7)?,
+        in_cold: r.get::<_, i64>(8)? != 0,
+        body: r.get(9)?,
+    })
+}
+
+fn headers_value(json_text: Option<&str>) -> Value {
+    json_text
+        .and_then(|t| json::parse(t).ok())
+        .unwrap_or_else(|| Value::Obj(Vec::new()))
+}
+
+fn day_bucket(accepted_at_ms: Option<i64>, day_ms: i64) -> i64 {
+    accepted_at_ms.map(|a| a.div_euclid(day_ms)).unwrap_or(0)
+}
+
+impl Inner {
+    fn shard(&self, key: &str) -> usize {
+        hash_pair(key.as_bytes()).0 as usize % self.slices.len()
+    }
+
+    fn seq(&self) -> i64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn hold(&self, id: &str) -> Flight<'_> {
+        let (m, cv) = &self.in_flight;
+        let mut g = m.lock().unwrap();
+        while g.contains(id) {
+            g = cv.wait(g).unwrap();
+        }
+        g.insert(id.to_string());
+        Flight {
+            inner: self,
+            id: id.to_string(),
+        }
+    }
+
+    fn read<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> io::Result<R> {
+        f(&self.slices[idx].read.lock().unwrap()).map_err(sq)
+    }
+
+    fn seen(&self, mail_id: &str) -> io::Result<(Option<SeenRow>, Option<SeenRow>)> {
+        self.read(self.shard(mail_id), |c| {
+            let seen = c
+                .query_row(
+                    "SELECT kind, sender, target, body_len, body_sha256, article_num FROM seen_ids WHERE mail_id = ?1",
+                    [mail_id],
+                    |r| {
+                        Ok(SeenRow {
+                            kind: r.get(0)?,
+                            sender: r.get(1)?,
+                            target: r.get(2)?,
+                            body_len: r.get(3)?,
+                            body_sha256: r.get(4)?,
+                            article_num: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let bcast = c
+                .query_row(
+                    "SELECT sender, body_len, body_sha256 FROM broadcasts WHERE mail_id = ?1",
+                    [mail_id],
+                    |r| {
+                        Ok(SeenRow {
+                            kind: "broadcast".into(),
+                            sender: r.get(0)?,
+                            target: None,
+                            body_len: r.get(1)?,
+                            body_sha256: r.get(2)?,
+                            article_num: 0,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok((seen, bcast))
+        })
+    }
+
+    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<PendingDelivery> {
+        let body = match raw.body {
+            Some(b) => b,
+            None if raw.in_cold => self.slices[idx]
+                .cold
+                .read_body(raw.day_bucket, &raw.mail_id)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "expected mail {} in cold day {}, saw no such record",
+                            raw.mail_id, raw.day_bucket
+                        ),
+                    )
+                })?,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected a hot body for mail {}, saw none", raw.mail_id),
+                ))
+            }
+        };
+        let group = raw.kind == "group";
+        Ok(PendingDelivery {
+            seq: raw.seq,
+            mail_id: raw.mail_id,
+            from: raw.sender,
+            to: if group {
+                reader.to_string()
+            } else {
+                raw.recipient.clone()
+            },
+            group: group.then_some(raw.recipient),
+            article_num: group.then_some(raw.article_num),
+            body,
+            kind: raw.kind,
+            headers: headers_value(raw.headers_json.as_deref()),
+        })
+    }
+
+    /// Group articles above `reader`'s position on subscribed streams in slice
+    /// `idx` (only `stream` when given) that `reader` has not receipted.
+    fn group_pending(
+        &self,
+        idx: usize,
+        reader: &str,
+        stream: Option<&str>,
+    ) -> io::Result<Vec<PendingDelivery>> {
+        let raws = self.read(idx, |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {PENDING_COLS} FROM positions p
+                 JOIN envelopes e ON e.stream = p.stream AND e.article_num > p.position
+                 LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
+                 WHERE p.reader = ?1 AND p.subscribed = 1 AND e.kind = 'group'
+                   AND (?2 IS NULL OR p.stream = ?2)
+                   AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.mail_id = e.mail_id AND r.reader = ?1)
+                 ORDER BY e.seq"
+            ))?;
+            let rows = st.query_map(params![reader, stream], raw_pending)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        raws.into_iter()
+            .map(|r| self.resolve(idx, r, reader))
+            .collect()
+    }
+
+    fn pending_for(&self, session: &str) -> io::Result<Vec<PendingDelivery>> {
+        let stream = format!("m:{session}");
+        let idx = self.shard(&stream);
+        let raws = self.read(idx, |c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {PENDING_COLS} FROM envelopes e
+                 LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
+                 WHERE e.stream = ?1 AND e.kind IN ('directed', 'broadcast')
+                   AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.mail_id = e.mail_id)
+                 ORDER BY e.seq"
+            ))?;
+            let rows = st.query_map([&stream], raw_pending)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        let mut out = raws
+            .into_iter()
+            .map(|r| self.resolve(idx, r, session))
+            .collect::<io::Result<Vec<_>>>()?;
+        for i in 0..self.slices.len() {
+            out.extend(self.group_pending(i, session, None)?);
+        }
+        out.sort_by_key(|p| p.seq);
+        Ok(out)
+    }
+
+    /// Find an envelope by Mail id: (slice, stream, article, kind, sender, recipient, headers, accepted_at).
+    #[allow(clippy::type_complexity)]
+    fn find(
+        &self,
+        mail_id: &str,
+    ) -> io::Result<
+        Option<(
+            usize,
+            (
+                String,
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<i64>,
+            ),
+        )>,
+    > {
+        for idx in 0..self.slices.len() {
+            let row = self.read(idx, |c| {
+                c.query_row(
+                    "SELECT stream, article_num, kind, sender, recipient, headers_json, accepted_at_ms FROM envelopes WHERE mail_id = ?1",
+                    [mail_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                )
+                .optional()
+            })?;
+            if let Some(row) = row {
+                return Ok(Some((idx, row)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Seal every hot body accepted at or before `now - retain_ms` into its
+    /// slice's cold day file, then mark it cold and drop the hot copy.
+    fn sweep(&self, now: i64) -> io::Result<()> {
+        let _g = self.sweep_lock.lock().unwrap();
+        let cutoff = now.saturating_sub(self.cfg.retain_ms);
+        for (idx, slice) in self.slices.iter().enumerate() {
+            let rows = self.read(idx, |c| {
+                let mut st = c.prepare(
+                    "SELECT e.day_bucket, e.mail_id, e.stream, e.article_num, e.kind, e.sender, e.recipient,
+                            e.headers_json, h.body, e.body_sha256, e.accepted_at_ms
+                     FROM envelopes e JOIN hot_bodies h ON h.mail_id = e.mail_id
+                     WHERE e.in_cold = 0 AND e.accepted_at_ms IS NOT NULL AND e.accepted_at_ms <= ?1
+                     ORDER BY e.seq",
+                )?;
+                let rows = st.query_map([cutoff], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        ColdRecord {
+                            mail_id: r.get(1)?,
+                            stream: r.get(2)?,
+                            article_num: r.get(3)?,
+                            kind: r.get(4)?,
+                            sender: r.get(5)?,
+                            recipient: r.get(6)?,
+                            headers_json: r.get(7)?,
+                            body: r.get(8)?,
+                            body_sha256: r.get(9)?,
+                            accepted_at_ms: r.get(10)?,
+                        },
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })?;
+            if rows.is_empty() {
+                continue;
+            }
+            let mut days: BTreeMap<i64, Vec<ColdRecord>> = BTreeMap::new();
+            for (day, rec) in rows {
+                days.entry(day).or_default().push(rec);
+            }
+            let mut ids = Vec::new();
+            for (day, recs) in &days {
+                slice.cold.seal_day(&slice.cold_dir, *day, recs)?;
+                ids.extend(recs.iter().map(|r| r.mail_id.clone()));
+            }
+            slice.writer.exec(move |c| {
+                for id in &ids {
+                    c.execute("UPDATE envelopes SET in_cold = 1 WHERE mail_id = ?1", [id])?;
+                    c.execute("DELETE FROM hot_bodies WHERE mail_id = ?1", [id])?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> rusqlite::Result<()> {
+    // (kind, addr, host, old_host, label, declared, registration, claim_key, expires_ms, mail_id, at_ms)
+    type Cols<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<i64>,
+        Option<&'a str>,
+        Option<i64>,
+    );
+    let cols: Cols = match ev {
+        TimelineEvent::Session {
+            session,
+            host,
+            at_ms,
+        } => {
+            c.execute(
+                "INSERT INTO live_sessions (address, host, label, declared, at_ms) VALUES (?1, ?2, '', NULL, ?3)
+                 ON CONFLICT(address) DO UPDATE SET host = excluded.host, at_ms = excluded.at_ms",
+                params![session, host, at_ms],
+            )?;
+            (
+                "session",
+                Some(session),
+                Some(host),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                *at_ms,
+            )
+        }
+        TimelineEvent::Unregister { session, at_ms } => {
+            c.execute("DELETE FROM live_sessions WHERE address = ?1", [session])?;
+            (
+                "unregister",
+                Some(session),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                *at_ms,
+            )
+        }
+        TimelineEvent::Label {
+            session,
+            label,
+            at_ms,
+        } => {
+            c.execute(
+                "UPDATE live_sessions SET label = ?2 WHERE address = ?1",
+                params![session, label],
+            )?;
+            (
+                "label",
+                Some(session),
+                None,
+                None,
+                Some(label),
+                None,
+                None,
+                None,
+                None,
+                None,
+                *at_ms,
+            )
+        }
+        TimelineEvent::Declared {
+            session,
+            declared,
+            at_ms,
+        } => {
+            c.execute(
+                "UPDATE live_sessions SET declared = ?2 WHERE address = ?1",
+                params![session, declared],
+            )?;
+            (
+                "declared",
+                Some(session),
+                None,
+                None,
+                None,
+                declared.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                *at_ms,
+            )
+        }
+        TimelineEvent::Takeover {
+            session,
+            old_host,
+            host,
+            at_ms,
+            registration,
+        } => (
+            "takeover",
+            Some(session),
+            Some(host),
+            Some(old_host),
+            None,
+            None,
+            registration.as_deref(),
+            None,
+            None,
+            None,
+            *at_ms,
+        ),
+        TimelineEvent::Claim {
+            key,
+            owner,
+            expires_ms,
+        } => {
+            c.execute(
+                "INSERT OR REPLACE INTO live_claims (claim_key, owner, expires_ms) VALUES (?1, ?2, ?3)",
+                params![key, owner, expires_ms],
+            )?;
+            (
+                "claim",
+                Some(owner),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(key),
+                Some(*expires_ms),
+                None,
+                Some(now),
+            )
+        }
+        TimelineEvent::Release { key } => {
+            c.execute("DELETE FROM live_claims WHERE claim_key = ?1", [key])?;
+            (
+                "release",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(key),
+                None,
+                None,
+                Some(now),
+            )
+        }
+        // A receipt for Mail the coordinator never accepted: the record id rides in `label`.
+        TimelineEvent::StrayReceipt {
+            mail_id,
+            session,
+            record_id,
+        } => (
+            "receipt",
+            session.as_deref(),
+            None,
+            None,
+            Some(record_id),
+            None,
+            None,
+            None,
+            None,
+            Some(mail_id),
+            Some(now),
+        ),
+    };
+    c.execute(
+        "INSERT INTO timeline (seq, kind, addr, host, old_host, label, declared, registration, claim_key, expires_ms, mail_id, at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![seq, cols.0, cols.1, cols.2, cols.3, cols.4, cols.5, cols.6, cols.7, cols.8, cols.9, cols.10],
+    )?;
+    Ok(())
+}
+
+fn load_startup(c: &Connection) -> rusqlite::Result<CoordStartup> {
+    let mut out = CoordStartup::default();
+    let mut st = c.prepare("SELECT address, host, label, declared FROM live_sessions")?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            StoredSession {
+                host: r.get(1)?,
+                label: r.get(2)?,
+                declared: r.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (a, s) = row?;
+        out.sessions.insert(a, s);
+    }
+    let mut st = c.prepare("SELECT claim_key, owner, expires_ms FROM live_claims")?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (key, owner, expires_ms) = row?;
+        out.claims.apply(
+            &key,
+            &crate::claims::Change::Grant(crate::claims::Held { owner, expires_ms }),
+        );
+    }
+    let mut st = c.prepare(
+        "SELECT registration FROM timeline WHERE kind = 'takeover' AND registration IS NOT NULL AND registration != ''",
+    )?;
+    let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        out.takeover_registrations.insert(row?);
+    }
+    Ok(out)
+}
+
+fn max_seq(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT MAX(COALESCE((SELECT MAX(seq) FROM timeline), 0),
+                    COALESCE((SELECT MAX(seq) FROM envelopes), 0),
+                    COALESCE((SELECT MAX(receipt_seq) FROM receipts), 0),
+                    COALESCE((SELECT MAX(seq) FROM broadcasts), 0))",
+        [],
+        |r| r.get(0),
+    )
+}
+
+impl CoordinatorStore {
+    pub fn open(cfg: CoordOpenConfig) -> io::Result<(Self, CoordStartup)> {
+        if cfg.num_slices == 0 || cfg.day_ms <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "expected num_slices >= 1 and day_ms > 0, saw num_slices={} day_ms={}",
+                    cfg.num_slices, cfg.day_ms
+                ),
+            ));
+        }
+        let root = coordinator_root(&cfg.data);
+        fs::create_dir_all(&root)?;
+        let lock = crate::durlog::open_exclusive_lock(&root.join("LOCK"))?;
+        let mut dirs = Vec::with_capacity(cfg.num_slices);
+        let mut conns = Vec::with_capacity(cfg.num_slices);
+        for idx in 0..cfg.num_slices {
+            let dir = slice_dir(&root, idx);
+            fs::create_dir_all(dir.join("cold"))?;
+            conns.push(open_conn(&dir.join("hot.sqlite"), true)?);
+            dirs.push(dir);
+        }
+        if cfg.data.is_file()
+            && !is_sqlite_file(&cfg.data)
+            && meta(&conns[0], "imported_legacy").map_err(sq)?.as_deref() != Some("1")
+            && super::import::maybe_import_coordinator_log(&cfg.data, &mut conns)?
+        {
+            conns[0]
+                .execute(
+                    "INSERT OR REPLACE INTO meta (key, val) VALUES ('imported_legacy', '1')",
+                    [],
+                )
+                .map_err(sq)?;
+        }
+        let startup = load_startup(&conns[0]).map_err(sq)?;
+        let mut top = 0;
+        for c in &conns {
+            top = top.max(max_seq(c).map_err(sq)?);
+        }
+        let mut slices = Vec::with_capacity(cfg.num_slices);
+        for (idx, (conn, dir)) in conns.into_iter().zip(dirs).enumerate() {
+            let cold_dir = dir.join("cold");
+            slices.push(Slice {
+                cold: Arc::new(ColdIndex::load(&cold_dir)?),
+                cold_dir,
+                read: Mutex::new(open_conn(&dir.join("hot.sqlite"), false)?),
+                writer: SliceWriter::spawn(conn, idx)?,
+            });
+        }
+        let inner = Inner {
+            cfg,
+            slices,
+            next_seq: AtomicI64::new(top + 1),
+            in_flight: (Mutex::new(HashSet::new()), Condvar::new()),
+            last_swept_day: AtomicI64::new(i64::MIN),
+            sweep_lock: Mutex::new(()),
+            sweeps: Mutex::new(Vec::new()),
+            _lock: lock,
+        };
+        Ok((
+            Self {
+                inner: Arc::new(inner),
+            },
+            startup,
+        ))
+    }
+
+    pub fn commit_timeline(&self, events: Vec<TimelineEvent>, now_ms: i64) -> io::Result<()> {
+        let rows: Vec<(i64, TimelineEvent)> =
+            events.into_iter().map(|e| (self.inner.seq(), e)).collect();
+        self.inner.slices[0].writer.exec(move |c| {
+            for (seq, ev) in &rows {
+                insert_timeline(c, *seq, ev, now_ms)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// After a commit: a Mail from a later day than the last sweep starts a
+    /// background sweep, off the send path.
+    fn after_send(&self, accepted_at_ms: Option<i64>) {
+        let Some(at) = accepted_at_ms else { return };
+        if !self.inner.cfg.sweep_enabled {
+            return;
+        }
+        let day = at.div_euclid(self.inner.cfg.day_ms);
+        if self.inner.last_swept_day.fetch_max(day, Ordering::SeqCst) >= day {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let spawned = std::thread::Builder::new()
+            .name("roger-cold-sweep".into())
+            .spawn(move || {
+                if let Err(e) = inner.sweep(now_ms()) {
+                    eprintln!("cold sweep failed: {e}");
+                }
+            });
+        match spawned {
+            Ok(h) => {
+                let mut g = self.inner.sweeps.lock().unwrap();
+                g.retain(|h| !h.is_finished());
+                g.push(h);
+            }
+            Err(e) => eprintln!("cold sweep not started: {e}"),
+        }
+    }
+
+    /// Write one single-stream envelope plus its Mail-id record; atomic when
+    /// both live in the same slice.
+    fn write_single(
+        &self,
+        env: NewEnvelope,
+        seen: NewSeen,
+    ) -> io::Result<Result<(i64, Vec<String>), String>> {
+        let inner = &self.inner;
+        let st_idx = inner.shard(&env.stream);
+        let seen_idx = inner.shard(&seen.mail_id);
+        let same = st_idx == seen_idx;
+        let res = inner.slices[st_idx].writer.exec(move |c| {
+            let art = match insert_envelope(c, &env)? {
+                Ok(a) => a,
+                Err(w) => return Ok(Err(w)),
+            };
+            if same {
+                insert_seen(c, &seen, art)?;
+            }
+            let subs = if env.kind == "group" {
+                subscribers_of(c, &env.stream)?
+            } else {
+                vec![env.recipient.clone()]
+            };
+            Ok(Ok((art, subs, (!same).then_some(seen))))
+        })?;
+        match res {
+            Err(w) => Ok(Err(w)),
+            Ok((art, subs, rest)) => {
+                if let Some(seen) = rest {
+                    inner.slices[seen_idx]
+                        .writer
+                        .exec(move |c| insert_seen(c, &seen, art))?;
+                }
+                Ok(Ok((art, subs)))
+            }
+        }
+    }
+
+    pub fn send_directed(&self, req: SendDirectedReq) -> io::Result<SendStatus> {
+        self.send_single(
+            req.mail_id,
+            req.from,
+            req.to,
+            req.body,
+            req.headers,
+            req.accepted_at_ms,
+            false,
+        )
+    }
+
+    pub fn send_group(&self, req: SendGroupReq) -> io::Result<SendStatus> {
+        self.send_single(
+            req.mail_id,
+            req.from,
+            req.group,
+            req.body,
+            req.headers,
+            req.accepted_at_ms,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_single(
+        &self,
+        mail_id: String,
+        from: String,
+        target: String,
+        body: String,
+        headers: Option<Value>,
+        accepted_at_ms: Option<i64>,
+        group: bool,
+    ) -> io::Result<SendStatus> {
+        let inner = &self.inner;
+        let _flight = inner.hold(&mail_id);
+        let kind = if group { "group" } else { "directed" };
+        let sha = hex_digest(body.as_bytes());
+        let len = body.len() as i64;
+        let (seen, bcast) = inner.seen(&mail_id)?;
+        if let Some(s) = seen {
+            return Ok(match s.differs(kind, &from, Some(&target), len, &sha) {
+                None => SendStatus::DuplicateAccepted {
+                    article_num: s.article_num,
+                },
+                Some(w) => SendStatus::Conflict(resend_refusal(&mail_id, &w)),
+            });
+        }
+        if bcast.is_some() {
+            return Ok(SendStatus::Conflict(resend_refusal(&mail_id, "recipient")));
+        }
+        let env = NewEnvelope {
+            seq: inner.seq(),
+            mail_id: mail_id.clone(),
+            stream: format!("{}:{target}", if group { "g" } else { "m" }),
+            stream_kind: if group { "group" } else { "mail" },
+            kind,
+            sender: from.clone(),
+            recipient: target.clone(),
+            headers_json: headers.as_ref().map(json::stringify),
+            body,
+            body_sha256: sha.clone(),
+            accepted_at_ms,
+            day_bucket: day_bucket(accepted_at_ms, inner.cfg.day_ms),
+            reader: (!group).then(|| target.clone()),
+        };
+        let seen = NewSeen {
+            mail_id: mail_id.clone(),
+            kind,
+            sender: from,
+            target: Some(target),
+            body_len: len,
+            body_sha256: sha,
+        };
+        let status = match self.write_single(env, seen)? {
+            Err(w) => return Ok(SendStatus::Conflict(resend_refusal(&mail_id, &w))),
+            Ok((article_num, subscribers)) => SendStatus::Committed {
+                article_num,
+                subscribers,
+            },
+        };
+        drop(_flight);
+        self.after_send(accepted_at_ms);
+        Ok(status)
+    }
+
+    pub fn send_broadcast(&self, req: SendBroadcastReq) -> io::Result<SendStatus> {
+        let inner = &self.inner;
+        let _flight = inner.hold(&req.mail_id);
+        let sha = hex_digest(req.body.as_bytes());
+        let len = req.body.len() as i64;
+        let (seen, bcast) = inner.seen(&req.mail_id)?;
+        if let Some(b) = bcast {
+            return Ok(match b.differs("broadcast", &req.from, None, len, &sha) {
+                None => SendStatus::DuplicateAccepted { article_num: 0 },
+                Some(w) => SendStatus::Conflict(resend_refusal(&req.mail_id, &w)),
+            });
+        }
+        if seen.is_some() {
+            return Ok(SendStatus::Conflict(resend_refusal(
+                &req.mail_id,
+                "recipient",
+            )));
+        }
+        let headers_json = req.headers.as_ref().map(json::stringify);
+        let n = inner.slices.len();
+        let mut envs: Vec<Vec<NewEnvelope>> = (0..n).map(|_| Vec::new()).collect();
+        let mut seens: Vec<Vec<NewSeen>> = (0..n).map(|_| Vec::new()).collect();
+        for rcpt in &req.recipients {
+            let copy = format!("{}/{rcpt}", req.mail_id);
+            let (copy_seen, _) = inner.seen(&copy)?;
+            // A copy already recorded by this same broadcast is a resume after a
+            // partial write; anything else under the copy id is a conflict.
+            if let Some(s) = copy_seen {
+                if let Some(w) = s.differs("broadcast", &req.from, Some(rcpt), len, &sha) {
+                    return Ok(SendStatus::Conflict(resend_refusal(&copy, &w)));
+                }
+            }
+            let stream = format!("m:{rcpt}");
+            envs[inner.shard(&stream)].push(NewEnvelope {
+                seq: inner.seq(),
+                mail_id: copy.clone(),
+                stream,
+                stream_kind: "mail",
+                kind: "broadcast",
+                sender: req.from.clone(),
+                recipient: rcpt.clone(),
+                headers_json: headers_json.clone(),
+                body: req.body.clone(),
+                body_sha256: sha.clone(),
+                accepted_at_ms: req.accepted_at_ms,
+                day_bucket: day_bucket(req.accepted_at_ms, inner.cfg.day_ms),
+                reader: Some(rcpt.clone()),
+            });
+            seens[inner.shard(&copy)].push(NewSeen {
+                mail_id: copy,
+                kind: "broadcast",
+                sender: req.from.clone(),
+                target: Some(rcpt.clone()),
+                body_len: len,
+                body_sha256: sha.clone(),
+            });
+        }
+        // Phase 1: every copy's envelope, all slices at once.
+        let mut waits = Vec::new();
+        for (idx, list) in envs.into_iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+            waits.push(inner.slices[idx].writer.submit(move |c| {
+                let mut out = Vec::new();
+                for e in &list {
+                    out.push((e.mail_id.clone(), insert_envelope(c, e)?));
+                }
+                Ok(out)
+            })?);
+        }
+        let mut articles: HashMap<String, i64> = HashMap::new();
+        let mut conflict = None;
+        for w in waits {
+            for (id, r) in w.wait()? {
+                match r {
+                    Ok(a) => {
+                        articles.insert(id, a);
+                    }
+                    Err(what) => conflict = Some(resend_refusal(&id, &what)),
+                }
+            }
+        }
+        if let Some(c) = conflict {
+            return Ok(SendStatus::Conflict(c));
+        }
+        // Phase 2: Mail-id records for every copy, then the broadcast itself.
+        let bseq = inner.seq();
+        let b_idx = inner.shard(&req.mail_id);
+        let recipients_json = json::stringify(&Value::Arr(
+            req.recipients
+                .iter()
+                .map(|r| Value::Str(r.clone()))
+                .collect(),
+        ));
+        let mut brow = Some((
+            req.mail_id.clone(),
+            bseq,
+            req.from.clone(),
+            len,
+            sha.clone(),
+            headers_json,
+            recipients_json,
+            req.accepted_at_ms,
+        ));
+        let mut waits = Vec::new();
+        for (idx, list) in seens.into_iter().enumerate() {
+            let b = if idx == b_idx { brow.take() } else { None };
+            if list.is_empty() && b.is_none() {
+                continue;
+            }
+            let arts: Vec<i64> = list
+                .iter()
+                .map(|s| articles.get(&s.mail_id).copied().unwrap_or(0))
+                .collect();
+            waits.push(inner.slices[idx].writer.submit(move |c| {
+                for (s, a) in list.iter().zip(arts) {
+                    insert_seen(c, s, a)?;
+                }
+                if let Some((id, seq, sender, len, sha, hj, rj, at)) = b {
+                    c.execute(
+                        "INSERT OR IGNORE INTO broadcasts (mail_id, seq, sender, body_len, body_sha256, headers_json, recipients_json, accepted_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![id, seq, sender, len, sha, hj, rj, at],
+                    )?;
+                }
+                Ok(())
+            })?);
+        }
+        for w in waits {
+            w.wait()?;
+        }
+        drop(_flight);
+        self.after_send(req.accepted_at_ms);
+        Ok(SendStatus::Committed {
+            article_num: 0,
+            subscribers: req.recipients,
+        })
+    }
+
+    pub fn record_ack(
+        &self,
+        mail_id: &str,
+        session: &str,
+        record_id: &str,
+        now_ms: i64,
+    ) -> io::Result<AckResult> {
+        let inner = &self.inner;
+        let Some((idx, (stream, article_num, kind, _sender, recipient, _, _))) =
+            inner.find(mail_id)?
+        else {
+            return Ok(AckResult::UnknownMail);
+        };
+        let group = kind == "group";
+        let reader = if group {
+            session.to_string()
+        } else {
+            recipient
+        };
+        let receipt_seq = inner.seq();
+        let (mail_id, record_id) = (mail_id.to_string(), record_id.to_string());
+        let newly = inner.slices[idx].writer.exec(move |c| {
+            if !group
+                && c.query_row("SELECT 1 FROM receipts WHERE mail_id = ?1", [&mail_id], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+            {
+                return Ok(false);
+            }
+            let n = c.execute(
+                "INSERT OR IGNORE INTO receipts (mail_id, reader, stream, article_num, record_id, receipted_at_ms, receipt_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![mail_id, reader, stream, article_num, record_id, now_ms, receipt_seq],
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+            c.execute(
+                "INSERT OR IGNORE INTO positions (stream, reader, subscribed, position, updated_at_ms) VALUES (?1, ?2, ?3, 0, ?4)",
+                params![stream, reader, i64::from(!group), now_ms],
+            )?;
+            advance_position(c, &stream, &reader, now_ms)?;
+            Ok(true)
+        })?;
+        Ok(AckResult::Recorded {
+            newly_receipted: newly,
+        })
+    }
+
+    pub fn pending_for_session(&self, session: &str) -> io::Result<Vec<PendingDelivery>> {
+        self.inner.pending_for(session)
+    }
+
+    pub fn pending_for_host(&self, sessions: &[String]) -> io::Result<Vec<PendingDelivery>> {
+        let mut out = Vec::new();
+        for s in sessions {
+            out.extend(self.inner.pending_for(s)?);
+        }
+        out.sort_by_key(|p| p.seq);
+        Ok(out)
+    }
+
+    pub fn query_receipt(
+        &self,
+        mail_id: &str,
+        reader: Option<&str>,
+    ) -> io::Result<Option<ReceiptInfo>> {
+        let inner = &self.inner;
+        let Some((
+            idx,
+            (_stream, article_num, kind, sender, recipient, headers_json, accepted_at_ms),
+        )) = inner.find(mail_id)?
+        else {
+            return Ok(None);
+        };
+        let receipt: Option<(String, Option<i64>)> = inner.read(idx, |c| {
+            match reader {
+                Some(r) => c.query_row(
+                    "SELECT record_id, receipted_at_ms FROM receipts WHERE mail_id = ?1 AND reader = ?2",
+                    params![mail_id, r],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ),
+                None => c.query_row(
+                    "SELECT record_id, receipted_at_ms FROM receipts WHERE mail_id = ?1 ORDER BY receipt_seq LIMIT 1",
+                    [mail_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ),
+            }
+            .optional()
+        })?;
+        let group = kind == "group";
+        let (record_id, receipted_at_ms) = match receipt {
+            Some((r, at)) => (Some(r), at),
+            None => (None, None),
+        };
+        Ok(Some(ReceiptInfo {
+            mail_id: mail_id.to_string(),
+            from: sender,
+            to: recipient.clone(),
+            group: group.then_some(recipient),
+            article_num: group.then_some(article_num),
+            kind,
+            headers: headers_json.as_deref().and_then(|t| json::parse(t).ok()),
+            accepted_at_ms,
+            record_id,
+            receipted_at_ms,
+        }))
+    }
+
+    pub fn subscribe_group(
+        &self,
+        session: &str,
+        group: &str,
+        after_article: Option<i64>,
+        from_latest: bool,
+        now_ms: i64,
+    ) -> io::Result<(i64, i64, Vec<PendingDelivery>)> {
+        let inner = &self.inner;
+        let stream = format!("g:{group}");
+        let idx = inner.shard(&stream);
+        let (s, reader) = (stream.clone(), session.to_string());
+        let (position, high_water) = inner.slices[idx].writer.exec(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO streams (stream, kind, next_article) VALUES (?1, 'group', 1)",
+                [&s],
+            )?;
+            let hw: i64 = c.query_row(
+                "SELECT next_article - 1 FROM streams WHERE stream = ?1",
+                [&s],
+                |r| r.get(0),
+            )?;
+            let existing: Option<i64> = c
+                .query_row(
+                    "SELECT position FROM positions WHERE stream = ?1 AND reader = ?2",
+                    params![s, reader],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let pos = match (after_article, from_latest) {
+                (Some(a), _) => a.max(0),
+                (None, true) => hw,
+                (None, false) => existing.unwrap_or(0),
+            };
+            c.execute(
+                "INSERT INTO positions (stream, reader, subscribed, position, updated_at_ms) VALUES (?1, ?2, 1, ?3, ?4)
+                 ON CONFLICT(stream, reader) DO UPDATE SET subscribed = 1, position = excluded.position, updated_at_ms = excluded.updated_at_ms",
+                params![s, reader, pos, now_ms],
+            )?;
+            Ok((pos, hw))
+        })?;
+        let pending = inner.group_pending(idx, session, Some(&stream))?;
+        Ok((position, high_water, pending))
+    }
+
+    pub fn unsubscribe_group(&self, session: &str, group: &str, now_ms: i64) -> io::Result<i64> {
+        let stream = format!("g:{group}");
+        let idx = self.inner.shard(&stream);
+        let reader = session.to_string();
+        self.inner.slices[idx].writer.exec(move |c| {
+            c.execute(
+                "UPDATE positions SET subscribed = 0, updated_at_ms = ?3 WHERE stream = ?1 AND reader = ?2",
+                params![stream, reader, now_ms],
+            )?;
+            Ok(c.query_row(
+                "SELECT position FROM positions WHERE stream = ?1 AND reader = ?2",
+                params![stream, reader],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+        })
+    }
+
+    pub fn list_groups(&self, session: Option<&str>) -> io::Result<Vec<GroupSummary>> {
+        let mut out = Vec::new();
+        for idx in 0..self.inner.slices.len() {
+            out.extend(self.inner.read(idx, |c| {
+                let mut st = c.prepare(
+                    "SELECT s.stream, s.next_article - 1,
+                            (SELECT COUNT(*) FROM positions p WHERE p.stream = s.stream AND p.subscribed = 1),
+                            q.position, q.subscribed, q.record_id
+                     FROM streams s
+                     LEFT JOIN positions q ON q.stream = s.stream AND q.reader = ?1
+                     WHERE s.kind = 'group'",
+                )?;
+                let rows = st.query_map([session], |r| {
+                    let stream: String = r.get(0)?;
+                    Ok(GroupSummary {
+                        group: stream.strip_prefix("g:").unwrap_or(&stream).to_string(),
+                        high_water: r.get(1)?,
+                        subscribers: r.get::<_, i64>(2)? as usize,
+                        position: r.get(3)?,
+                        subscribed: r.get::<_, Option<i64>>(4)? == Some(1),
+                        record_id: r.get(5)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })?);
+        }
+        out.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(out)
+    }
+
+    /// Wait for every background sweep started so far, then sweep once more now.
+    pub fn flush_cold_sweeps_for_test(&self) -> io::Result<()> {
+        let handles = std::mem::take(&mut *self.inner.sweeps.lock().unwrap());
+        for h in handles {
+            let _ = h.join();
+        }
+        self.inner.sweep(now_ms())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempdir(name: &str) -> TempDir {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "rw-coord-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+    fn cfg(dir: &TempDir, slices: usize) -> CoordOpenConfig {
+        let mut c = CoordOpenConfig::new(dir.0.join("coordinator.db"));
+        c.num_slices = slices;
+        c
+    }
+    fn directed(id: &str, from: &str, to: &str, body: &str) -> SendDirectedReq {
+        SendDirectedReq {
+            mail_id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            body: body.into(),
+            headers: None,
+            accepted_at_ms: Some(now_ms()),
+        }
+    }
+    fn group(id: &str, from: &str, g: &str, body: &str) -> SendGroupReq {
+        SendGroupReq {
+            mail_id: id.into(),
+            from: from.into(),
+            group: g.into(),
+            body: body.into(),
+            headers: None,
+            accepted_at_ms: Some(now_ms()),
+        }
+    }
+    fn bcast(id: &str, from: &str, to: &[&str], body: &str) -> SendBroadcastReq {
+        SendBroadcastReq {
+            mail_id: id.into(),
+            from: from.into(),
+            recipients: to.iter().map(|s| s.to_string()).collect(),
+            body: body.into(),
+            headers: None,
+            accepted_at_ms: Some(now_ms()),
+        }
+    }
+    fn count(store: &CoordinatorStore, idx: usize, sql: &str) -> i64 {
+        store
+            .inner
+            .read(idx, |c| c.query_row(sql, [], |r| r.get(0)))
+            .unwrap()
+    }
+    fn committed(s: SendStatus) -> i64 {
+        match s {
+            SendStatus::Committed { article_num, .. } => article_num,
+            other => panic!("expected Committed, saw {other:?}"),
+        }
+    }
+    fn conflict(s: SendStatus) -> String {
+        match s {
+            SendStatus::Conflict(r) => r,
+            other => panic!("expected Conflict, saw {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_sends_commit_in_one_transaction_and_answer_after_it() {
+        let dir = tempdir("batch");
+        let (store, _) = CoordinatorStore::open(cfg(&dir, 1)).unwrap();
+        let store = Arc::new(store);
+        let w = &store.inner.slices[0].writer;
+        let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (gate_tx, gate_rx) = sync_channel::<()>(1);
+        let gate = w
+            .submit(move |_| {
+                entered_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        entered_rx.recv().unwrap();
+        let before = w.commits.load(Ordering::SeqCst);
+        let answered = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for i in 0..8 {
+            let (store, answered) = (Arc::clone(&store), Arc::clone(&answered));
+            threads.push(std::thread::spawn(move || {
+                let s = store
+                    .send_directed(directed(&format!("m{i}"), "s", "r", &format!("b{i}")))
+                    .unwrap();
+                answered.fetch_add(1, Ordering::SeqCst);
+                committed(s)
+            }));
+        }
+        w.wait_queued(8);
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            0,
+            "no answer before COMMIT"
+        );
+        gate_tx.send(()).unwrap();
+        gate.wait().unwrap();
+        let mut arts: Vec<i64> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        arts.sort();
+        assert_eq!(arts, (1..=8).collect::<Vec<_>>());
+        assert_eq!(
+            w.commits.load(Ordering::SeqCst) - before,
+            2,
+            "gate transaction plus one group commit for all eight sends"
+        );
+        assert_eq!(store.pending_for_session("r").unwrap().len(), 8);
+    }
+
+    #[test]
+    fn mail_ids_are_never_reused_across_kinds_slices_or_restarts() {
+        let dir = tempdir("ids");
+        for round in 0..2 {
+            let (store, _) = CoordinatorStore::open(cfg(&dir, 4)).unwrap();
+            let r = store
+                .send_directed(directed("m1", "a", "b", "hello"))
+                .unwrap();
+            if round == 0 {
+                assert_eq!(committed(r), 1);
+            } else {
+                assert!(
+                    matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                    "{r:?}"
+                );
+            }
+            let r = store
+                .send_directed(directed("m1", "a", "b", "hello"))
+                .unwrap();
+            assert!(
+                matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                "{r:?}"
+            );
+            let c = conflict(
+                store
+                    .send_directed(directed("m1", "a", "b", "other"))
+                    .unwrap(),
+            );
+            assert_eq!(
+                c,
+                "mail m1: expected a resend to repeat the Mail already accepted under this id, saw a different body"
+            );
+            assert!(conflict(
+                store
+                    .send_directed(directed("m1", "x", "c", "hello"))
+                    .unwrap()
+            )
+            .ends_with("different sender, recipient"));
+            conflict(store.send_group(group("m1", "a", "b", "hello")).unwrap());
+            conflict(
+                store
+                    .send_broadcast(bcast("m1", "a", &["b"], "hello"))
+                    .unwrap(),
+            );
+
+            let r = store
+                .send_broadcast(bcast("b1", "a", &["x", "y"], "all"))
+                .unwrap();
+            if round == 0 {
+                committed(r);
+            } else {
+                assert!(matches!(r, SendStatus::DuplicateAccepted { .. }), "{r:?}");
+            }
+            conflict(
+                store
+                    .send_broadcast(bcast("b1", "a", &["x"], "changed"))
+                    .unwrap(),
+            );
+            conflict(
+                store
+                    .send_directed(directed("b1", "a", "x", "all"))
+                    .unwrap(),
+            );
+            conflict(
+                store
+                    .send_directed(directed("b1/x", "a", "x", "all"))
+                    .unwrap(),
+            );
+
+            let r = store.send_group(group("g1", "a", "G", "post")).unwrap();
+            if round == 0 {
+                assert_eq!(committed(r), 1);
+            }
+            let r = store.send_group(group("g1", "a", "G", "post")).unwrap();
+            assert!(
+                matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                "{r:?}"
+            );
+            conflict(store.send_group(group("g1", "z", "G", "post")).unwrap());
+            conflict(
+                store
+                    .send_directed(directed("g1", "a", "G", "post"))
+                    .unwrap(),
+            );
+
+            assert_eq!(store.pending_for_session("b").unwrap().len(), 1);
+            let total: i64 = (0..4)
+                .map(|i| count(&store, i, "SELECT COUNT(*) FROM envelopes"))
+                .sum();
+            assert_eq!(total, 4, "m1, b1/x, b1/y, g1 once each");
+        }
+    }
+
+    #[test]
+    fn old_bodies_move_to_cold_and_restore_on_pending() {
+        let dir = tempdir("cold");
+        let mut c = cfg(&dir, 2);
+        c.retain_ms = 60_000;
+        c.day_ms = 1_000;
+        let (store, _) = CoordinatorStore::open(c).unwrap();
+        store
+            .subscribe_group("reader", "G", None, false, 1)
+            .unwrap();
+        let mut old = directed("old", "s", "a", "ancient body");
+        old.accepted_at_ms = Some(5_000);
+        committed(store.send_directed(old).unwrap());
+        let mut post = group("post", "s", "G", "ancient post");
+        post.accepted_at_ms = Some(5_500);
+        committed(store.send_group(post).unwrap());
+        committed(
+            store
+                .send_directed(directed("new", "s", "a", "fresh body"))
+                .unwrap(),
+        );
+        store.flush_cold_sweeps_for_test().unwrap();
+
+        let cold: i64 = (0..2)
+            .map(|i| {
+                count(
+                    &store,
+                    i,
+                    "SELECT COUNT(*) FROM envelopes WHERE in_cold = 1",
+                )
+            })
+            .sum();
+        let hot: i64 = (0..2)
+            .map(|i| count(&store, i, "SELECT COUNT(*) FROM hot_bodies"))
+            .sum();
+        assert_eq!(
+            (cold, hot),
+            (2, 1),
+            "two old bodies cold, the fresh one hot"
+        );
+        assert!(store
+            .inner
+            .slices
+            .iter()
+            .any(|s| s.cold_dir.join("day-5.cold").exists()));
+
+        let a = store.pending_for_session("a").unwrap();
+        let bodies: Vec<&str> = a.iter().map(|p| p.body.as_str()).collect();
+        assert_eq!(bodies, ["ancient body", "fresh body"]);
+        let r = store.pending_for_session("reader").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].body, "ancient post");
+        assert_eq!(r[0].group.as_deref(), Some("G"));
+
+        // A late subscriber restores the cold article too.
+        let (_, hw, late) = store.subscribe_group("late", "G", None, false, 2).unwrap();
+        assert_eq!(hw, 1);
+        assert_eq!(late[0].body, "ancient post");
+        drop(store);
+        let (store, _) = CoordinatorStore::open({
+            let mut c = cfg(&dir, 2);
+            c.day_ms = 1_000;
+            c
+        })
+        .unwrap();
+        assert_eq!(
+            store.pending_for_session("a").unwrap()[0].body,
+            "ancient body"
+        );
+    }
+
+    #[test]
+    fn group_article_has_one_body_and_one_position_per_reader() {
+        let dir = tempdir("group");
+        let (store, _) = CoordinatorStore::open(cfg(&dir, 3)).unwrap();
+        for r in ["r1", "r2"] {
+            assert_eq!(store.subscribe_group(r, "G", None, false, 1).unwrap().0, 0);
+        }
+        committed(store.send_group(group("p1", "s", "G", "one")).unwrap());
+        let (pos, hw, pend) = store.subscribe_group("r3", "G", None, true, 2).unwrap();
+        assert_eq!((pos, hw, pend.len()), (1, 1, 0));
+        committed(store.send_group(group("p2", "s", "G", "two")).unwrap());
+        match store.send_group(group("p3", "s", "G", "three")).unwrap() {
+            SendStatus::Committed {
+                article_num,
+                subscribers,
+            } => {
+                assert_eq!(article_num, 3);
+                assert_eq!(subscribers, ["r1", "r2", "r3"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let idx = store.inner.shard("g:G");
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM envelopes"), 3);
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM hot_bodies"), 3);
+
+        let pos = |r: &str| {
+            store
+                .list_groups(Some(r))
+                .unwrap()
+                .into_iter()
+                .find(|g| g.group == "G")
+                .unwrap()
+                .position
+                .unwrap()
+        };
+        assert_eq!(
+            store.record_ack("p2", "r1", "r-2", 10).unwrap(),
+            AckResult::Recorded {
+                newly_receipted: true
+            }
+        );
+        assert_eq!(pos("r1"), 0, "a gap holds the position");
+        store.record_ack("p1", "r1", "r-1", 11).unwrap();
+        assert_eq!(pos("r1"), 2);
+        assert_eq!(
+            store.record_ack("p1", "r1", "r-9", 12).unwrap(),
+            AckResult::Recorded {
+                newly_receipted: false
+            }
+        );
+        store.record_ack("p1", "r2", "r-1", 13).unwrap();
+        assert_eq!(pos("r2"), 1);
+        assert_eq!(
+            store.record_ack("nope", "r1", "r-1", 1).unwrap(),
+            AckResult::UnknownMail
+        );
+        let arts = |r: &str| -> Vec<i64> {
+            store
+                .pending_for_session(r)
+                .unwrap()
+                .iter()
+                .map(|p| p.article_num.unwrap())
+                .collect()
+        };
+        assert_eq!(arts("r1"), [3]);
+        assert_eq!(arts("r2"), [2, 3]);
+        assert_eq!(arts("r3"), [2, 3]);
+        let q = store.query_receipt("p1", Some("r1")).unwrap().unwrap();
+        assert_eq!(
+            (q.record_id.as_deref(), q.group.as_deref()),
+            (Some("r-1"), Some("G"))
+        );
+
+        assert_eq!(store.unsubscribe_group("r3", "G", 20).unwrap(), 1);
+        assert!(arts("r3").is_empty());
+        let g = &store.list_groups(None).unwrap()[0];
+        assert_eq!((g.high_water, g.subscribers), (3, 2));
+        let (p, _, back) = store.subscribe_group("r3", "G", None, false, 21).unwrap();
+        assert_eq!((p, back.len()), (1, 2), "re-subscribe keeps the position");
+        let (_, _, all) = store
+            .subscribe_group("r3", "G", Some(0), false, 22)
+            .unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn streams_and_ids_shard_across_slices_and_survive_reopen() {
+        let dir = tempdir("shard");
+        let n = 4;
+        let addrs: Vec<String> = (0..24).map(|i| format!("[[x:{i}]]addr-{i}")).collect();
+        {
+            let (store, _) = CoordinatorStore::open(cfg(&dir, n)).unwrap();
+            for (i, a) in addrs.iter().enumerate() {
+                committed(
+                    store
+                        .send_directed(directed(&format!("id-{i}"), "s", a, a))
+                        .unwrap(),
+                );
+            }
+            let mut used = HashSet::new();
+            for (i, a) in addrs.iter().enumerate() {
+                let st = hash_pair(format!("m:{a}").as_bytes()).0 as usize % n;
+                let id = format!("id-{i}");
+                let sd = hash_pair(id.as_bytes()).0 as usize % n;
+                used.insert(st);
+                let here = |idx: usize, table: &str| {
+                    store
+                        .inner
+                        .read(idx, |c| {
+                            c.query_row(
+                                &format!("SELECT COUNT(*) FROM {table} WHERE mail_id = ?1"),
+                                [&id],
+                                |r| r.get::<_, i64>(0),
+                            )
+                        })
+                        .unwrap()
+                };
+                for idx in 0..n {
+                    assert_eq!(
+                        here(idx, "envelopes"),
+                        i64::from(idx == st),
+                        "{id} envelope"
+                    );
+                    assert_eq!(here(idx, "seen_ids"), i64::from(idx == sd), "{id} seen");
+                }
+            }
+            assert!(used.len() > 1, "streams spread over slices");
+        }
+        let (store, _) = CoordinatorStore::open(cfg(&dir, n)).unwrap();
+        let all = store.pending_for_host(&addrs).unwrap();
+        assert_eq!(all.len(), addrs.len());
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        let top = all.last().unwrap().seq;
+        committed(
+            store
+                .send_directed(directed("after", "s", &addrs[0], "x"))
+                .unwrap(),
+        );
+        let p = store.pending_for_session(&addrs[0]).unwrap();
+        assert!(
+            p.last().unwrap().seq > top,
+            "sequence continues after reopen"
+        );
+        store.record_ack("id-0", &addrs[0], "r-1", 5).unwrap();
+        assert_eq!(store.pending_for_session(&addrs[0]).unwrap().len(), 1);
+        let q = store.query_receipt("id-0", None).unwrap().unwrap();
+        assert_eq!(q.record_id.as_deref(), Some("r-1"));
+    }
+
+    #[test]
+    fn timeline_reloads_sessions_claims_and_takeovers_under_one_lock() {
+        let dir = tempdir("timeline");
+        {
+            let (store, _) = CoordinatorStore::open(cfg(&dir, 2)).unwrap();
+            assert!(
+                CoordinatorStore::open(cfg(&dir, 2)).is_err(),
+                "second open is refused"
+            );
+            store
+                .commit_timeline(
+                    vec![
+                        TimelineEvent::Session {
+                            session: "a".into(),
+                            host: "h1".into(),
+                            at_ms: Some(1),
+                        },
+                        TimelineEvent::Label {
+                            session: "a".into(),
+                            label: "L".into(),
+                            at_ms: Some(2),
+                        },
+                        TimelineEvent::Declared {
+                            session: "a".into(),
+                            declared: Some("d".into()),
+                            at_ms: Some(3),
+                        },
+                        TimelineEvent::Session {
+                            session: "b".into(),
+                            host: "h1".into(),
+                            at_ms: Some(4),
+                        },
+                        TimelineEvent::Unregister {
+                            session: "b".into(),
+                            at_ms: Some(5),
+                        },
+                        TimelineEvent::Claim {
+                            key: "k".into(),
+                            owner: "a".into(),
+                            expires_ms: 1_000,
+                        },
+                        TimelineEvent::Claim {
+                            key: "k2".into(),
+                            owner: "a".into(),
+                            expires_ms: 1_000,
+                        },
+                        TimelineEvent::Release { key: "k2".into() },
+                        TimelineEvent::Takeover {
+                            session: "a".into(),
+                            old_host: "h1".into(),
+                            host: "h2".into(),
+                            at_ms: Some(6),
+                            registration: Some("reg-1".into()),
+                        },
+                    ],
+                    7,
+                )
+                .unwrap();
+        }
+        let (_store, st) = CoordinatorStore::open(cfg(&dir, 2)).unwrap();
+        let a = &st.sessions["a"];
+        assert_eq!(
+            (a.host.as_str(), a.label.as_str(), a.declared.as_deref()),
+            ("h1", "L", Some("d"))
+        );
+        assert!(!st.sessions.contains_key("b"));
+        assert_eq!(st.claims.live("k", 0).unwrap().owner, "a");
+        assert!(st.claims.live("k2", 0).is_none());
+        assert!(st.takeover_registrations.contains("reg-1"));
+    }
+}

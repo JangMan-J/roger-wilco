@@ -5,10 +5,10 @@
 //! locally, then forwarded upstream. Pending mail is pushed on registration,
 //! never by a timer.
 
-use crate::durlog::DurLog;
-use crate::json::{self, obj, s, Value};
+use crate::json::{obj, s, Value};
 use crate::net::{self, Writer};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::sql::{DaemonDeliverRow, DaemonStore};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
@@ -19,18 +19,6 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-#[derive(Clone)]
-struct Mail {
-    from: String,
-    to: String,
-    body: String,
-    kind: String,
-    /// The sender's headers, forwarded as the coordinator sent them.
-    headers: Value,
-    /// This Mail's place in arrival order among the Mail awaiting an Ack.
-    seq: u64,
-}
 
 /// A receipt committed to this host's log: which Mail, which session acked
 /// it, and which Record id that session named.
@@ -51,15 +39,7 @@ struct Registration {
 }
 
 struct State {
-    log: DurLog,
-    /// Every Mail id this log holds a `deliver` line for. The Mail itself is
-    /// held until its Ack and dropped with it (`None`): nothing pushes an
-    /// acked Mail again, and its body stays on the log.
-    inbox: HashMap<String, Option<Mail>>,
-    /// The Mail awaiting an Ack, in arrival order: what a Register has to push.
-    pending: BTreeMap<u64, String>,
-    next_seq: u64,
-    acked: HashSet<String>,
+    store: Arc<DaemonStore>,
     /// Receipts committed locally and not yet confirmed upstream, in commit
     /// order. Replayed after every reconnect, because the coordinator's ack
     /// handler is idempotent and a locally committed receipt that never
@@ -82,13 +62,9 @@ struct State {
 
 impl State {
     /// Nothing delivered or acked yet: what a replay starts from.
-    fn new(log: DurLog) -> State {
+    fn new(store: DaemonStore) -> State {
         State {
-            log,
-            inbox: HashMap::new(),
-            pending: BTreeMap::new(),
-            next_seq: 0,
-            acked: HashSet::new(),
+            store: Arc::new(store),
             receipts: Vec::new(),
             sessions: HashMap::new(),
             declared: HashMap::new(),
@@ -138,13 +114,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
             "expected --listen with --client-token-env, saw none",
         ));
     }
-    let (log, prior) = DurLog::open(&cfg.data)?;
-    let mut state = State::new(log);
-    for line in prior {
-        if let Ok(v) = json::parse(&line?) {
-            apply(&mut state, &v);
-        }
-    }
+    let (store, prior) = DaemonStore::open(&cfg.data)?;
+    let mut state = State::new(store);
+    state.receipts = prior
+        .receipts
+        .into_iter()
+        .map(|r| Receipt {
+            mail: r.mail_id,
+            session: r.session,
+            record: r.record_id,
+        })
+        .collect();
     // Bind before dialing upstream: a daemon refused its socket or TCP address
     // must not have joined the coordinator first.
     #[cfg(unix)]
@@ -300,78 +280,6 @@ fn bind_socket(path: &Path) -> io::Result<UnixListener> {
         },
     }
     UnixListener::bind(path)
-}
-
-fn apply(state: &mut State, v: &Value) {
-    match v.get("ev").and_then(|x| x.as_str()) {
-        Some("deliver") => {
-            if let (Ok(mail), Ok(from), Ok(to), Ok(body)) = (
-                net::field(v, "mail"),
-                net::field(v, "from"),
-                net::field(v, "to"),
-                net::field(v, "body"),
-            ) {
-                if !state.inbox.contains_key(mail) {
-                    hold(
-                        state,
-                        mail,
-                        (from, to, body),
-                        net::kind_of(v),
-                        net::headers_of(v),
-                    );
-                }
-            }
-        }
-        Some("receipt") => {
-            if let (Ok(mail), Ok(session), Ok(record)) = (
-                net::field(v, "mail"),
-                net::field(v, "session"),
-                net::field(v, "record"),
-            ) {
-                if state.acked.insert(mail.to_string()) {
-                    settle(state, mail);
-                    state.receipts.push(Receipt {
-                        mail: mail.to_string(),
-                        session: session.to_string(),
-                        record: record.to_string(),
-                    });
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Keep a Mail whose `deliver` line is on the log until its Ack. One that is
-/// already acked is only noted: it is never pushed.
-fn hold(
-    state: &mut State,
-    mail: &str,
-    (from, to, body): (&str, &str, &str),
-    kind: String,
-    headers: Value,
-) {
-    let held = (!state.acked.contains(mail)).then(|| {
-        let seq = state.next_seq;
-        state.next_seq += 1;
-        state.pending.insert(seq, mail.to_string());
-        Mail {
-            from: from.into(),
-            to: to.into(),
-            body: body.into(),
-            kind,
-            headers,
-            seq,
-        }
-    });
-    state.inbox.insert(mail.to_string(), held);
-}
-
-/// The Ack for `mail` is on the log: drop the Mail, keep its id.
-fn settle(state: &mut State, mail: &str) {
-    if let Some(m) = state.inbox.get_mut(mail).and_then(Option::take) {
-        state.pending.remove(&m.seq);
-    }
 }
 
 fn upstream_loop(cfg: Arc<Config>, state: Arc<Mutex<State>>) {
@@ -584,7 +492,11 @@ fn upstream_link(
                 if kind == "acked" {
                     if let Ok(mail) = net::field(&v, "mail") {
                         let mail = mail.to_string();
-                        state.lock().unwrap().receipts.retain(|r| r.mail != mail);
+                        let session = v.get("session").and_then(Value::as_str);
+                        let mut st = state.lock().unwrap();
+                        st.store.confirm_receipt(&mail, session)?;
+                        st.receipts
+                            .retain(|r| r.mail != mail || session.is_some_and(|s| s != r.session));
                     }
                 }
                 let waiter = v
@@ -646,33 +558,26 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
     let mail_id = net::field(v, "mail")?.to_string();
     let mut push: Option<(Writer, Value)> = None;
     {
-        let mut st = state.lock().unwrap();
-        if !st.inbox.contains_key(&mail_id) {
-            let (from, to, body) = (
-                net::field(v, "from")?,
-                net::field(v, "to")?,
-                net::field(v, "body")?,
-            );
-            let (kind, headers) = (net::kind_of(v), net::headers_of(v));
-            let ev = obj(vec![
-                ("ev", s("deliver")),
-                ("mail", s(&mail_id)),
-                ("from", s(from)),
-                ("to", s(to)),
-                ("body", s(body)),
-                ("kind", s(&kind)),
-                ("headers", headers.clone()),
-            ]);
-            st.log.append(&json::stringify(&ev))?;
-            hold(&mut st, &mail_id, (from, to, body), kind, headers);
-        }
-        // Held means not yet acked.
-        if let Some(Some(m)) = st.inbox.get(&mail_id) {
+        let st = state.lock().unwrap();
+        let row = DaemonDeliverRow {
+            mail_id: mail_id.clone(),
+            from: net::field(v, "from")?.into(),
+            to: net::field(v, "to")?.into(),
+            body: net::field(v, "body")?.into(),
+            kind: net::kind_of(v),
+            headers: net::headers_of(v),
+            group: v.get("group").and_then(Value::as_str).map(str::to_string),
+            article_num: v.get("article").and_then(Value::as_i64),
+        };
+        st.store.insert_deliver(&row)?;
+        if let Some(m) = st
+            .store
+            .pending_for_session(&row.to)?
+            .iter()
+            .find(|m| m.mail_id == mail_id)
+        {
             if let Some(w) = st.sessions.get(&m.to) {
-                push = Some((
-                    Arc::clone(w),
-                    net::deliver_msg(&mail_id, &m.from, &m.to, &m.body, &m.kind, &m.headers),
-                ));
+                push = Some((Arc::clone(w), delivery(m)));
             }
         }
     }
@@ -915,13 +820,10 @@ fn local_loop(
                         None => st.declared.remove(&session),
                     };
                     let pending: Vec<Value> = st
-                        .pending
-                        .values()
-                        .filter_map(|id| Some((id, st.inbox.get(id)?.as_ref()?)))
-                        .filter(|(_, m)| m.to == session)
-                        .map(|(id, m)| {
-                            net::deliver_msg(id, &m.from, &m.to, &m.body, &m.kind, &m.headers)
-                        })
+                        .store
+                        .pending_for_session(&session)?
+                        .iter()
+                        .map(delivery)
                         .collect();
                     let mut msg = register_msg(
                         &session,
@@ -966,15 +868,24 @@ fn local_loop(
                     ("type", s("send")),
                     ("mail", s(net::field(&v, "mail")?)),
                     ("from", s(net::field(&v, "from")?)),
-                    ("to", s(net::field(&v, "to")?)),
                     ("body", s(net::field(&v, "body")?)),
                 ];
+                match (v.get("to"), v.get("group")) {
+                    (Some(to), None) => up.push(("to", to.clone())),
+                    (None, Some(group)) => up.push(("group", group.clone())),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "expected to or group",
+                        ))
+                    }
+                }
                 // Headers are the coordinator's to check; this hop forwards them as given.
                 if let Some(h) = v.get("headers") {
                     up.push(("headers", h.clone()));
                 }
                 let resp = upstream_request(state, obj(up))?;
-                let answer = if net::field(&resp, "type")? == "error" {
+                let mut answer = if net::field(&resp, "type")? == "error" {
                     obj(vec![
                         ("type", s("error")),
                         ("req", Value::Int(req)),
@@ -987,6 +898,13 @@ fn local_loop(
                         ("mail", s(net::field(&resp, "mail")?)),
                     ])
                 };
+                if let Value::Obj(pairs) = &mut answer {
+                    for key in ["group", "article"] {
+                        if let Some(value) = resp.get(key) {
+                            pairs.push((key.into(), value.clone()));
+                        }
+                    }
+                }
                 net::send(writer, &answer)?;
             }
             "relabel" => {
@@ -1012,19 +930,7 @@ fn local_loop(
                 let record = net::field(&v, "record")?.to_string();
                 {
                     let mut st = state.lock().unwrap();
-                    if !st.acked.contains(&mail) {
-                        let ev = obj(vec![
-                            ("ev", s("receipt")),
-                            ("mail", s(&mail)),
-                            ("session", s(&session)),
-                            ("record", s(&record)),
-                        ]);
-                        // Durable first: a receipt that is acked in memory but
-                        // absent from the log would never be replayed, and a
-                        // retry would not commit it either.
-                        st.log.append(&json::stringify(&ev))?;
-                        st.acked.insert(mail.clone());
-                        settle(&mut st, &mail);
+                    if st.store.settle_ack(&mail, &session, &record)? {
                         st.receipts.push(Receipt {
                             mail: mail.clone(),
                             session: session.clone(),
@@ -1064,7 +970,7 @@ fn local_loop(
             }
             // Claims, the Board and Receipts live only at the coordinator, so
             // the host daemon relays them and answers under the session's own req.
-            "claim" | "board" | "receipt" => {
+            "claim" | "board" | "receipt" | "subscribe" | "unsubscribe" | "groups" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let mut upstream = v.clone();
                 if let Value::Obj(pairs) = &mut upstream {
@@ -1084,41 +990,35 @@ fn local_loop(
     Ok(())
 }
 
+fn delivery(m: &DaemonDeliverRow) -> Value {
+    let mut v = net::deliver_msg(&m.mail_id, &m.from, &m.to, &m.body, &m.kind, &m.headers);
+    if let Value::Obj(pairs) = &mut v {
+        if let Some(g) = &m.group {
+            pairs.push(("group".into(), s(g)));
+        }
+        if let Some(n) = m.article_num {
+            pairs.push(("article".into(), Value::Int(n)));
+        }
+    }
+    v
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn an_ack_drops_the_mail_and_keeps_its_id() {
-        let path = std::env::temp_dir().join(format!("roger-daemon-{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let (log, mut prior) = DurLog::open(&path).unwrap();
-        assert!(prior.next().is_none());
-        let _ = std::fs::remove_file(&path);
-        let mut st = State::new(log);
-        for line in [
-            r#"{"ev":"deliver","mail":"m1","from":"a","to":"b","body":"one","kind":"directed","headers":{}}"#,
-            r#"{"ev":"deliver","mail":"m2","from":"a","to":"b","body":"two","kind":"directed","headers":{}}"#,
-            r#"{"ev":"deliver","mail":"m3","from":"a","to":"c","body":"three","kind":"broadcast","headers":{}}"#,
-            r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-1"}"#,
-            // A receipt whose delivery this log holds later, or never.
-            r#"{"ev":"receipt","mail":"m4","session":"b","record":"r-2"}"#,
-            r#"{"ev":"deliver","mail":"m4","from":"a","to":"b","body":"four","kind":"directed","headers":{}}"#,
-            r#"{"ev":"receipt","mail":"m5","session":"b","record":"r-3"}"#,
-        ] {
-            apply(&mut st, &json::parse(line).unwrap());
-        }
-        // Awaiting an Ack, in arrival order: only what was never acked.
-        let waiting: Vec<&str> = st.pending.values().map(String::as_str).collect();
-        assert_eq!(waiting, ["m2", "m3"]);
-        for (mail, held) in [("m1", false), ("m2", true), ("m3", true), ("m4", false)] {
-            assert_eq!(st.inbox[mail].is_some(), held, "{mail}");
-        }
-        // Every delivered id is still known, so a second push logs nothing new.
-        assert!(!st.inbox.contains_key("m5"));
-        assert_eq!(st.inbox.len(), 4);
-        // Every receipt is still replayed upstream.
-        let replayed: Vec<&str> = st.receipts.iter().map(|r| r.mail.as_str()).collect();
-        assert_eq!(replayed, ["m1", "m4", "m5"]);
+    fn group_delivery_fields() {
+        let m = DaemonDeliverRow {
+            mail_id: "m".into(),
+            from: "a".into(),
+            to: "b".into(),
+            body: "text".into(),
+            kind: "group".into(),
+            headers: obj(vec![]),
+            group: Some("g".into()),
+            article_num: Some(9),
+        };
+        let v = delivery(&m);
+        assert_eq!(v.get("group").and_then(Value::as_str), Some("g"));
+        assert_eq!(v.get("article").and_then(Value::as_i64), Some(9));
     }
 }

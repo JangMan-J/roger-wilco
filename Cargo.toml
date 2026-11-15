@@ -15,8 +15,11 @@ name = "roger"
 path = "src/main.rs"
 
 [dependencies]
+rusqlite = { version = "0.37.0", default-features = false }
 
 [features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
 # Test-only hooks (`--hold-before-ack`); release and deploy builds leave them out.
 test-hooks = []
 

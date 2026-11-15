@@ -311,9 +311,10 @@ fn takeover_disconnected_restore_is_quiet_and_failed_observer_does_not_block_win
     drop(a);
     wait_connected(&rig, "a.sock", false);
     let b = takeover_socket(&rig, "b.sock", RECIPIENT, true);
-    assert!(!fs::read_to_string(rig.p("coord.log"))
-        .unwrap()
-        .contains("\"ev\":\"takeover\""));
+    assert_eq!(
+        rows_of(&rig.coord_records("coord.log"), "TAKEOVER").len(),
+        0
+    );
     b.get_ref().shutdown(std::net::Shutdown::Read).unwrap();
     let mut c = takeover_socket(&rig, "b.sock", RECIPIENT, true);
     writeln!(c.get_mut(), "{{\"type\":\"board\"}}").unwrap();
@@ -325,10 +326,7 @@ fn takeover_disconnected_restore_is_quiet_and_failed_observer_does_not_block_win
     wait_connected(&rig, "a.sock", false);
     let _d = takeover_socket(&rig, "a.sock", RECIPIENT, true);
     assert_eq!(
-        fs::read_to_string(rig.p("coord.log"))
-            .unwrap()
-            .matches("\"ev\":\"takeover\"")
-            .count(),
+        rows_of(&rig.coord_records("coord.log"), "TAKEOVER").len(),
         1
     );
 }
@@ -360,10 +358,7 @@ fn takeover_socket_opt_out_and_disconnected_restore_have_no_notice() {
         Some("board")
     );
     assert_eq!(
-        fs::read_to_string(rig.p("coord.log"))
-            .unwrap()
-            .matches("\"ev\":\"takeover\"")
-            .count(),
+        rows_of(&rig.coord_records("coord.log"), "TAKEOVER").len(),
         1
     );
 }
@@ -483,13 +478,14 @@ fn takeover_socket_correlation_old_ack_and_release_keep_winner() {
         }
         assert_eq!(notice.get("type").unwrap().as_str(), Some("superseded"));
         assert_eq!(notice.get("host").unwrap().as_str(), Some(host));
-        let log = fs::read_to_string(rig.p("coord.log")).unwrap();
-        assert!(log.lines().map(|l| json::parse(l).unwrap()).any(|e| e
-            .get("ev")
-            .and_then(json::Value::as_str)
-            == Some("takeover")
-            && e.get("host") == notice.get("host")
-            && e.get("at_ms") == notice.get("at_ms")));
+        let rows = rig.coord_records("coord.log");
+        assert!(
+            rows_of(&rows, "TAKEOVER")
+                .iter()
+                .any(|e| e.get("host") == notice.get("host")
+                    && e.get("at_ms") == notice.get("at_ms")),
+            "{rows:?}"
+        );
     }
     writeln!(
         a.get_mut(),
@@ -530,8 +526,10 @@ fn takeover_adapter_legacy_stdout_stays_reply_only_and_process_can_send() {
         let flags: &[&str] = if confirm { &["--registered"] } else { &[] };
         let (idx, mut input) =
             rig.start_adapter("a.sock", RECIPIENT, "old.store", "old.out", flags);
-        // A Board on this connection is not the Register stream; wait on the log.
-        wait_for_text(&rig.p("coord.log"), RECIPIENT, Duration::from_secs(5));
+        // A Board on this connection is not the Register stream; wait on the records.
+        rig.wait_coord("coord.log", Duration::from_secs(5), "its Register", |r| {
+            session_count(r, "REGISTER", RECIPIENT) > 0
+        });
         if confirm {
             wait_for_text(&rig.p("old.out"), "registered", Duration::from_secs(5));
         }
@@ -633,10 +631,7 @@ fn takeover_offline_replacements_are_retained_but_restore_is_not_replacement() {
         Some("board")
     );
     assert_eq!(
-        fs::read_to_string(rig.p("coord.log"))
-            .unwrap()
-            .matches("\"ev\":\"takeover\"")
-            .count(),
+        rows_of(&rig.coord_records("coord.log"), "TAKEOVER").len(),
         2
     );
 }
@@ -1175,6 +1170,200 @@ fn count_lines_with(text: &str, needle: &str) -> usize {
     text.lines().filter(|l| l.contains(needle)).count()
 }
 
+// ---- the stack's records, read through `roger audit --json` ----
+//
+// The coordinator keeps its records under `<data>.slices/` and a host daemon
+// under `<data>.sqlite`; `roger audit` reads either read-only (and a legacy
+// log file the same way), so the tests read records only through it.
+
+/// `roger audit <args> --json`, one parsed object per output line, or the
+/// error output while an input cannot be read yet.
+fn try_audit(args: &[String]) -> Result<Vec<json::Value>, String> {
+    let out = Command::new(BIN)
+        .arg("audit")
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    Ok(String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| json::parse(l).unwrap_or_else(|e| panic!("audit line {l:?}: {e}")))
+        .collect())
+}
+
+impl Rig {
+    /// Audit argv: `flag` (`--coordinator-log` or `--daemon-log`) on this
+    /// rig's `--data` file `data`, then `extra` verbatim.
+    fn audit_args(&self, flag: &str, data: &str, extra: &[&str]) -> Vec<String> {
+        let mut args = vec![flag.to_string(), self.p(data).to_str().unwrap().to_string()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    fn records(&self, flag: &str, data: &str, extra: &[&str]) -> Vec<json::Value> {
+        let args = self.audit_args(flag, data, extra);
+        try_audit(&args).unwrap_or_else(|e| panic!("roger audit {args:?}: {e}"))
+    }
+
+    /// What the coordinator started with `--data <data>` holds.
+    fn coord_records(&self, data: &str) -> Vec<json::Value> {
+        self.records("--coordinator-log", data, &[])
+    }
+
+    /// The same, with a BODY row after each MAIL row.
+    fn coord_bodies(&self, data: &str) -> Vec<json::Value> {
+        self.records("--coordinator-log", data, &["--bodies"])
+    }
+
+    /// What the host daemon started with `--data <data>` still holds:
+    /// deliveries no session acked, receipts the coordinator has not confirmed.
+    fn daemon_records(&self, data: &str) -> Vec<json::Value> {
+        self.records("--daemon-log", data, &[])
+    }
+
+    /// Read `flag`'s records under `data` until `done` holds, and return them.
+    fn wait_audit(
+        &self,
+        flag: &str,
+        data: &str,
+        timeout: Duration,
+        what: &str,
+        done: impl Fn(&[json::Value]) -> bool,
+    ) -> Vec<json::Value> {
+        let start = Instant::now();
+        loop {
+            let got = try_audit(&self.audit_args(flag, data, &[]));
+            if let Ok(rows) = &got {
+                if done(rows) {
+                    return got.unwrap();
+                }
+            }
+            assert!(start.elapsed() < timeout, "{what}: {got:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_coord(
+        &self,
+        data: &str,
+        timeout: Duration,
+        what: &str,
+        done: impl Fn(&[json::Value]) -> bool,
+    ) -> Vec<json::Value> {
+        self.wait_audit("--coordinator-log", data, timeout, what, done)
+    }
+
+    /// Wait until the coordinator under `data` holds a receipt for `mail`, and
+    /// return its MAIL row. The Mail is never committed twice meanwhile.
+    fn wait_receipt(&self, data: &str, mail: &str, timeout: Duration) -> json::Value {
+        let rows = self.wait_coord(data, timeout, &format!("a receipt for {mail}"), |r| {
+            let rows = mail_rows(r, mail);
+            assert!(rows.len() <= 1, "{mail} committed twice: {rows:?}");
+            rows.first().is_some_and(|row| is_receipted(row))
+        });
+        mail_rows(&rows, mail)[0].clone()
+    }
+}
+
+/// The rows of one audit type, in order.
+fn rows_of<'a>(rows: &'a [json::Value], ty: &str) -> Vec<&'a json::Value> {
+    rows.iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some(ty))
+        .collect()
+}
+
+/// The MAIL rows for one Mail id (a Broadcast copy's id is `<mail>/<to>`).
+fn mail_rows<'a>(rows: &'a [json::Value], mail: &str) -> Vec<&'a json::Value> {
+    rows_of(rows, "MAIL")
+        .into_iter()
+        .filter(|v| str_field(v, "mail") == mail)
+        .collect()
+}
+
+fn is_receipted(row: &json::Value) -> bool {
+    str_field(row, "record") != "pending"
+}
+
+/// Every receipt the coordinator holds: those joined to a Mail, and strays.
+fn receipts_held(rows: &[json::Value]) -> usize {
+    rows_of(rows, "MAIL")
+        .into_iter()
+        .filter(|v| is_receipted(v))
+        .count()
+        + rows_of(rows, "STRAY_RECEIPT").len()
+}
+
+/// MAIL rows of one Kind.
+fn kind_count(rows: &[json::Value], kind: &str) -> usize {
+    rows_of(rows, "MAIL")
+        .into_iter()
+        .filter(|v| str_field(v, "kind") == kind)
+        .count()
+}
+
+/// The recipients of Broadcast `mail`'s copies, in order.
+fn copies_of(rows: &[json::Value], mail: &str) -> Vec<String> {
+    let prefix = format!("{mail}/");
+    rows_of(rows, "MAIL")
+        .into_iter()
+        .filter(|v| {
+            str_field(v, "kind") == "broadcast" && str_field(v, "mail").starts_with(&prefix)
+        })
+        .map(|v| str_field(v, "to").to_string())
+        .collect()
+}
+
+/// The header set of `mail`'s one HEADERS row, as JSON text, key order kept.
+fn headers_of(rows: &[json::Value], mail: &str) -> String {
+    let found: Vec<_> = rows_of(rows, "HEADERS")
+        .into_iter()
+        .filter(|v| str_field(v, "mail") == mail)
+        .collect();
+    assert_eq!(found.len(), 1, "HEADERS for {mail}: {rows:?}");
+    json::stringify(found[0].get("headers").unwrap())
+}
+
+/// The bodies of `mail`'s BODY rows.
+fn bodies_of(rows: &[json::Value], mail: &str) -> Vec<String> {
+    rows_of(rows, "BODY")
+        .into_iter()
+        .filter(|v| str_field(v, "mail") == mail)
+        .map(|v| str_field(v, "body").to_string())
+        .collect()
+}
+
+/// Rows of one type naming `address`.
+fn session_count(rows: &[json::Value], ty: &str, address: &str) -> usize {
+    rows_of(rows, ty)
+        .into_iter()
+        .filter(|v| v.get("address").and_then(|x| x.as_str()) == Some(address))
+        .count()
+}
+
+/// Host daemon rows of one type (`DAEMON_DELIVER`, `DAEMON_RECEIPT`) for `mail`.
+fn daemon_count(rows: &[json::Value], ty: &str, mail: &str) -> usize {
+    rows_of(rows, ty)
+        .into_iter()
+        .filter(|v| str_field(v, "mail") == mail)
+        .count()
+}
+
+/// host-b's daemon holds one unconfirmed receipt for `mail`: RECIPIENT's, naming r-1.
+fn assert_host_holds_receipt(rig: &Rig, mail: &str) {
+    let rows = rig.daemon_records("b.log");
+    let held: Vec<_> = rows_of(&rows, "DAEMON_RECEIPT")
+        .into_iter()
+        .filter(|v| str_field(v, "mail") == mail)
+        .collect();
+    assert_eq!(held.len(), 1, "{rows:?}");
+    assert_eq!(str_field(held[0], "session"), RECIPIENT, "{rows:?}");
+    assert_eq!(str_field(held[0], "record"), "r-1", "{rows:?}");
+}
+
 #[test]
 fn receipt_survives_a_host_daemon_restart() {
     let mut rig = Rig::new("daemon-restart");
@@ -1184,37 +1373,27 @@ fn receipt_survives_a_host_daemon_restart() {
     rig.send("m-restart", "acked before the host daemon restarts");
     wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
 
-    // Coordinator down, so the ack can only be committed to the host log.
+    // Coordinator down, so the ack can only be committed on the host.
     rig.kill(0);
     rig.kill(recipient);
     rig.start_recipient("recipient2.out", true);
+    // The session prints DELIVERED once the host daemon committed the receipt.
     wait_for_text(
-        &rig.p("b.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-restart\"",
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-restart record=r-1",
         Duration::from_secs(10),
     );
+    assert_host_holds_receipt(&rig, "m-restart");
 
     // Nothing live may be able to produce the receipt from here on: the
     // session is gone and the daemon that committed it is replaced by one
-    // whose receipts come only from replaying that log.
+    // whose receipts come only from what it committed to disk.
     rig.kill(4);
     rig.restart_recipient_daemon();
     rig.restart_coordinator();
 
-    let start = Instant::now();
-    loop {
-        let coord = read(&rig.p("coord.log"));
-        let rows = count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-restart\"");
-        if rows == 1 {
-            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
-            return;
-        }
-        assert!(rows <= 1, "receipt duplicated: {coord}");
-        if start.elapsed() > Duration::from_secs(20) {
-            panic!("a receipt committed before the daemon restart never reached the coordinator: {coord}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let row = rig.wait_receipt("coord.log", "m-restart", Duration::from_secs(20));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
 }
 
 #[test]
@@ -1231,10 +1410,11 @@ fn receipt_survives_an_upstream_that_never_accepted_the_mail() {
     rig.kill(recipient);
     rig.start_recipient("recipient2.out", true);
     wait_for_text(
-        &rig.p("b.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-orphan\"",
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-orphan record=r-1",
         Duration::from_secs(10),
     );
+    assert_host_holds_receipt(&rig, "m-orphan");
 
     // A coordinator with an empty store never accepted m-orphan, so it cannot
     // record a receipt for it. Its refusal must not be read as confirmation:
@@ -1248,30 +1428,19 @@ fn receipt_survives_an_upstream_that_never_accepted_the_mail() {
         "upstream refused the replayed receipt for m-orphan",
         Duration::from_secs(15),
     );
-    let empty = read(&rig.p("coord-empty.log"));
+    let empty = rig.coord_records("coord-empty.log");
     assert_eq!(
-        count_lines_with(&empty, "\"ev\":\"receipt\""),
+        receipts_held(&empty),
         0,
-        "a coordinator that never accepted the mail cannot hold a receipt: {empty}"
+        "a coordinator that never accepted the mail cannot hold a receipt: {empty:?}"
     );
+    assert_host_holds_receipt(&rig, "m-orphan");
 
     // The coordinator that did accept it comes back, and the same receipt must
     // still be queued to reach it.
     rig.restart_coordinator_on("coord.log", "coord4");
-    let start = Instant::now();
-    loop {
-        let coord = read(&rig.p("coord.log"));
-        let rows = count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-orphan\"");
-        if rows == 1 {
-            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
-            return;
-        }
-        assert!(rows <= 1, "receipt duplicated: {coord}");
-        if start.elapsed() > Duration::from_secs(20) {
-            panic!("a refusal from one coordinator dropped the receipt for the next: {coord}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let row = rig.wait_receipt("coord.log", "m-orphan", Duration::from_secs(20));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
 }
 
 #[test]
@@ -1289,53 +1458,34 @@ fn receipt_reaches_the_coordinator_after_it_returns() {
     rig.start_recipient("recipient2.out", true);
 
     // Pin the ordering before anything is restarted: the receipt must be
-    // durable in the host daemon's own log, and the session must be answered,
-    // while the coordinator is still down. Without these two waits the rest
-    // of the test could pass through a live forward after the restart.
-    wait_for_text(
-        &rig.p("b.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-late\"",
-        Duration::from_secs(10),
-    );
+    // durable on the host daemon, and the session must be answered, while the
+    // coordinator is still down. Without these two checks the rest of the
+    // test could pass through a live forward after the restart.
     wait_for_text(
         &rig.p("recipient2.out"),
         "DELIVERED mail=m-late record=r-1",
         Duration::from_secs(10),
     );
+    assert_host_holds_receipt(&rig, "m-late");
 
-    let coord = read(&rig.p("coord.log"));
+    let coord = rig.coord_records("coord.log");
     assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"receipt\""),
+        receipts_held(&coord),
         0,
-        "no receipt can exist while the coordinator is down: {coord}"
+        "no receipt can exist while the coordinator is down: {coord:?}"
     );
 
     rig.restart_coordinator();
-    let start = Instant::now();
-    loop {
-        let coord = read(&rig.p("coord.log"));
-        if count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-late\"") == 1 {
-            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
-            // The restarted coordinator re-pushes pending mail on hello before
-            // the replayed ack arrives; the body must still be in the Store
-            // exactly once.
-            let store = read(&rig.p("recipient.store"));
-            assert_eq!(
-                store.lines().count(),
-                1,
-                "re-push after the coordinator returned duplicated the body: {store}"
-            );
-            return;
-        }
-        assert!(
-            count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-late\"") <= 1,
-            "receipt duplicated: {coord}"
-        );
-        if start.elapsed() > Duration::from_secs(15) {
-            panic!("locally committed receipt never reached the coordinator: {coord}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let row = rig.wait_receipt("coord.log", "m-late", Duration::from_secs(15));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
+    // The restarted coordinator re-pushes pending mail on hello before the
+    // replayed ack arrives; the body must still be in the Store exactly once.
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(
+        store.lines().count(),
+        1,
+        "re-push after the coordinator returned duplicated the body: {store}"
+    );
 }
 
 #[test]
@@ -1358,8 +1508,8 @@ fn mail_survives_recipient_kill_between_store_and_ack() {
     rig.kill(recipient);
 
     // No receipt may exist yet.
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"receipt\""), 0, "{coord}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(receipts_held(&coord), 0, "{coord:?}");
 
     rig.start_recipient("recipient2.out", true);
     wait_for_text(
@@ -1376,20 +1526,12 @@ fn mail_survives_recipient_kill_between_store_and_ack() {
     );
     assert_eq!(count_lines_with(&store, body), 1, "{store}");
 
-    let coord = read(&rig.p("coord.log"));
+    // One MAIL row, no duplicate, and its receipt names the Store record.
+    let row = rig.wait_receipt("coord.log", "m-kill", Duration::from_secs(10));
     assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"mail\",\"mail\":\"m-kill\""),
-        1,
-        "no duplicate row: {coord}"
-    );
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-kill\""),
-        1,
-        "{coord}"
-    );
-    assert!(
-        coord.contains("\"record\":\"r-1\""),
-        "receipt names the Store record: {coord}"
+        str_field(&row, "record"),
+        "r-1",
+        "receipt names the Store record: {row:?}"
     );
 }
 
@@ -1528,17 +1670,8 @@ fn directed_mail_round_trips_once_in_order() {
     let second = store.find("second").unwrap();
     assert!(first < second, "order preserved: {store}");
 
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"mail\",\"mail\":\"m-1\""),
-        1,
-        "{coord}"
-    );
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-1\""),
-        1,
-        "{coord}"
-    );
+    let row = rig.wait_receipt("coord.log", "m-1", Duration::from_secs(10));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
 }
 
 #[test]
@@ -1601,13 +1734,8 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     );
     let store = read(&rig.p("adapter.store"));
     assert_eq!(count_lines_with(&store, body_in), 1, "{store}");
-    wait_for_text(
-        &rig.p("coord.log"),
-        "\"ev\":\"receipt\",\"mail\":\"s-2\"",
-        Duration::from_secs(10),
-    );
-    let coord = read(&rig.p("coord.log"));
-    assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+    let row = rig.wait_receipt("coord.log", "s-2", Duration::from_secs(10));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
 }
 
 /// An Address may be the whole composite `[[<token>:<label>:<token>]]<uuid>`, tokens base 36 and several characters long
@@ -1653,14 +1781,14 @@ fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel
         "{stored}"
     );
     assert_eq!(count_lines_with(&stored, body_out), 1, "{stored}");
-    let coord = read(&rig.p("coord.log"));
+    let coord = rig.coord_records("coord.log");
+    let whole = rows_of(&coord, "MAIL")
+        .into_iter()
+        .filter(|v| str_field(v, "from") == AGENT && str_field(v, "to") == DIRECTOR)
+        .count();
     assert_eq!(
-        count_lines_with(
-            &coord,
-            &format!("\"from\":\"{AGENT}\",\"to\":\"{DIRECTOR}\"")
-        ),
-        1,
-        "coordinator log keeps both Addresses whole: {coord}"
+        whole, 1,
+        "the coordinator keeps both Addresses whole: {coord:?}"
     );
 
     // Reply: director -> agent, to the whole composite; the agent's client is
@@ -1695,11 +1823,7 @@ fn a_composite_address_round_trips_send_store_deliver_reply_and_survives_relabel
         &format!("\"type\":\"mail\",\"mail\":\"c-2\",\"from\":\"{DIRECTOR}\",\"body\":\"answer\",\"record\":\"r-1\""),
         Duration::from_secs(10),
     );
-    wait_for_text(
-        &rig.p("coord.log"),
-        "\"ev\":\"receipt\",\"mail\":\"c-2\"",
-        Duration::from_secs(10),
-    );
+    rig.wait_receipt("coord.log", "c-2", Duration::from_secs(10));
     assert_eq!(count_lines_with(&read(&rig.p("agent.store")), "answer"), 1);
 
     // Relabel: the display label changes; the Address, inner label included,
@@ -1767,8 +1891,8 @@ fn adapter_rejects_a_malformed_send_and_keeps_serving() {
     );
     let out = read(&rig.p("adapter.out"));
     assert_eq!(count_lines_with(&out, "\"type\":\"error\""), 2, "{out}");
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(kind_count(&coord, "directed"), 1, "{coord:?}");
 }
 
 #[test]
@@ -1838,11 +1962,7 @@ fn adapter_redelivery_after_a_kill_reports_the_same_record() {
             "{out}: {text}"
         );
     }
-    wait_for_text(
-        &rig.p("coord.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-1\"",
-        Duration::from_secs(10),
-    );
+    rig.wait_receipt("coord.log", "m-1", Duration::from_secs(10));
     let store = read(&rig.p("adapter.store"));
     assert_eq!(count_lines_with(&store, "held body"), 1, "{store}");
 }
@@ -1974,8 +2094,8 @@ fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
     assert_eq!(code, 0, "{out}");
     assert_one_holder(&rig, RECIPIENT);
 
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"release\""), 0, "{coord}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(rows_of(&coord, "RELEASE").len(), 0, "{coord:?}");
 }
 
 #[test]
@@ -2051,17 +2171,24 @@ fn start_session(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str) ->
     idx
 }
 
-fn wait_for_count(path: &Path, needle: &str, n: usize) {
-    let start = Instant::now();
-    while count_lines_with(&read(path), needle) != n {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "expected {n} lines with {needle:?} in {}: {}",
-            path.display(),
-            read(path)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+/// Wait until the coordinator holds exactly `n` Registers.
+fn wait_registers(rig: &Rig, n: usize) {
+    rig.wait_coord(
+        "coord.log",
+        Duration::from_secs(10),
+        &format!("{n} Registers"),
+        |r| rows_of(r, "REGISTER").len() == n,
+    );
+}
+
+/// Wait until the coordinator holds exactly `n` receipts.
+fn wait_receipts(rig: &Rig, n: usize) {
+    rig.wait_coord(
+        "coord.log",
+        Duration::from_secs(10),
+        &format!("{n} receipts"),
+        |r| receipts_held(r) == n,
+    );
 }
 
 #[test]
@@ -2071,7 +2198,7 @@ fn broadcast_reaches_every_registered_session_once_with_kind_broadcast() {
     start_session(&mut rig, "a.sock", SENDER, "sender.store", "sender.out");
     start_session(&mut rig, "b.sock", THIRD, "third.store", "third.out");
     let recipient = rig.start_recipient("recipient1.out", true);
-    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 3);
+    wait_registers(&rig, 3);
 
     let body = "fleet notice [[0:FLEET:0]]";
     let output = Command::new(BIN)
@@ -2087,7 +2214,7 @@ fn broadcast_reaches_every_registered_session_once_with_kind_broadcast() {
     // restart the coordinator: the copy must come back from its log.
     wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
     rig.kill(recipient);
-    wait_for_count(&rig.p("coord.log"), "\"ev\":\"receipt\"", 2);
+    wait_receipts(&rig, 2);
     rig.restart_coordinator();
     rig.start_recipient("recipient2.out", true);
     wait_for_text(
@@ -2095,7 +2222,7 @@ fn broadcast_reaches_every_registered_session_once_with_kind_broadcast() {
         &format!("DELIVERED mail=b-1/{RECIPIENT} record=r-1"),
         Duration::from_secs(10),
     );
-    wait_for_count(&rig.p("coord.log"), "\"ev\":\"receipt\"", 3);
+    wait_receipts(&rig, 3);
 
     // A resent broadcast id commits and delivers nothing new.
     let again = Command::new(BIN)
@@ -2106,12 +2233,9 @@ fn broadcast_reaches_every_registered_session_once_with_kind_broadcast() {
         .output()
         .unwrap();
     assert!(again.status.success(), "{again:?}");
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"broadcast\""),
-        1,
-        "{coord}"
-    );
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(copies_of(&coord, "b-1").len(), 3, "{coord:?}");
+    assert_eq!(kind_count(&coord, "broadcast"), 3, "{coord:?}");
 
     for (store, out) in [
         ("sender.store", "sender.out"),
@@ -2144,7 +2268,7 @@ fn a_directed_mail_id_can_never_equal_a_broadcast_copy_id() {
     let mut rig = Rig::new("copy-id");
     rig.start_stack();
     rig.start_recipient("recipient.out", false);
-    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 1);
+    wait_registers(&rig, 1);
 
     // The id a broadcast `b-1` gives the recipient's copy, sent as directed
     // mail first: refused, so the broadcast's copy is still delivered.
@@ -2177,8 +2301,15 @@ fn a_directed_mail_id_can_never_equal_a_broadcast_copy_id() {
     let store = read(&rig.p("recipient.store"));
     assert_eq!(store.lines().count(), 1, "{store}");
     assert_eq!(count_lines_with(&store, "\"body\":\"real\""), 1, "{store}");
-    let coord = read(&rig.p("coord.log"));
-    assert!(!coord.contains("impostor"), "{coord}");
+    let coord = rig.coord_bodies("coord.log");
+    assert_eq!(bodies_of(&coord, &copy), ["real"], "{coord:?}");
+    assert!(
+        rows_of(&coord, "BODY")
+            .iter()
+            .all(|v| !str_field(v, "body").contains("impostor")),
+        "{coord:?}"
+    );
+    assert_eq!(kind_count(&coord, "directed"), 0, "{coord:?}");
 }
 
 /// A session's declared text is opaque: the Board returns it byte-identical
@@ -2219,13 +2350,9 @@ fn declared_text_reaches_the_board_verbatim_and_survives_a_coordinator_restart()
         let b = board(&rig, s);
         assert!(b.contains(&want), "{s}: {b}");
     }
-    let coord = read(&rig.p("coord.log"));
-    // The daemon's re-Register repeats the same text, which logs nothing new.
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"declared\""),
-        1,
-        "{coord}"
-    );
+    let coord = rig.coord_records("coord.log");
+    // The daemon's re-Register repeats the same text, which records nothing new.
+    assert_eq!(session_count(&coord, "DECLARED", RECIPIENT), 1, "{coord:?}");
 }
 
 /// RECIPIENT's Board row as (connected, last_seen_ms), read through `sock`
@@ -2396,15 +2523,7 @@ fn a_replayed_ack_is_not_activity() {
     // The new coordinator hears only the replayed receipt for RECIPIENT: no
     // Register, no live ack.
     rig.restart_coordinator();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while count_lines_with(
-        &read(&rig.p("coord.log")),
-        "\"ev\":\"receipt\",\"mail\":\"m-replay\"",
-    ) == 0
-    {
-        assert!(Instant::now() < deadline, "receipt never replayed");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    rig.wait_receipt("coord.log", "m-replay", Duration::from_secs(15));
     wait_until_board_reaches_both(&rig);
     assert_eq!(presence(&rig, "a.sock", None), (false, 0));
 }
@@ -2476,8 +2595,8 @@ fn relabel_of_an_unregistered_address_is_refused() {
         "{refused:?}"
     );
     assert!(label(RECIPIENT).status.success());
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"label\""), 1, "{coord}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(rows_of(&coord, "LABEL").len(), 1, "{coord:?}");
 }
 
 /// Wait until the Board read through `sock` does (`want`) or does not list
@@ -2508,11 +2627,11 @@ fn broadcast_from_sender(rig: &Rig, mail: &str) -> String {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    read(&rig.p("coord.log"))
-        .lines()
-        .find(|l| l.contains(&format!("\"ev\":\"broadcast\",\"mail\":\"{mail}\"")))
-        .unwrap_or_else(|| panic!("broadcast {mail} not committed"))
-        .to_string()
+    // Accepted means committed: the copies' recipients, comma-separated.
+    let rows = rig.coord_records("coord.log");
+    let to = copies_of(&rows, mail);
+    assert!(!to.is_empty(), "broadcast {mail} not committed: {rows:?}");
+    to.join(",")
 }
 
 /// A client closing the adapter's stdin ends the session on purpose: it leaves
@@ -2529,14 +2648,11 @@ fn adapter_stdin_eof_unregisters_at_once_and_keeps_later_mail() {
     drop(stdin);
     rig.children[idx].wait().unwrap();
     wait_board_lists(&rig, "a.sock", RECIPIENT, false);
-    let coord = read(&rig.p("coord.log"));
+    let coord = rig.coord_records("coord.log");
     assert_eq!(
-        count_lines_with(
-            &coord,
-            &format!("\"ev\":\"unregister\",\"session\":\"{RECIPIENT}\"")
-        ),
+        session_count(&coord, "UNREGISTER", RECIPIENT),
         1,
-        "{coord}"
+        "{coord:?}"
     );
     let b = broadcast_from_sender(&rig, "b-after");
     assert!(!b.contains(RECIPIENT), "{b}");
@@ -2567,27 +2683,24 @@ fn a_session_that_ends_at_once_keeps_its_mail_once_for_the_next_register() {
     let (idx, stdin) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended1.out", &[]);
     drop(stdin);
     rig.children[idx].wait().unwrap();
-    let unregister = format!("\"ev\":\"unregister\",\"session\":\"{RECIPIENT}\"");
-    wait_for_count(&rig.p("coord.log"), &unregister, 1);
+    rig.wait_coord(
+        "coord.log",
+        Duration::from_secs(10),
+        "one Unregister",
+        |r| session_count(r, "UNREGISTER", RECIPIENT) == 1,
+    );
 
     let (_, _stdin2) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "ended2.out", &[]);
-    wait_for_count(
-        &rig.p("coord.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-once\"",
-        1,
-    );
+    // One MAIL row, one receipt.
+    rig.wait_receipt("coord.log", "m-once", Duration::from_secs(10));
     let store = read(&rig.p("adapter.store"));
     assert_eq!(
         count_lines_with(&store, "\"mail\":\"m-once\""),
         1,
         "{store}"
     );
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"mail\",\"mail\":\"m-once\""),
-        1,
-        "{coord}"
-    );
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(mail_rows(&coord, "m-once").len(), 1, "{coord:?}");
 }
 
 /// A session that dies without unregistering stays registered while it is
@@ -3043,6 +3156,7 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
         ),
     )
     .unwrap();
+    let legacy = fs::read(rig.p("coord.log")).unwrap();
     rig.start_stack();
     assert_eq!(
         receipt_line(&rig, "old-1"),
@@ -3093,14 +3207,35 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
     let to_events = session_events(&rig, to);
     assert_eq!(
         kinds(&to_events),
-        ["session", "label", "declared", "receipt", "label"],
+        ["session", "label", "declared", "label"],
         "{to_events:?}"
     );
-    assert_eq!(str_field(&to_events[4], "label"), "new");
-    assert!(at_ms_of(&to_events[4]) >= before, "{to_events:?}");
-    for bare in &to_events[..4] {
-        assert!(bare.get("at_ms").is_none(), "{}", json::stringify(bare));
+    assert_eq!(str_field(&to_events[3], "label"), "new");
+    assert!(at_ms_of(&to_events[3]) >= before, "{to_events:?}");
+    for bare in &to_events[..3] {
+        assert_eq!(bare.get("at_ms"), Some(&json::Value::Null), "{bare:?}");
     }
+    // The old Mail and its receipt keep every stamp absent.
+    let coord = rig.coord_records("coord.log");
+    let old = mail_rows(&coord, "old-1");
+    assert_eq!(old.len(), 1, "{coord:?}");
+    assert_eq!(str_field(old[0], "record"), "r-1", "{coord:?}");
+    for stamp in ["accepted_at_ms", "receipted_at_ms", "latency_ms"] {
+        assert_eq!(
+            old[0].get(stamp),
+            Some(&json::Value::Null),
+            "{stamp}: {coord:?}"
+        );
+    }
+    let copy = mail_rows(&coord, &format!("old-b/{to}"));
+    assert_eq!(copy.len(), 1, "{coord:?}");
+    assert!(!is_receipted(copy[0]), "{coord:?}");
+    // Imported read-only: the old log is byte-identical.
+    assert_eq!(
+        fs::read(rig.p("coord.log")).unwrap(),
+        legacy,
+        "the old coordinator log changed"
+    );
 }
 
 /// The host daemon's wait for the coordinator to answer a forwarded ack runs
@@ -3134,17 +3269,11 @@ fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resum
         "receipt m-stall committed, upstream forward deferred: upstream did not answer",
         Duration::from_secs(15),
     );
-    assert_eq!(
-        count_lines_with(&read(&rig.p("coord.log")), "\"ev\":\"receipt\""),
-        0
-    );
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(receipts_held(&coord), 0, "{coord:?}");
     let resumed = epoch_ms();
     signal("-CONT");
-    wait_for_text(
-        &rig.p("coord.log"),
-        "\"ev\":\"receipt\",\"mail\":\"m-stall\"",
-        Duration::from_secs(2),
-    );
+    rig.wait_receipt("coord.log", "m-stall", Duration::from_secs(2));
     let line = receipt_line(&rig, "m-stall");
     let r = stamp_in(&line, "receipted_at_ms");
     assert!(
@@ -3189,7 +3318,13 @@ fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
     rig.kill(recipient);
     wait_connected(&rig, "a.sock", false);
     rig.send("m-inbox", "held by the daemon");
-    wait_for_text(&rig.p("b.log"), "m-inbox", Duration::from_secs(10));
+    rig.wait_audit(
+        "--daemon-log",
+        "b.log",
+        Duration::from_secs(10),
+        "m-inbox pending on host-b",
+        |r| daemon_count(r, "DAEMON_DELIVER", "m-inbox") == 1,
+    );
     // Daemon gone too: this Mail waits only at the coordinator.
     rig.kill(2);
     rig.send("m-coord", "held by the coordinator");
@@ -3217,15 +3352,13 @@ fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
 
     let store = read(&rig.p("recipient.store"));
     assert_eq!(store.lines().count(), 3, "{store}");
-    let coord = read(&rig.p("coord.log"));
     for mail in ["m-before", "m-inbox", "m-coord"] {
         assert_eq!(
             count_lines_with(&store, &format!("\"{mail}\"")),
             1,
             "{store}"
         );
-        let row = format!("\"ev\":\"receipt\",\"mail\":\"{mail}\"");
-        assert_eq!(count_lines_with(&coord, &row), 1, "{coord}");
+        rig.wait_receipt("coord.log", mail, Duration::from_secs(10));
     }
 }
 
@@ -3248,8 +3381,10 @@ fn kind_and_headers_round_trip_on_directed_and_broadcast_mail() {
     let mut rig = Rig::new("kind-headers");
     rig.start_stack();
     rig.register("a.sock", SENDER);
-    rig.start_recipient("recipient.out", false);
-    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 2);
+    // A raw connection holds RECIPIENT's Register and never acks, so host-b's
+    // daemon still holds both deliveries when its records are read.
+    let mut held = takeover_socket(&rig, "b.sock", RECIPIENT, false);
+    wait_registers(&rig, 2);
 
     let set = r#"{"z":"1","a":"","m":"héllo \"q\" \\ x"}"#;
     let out = send_with_headers(&rig, RECIPIENT, "h-1", &["z=1", "a=", "m=héllo \"q\" \\ x"]);
@@ -3257,6 +3392,27 @@ fn kind_and_headers_round_trip_on_directed_and_broadcast_mail() {
     let out = send_with_headers(&rig, "*", "hb-1", &["k=a=b"]);
     assert!(out.status.success(), "{out:?}");
     let copy = format!("hb-1/{RECIPIENT}");
+    for mail in ["h-1", copy.as_str()] {
+        let deliver = takeover_read(&mut held);
+        assert_eq!(str_field(&deliver, "type"), "deliver", "{deliver:?}");
+        assert_eq!(str_field(&deliver, "mail"), mail, "{deliver:?}");
+    }
+    let daemon = rig.daemon_records("b.log");
+    for (mail, kind, headers) in [
+        ("h-1", "directed", set.to_string()),
+        (copy.as_str(), "broadcast", r#"{"k":"a=b"}"#.to_string()),
+    ] {
+        let row: Vec<_> = rows_of(&daemon, "DAEMON_DELIVER")
+            .into_iter()
+            .filter(|v| str_field(v, "mail") == mail)
+            .collect();
+        assert_eq!(row.len(), 1, "{daemon:?}");
+        assert_eq!(str_field(row[0], "kind"), kind, "{daemon:?}");
+        assert_eq!(headers_of(&daemon, mail), headers, "{daemon:?}");
+    }
+    // The session ends unacked; the next one at the Address is handed both.
+    drop(held);
+    rig.start_recipient("recipient.out", false);
     wait_for_text(
         &rig.p("recipient.out"),
         &format!("DELIVERED mail={copy} record=r-2"),
@@ -3289,20 +3445,11 @@ fn kind_and_headers_round_trip_on_directed_and_broadcast_mail() {
         store.contains("\"kind\":\"broadcast\",\"headers\":{\"k\":\"a=b\"}}"),
         "{store}"
     );
-    for log in ["coord.log", "b.log"] {
-        let text = read(&rig.p(log));
-        assert!(
-            text.contains(&format!("\"headers\":{set}")),
-            "{log}: {text}"
-        );
-        assert!(
-            text.contains("\"headers\":{\"k\":\"a=b\"}"),
-            "{log}: {text}"
-        );
-    }
-    let daemon = read(&rig.p("b.log"));
-    assert!(daemon.contains("\"kind\":\"directed\""), "{daemon}");
-    assert!(daemon.contains("\"kind\":\"broadcast\""), "{daemon}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(headers_of(&coord, "h-1"), set, "{coord:?}");
+    assert_eq!(headers_of(&coord, &copy), r#"{"k":"a=b"}"#, "{coord:?}");
+    assert_eq!(str_field(mail_rows(&coord, "h-1")[0], "kind"), "directed");
+    assert_eq!(str_field(mail_rows(&coord, &copy)[0], "kind"), "broadcast");
 
     // The receipt line and reply carry both, and survive a coordinator restart.
     for round in 0..2 {
@@ -3447,13 +3594,9 @@ fn each_header_bound_is_refused_with_its_reason_and_commits_nothing() {
             "{o:?}"
         );
     }
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 0, "{coord}");
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"broadcast\""),
-        0,
-        "{coord}"
-    );
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(kind_count(&coord, "directed"), 0, "{coord:?}");
+    assert_eq!(kind_count(&coord, "broadcast"), 0, "{coord:?}");
     assert!(!read(&rig.p("recipient.out")).contains("STORED"));
     // The same link still carries a good send, and a resend of its id does not
     // replace its headers.
@@ -3466,9 +3609,9 @@ fn each_header_bound_is_refused_with_its_reason_and_commits_nothing() {
         "DELIVERED mail=good",
         Duration::from_secs(10),
     );
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
-    assert!(coord.contains("\"headers\":{\"a\":\"1\"}"), "{coord}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(kind_count(&coord, "directed"), 1, "{coord:?}");
+    assert_eq!(headers_of(&coord, "good"), r#"{"a":"1"}"#, "{coord:?}");
 }
 
 /// The largest set the bounds allow survives the whole path byte-identical.
@@ -3568,6 +3711,7 @@ fn an_old_host_daemon_log_replays_with_the_right_kinds() {
         format!("{}}}\n", head("o-3")),
     ];
     fs::write(rig.p("b.log"), old.concat()).unwrap();
+    let legacy = fs::read(rig.p("b.log")).unwrap();
     rig.start_stack();
     rig.start_recipient("recipient.out", false);
     for (mail, record, kind) in [
@@ -3588,14 +3732,23 @@ fn an_old_host_daemon_log_replays_with_the_right_kinds() {
         "DELIVERED mail=o-4",
         Duration::from_secs(10),
     );
-    let log = read(&rig.p("b.log"));
-    let line = log
+    // The new Mail reaches the session with Kind and an empty set.
+    let store = read(&rig.p("recipient.store"));
+    let line = store
         .lines()
         .find(|l| l.contains("\"mail\":\"o-4\""))
-        .unwrap();
-    assert!(line.contains("\"kind\":\"directed\""), "{line}");
-    assert!(line.contains("\"headers\":{}"), "{line}");
+        .unwrap_or_else(|| panic!("{store}"));
+    assert!(
+        line.ends_with("\"kind\":\"directed\",\"headers\":{}}"),
+        "{line}"
+    );
     assert!(!line.contains("wake"), "{line}"); // legacy-wire: no older field is written
+                                               // Imported read-only: the old log is byte-identical.
+    assert_eq!(
+        fs::read(rig.p("b.log")).unwrap(),
+        legacy,
+        "the old host daemon log changed"
+    );
 }
 
 /// A coordinator log whose events lack `headers` replays: its Mail reads as
@@ -3613,6 +3766,7 @@ fn an_old_coordinator_log_replays_and_delivers_with_kind_and_empty_headers() {
         ),
     )
     .unwrap();
+    let legacy = fs::read(rig.p("coord.log")).unwrap();
     rig.start_stack();
     rig.start_recipient("recipient.out", false);
     for line in [
@@ -3628,6 +3782,26 @@ fn an_old_coordinator_log_replays_and_delivers_with_kind_and_empty_headers() {
         Duration::from_secs(10),
     );
     assert!(receipt_line(&rig, "c-1").ends_with(" kind=directed"));
+    // Rows that never carried headers keep them absent, not empty.
+    let coord = rig.coord_records("coord.log");
+    for mail in ["c-1".to_string(), format!("c-b/{to}")] {
+        let rows: Vec<_> = rows_of(&coord, "HEADERS")
+            .into_iter()
+            .filter(|v| str_field(v, "mail") == mail)
+            .collect();
+        assert_eq!(rows.len(), 1, "{coord:?}");
+        assert_eq!(
+            rows[0].get("headers"),
+            Some(&json::Value::Null),
+            "{coord:?}"
+        );
+    }
+    // Imported read-only: the old log is byte-identical.
+    assert_eq!(
+        fs::read(rig.p("coord.log")).unwrap(),
+        legacy,
+        "the old coordinator log changed"
+    );
 }
 
 /// A Store whose entries lack `kind` and `headers` replays: a redelivery of
@@ -3847,20 +4021,34 @@ fn start_tracer(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str, ext
     rig.await_registered(out);
 }
 
-/// Every parsed coordinator-log line whose `session` field is `address`,
-/// in log order.
+/// Every session event the coordinator holds for `address`, in its order:
+/// the audit's REGISTER, LABEL, DECLARED, UNDECLARED, UNREGISTER and
+/// TAKEOVER rows, each with its `at_ms` (null where never stamped).
 fn session_events(rig: &Rig, address: &str) -> Vec<json::Value> {
-    read(&rig.p("coord.log"))
-        .lines()
-        .filter_map(|l| json::parse(l).ok())
-        .filter(|v| v.get("session").and_then(|x| x.as_str()) == Some(address))
+    rig.coord_records("coord.log")
+        .into_iter()
+        .filter(|v| {
+            event_kind(v).is_some() && v.get("address").and_then(|x| x.as_str()) == Some(address)
+        })
         .collect()
+}
+
+/// The event an audit row records, named as the coordinator's events are.
+fn event_kind(v: &json::Value) -> Option<&'static str> {
+    match v.get("type").and_then(|t| t.as_str())? {
+        "REGISTER" => Some("session"),
+        "LABEL" => Some("label"),
+        "DECLARED" | "UNDECLARED" => Some("declared"),
+        "UNREGISTER" => Some("unregister"),
+        "TAKEOVER" => Some("takeover"),
+        _ => None,
+    }
 }
 
 fn kinds(events: &[json::Value]) -> Vec<String> {
     events
         .iter()
-        .map(|v| str_field(v, "ev").to_string())
+        .map(|v| event_kind(v).unwrap().to_string())
         .collect()
 }
 
@@ -4236,12 +4424,10 @@ fn a_burst_from_many_senders_to_one_session_is_all_delivered() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), senders * each);
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"receipt\""),
-        senders * each
-    );
+    let coord = rig.wait_coord("coord.log", Duration::from_secs(30), "every receipt", |r| {
+        receipts_held(r) == senders * each
+    });
+    assert_eq!(kind_count(&coord, "directed"), senders * each);
     assert_eq!(
         count_lines_with(&read(&rig.p("recipient.store")), "\"record\""),
         senders * each
@@ -4377,13 +4563,9 @@ fn a_send_under_an_existing_mail_id_is_accepted_only_when_it_repeats_the_mail() 
     rig.restart_coordinator();
     wait_until_board_reaches_both(&rig);
     check(&rig);
-    let coord = read(&rig.p("coord.log"));
-    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
-    assert_eq!(
-        count_lines_with(&coord, "\"ev\":\"broadcast\""),
-        1,
-        "{coord}"
-    );
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(kind_count(&coord, "directed"), 1, "{coord:?}");
+    assert_eq!(copies_of(&coord, "all"), [RECIPIENT], "{coord:?}");
     assert_eq!(
         count_lines_with(&read(&rig.p("recipient.store")), "\"record\""),
         2
@@ -5544,4 +5726,461 @@ fn watchers_see_committed_board_changes_and_others_see_none() {
         matches!(raw.read_line(&mut seen), Ok(n) if n > 0)
     } {}
     assert!(!seen.contains("board_event"), "{seen}");
+}
+
+// ---- SQLite storage, the cold tier, and Groups ----
+
+/// An Address nobody registers in these tests.
+const FOURTH: &str = "66666666-6666-4666-8666-666666666666";
+
+/// Coordinator flags for the cold tier: a body leaves the retention window
+/// 100 ms after it is accepted and a day lasts 200 ms. With `sweep` false
+/// the sweep is off.
+fn cold_flags(rig: &mut Rig, sweep: bool) {
+    rig.coord_extra = ["--cold-retain-ms", "100", "--cold-day-ms", "200"]
+        .map(String::from)
+        .to_vec();
+    if !sweep {
+        rig.coord_extra.push("--no-cold-sweep".into());
+    }
+}
+
+/// Every cold day file under the coordinator's slices, with its text.
+fn cold_files(rig: &Rig) -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "cold") {
+                let text = read(&path);
+                out.push((path, text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&rig.p("coord.log.slices"), &mut out);
+    out
+}
+
+/// The cold day file holding `mail`'s record, if any.
+fn cold_file_of(rig: &Rig, mail: &str) -> Option<(PathBuf, String)> {
+    let needle = format!("\"mail\":\"{mail}\"");
+    cold_files(rig)
+        .into_iter()
+        .find(|(_, t)| t.contains(&needle))
+}
+
+/// Send a fresh Mail to FOURTH every 250 ms, so the coordinator crosses day
+/// boundaries, until a cold day file holds `mail` or `ticks` have gone out.
+/// True when one does.
+fn tick_until_cold(rig: &Rig, mail: &str, ticks: usize) -> bool {
+    for n in 0..ticks {
+        if cold_file_of(rig, mail).is_some() {
+            return true;
+        }
+        let out = send_as(
+            rig,
+            "a.sock",
+            (SENDER, FOURTH),
+            &format!("tick-{mail}-{n}"),
+            "t",
+        );
+        assert!(out.status.success(), "{out:?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    cold_file_of(rig, mail).is_some()
+}
+
+/// A Mail id is never taken as new Mail once seen: a resend that differs is
+/// refused while the body is hot, after it moved to a cold day file, and
+/// after a coordinator restart; a resend that repeats it commits nothing.
+#[test]
+fn mail_ids_are_never_reused_across_hot_and_cold_tiers() {
+    let mut rig = Rig::new("ids-hot-cold");
+    cold_flags(&mut rig, true);
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    rig.send("m-1", "first");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-1 record=r-1",
+        Duration::from_secs(10),
+    );
+    let refused = |rig: &Rig, body: &str| {
+        let out = send_as(rig, "a.sock", (SENDER, RECIPIENT), "m-1", body);
+        assert!(!out.status.success(), "{body}: {out:?}");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            err.contains("mail m-1: expected a resend to repeat the Mail already accepted under this id, saw a different body"),
+            "{body}: {err}"
+        );
+    };
+    let repeated = |rig: &Rig| {
+        let out = send_as(rig, "a.sock", (SENDER, RECIPIENT), "m-1", "first");
+        assert!(out.status.success(), "{out:?}");
+    };
+    refused(&rig, "second while hot");
+    assert!(
+        tick_until_cold(&rig, "m-1", 40),
+        "m-1 never reached a cold day file: {:?}",
+        cold_files(&rig)
+    );
+    refused(&rig, "third while cold");
+    repeated(&rig);
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    refused(&rig, "fourth after a restart");
+    repeated(&rig);
+
+    // A new id is still new, and the old one was stored and receipted once.
+    rig.send("m-2", "second mail");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-2 record=r-2",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 2, "{store}");
+    assert_eq!(count_lines_with(&store, "\"mail\":\"m-1\""), 1, "{store}");
+    let coord = rig.coord_bodies("coord.log");
+    let rows = mail_rows(&coord, "m-1");
+    assert_eq!(rows.len(), 1, "{coord:?}");
+    assert_eq!(str_field(rows[0], "record"), "r-1", "{coord:?}");
+    assert_eq!(bodies_of(&coord, "m-1"), ["first"], "{coord:?}");
+}
+
+/// Past the retention window the sweep moves a body to a sealed, checksummed
+/// cold day file; an Address that registers late is still handed it once,
+/// and audit reads it. With `--no-cold-sweep` nothing is exported and the
+/// late Register is served from the hot tier the same way.
+#[test]
+fn cold_sweep_exports_aged_bodies_and_restores_for_late_register_unless_disabled() {
+    for sweep in [true, false] {
+        let mut rig = Rig::new(if sweep {
+            "cold-sweep"
+        } else {
+            "cold-sweep-off"
+        });
+        cold_flags(&mut rig, sweep);
+        rig.start_stack();
+        let body = "aged body [[153:Meteor Shower:7]]";
+        rig.send("m-old", body);
+        let cold = tick_until_cold(&rig, "m-old", if sweep { 40 } else { 12 });
+        assert_eq!(cold, sweep, "sweep={sweep}: {:?}", cold_files(&rig));
+        if sweep {
+            let (path, text) = cold_file_of(&rig, "m-old").unwrap();
+            assert!(text.starts_with("RWCOLD01\n"), "{}", path.display());
+            assert!(
+                text.lines().last().unwrap().starts_with("SHA256:"),
+                "{}",
+                path.display()
+            );
+            assert!(text.contains(&format!("\"body\":\"{body}\"")), "{text}");
+        } else {
+            assert!(cold_files(&rig).is_empty(), "{:?}", cold_files(&rig));
+        }
+        // Audit reads the body from whichever tier holds it.
+        let coord = rig.coord_bodies("coord.log");
+        assert_eq!(bodies_of(&coord, "m-old"), [body], "{coord:?}");
+
+        // The late Register is handed the body once.
+        rig.start_recipient("recipient.out", false);
+        wait_for_text(
+            &rig.p("recipient.out"),
+            "DELIVERED mail=m-old record=r-1",
+            Duration::from_secs(10),
+        );
+        let store = read(&rig.p("recipient.store"));
+        assert_eq!(store.lines().count(), 1, "{store}");
+        assert_eq!(
+            count_lines_with(&store, &format!("\"body\":\"{body}\"")),
+            1,
+            "{store}"
+        );
+        let row = rig.wait_receipt("coord.log", "m-old", Duration::from_secs(10));
+        assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
+    }
+}
+
+/// host-b's daemon keeps a delivery in `b.log.sqlite` until its session acks,
+/// then the receipt until the coordinator confirms it, and deletes each row
+/// then. It writes no `b.log` of its own, and once restarted holds nothing
+/// for the confirmed Mail.
+#[test]
+fn daemon_sqlite_deletes_pending_and_receipt_rows_once_coordinator_confirms() {
+    let mut rig = Rig::new("daemon-sqlite");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+    rig.send("m-d", "held by the host");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+    // Stored by the session, not acked: pending on the host, no receipt.
+    let rows = rig.daemon_records("b.log");
+    assert_eq!(daemon_count(&rows, "DAEMON_DELIVER", "m-d"), 1, "{rows:?}");
+    assert_eq!(daemon_count(&rows, "DAEMON_RECEIPT", "m-d"), 0, "{rows:?}");
+
+    // Coordinator down: the ack settles on the host alone, in one step.
+    rig.kill(0);
+    rig.kill(recipient);
+    rig.start_recipient("recipient2.out", true);
+    wait_for_text(
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-d record=r-1",
+        Duration::from_secs(10),
+    );
+    let rows = rig.daemon_records("b.log");
+    assert_eq!(daemon_count(&rows, "DAEMON_DELIVER", "m-d"), 0, "{rows:?}");
+    assert_host_holds_receipt(&rig, "m-d");
+
+    // The coordinator records the receipt and confirms it; the row goes.
+    rig.restart_coordinator();
+    let row = rig.wait_receipt("coord.log", "m-d", Duration::from_secs(15));
+    assert_eq!(str_field(&row, "record"), "r-1", "{row:?}");
+    rig.wait_audit(
+        "--daemon-log",
+        "b.log",
+        Duration::from_secs(10),
+        "the confirmed receipt row deleted",
+        |r| daemon_count(r, "DAEMON_RECEIPT", "m-d") == 0,
+    );
+    assert!(rig.p("b.log.sqlite").is_file());
+    assert!(!rig.p("b.log").exists(), "the daemon wrote a log file");
+
+    // A restarted daemon holds nothing for m-d and adds no receipt.
+    rig.restart_recipient_daemon();
+    wait_until_board_reaches_both(&rig);
+    let rows = rig.daemon_records("b.log");
+    assert_eq!(daemon_count(&rows, "DAEMON_DELIVER", "m-d"), 0, "{rows:?}");
+    assert_eq!(daemon_count(&rows, "DAEMON_RECEIPT", "m-d"), 0, "{rows:?}");
+    let coord = rig.coord_records("coord.log");
+    assert_eq!(receipts_held(&coord), 1, "{coord:?}");
+    assert_eq!(read(&rig.p("recipient.store")).lines().count(), 1);
+}
+
+/// `roger <verb> --socket a.sock <rest>`, which must succeed; its stdout.
+fn cli(rig: &Rig, verb: &str, rest: &[&str]) -> String {
+    let out = Command::new(BIN)
+        .args([verb, "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(rest)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{verb} {rest:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// `roger send --group <group>` from SENDER; its stdout.
+fn group_send(rig: &Rig, group: &str, mail: &str, body: &str) -> String {
+    cli(
+        rig,
+        "send",
+        &[
+            "--from", SENDER, "--group", group, "--mail", mail, "--body", body,
+        ],
+    )
+}
+
+/// Wait until `roger groups --session <session>` lists a line starting `want`.
+fn wait_group_line(rig: &Rig, session: &str, want: &str) {
+    let start = Instant::now();
+    loop {
+        let out = Command::new(BIN)
+            .args(["groups", "--socket", rig.p("a.sock").to_str().unwrap()])
+            .args(["--session", session])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if out.status.success() && text.lines().any(|l| l.starts_with(want)) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{want:?} never listed for {session}: {text} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A Group post is one article, numbered in its Group and never renumbered,
+/// handed to each subscribed reader and stored once by each. A reader that
+/// unsubscribes keeps its position, and subscribing again later, after a
+/// coordinator restart and a new session process, hands it exactly the
+/// articles past that position. Four slices hold it all; an adapter that did
+/// not ask for Groups answers as before.
+#[test]
+#[ignore = "enabled in step 3 once group CLI subcommands wire into main.rs"]
+fn named_groups_deliver_one_article_to_subscribed_readers_with_durable_positions_across_slices() {
+    let mut rig = Rig::new("groups");
+    rig.coord_extra = ["--slices", "4"].map(String::from).to_vec();
+    rig.start_stack();
+    for n in 0..4 {
+        let slice = rig.p(&format!("coord.log.slices/slice-{n:02}/hot.sqlite"));
+        assert!(slice.is_file(), "{}", slice.display());
+    }
+
+    // Reader one subscribes through its Tracer's flag, reader two through the CLI.
+    start_tracer(
+        &mut rig,
+        "b.sock",
+        RECIPIENT,
+        "recipient.store",
+        "recipient.out",
+        &["--subscribe", "ops"],
+    );
+    wait_group_line(
+        &rig,
+        RECIPIENT,
+        "GROUP group=ops high_water=0 subscribers=1 subscribed=true position=0",
+    );
+    let third = start_session(&mut rig, "a.sock", THIRD, "third.store", "third.out");
+    assert_eq!(
+        cli(&rig, "subscribe", &["--session", THIRD, "--group", "ops"]),
+        format!("SUBSCRIBED group=ops session={THIRD} position=0 high_water=0\n")
+    );
+
+    // An adapter without --groups refuses Group requests as before and still sends.
+    let (_, mut plain) = rig.start_adapter("a.sock", SENDER, "plain.store", "plain.out", &[]);
+    writeln!(plain, "{{\"type\":\"subscribe\",\"group\":\"ops\"}}").unwrap();
+    wait_for_text(
+        &rig.p("plain.out"),
+        "expected request send, board, relabel, or claim; saw subscribe",
+        Duration::from_secs(10),
+    );
+    writeln!(
+        plain,
+        "{{\"type\":\"send\",\"to\":\"{FOURTH}\",\"mail\":\"d-1\",\"body\":\"directed\"}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("plain.out"),
+        "\"type\":\"accepted\",\"mail\":\"d-1\"",
+        Duration::from_secs(10),
+    );
+
+    // One article reaches both readers.
+    assert_eq!(
+        group_send(&rig, "ops", "g-1", "article one"),
+        "ACCEPTED mail=g-1 group=ops article=1\n"
+    );
+    for out in ["recipient.out", "third.out"] {
+        wait_for_text(
+            &rig.p(out),
+            "DELIVERED mail=g-1 record=r-1",
+            Duration::from_secs(10),
+        );
+        assert!(
+            read(&rig.p(out))
+                .contains("STORED mail=g-1 record=r-1 kind=group group=ops article=1\n"),
+            "{out}: {}",
+            read(&rig.p(out))
+        );
+    }
+    wait_group_line(
+        &rig,
+        THIRD,
+        "GROUP group=ops high_water=1 subscribers=2 subscribed=true position=1 record=r-1",
+    );
+    let coord = rig.coord_bodies("coord.log");
+    let rows = mail_rows(&coord, "g-1");
+    assert_eq!(rows.len(), 1, "one article for two readers: {coord:?}");
+    assert_eq!(str_field(rows[0], "kind"), "group", "{coord:?}");
+    assert_eq!(str_field(rows[0], "to"), "ops", "{coord:?}");
+    assert_eq!(rows[0].get("article").and_then(|x| x.as_i64()), Some(1));
+    assert_eq!(bodies_of(&coord, "g-1"), ["article one"], "{coord:?}");
+    let mine = rig.records("--coordinator-log", "coord.log", &["--address", THIRD]);
+    let rows = mail_rows(&mine, "g-1");
+    assert_eq!(rows.len(), 1, "{mine:?}");
+    assert_eq!(str_field(rows[0], "to"), "ops", "{mine:?}");
+    assert_eq!(str_field(rows[0], "record"), "r-1", "{mine:?}");
+
+    // A second Group numbers its own articles.
+    assert_eq!(
+        cli(
+            &rig,
+            "subscribe",
+            &["--session", RECIPIENT, "--group", "night"]
+        ),
+        format!("SUBSCRIBED group=night session={RECIPIENT} position=0 high_water=0\n")
+    );
+    assert_eq!(
+        group_send(&rig, "night", "n-1", "night one"),
+        "ACCEPTED mail=n-1 group=night article=1\n"
+    );
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=n-1 record=r-2",
+        Duration::from_secs(10),
+    );
+
+    // Reader two leaves ops at its position; the next article reaches reader one alone.
+    assert_eq!(
+        cli(&rig, "unsubscribe", &["--session", THIRD, "--group", "ops"]),
+        format!("UNSUBSCRIBED group=ops session={THIRD} position=1\n")
+    );
+    assert_eq!(
+        group_send(&rig, "ops", "g-2", "article two"),
+        "ACCEPTED mail=g-2 group=ops article=2\n"
+    );
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=g-2 record=r-3",
+        Duration::from_secs(10),
+    );
+    assert!(!read(&rig.p("third.out")).contains("mail=g-2"));
+    let all = cli(&rig, "groups", &[]);
+    assert!(
+        all.contains("GROUP group=ops high_water=2 subscribers=1\n")
+            && all.contains("GROUP group=night high_water=1 subscribers=1\n")
+            && all.ends_with("GROUPS count=2\n"),
+        "{all}"
+    );
+
+    // Subscriptions and positions outlive the coordinator and the session.
+    rig.kill(third);
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    assert_eq!(
+        group_send(&rig, "ops", "g-3", "article three"),
+        "ACCEPTED mail=g-3 group=ops article=3\n"
+    );
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=g-3 record=r-4",
+        Duration::from_secs(10),
+    );
+    start_session(&mut rig, "a.sock", THIRD, "third.store", "third2.out");
+    assert_eq!(
+        cli(&rig, "subscribe", &["--session", THIRD, "--group", "ops"]),
+        format!("SUBSCRIBED group=ops session={THIRD} position=1 high_water=3\n")
+    );
+    for (mail, record) in [("g-2", "r-2"), ("g-3", "r-3")] {
+        wait_for_text(
+            &rig.p("third2.out"),
+            &format!("DELIVERED mail={mail} record={record}"),
+            Duration::from_secs(10),
+        );
+    }
+    assert!(!read(&rig.p("third2.out")).contains("mail=g-1"));
+    let store = read(&rig.p("third.store"));
+    assert_eq!(store.lines().count(), 3, "{store}");
+    assert_eq!(count_lines_with(&store, "\"mail\":\"g-1\""), 1, "{store}");
+    wait_group_line(
+        &rig,
+        THIRD,
+        "GROUP group=ops high_water=3 subscribers=2 subscribed=true position=3 record=r-3",
+    );
+    assert!(!read(&rig.p("plain.out")).contains("\"kind\":\"group\""));
+
+    let coord = rig.coord_records("coord.log");
+    for (mail, article) in [("g-1", 1), ("g-2", 2), ("g-3", 3), ("n-1", 1)] {
+        let rows = mail_rows(&coord, mail);
+        assert_eq!(rows.len(), 1, "{mail}: {coord:?}");
+        assert_eq!(
+            rows[0].get("article").and_then(|x| x.as_i64()),
+            Some(article),
+            "{mail}: {coord:?}"
+        );
+    }
 }

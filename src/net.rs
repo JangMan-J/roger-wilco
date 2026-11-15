@@ -107,6 +107,9 @@ pub fn ack_msg(mail: &str, session: &str, record: &str) -> Value {
 pub const DIRECTED: &str = "directed";
 /// The Kind of a copy of a Broadcast.
 pub const BROADCAST: &str = "broadcast";
+/// The Kind of an article delivered to a subscribed reader of a Group.
+#[allow(dead_code)]
+pub const GROUP: &str = "group";
 
 /// The one shape both the coordinator and a host daemon use to hand a Mail
 /// to the next hop: its Kind and the sender's headers, carried as given.

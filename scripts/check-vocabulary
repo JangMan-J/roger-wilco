@@ -5,9 +5,10 @@
 # serves a call center and an autonomous team. What a consumer does when Mail arrives is
 # the consumer's.
 #
-# Scanned: every file in the checkout (tracked or untracked, minus .gitignore and Cargo target/
-# build directories) outside VECTORS/ and docs/reviews/, including modules/*/Cargo.toml and all
-# modules/ source, tests, scripts, and docs.
+# Scanned: every file in the checkout (tracked or untracked, minus .gitignore, Cargo target/
+# build directories, and third-party vendor/ upstream crates) outside VECTORS/ and docs/reviews/,
+# including Cargo.toml, modules/*/Cargo.toml, and all core and modules/ source, tests, scripts,
+# and docs.
 # Exempt:
 #   frontmatter             a leading YAML block in a markdown file
 #   .slice/, KERNEL.md, INVARIANTS.md, GLOSSARY.md  the generated scoped set of a slice worktree
@@ -15,9 +16,9 @@
 #   docs/reviews/           historical review evidence
 #   AGENTS.md               the director's file; it quotes dated directives verbatim
 #   scripts/check-vocabulary  this list of words
-#   modules/*/Cargo.lock    third-party transitive crate metadata in lockfiles is upstream
-#                           package metadata, not project vocabulary (modules/*/Cargo.toml
-#                           and all modules/ source, tests, scripts, and docs ARE scanned)
+#   Cargo.lock, modules/*/Cargo.lock, vendor/  third-party upstream package metadata and sources
+#                           are not project vocabulary (Cargo.toml, modules/*/Cargo.toml, and all
+#                           core and modules/ source, tests, scripts, and docs ARE scanned)
 #   a line carrying `legacy-wire:` and a reason, for the old wire field that a
 #                           reader of logs written before `kind` still needs
 #
@@ -44,10 +45,8 @@ list_files() {
     find "$@" -type f -not -path '*/target/*' -not -path '*/.git/*' | sed 's#^\./##'
   fi
 }
-# Third-party transitive crate metadata in modules/*/Cargo.lock is not project vocabulary,
-# whereas modules/*/Cargo.toml and all modules/ source, tests, scripts, and docs ARE scanned.
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(VECTORS|\.slice)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$|^modules/[^/]+/Cargo\.lock$' | sort -u |
+  grep -vE '^(VECTORS|\.slice|vendor)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$|^(Cargo\.lock|modules/[^/]+/Cargo\.lock)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core or optional-module files under ${*:-.}" >&2; exit 1; }
 
