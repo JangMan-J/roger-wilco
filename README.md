@@ -603,6 +603,7 @@ core log grows while nobody asks.
 | `modules/mcp-gateway/` | optional multi-session MCP Streamable HTTP and SSE push gateway ([modules/mcp-gateway/README.md](modules/mcp-gateway/README.md)) |
 | `modules/ws-gateway/` | optional WebSocket adapter face ([modules/ws-gateway/README.md](modules/ws-gateway/README.md)) |
 | `modules/verify/` | optional offline provenance verifier over `roger audit` ([modules/verify/README.md](modules/verify/README.md)) |
+| `modules/cold-shipper/` | optional archive shipper and verifier for sealed `RWCOLD01` cold day files ([modules/cold-shipper/README.md](modules/cold-shipper/README.md)) |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |

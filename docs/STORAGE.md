@@ -20,7 +20,7 @@ flowchart LR
     subgraph CoordDisk["<data>.slices/ (sql::coordinator_root)"]
         CLOCK["LOCK (durlog::open_exclusive_lock)"]
         HOT[("slice-00/hot.sqlite (WAL, synchronous=FULL)\ntables: meta, live_sessions, live_claims,\ntimeline, streams, seen_ids, broadcasts,\nenvelopes, hot_bodies, positions, receipts")]
-        COLD[("slice-00/cold/day-<bucket>.cold\n(RWCOLD01 + SHA256 trailer)")]
+        COLD[("slice-00..NN/cold/day-<bucket>.cold\n(RWCOLD01 + SHA256 trailer)")]
         LEG_C[("coordinator.log\n(pre-cutover JSONL, read-only)")]
     end
 
@@ -133,4 +133,25 @@ flowchart LR
     R1 -- "CoordinatorStore::record_ack" --> POS1["positions('g:<group>', Reader 1)\nposition=article_num, record_id='r-1'"]
     R2 -- "CoordinatorStore::record_ack" --> POS2["positions('g:<group>', Reader 2)\nposition=article_num, record_id='r-4'"]
     R3 -- "CoordinatorStore::record_ack" --> POS3["positions('g:<group>', Reader 3)\nposition=article_num, record_id='r-9'"]
+```
+
+## 5. Multi-Slice Writers (`--slices <n>`) and Cold Archive Shipping (`roger-cold-shipper`)
+
+When `roger coordinator --slices <n>` runs with `n > 1`, `CoordinatorStore` opens `slice-00/hot.sqlite` through `slice-(n-1)/hot.sqlite`, each owned by its own independent group-commit `SliceWriter` thread (`sql::coord::writer_loop`). Streams (`m:<address>`, `g:<group>`) route to `sha256::hash_pair(stream.as_bytes()).0 % num_slices`, while `seen_ids` and `broadcasts` route to `sha256::hash_pair(mail_id.as_bytes()).0 % num_slices` so Mail id non-reuse holds globally across all slices while writes scale across independent `WAL` writers. Each slice directory `slice-NN/` is self-contained (`hot.sqlite` + `cold/`) and movable as files.
+
+Alongside the core, the standalone Optional module `modules/cold-shipper/` (`roger-cold-shipper`) scans `slice-*/cold/day-*.cold` via `archive::ship` (or event-driven `archive::watch_stdin`), verifies `format::verify_cold_file` (`RWCOLD01`, per-record `digest`, and `SHA256:` trailer), atomically writes read-only copies plus `manifest.json` (`roger-cold-manifest/1`) to an archive destination, checks archive integrity via `archive::verify_archive`, and restores missing local day files via `archive::restore`.
+
+```mermaid
+flowchart LR
+    SEND["coordinator::send"] -- "sha256::hash_pair(stream) % N" --> SW0["Slice 00 SliceWriter\nslice-00/hot.sqlite"]
+    SEND -- "sha256::hash_pair(stream) % N" --> SWK["Slice NN SliceWriter\nslice-NN/hot.sqlite"]
+    SEND -- "sha256::hash_pair(mail_id) % N" --> IDS["Global Mail-id shard\nseen_ids / broadcasts"]
+
+    SW0 -- "ColdIndex::seal_day" --> C0[("slice-00/cold/day-<d>.cold")]
+    SWK -- "ColdIndex::seal_day" --> CK[("slice-NN/cold/day-<d>.cold")]
+
+    C0 --> SHIP["roger-cold-shipper\narchive::ship / archive::watch_stdin\nformat::verify_cold_file"]
+    CK --> SHIP
+    SHIP -- "atomic write + readonly" --> ARCH[("Archive Destination\n<dest>/slice-NN/day-<d>.cold\n<dest>/manifest.json")]
+    ARCH -- "archive::verify_archive / archive::restore" --> CK
 ```
