@@ -50,7 +50,7 @@ coord=""
 token=""
 loopback_stack() {
   (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
-  bin="$ROOT/target/release/roger"
+  bin="${CARGO_TARGET_DIR:-$ROOT/target}/release/roger"
   local h
   work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -79,6 +79,30 @@ start_tracer() { # the Tracer: a session with no harness, on host-b
 
 log_count() { # log_count <fixed-string> <n> <file>: the file holds exactly n such lines
   [[ "$(grep -cF -- "$1" "$3")" == "$2" ]]
+}
+
+# Live coordinator and host daemon records are SQLite after the storage
+# cutover. Audit resolves the data argument to their databases and also reads
+# legacy JSONL fixtures, so every check uses the same read-only interface.
+audit_json() { # audit_json <coordinator-data>
+  "$bin" audit --coordinator-log "$1" --json
+}
+
+audit_bodies_json() { # audit_bodies_json <coordinator-data>
+  "$bin" audit --coordinator-log "$1" --bodies --json
+}
+
+daemon_audit_json() { # daemon_audit_json <daemon-data>
+  "$bin" audit --daemon-log "$1" --json
+}
+
+# Hash every coordinator slice/cold file and every host daemon database file.
+# The paths are stable, so identical output proves no bytes changed or appeared.
+storage_fingerprint() { # storage_fingerprint <work-directory>
+  {
+    find "$1/coord.log.slices" -type f -print 2>/dev/null || true
+    find "$1" -maxdepth 1 -type f \( -name '*.sqlite' -o -name '*.sqlite-*' \) -print
+  } | LC_ALL=C sort | xargs -r sha256sum
 }
 
 now_ms() { date +%s%3N; }

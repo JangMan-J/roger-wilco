@@ -26,7 +26,7 @@ two_host_stack() {
   [[ "$ts_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "set ROGER_ACCEPT_BIND to this host's IPv4 address reachable from the remote host"
 
   (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
-  bin="$ROOT/target/release/roger"
+  bin="${CARGO_TARGET_DIR:-$ROOT/target}/release/roger"
 
   local token
   work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
@@ -64,6 +64,7 @@ two_host_stack() {
 }
 
 cross_host() {
+  command -v jq >/dev/null || fail "jq required"
   two_host_stack
 
   remote_spawn recipient.pid recipient1.out \
@@ -84,9 +85,8 @@ cross_host() {
   ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" \
     || fail "SIGKILL recipient"
 
-  if grep -q '"ev":"receipt"' "$work/coord.log"; then
-    fail "receipt exists before the recipient acked"
-  fi
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .receipted_at_ms != null)] | length')" == 0 ]] \
+    || fail "receipt exists before the recipient acked"
 
   remote_spawn recipient.pid recipient2.out \
     "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
@@ -100,11 +100,13 @@ cross_host() {
   ssh -n "$REMOTE_HOST" "grep -qF '$body' $remote_work/recipient.store" \
     || fail "body not byte-identical in recipient Store"
 
-  [[ "$(grep -c '"ev":"mail","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
-    || fail "coordinator holds a duplicate mail row"
-  [[ "$(grep -c '"ev":"receipt","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
-    || fail "coordinator receipt missing or duplicated"
-  grep -q '"record":"r-1"' "$work/coord.log" || fail "receipt does not name Store record r-1"
+  accepted_receipted() {
+    audit_json "$work/coord.log" | jq -es '
+      [.[] | select(.type == "MAIL" and .mail == "accept-1")] as $rows
+      | ($rows | length) == 1 and $rows[0].record == "r-1"
+        and $rows[0].receipted_at_ms != null' >/dev/null
+  }
+  wait_for 15 "one receipted accept-1 naming r-1" accepted_receipted
 
   # Both stamps are on the coordinator's clock; the latency spans the kill.
   local rcpt re
@@ -139,7 +141,12 @@ independence() {
   local claude_to_tracer="claude to tracer [[153:Meteor Shower:7]] 5"
   "$bin" send --socket "$work/a.sock" --from "$tracer_addr" --to "$claude_addr" \
     --mail indep-1 --body "$tracer_to_claude" | grep -q "ACCEPTED mail=indep-1" || fail "send to Claude not accepted"
-  wait_for 15 "coordinator accepted the Tracer's mail for Claude" grep -qF "$tracer_to_claude" "$work/coord.log"
+  indep_accepted() {
+    audit_bodies_json "$work/coord.log" | jq -es --arg b "$tracer_to_claude" '
+      any(.[]; .type == "MAIL" and .mail == "indep-1")
+      and any(.[]; .type == "BODY" and .mail == "indep-1" and .body == $b)' >/dev/null
+  }
+  wait_for 15 "coordinator accepted the Tracer's mail for Claude" indep_accepted
 
   local mcp
   mcp="$(jq -cn --arg bin "$bin" --arg sock "$work/b.sock" --arg store "$work/claude.store" \
@@ -173,10 +180,15 @@ independence() {
   log_count "$claude_to_tracer" 1 "$work/tracer.store" || fail "Tracer Store must hold Claude's body exactly once"
 
   # Receipts follow the acks; wait for the observable count, not a delay.
-  wait_for 15 "two receipts at the coordinator" log_count '"ev":"receipt"' 2 "$work/coord.log"
-  log_count '"ev":"mail"' 2 "$work/coord.log" || fail "coordinator must hold exactly two mail rows"
-  log_count "$tracer_to_claude" 1 "$work/coord.log" || fail "coordinator must hold the Tracer's mail once"
-  log_count "$claude_to_tracer" 1 "$work/coord.log" || fail "coordinator must hold Claude's mail once"
+  indep_receipted() {
+    audit_bodies_json "$work/coord.log" | jq -es \
+      --arg a "$tracer_to_claude" --arg b "$claude_to_tracer" '
+      [.[] | select(.type == "MAIL")] as $rows
+      | ($rows | length) == 2 and all($rows[]; .receipted_at_ms != null)
+        and ([.[] | select(.type == "BODY" and .body == $a)] | length) == 1
+        and ([.[] | select(.type == "BODY" and .body == $b)] | length) == 1' >/dev/null
+  }
+  wait_for 15 "two receipted Mail rows and each body once" indep_receipted
 
   "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
   echo "PASS independence: a session on the built-in MCP face (Claude Code via one real haiku call) and a Tracer exchanged Mail both ways, through one coordinator, two host daemons and one roger binary; each Store holds each body once, the coordinator one row for each"
@@ -217,6 +229,7 @@ key_free_on_board() {
 }
 
 claims() {
+  command -v jq >/dev/null || fail "jq required"
   local a="$SENDER" b="$RECIPIENT" stray="99999999-9999-4999-8999-999999999999" t0 t1 tr
   two_host_stack
 
@@ -258,7 +271,8 @@ claims() {
   wait_for 20 "expiry frees the key" key_free_on_board local
   (( $(now_ms) >= tr + 8000 )) || fail "key freed before the renewed deadline"
   key_free_on_board remote || fail "remote board still shows the key after expiry"
-  grep -q '"ev":"release"' "$work/coord.log" && fail "a release event freed the key, not expiry"
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "RELEASE")] | length')" == 0 ]] \
+    || fail "a release event freed the key, not expiry"
   expect_claim 3 "REFUSED op=renew " local renew --owner "$a" --ttl-ms 8000
 
   expect_claim 0 "CLAIMED op=acquire holder=$b " remote claim --owner "$b" --ttl-ms 60000
@@ -302,11 +316,10 @@ references() {
   "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
     --mail ref-1 --body "$body" >"$work/send.out" || fail "send refused"
   wait_for 10 "ref-1 delivered" grep -q 'DELIVERED mail=ref-1' "$work/tracer.out"
-  jq -e --arg b "$body" 'select(.ev == "mail" and .mail == "ref-1") | .body == $b' \
-    "$work/coord.log" >/dev/null || fail "coordinator log body differs from what was sent"
-  # Delivery: the host-b daemon's inbox holds the same bytes.
-  jq -e --arg b "$body" 'select(.ev == "deliver" and .mail == "ref-1") | .body == $b' \
-    "$work/b.log" >/dev/null || fail "host daemon delivery body differs"
+  audit_bodies_json "$work/coord.log" | jq -es --arg b "$body" '
+    any(.[]; .type == "MAIL" and .mail == "ref-1")
+    and any(.[]; .type == "BODY" and .mail == "ref-1" and .body == $b)' >/dev/null \
+    || fail "coordinator body differs from what was sent"
   # Store: the recipient's record holds the same bytes, once.
   [[ "$(jq -r 'select(.mail == "ref-1") | .body' "$work/tracer.store")" == "$body" ]] \
     || fail "recipient Store body differs: $(cat "$work/tracer.store")"
@@ -364,9 +377,10 @@ references() {
   "$bin" send --socket "$work/a.sock" --from "$agent" --to "$director" \
     --mail comp-1 --body "question $meteor" >"$work/comp.out" || fail "send to a composite Address refused"
   wait_for 10 "comp-1 delivered" grep -q 'DELIVERED mail=comp-1' "$work/director.out"
-  jq -e --arg f "$agent" --arg t "$director" \
-    'select(.ev == "mail" and .mail == "comp-1") | .from == $f and .to == $t' "$work/coord.log" >/dev/null \
-    || fail "coordinator log changed a composite Address"
+  audit_bodies_json "$work/coord.log" | jq -es --arg f "$agent" --arg t "$director" '
+    any(.[]; .type == "MAIL" and .mail == "comp-1" and .from == $f and .to == $t)
+    and any(.[]; .type == "BODY" and .mail == "comp-1" and .body == "question [[153:Meteor Shower:7]]")' \
+    >/dev/null || fail "coordinator changed a composite Address or body"
   jq -e --arg f "$agent" 'select(.mail == "comp-1") | .from == $f' "$work/director.store" >/dev/null \
     || fail "recipient Store changed the sender's composite Address"
   "$bin" send --socket "$work/b.sock" --from "$director" --to "$agent" \
@@ -399,6 +413,7 @@ references() {
 # the kind its delivery carried: every broadcast copy must report kind=broadcast.
 THIRD="44444444-4444-4444-8444-444444444444"
 broadcast() {
+  command -v jq >/dev/null || fail "jq required"
   local mail="bcast-1" body="fleet notice [[0:FLEET:0]] to every session"
   two_host_stack
 
@@ -412,7 +427,10 @@ broadcast() {
   remote_spawn recipient.pid recipient1.out \
     "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
     || fail "start remote recipient"
-  wait_for 15 "three sessions registered at the coordinator" log_count '"ev":"session"' 3 "$work/coord.log"
+  three_registered() {
+    [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "REGISTER")] | length')" == 3 ]]
+  }
+  wait_for 15 "three sessions registered at the coordinator" three_registered
 
   "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
     | grep -q "ACCEPTED mail=$mail" || fail "broadcast not accepted"
@@ -420,26 +438,39 @@ broadcast() {
   wait_for 15 "recipient stored and holding before ack" \
     ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
   ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" || fail "SIGKILL recipient"
-  wait_for 15 "receipts from the two live sessions" log_count '"ev":"receipt"' 2 "$work/coord.log"
-  grep -qF "\"mail\":\"$mail/$RECIPIENT\",\"session\"" "$work/coord.log" \
-    && fail "receipt for the killed recipient exists before it acked"
+  two_live_receipts() {
+    audit_json "$work/coord.log" | jq -es --arg mail "$mail" --arg killed "$mail/$RECIPIENT" '
+      [.[] | select(.type == "MAIL" and (.mail | startswith($mail + "/")))] as $rows
+      | ($rows | length) == 3
+        and ([$rows[] | select(.receipted_at_ms != null)] | length) == 2
+        and all($rows[]; .mail != $killed or .receipted_at_ms == null)' >/dev/null
+  }
+  wait_for 15 "receipts from the two live sessions only" two_live_receipts
 
   remote_spawn recipient.pid recipient2.out \
     "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
     || fail "restart remote recipient"
   wait_for 15 "DELIVERED after restart" \
     ssh -n "$REMOTE_HOST" "grep -q 'DELIVERED mail=$mail/$RECIPIENT record=r-1' $remote_work/recipient2.out"
-  wait_for 15 "three receipts" log_count '"ev":"receipt"' 3 "$work/coord.log"
+  three_receipts() {
+    audit_json "$work/coord.log" | jq -es --arg mail "$mail" '
+      [.[] | select(.type == "MAIL" and (.mail | startswith($mail + "/")))] as $rows
+      | ($rows | length) == 3 and all($rows[]; .receipted_at_ms != null)
+        and ([.[] | select(.type == "MAIL" and .kind == "directed")] | length) == 0' >/dev/null
+  }
+  wait_for 15 "three receipted copies and no directed rows" three_receipts
 
   # A resent broadcast id fans out nothing new.
   "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
     | grep -q "ACCEPTED mail=$mail" || fail "resent broadcast not accepted"
-  log_count '"ev":"broadcast"' 1 "$work/coord.log" || fail "coordinator must hold one broadcast event"
-  log_count '"ev":"mail"' 0 "$work/coord.log" || fail "a broadcast must not be stored as directed mail"
+  three_receipts || fail "a resent broadcast fanned out again or stored directed Mail"
+  audit_json "$work/coord.log" >"$work/broadcast-audit.json"
 
   local addr
   for addr in "$SENDER" "$THIRD" "$RECIPIENT"; do
-    log_count "\"ev\":\"receipt\",\"mail\":\"$mail/$addr\"" 1 "$work/coord.log" \
+    jq -es --arg m "$mail/$addr" '
+      [.[] | select(.type == "MAIL" and .mail == $m and .receipted_at_ms != null)] | length == 1' \
+      "$work/broadcast-audit.json" >/dev/null \
       || fail "coordinator must hold exactly one receipt for $addr"
   done
 
@@ -465,8 +496,8 @@ broadcast() {
 
 # Invariant 2: no fixed-interval scan on the correctness path. Mail, receipts,
 # claim expiry and unregister follow committed events, with every sweep
-# disabled. The core has no sweep to disable: nothing in src looks for work
-# on a timer (scripts/check-no-poll finds only the daemon's reconnect backoff,
+# disabled. The coordinator runs with --no-cold-sweep: nothing in src looks for
+# correctness work on a timer (scripts/check-no-poll finds only the daemon's reconnect backoff,
 # the daemon's bounded wait for one upstream reply, the Store lock's single
 # try, and the link's liveness ping with its silence bound, which carries no
 # Mail and commits nothing). A sweep added later must take a switch that this check switches off; the
@@ -493,7 +524,7 @@ no_poll() {
   command -v jq >/dev/null || fail "jq required"
   "$ROOT/scripts/check-no-poll" >/dev/null || fail "scripts/check-no-poll found an unmarked timed wait in src"
   (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
-  bin="$ROOT/target/release/roger"
+  bin="${CARGO_TARGET_DIR:-$ROOT/target}/release/roger"
   work="$(mktemp -d "${TMPDIR:-/tmp}/roger-accept.XXXXXX")"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   export ROGER_TOKEN="$token"
@@ -506,7 +537,7 @@ no_poll() {
 
   coordinator_start() { # coordinator_start <bind> <out>
     "$bin" coordinator --bind "$1" --port-file "$work/port" --data "$work/coord.log" \
-      --unregister-after-ms "$NP_GRACE_MS" >"$work/$2" 2>&1 &
+      --unregister-after-ms "$NP_GRACE_MS" --no-cold-sweep >"$work/$2" 2>&1 &
     coord_pid=$!
     wait_for 10 "coordinator listening ($2)" grep -q 'coordinator listening' "$work/$2"
   }
@@ -523,20 +554,33 @@ no_poll() {
     tracer_pid=$!
     pids+=("$tracer_pid")
   }
-  registered() { grep -qF "\"ev\":\"session\",\"session\":\"$1\"" "$work/coord.log"; }
-  unregistered() { grep -qF "\"ev\":\"unregister\",\"session\":\"$1\"" "$work/coord.log"; }
-  receipt() { grep -qF "\"ev\":\"receipt\",\"mail\":\"$1\"" "$work/coord.log"; }
+  registered() {
+    audit_json "$work/coord.log" | jq -es --arg a "$1" \
+      'any(.[]; .type == "REGISTER" and .address == $a)' >/dev/null
+  }
+  unregistered() {
+    audit_json "$work/coord.log" | jq -es --arg a "$1" \
+      'any(.[]; .type == "UNREGISTER" and .address == $a)' >/dev/null
+  }
+  receipt() {
+    audit_json "$work/coord.log" | jq -es --arg m "$1" \
+      'any(.[]; .type == "MAIL" and .mail == $m and .receipted_at_ms != null)' >/dev/null
+  }
+  daemon_pending() { # daemon_pending <host> <mail>: an unacked inbox delivery
+    daemon_audit_json "$work/$1.log" | jq -es --arg m "$2" \
+      'any(.[]; .type == "DAEMON_DELIVER" and .mail == $m)' >/dev/null
+  }
   send() { # send <h> <to> <mail> <body>
     "$bin" send --socket "$work/$1.sock" --from "$SENDER" --to "$2" --mail "$3" --body "$4" \
       | grep -q "ACCEPTED mail=$3" || fail "send $3 not accepted"
   }
-  # quiet <ms> <why>: nobody asks for <ms>; no log in the core may grow.
+  # quiet <ms> <why>: nobody asks for <ms>; no SQLite bytes may change.
   quiet() {
     local before after
-    before="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
+    before="$(storage_fingerprint "$work")"
     sleep "$(awk -v ms="$1" 'BEGIN { print ms / 1000 }')"
-    after="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
-    [[ "$before" == "$after" ]] || fail "$2: a log grew from $before to $after lines while nobody asked"
+    after="$(storage_fingerprint "$work")"
+    [[ "$before" == "$after" ]] || fail "$2: SQLite storage changed while nobody asked"
   }
 
   coordinator_start 127.0.0.1:0 coord1.out
@@ -560,7 +604,9 @@ no_poll() {
   # register: mail for an Address no host daemon has seen waits at the
   # coordinator until that Address registers.
   send a "$l" np-2 "before register [[153:Meteor Shower:7]]"
-  grep -qF '"mail":"np-2"' "$work/a.log" && fail "register: np-2 reached a host daemon before its recipient registered"
+  if daemon_pending a np-2; then
+    fail "register: np-2 reached a host daemon before its recipient registered"
+  fi
   tracer a "$l" l; l_pid=$tracer_pid
   wait_for 10 "register: np-2 delivered on Register" grep -q 'DELIVERED mail=np-2 record=r-1' "$work/l.out"
   wait_for 10 "register: receipt for np-2" receipt np-2
@@ -571,7 +617,7 @@ no_poll() {
   wait "$l_pid" 2>/dev/null || true
   send b "$l" np-3 "while host-a is down"
   daemon_start a 2
-  wait_for 10 "hello: np-3 in host-a's inbox with no session registered" grep -qF '"ev":"deliver","mail":"np-3"' "$work/a.log"
+  wait_for 10 "hello: np-3 in host-a's inbox with no session registered" daemon_pending a np-3
   tracer a "$l" l; l_pid=$tracer_pid
   wait_for 10 "hello: np-3 delivered" grep -q 'DELIVERED mail=np-3 record=r-2' "$work/l.out"
   wait_for 10 "hello: receipt for np-3" receipt np-3
@@ -586,7 +632,8 @@ no_poll() {
   out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
     || fail "claims: the key was not free at the first request after its deadline: $out"
   [[ "$out" == "CLAIMED op=acquire holder=$r "* ]] || fail "claims: expected R to hold the key, saw: $out"
-  grep -q '"ev":"release"' "$work/coord.log" && fail "claims: a release freed the key, not expiry"
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "RELEASE")] | length')" == 0 ]] \
+    || fail "claims: a release freed the key, not expiry"
 
   # leave, explicit: an adapter whose stdin closes unregisters at once, with
   # no registered-set read to do it.
@@ -622,9 +669,13 @@ no_poll() {
     esac
     unregistered "$d" || fail "leave: D$i not unregistered by the first $reader after its grace (its connection closed, or that read does not expire)"
   done
-  jq -e --arg d "88888881-8888-4888-8888-888888888881" --arg r "$r" --arg l "$l" \
-    'select(.ev == "broadcast" and .mail == "np-b2") | .to | (any(. == $d) | not) and any(. == $r) and any(. == $l)' \
-    "$work/coord.log" >/dev/null || fail "leave: np-b2 went to an expired session or missed a live one"
+  audit_json "$work/coord.log" | jq -es \
+    --arg d "np-b2/88888881-8888-4888-8888-888888888881" \
+    --arg r "np-b2/$r" --arg l "np-b2/$l" '
+    [.[] | select(.type == "MAIL" and (.mail | startswith("np-b2/"))) | .mail] as $rows
+    | ($rows | length) == 2 and ($rows | index($d)) == null
+      and ($rows | index($r)) != null and ($rows | index($l)) != null' >/dev/null \
+    || fail "leave: np-b2 went to an expired session or missed a live one"
   grep -q '^SESSION address=8888888' "$work/board.out" && fail "leave: the Board shows an expired session"
   for d in "$r" "$l"; do
     grep -q "^SESSION address=$d .*connected=true" "$work/board.out" || fail "leave: connected session $d left the Board"
@@ -646,7 +697,7 @@ no_poll() {
   # next hello.
   kill -9 "$r_pid"; wait "$r_pid" 2>/dev/null || true
   send a "$r" np-5 "while R is down"
-  wait_for 10 "offline: np-5 in host-b's inbox" grep -qF '"ev":"deliver","mail":"np-5"' "$work/b.log"
+  wait_for 10 "offline: np-5 in host-b's inbox" daemon_pending b np-5
   # Every host daemon so far kept its first link to the coordinator.
   grep -qE "$NP_LINK_LOST" "$work"/daemon-*.out && fail "a host daemon lost its link: $(grep -hE "$NP_LINK_LOST" "$work"/daemon-*.out)"
   kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
@@ -665,11 +716,15 @@ no_poll() {
   grep -qE "$NP_LINK_LOST" "$work/daemon-b2.out" && fail "host-b reconnected: $(grep -hE "$NP_LINK_LOST" "$work/daemon-b2.out")"
 
   # Nothing lost, nothing twice.
+  audit_json "$work/coord.log" >"$work/final-audit.json"
   for m in np-1 np-2 np-3 np-5 "np-b1/$r" "np-b2/$r" "np-b2/$l"; do
-    log_count "\"ev\":\"receipt\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one receipt"
+    jq -es --arg m "$m" '
+      [.[] | select(.type == "MAIL" and .mail == $m and .receipted_at_ms != null)] | length == 1' \
+      "$work/final-audit.json" >/dev/null || fail "$m: expected one receipt"
   done
   for m in np-1 np-2 np-3 np-5; do
-    log_count "\"ev\":\"mail\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one mail row"
+    jq -es --arg m "$m" '[.[] | select(.type == "MAIL" and .mail == $m)] | length == 1' \
+      "$work/final-audit.json" >/dev/null || fail "$m: expected one mail row"
   done
   for m in np-1 np-b1/ np-b2/ np-5; do
     log_count "\"mail\":\"$m" 1 "$work/r.store" || fail "R's Store must hold $m once"
@@ -678,7 +733,7 @@ no_poll() {
     log_count "\"mail\":\"$m" 1 "$work/l.store" || fail "L's Store must hold $m once"
   done
 
-  echo "PASS no-poll: with no sweep in the core, directed mail, a broadcast, mail pending at Register and at a host daemon's hello, and mail held in a host daemon's inbox while the coordinator was down were each delivered and acked once; receipts reached the coordinator on the ack and on replay; a claim expired at the first request past its deadline; sessions were unregistered on stdin EOF and, after their grace, by the first Broadcast, claim, relabel and Board read (after a closed connection and a dropped host link); and no log grew while nobody asked"
+  echo "PASS no-poll: with --no-cold-sweep, directed mail, a broadcast, mail pending at Register and at a host daemon's hello, and mail held in a host daemon's inbox while the coordinator was down were each delivered and acked once; receipts reached the coordinator on the ack and on replay; a claim expired at the first request past its deadline; sessions were unregistered on stdin EOF and, after their grace, by the first Broadcast, claim, relabel and Board read (after a closed connection and a dropped host link); and no SQLite bytes changed while nobody asked"
 }
 
 # Proof K7. Kind and headers arrive verbatim. Loopback: a throwaway coordinator and
@@ -758,8 +813,15 @@ headers() {
   grep -qx "STORED mail=k7-1 record=r-1 kind=directed" "$work/tracer.out" || fail "STORED line lacks kind=directed: $(cat "$work/tracer.out")"
   [[ "$(grep '^HEADERS mail=k7-1 ' "$work/tracer.out")" == "HEADERS mail=k7-1 $want" ]] \
     || fail "recipient HEADERS differ from the sent set: $(grep '^HEADERS' "$work/tracer.out")"
+  audit_bodies_json "$work/coord.log" >"$work/coord-headers.json"
+  grep -qF "\"type\":\"HEADERS\",\"mail\":\"k7-1\",\"headers\":$want" "$work/coord-headers.json" \
+    || fail "coordinator headers differ from the sent set"
+  daemon_audit_json "$work/b.log" >"$work/daemon-headers.json"
+  grep -qF "\"type\":\"HEADERS\",\"mail\":\"k7-1\",\"headers\":$want" "$work/daemon-headers.json" \
+    || fail "host daemon headers differ from the sent set"
   kill -9 "$tracer_pid"; wait "$tracer_pid" 2>/dev/null || true
-  log_count '"ev":"receipt"' 0 "$work/coord.log" || fail "receipt exists before the recipient acked"
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .receipted_at_ms != null)] | length')" == 0 ]] \
+    || fail "receipt exists before the recipient acked"
 
   # Restart the coordinator and the recipient's host daemon, then the recipient.
   kill "$coord_pid" "$daemon_b_pid"; wait "$coord_pid" "$daemon_b_pid" 2>/dev/null || true
@@ -773,8 +835,6 @@ headers() {
   wait_for 15 "DELIVERED after restart" grep -q "DELIVERED mail=k7-1 record=r-1" "$work/tracer.out"
   [[ "$(wc -l <"$work/tracer.store")" == 1 ]] || fail "Store must hold the Mail once"
   grep -qF "\"kind\":\"directed\",\"headers\":$want}" "$work/tracer.store" || fail "Store entry lacks kind and the exact headers: $(cat "$work/tracer.store")"
-  grep -qF "\"headers\":$want" "$work/coord.log" || fail "coordinator log lacks the exact headers"
-  grep -qF "\"headers\":$want" "$work/b.log" || fail "host daemon log lacks the exact headers"
   local rc re
   wait_for 15 "receipt after the restarts" "$bin" receipt --socket "$work/a.sock" --mail k7-1
   rc="$("$bin" receipt --socket "$work/a.sock" --mail k7-1)"
@@ -803,7 +863,8 @@ headers() {
 
   # Refused sets commit nothing: no Mail, no log line, unknown to the receipt.
   local mails_before bcast_before n=0 refused reason
-  mails_before="$(grep -c '"ev":"mail"' "$work/coord.log")"; bcast_before="$(grep -c '"ev":"broadcast"' "$work/coord.log")"
+  mails_before="$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .kind == "directed")] | length')"
+  bcast_before="$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .kind == "broadcast")] | length')"
   refuse() { # refuse <to> <expected reason substring> <header args...>
     local to="$1" want_reason="$2"; shift 2
     n=$((n + 1))
@@ -822,9 +883,14 @@ headers() {
     refuse "$to" "expected a key of 1 to 128 bytes, saw a key of 0 bytes" --header "=v"
     refuse "$to" 'headers: duplicate key' --header a=1 --header a=2
   done
-  [[ "$(grep -c '"ev":"mail"' "$work/coord.log")" == "$mails_before" ]] || fail "a refused set committed a Mail"
-  [[ "$(grep -c '"ev":"broadcast"' "$work/coord.log")" == "$bcast_before" ]] || fail "a refused set committed a Broadcast"
-  ! grep -q 'k7-r' "$work/coord.log" "$work/a.log" "$work/b.log" || fail "a refused Mail left a log line"
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .kind == "directed")] | length')" == "$mails_before" ]] \
+    || fail "a refused set committed a Mail"
+  [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .kind == "broadcast")] | length')" == "$bcast_before" ]] \
+    || fail "a refused set committed a Broadcast"
+  if { audit_json "$work/coord.log"; daemon_audit_json "$work/a.log"; daemon_audit_json "$work/b.log"; } \
+    | jq -es 'any(.[]; (.mail? // "") | startswith("k7-r"))' >/dev/null; then
+    fail "a refused Mail left a record"
+  fi
 
   # Replay: a coordinator log, a host daemon log and a Store written before kind and headers.
   local to="$RECIPIENT" old="$work/old"
@@ -842,6 +908,7 @@ headers() {
     printf "$dl" old-d2 ',"wake":true'  # legacy-wire: read shape, directed
     printf "$dl" old-d3 ''
   } >"$old/daemon.log"
+  sha256sum "$old/coord.log" "$old/daemon.log" >"$old/legacy-inputs.sha"
   "$bin" coordinator --bind 127.0.0.1:0 --port-file "$old/port" --data "$old/coord.log" >"$old/coord.out" 2>&1 &
   pids+=("$!")
   wait_for 10 "old coordinator port" test -s "$old/port"
@@ -865,6 +932,8 @@ headers() {
   ! grep -q HEADERS "$old/tracer.out" || fail "a Mail with no headers printed a HEADERS line"
   rc="$("$bin" receipt --socket "$old/d.sock" --mail old-c2)"
   [[ "$rc" == RECEIPT*" kind=directed" ]] || fail "old coordinator mail receipt: $rc"
+  sha256sum -c "$old/legacy-inputs.sha" >/dev/null \
+    || fail "read-only import changed a legacy coordinator or daemon log"
 
   echo "PASS headers: kinds and headers (non-ASCII, empty, quotes, backslashes, newlines, order, the largest set) arrived byte-identical in the Store and the receipt across a recipient SIGKILL between Store and Ack and a restart of the coordinator and host daemon; every refused set committed nothing; old coordinator and host daemon logs and an old Store replayed with the right kinds; no core code names a header key, and no Optional module that names one has a path to delivery"
 }
@@ -1043,6 +1112,7 @@ mcp() {
 # Proof K9: real processes, live read-only inputs, then immutable copies.
 audit() {
   command -v python3 >/dev/null || fail "python3 required"
+  command -v jq >/dev/null || fail "jq required"
   loopback_stack
   local a='[[1a:Meteor Shower:zz]]aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   local b="$RECIPIENT" x='audit-adapter' bpid apid pid m
@@ -1061,7 +1131,10 @@ audit() {
     --header 'note=ü v' --header 'empty=' >>"$work/send.out"
   "$bin" send --socket "$work/a.sock" --from "$a" --to '*' --mail audit-b --body 'all' \
     --header 'note=ü v' --header 'empty=' >>"$work/send.out"
-  wait_for 10 'four receipts' log_count '"ev":"receipt"' 4 "$work/coord.log"
+  four_receipts() {
+    [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .receipted_at_ms != null)] | length')" == 4 ]]
+  }
+  wait_for 10 'four receipts' four_receipts
   "$bin" label --socket "$work/a.sock" --from "$b" --label 'new label ✓' >/dev/null
   kill "$bpid"; wait "$bpid" 2>/dev/null || true
   unset 'pids[${#pids[@]}-1]'
@@ -1080,14 +1153,42 @@ audit() {
   exec 4>&-
   wait "$apid"
   unset 'pids[${#pids[@]}-1]'
-  wait_for 10 'adapter unregistered' grep -q '"ev":"unregister"' "$work/coord.log"
-  sha256sum "$work/coord.log" "$work/b.log" "$work/b.store" >"$work/before.sha"
+  adapter_unregistered() {
+    audit_json "$work/coord.log" | jq -es --arg a "$x" \
+      'any(.[]; .type == "UNREGISTER" and .address == $a)' >/dev/null
+  }
+  wait_for 10 'adapter unregistered' adapter_unregistered
+  storage_fingerprint "$work" >"$work/before.sha"
+  sha256sum "$work/b.store" >"$work/store-before.sha"
   "$bin" audit --coordinator-log "$work/coord.log" --daemon-log "$work/b.log" --store "$work/b.store" >"$work/live.out"
-  sha256sum "$work/coord.log" "$work/b.log" "$work/b.store" >"$work/after.sha"
+  storage_fingerprint "$work" >"$work/after.sha"
+  sha256sum "$work/b.store" >"$work/store-after.sha"
   cmp "$work/before.sha" "$work/after.sha" || fail 'audit changed live inputs'
+  cmp "$work/store-before.sha" "$work/store-after.sha" || fail 'audit changed the live Store'
+
+  # Eight readers overlap a live send. Each must complete read-only verification.
+  local -a concurrent_pids=()
+  local concurrent_failures=0 i
+  for i in $(seq 1 8); do
+    "$bin" audit --coordinator-log "$work/coord.log" --daemon-log "$work/b.log" \
+      --store "$work/b.store" --bodies --json >"$work/concurrent-$i.json" \
+      2>"$work/concurrent-$i.err" &
+    concurrent_pids+=("$!")
+  done
   "$bin" send --socket "$work/b.sock" --from "$b" --to "$a" --mail audit-after --body 'after audit' \
     | grep -q 'ACCEPTED mail=audit-after' || fail 'send after audit failed'
-  wait_for 10 'fifth receipt' log_count '"ev":"receipt"' 5 "$work/coord.log"
+  for pid in "${concurrent_pids[@]}"; do
+    if ! wait "$pid"; then concurrent_failures=$((concurrent_failures + 1)); fi
+  done
+  [[ "$concurrent_failures" == 0 ]] || fail "$concurrent_failures concurrent audits failed"
+  for i in $(seq 1 8); do
+    jq -es 'length > 0 and any(.[]; .type == "AUDIT")' "$work/concurrent-$i.json" >/dev/null \
+      || fail "concurrent audit $i produced invalid or incomplete JSON"
+  done
+  five_receipts() {
+    [[ "$(audit_json "$work/coord.log" | jq -s '[.[] | select(.type == "MAIL" and .receipted_at_ms != null)] | length')" == 5 ]]
+  }
+  wait_for 10 'fifth receipt' five_receipts
   for m in audit-1 audit-2 "audit-b/$a" "audit-b/$b" audit-after; do
     "$bin" receipt --socket "$work/a.sock" --mail "$m" >>"$work/receipts"
   done
@@ -1098,17 +1199,27 @@ audit() {
   done
   pids=()
   kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true; coord_pid=''
-  cp "$work/coord.log" "$work/c.copy"
-  cp "$work/b.log" "$work/d.copy"
-  cp "$work/b.store" "$work/s.copy"
-  printf '{"ev":' >>"$work/c.copy"
-  local args=(--coordinator-log "$work/c.copy" --daemon-log "$work/d.copy" --store "$work/s.copy")
-  sha256sum "$work/c.copy" "$work/d.copy" "$work/s.copy" >"$work/copies.sha"
+  # The same SQLite inputs remain readable and unchanged after every writer stops.
+  local args=(--coordinator-log "$work/coord.log" --daemon-log "$work/b.log" --store "$work/b.store")
+  storage_fingerprint "$work" >"$work/stopped-before.sha"
+  sha256sum "$work/b.store" >"$work/stopped-store-before.sha"
   "$bin" audit "${args[@]}" >"$work/text"
   "$bin" audit "${args[@]}" --json >"$work/json"
   "$bin" audit "${args[@]}" --address "$b" >"$work/filtered-text"
   "$bin" audit "${args[@]}" --address "$b" --json >"$work/filtered"
-  sha256sum -c "$work/copies.sha" >/dev/null || fail 'audit changed copied inputs'
+  storage_fingerprint "$work" >"$work/stopped-after.sha"
+  sha256sum "$work/b.store" >"$work/stopped-store-after.sha"
+  cmp "$work/stopped-before.sha" "$work/stopped-after.sha" || fail 'stopped audit changed SQLite inputs'
+  cmp "$work/stopped-store-before.sha" "$work/stopped-store-after.sha" || fail 'stopped audit changed the Store'
+
+  # A standalone pre-cutover input still reports its torn tail without SQLite.
+  printf '%s\n' '{"ev":"session","session":"torn-a","host":"old-host"}' \
+    '{"ev":"mail","mail":"torn-m","from":"torn-a","to":"torn-b","body":"x"}' \
+    '{"ev":"receipt","mail":"torn-m","session":"torn-b","record":"r-1"}' >"$work/torn-legacy.log"
+  printf '{"ev":' >>"$work/torn-legacy.log"
+  sha256sum "$work/torn-legacy.log" >"$work/torn-before.sha"
+  "$bin" audit --coordinator-log "$work/torn-legacy.log" --json >"$work/torn-json"
+  sha256sum -c "$work/torn-before.sha" >/dev/null || fail 'audit changed the torn legacy input'
   printf '%s\n' '{"ev":"session","session":"old","host":"old-host"}' \
     '{"ev":"mail","mail":"old-m","from":"old","to":"other","body":"x"}' \
     '{"ev":"receipt","mail":"old-m","session":"other","record":"r-1"}' >"$work/old-c"
@@ -1143,8 +1254,12 @@ for t in ['REGISTER', 'LABEL', 'DECLARED', 'UNDECLARED', 'UNREGISTER', 'MAIL', '
 assert live[-1] == ('AUDIT sources=3 registers=4 unregisters=1 mails=5 receipted=4 '
     'unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0')
 assert of('AUDIT') == [dict(type='AUDIT', sources=3, registers=4, unregisters=1, mails=6,
-    receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)]
-assert of('TORN') == [dict(type='TORN', path=str(w/'c.copy'), bytes=6)]
+    receipted=5, unreceipted=1, duplicates=0, mismatches=0, torn=0, skipped=0)]
+torn = rows('torn-json')
+assert of('AUDIT',torn) == [dict(type='AUDIT', sources=1, registers=1, unregisters=0, mails=1,
+    receipted=1, unreceipted=0, duplicates=0, mismatches=0, torn=1, skipped=0)]
+assert of('TORN',torn) == [dict(type='TORN', path=str(w/'torn-legacy.log'), bytes=6)]
+assert [v['mail'] for v in of('MAIL',torn)] == ['torn-m']
 for t in ['REGISTER','LABEL','DECLARED','UNDECLARED','UNREGISTER']:
     assert of(t) and all(isinstance(v['at_ms'], int) for v in of(t)), t
 assert [(v['address'],v['declared']) for v in of('DECLARED')] == [(a,declared),(b,declared)]
@@ -1171,7 +1286,7 @@ assert all(v['address']==b for v in f if v['type'] in ['REGISTER','LABEL','DECLA
 assert of('STORE',f) == of('STORE')
 assert [v['mail'] for v in of('MAIL',f)] == ['audit-1','audit-2','audit-b/'+b,'audit-held','audit-after']
 assert of('AUDIT',f)[0] == dict(type='AUDIT', sources=3, registers=2, unregisters=0, mails=5,
-    receipted=4, unreceipted=1, duplicates=0, mismatches=0, torn=1, skipped=0)
+    receipted=4, unreceipted=1, duplicates=0, mismatches=0, torn=0, skipped=0)
 old = rows('old-json')
 assert of('REGISTER',old)[0]['at_ms'] is None
 assert all(of('MAIL',old)[0][k] is None for k in ['accepted_at_ms','receipted_at_ms','latency_ms'])
@@ -1179,7 +1294,7 @@ assert of('DAEMON_DELIVER',old)[0]['kind']=='broadcast'
 assert of('STORE',old)[0]['kind'] is None
 assert all(v['headers'] is None for v in of('HEADERS',old))
 PY
-  echo 'PASS audit: live read-only history, both stamps, receipts, headers, broadcast copies, filtering, held Mail, registration events, torn copies and old records'
+  echo 'PASS audit: eight concurrent live readers, unchanged live and stopped SQLite inputs and Store, both stamps, receipts, headers, broadcast copies, filtering, held Mail, registration events, torn legacy JSONL and old records'
 }
 
 takeover() {
