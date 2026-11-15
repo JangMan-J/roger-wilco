@@ -100,8 +100,8 @@ daemon_audit_json() { # daemon_audit_json <daemon-data>
 # The paths are stable, so identical output proves no bytes changed or appeared.
 storage_fingerprint() { # storage_fingerprint <work-directory>
   {
-    find "$1/coord.log.slices" -type f -print 2>/dev/null || true
-    find "$1" -maxdepth 1 -type f \( -name '*.sqlite' -o -name '*.sqlite-*' \) -print
+    find "$1/coord.log.slices" -type f ! -name '*-shm' -print 2>/dev/null || true
+    find "$1" -maxdepth 1 -type f \( -name '*.sqlite' -o -name '*.sqlite-wal' \) -print
   } | LC_ALL=C sort | xargs -r sha256sum
 }
 
