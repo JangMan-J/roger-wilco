@@ -1,0 +1,22 @@
+[package]
+name = "roger-cold-shipper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Optional module shipping verified cold day files to an archive directory and restoring on demand"
+readme = "README.md"
+
+[workspace]
+
+[[bin]]
+name = "roger-cold-shipper"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lints.clippy]
+all = "warn"
