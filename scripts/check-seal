@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Seal guard: the project's sealed documents (purpose, proofs, invariants, terms) are held
-# by its director in records outside this repository. When the `slice` tool is installed
-# and a seal exists for this checkout, the sealed bytes must still match it; on any other
-# machine (a clone, CI) this passes quietly. The seal is checked again at every merge by
-# `slice`. It names no harness.
+# by its director in records outside this repository, beside it in ../director. When a seal
+# exists there, every sealed file and the assignment must still match the sha256 recorded in
+# its SEAL.json (exit 3 when one does not); on any other machine (a clone, CI) this passes
+# quietly. It needs no tool beyond sha256sum (or shasum) and names no harness.
 # Usage: scripts/check-seal
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (verify the director's seal when it is present)"; exit 0; fi
@@ -11,5 +11,23 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (verify the 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-command -v slice >/dev/null 2>&1 || { echo "SKIP seal: slice is not installed"; exit 0; }
-slice verify --if-sealed
+GEN_FILE="$ROOT/../director/pact/CURRENT"
+[[ -f "$GEN_FILE" ]] || { echo "no seal for this checkout on this machine: nothing to verify"; exit 0; }
+GEN="$(tr -d '[:space:]' < "$GEN_FILE")"
+DIR="$ROOT/../director/pact/gen-$GEN"
+[[ -f "$DIR/SEAL.json" ]] || { echo "seal broken: $DIR/SEAL.json is missing" >&2; exit 3; }
+
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+recorded() { sed -n "s/.*\"$1\": \"\\([0-9a-f]\\{64\\}\\)\".*/\\1/p" "$DIR/SEAL.json"; }
+
+changed=()
+for pair in KERNEL.md:KERNEL.md INVARIANTS.md:INVARIANTS.md GLOSSARY.md:GLOSSARY.md assignment.md:assignment_sha256; do
+  file="${pair%%:*}" key="${pair#*:}"
+  want="$(recorded "$key")"
+  if [[ -z "$want" || ! -f "$DIR/$file" || "$(sha "$DIR/$file")" != "$want" ]]; then changed+=("$file"); fi
+done
+if (( ${#changed[@]} )); then
+  echo "seal broken: generation $GEN changed after sealing: ${changed[*]}" >&2
+  exit 3
+fi
+echo "seal: generation $GEN intact"
