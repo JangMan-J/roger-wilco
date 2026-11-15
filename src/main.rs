@@ -2,18 +2,19 @@ mod audit;
 mod claims;
 #[allow(dead_code)]
 mod cold;
-#[allow(dead_code)]
-mod sha256;
-#[allow(dead_code)]
-pub mod sql;
 mod coordinator;
 mod daemon;
+#[allow(dead_code)]
 mod durlog;
 mod headers;
 mod json;
 mod mcp;
 mod net;
 mod session;
+#[allow(dead_code)]
+mod sha256;
+#[allow(dead_code)]
+pub mod sql;
 
 use std::io;
 use std::path::PathBuf;
@@ -54,8 +55,9 @@ fn token() -> io::Result<String> {
 const USAGE: &str = "Usage: roger <command> [flags]
 
 Commands:
-  coordinator --bind <address:port> --data <log>
+  coordinator --bind <address:port> --data <path>
               [--port-file <path>] [--unregister-after-ms <ms>]
+              [--slices <n>] [--cold-retain-days <days>] [--no-cold-sweep]
   daemon      --coordinator <address:port> --host-id <host> [--socket <path>] [--listen <address:port>] [--port-file <path>]
               [--client-token-env <NAME>] --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
@@ -100,21 +102,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     match cmd {
-        "coordinator" => coordinator::run(
-            &need(&args, "--bind")?,
-            arg(&args, "--port-file").map(PathBuf::from),
-            PathBuf::from(need(&args, "--data")?),
-            token()?,
-            match arg(&args, "--unregister-after-ms") {
-                Some(ms) => ms.parse().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("--unregister-after-ms expects milliseconds, saw {ms}"),
-                    )
-                })?,
-                None => coordinator::UNREGISTER_AFTER_MS,
-            },
-        ),
+        "coordinator" => coordinator::run(coordinator::Config::from_args(&args, token()?)?),
         "daemon" => {
             let coordinator = need(&args, "--coordinator")?;
             let token = token()?;
