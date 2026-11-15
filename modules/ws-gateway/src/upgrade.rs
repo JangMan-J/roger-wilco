@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
 
 /// Query keys accepted on `GET /`.
-const KEYS: &str = "id, session, label, declare, registered, superseded, after";
+const KEYS: &str = "id, session, label, declare, registered, superseded, after, groups";
 
 /// One session's parameters and its open Store, ready for the session loop.
 pub struct Opened {
@@ -19,6 +19,8 @@ pub struct Opened {
     pub declared: Option<String>,
     pub confirm: bool,
     pub superseded: bool,
+    /// Whether Named Groups requests are enabled for this connection.
+    pub groups: bool,
     /// `Some(record)`: replay Store entries after that record (`Some("")`: every entry).
     pub after: Option<String>,
     pub store: DurLog,
@@ -34,6 +36,7 @@ pub struct Params {
     pub declared: Option<String>,
     pub confirm: bool,
     pub superseded: bool,
+    pub groups: bool,
     pub after: Option<String>,
 }
 
@@ -131,6 +134,7 @@ pub fn parse_query(query: Option<&str>) -> Result<Params, String> {
             "declare" => p.declared = Some(val),
             "registered" => p.confirm = flag("registered", &val)?,
             "superseded" => p.superseded = flag("superseded", &val)?,
+            "groups" => p.groups = flag("groups", &val)?,
             "after" => p.after = Some(val),
             _ => return Err(format!("expected query keys {KEYS}; saw {key}")),
         }
@@ -205,6 +209,7 @@ pub fn prepare(req: &Request, bearer: Option<&str>, store_dir: &Path) -> Result<
         declared: p.declared,
         confirm: p.confirm,
         superseded: p.superseded,
+        groups: p.groups,
         after: p.after,
         store,
         entries,
@@ -231,13 +236,14 @@ mod tests {
     #[test]
     fn query_decodes_composite_address_and_flags() {
         let p = parse_query(Some(
-            "id=%5B%5B153%3AMeteor%20Shower%3A7%5D%5Dcaf%C3%A9&label=a+b&registered=1&superseded=0&after=r-2",
+            "id=%5B%5B153%3AMeteor%20Shower%3A7%5D%5Dcaf%C3%A9&label=a+b&registered=1&superseded=0&groups=true&after=r-2",
         ))
         .unwrap();
         assert_eq!(p.address.as_deref(), Some("[[153:Meteor Shower:7]]café"));
         assert_eq!(p.label.as_deref(), Some("a+b"));
         assert!(p.confirm);
         assert!(!p.superseded);
+        assert!(p.groups);
         assert_eq!(p.after.as_deref(), Some("r-2"));
     }
 
@@ -254,6 +260,13 @@ mod tests {
         assert!(parse_query(Some("registered=yes"))
             .unwrap_err()
             .contains("saw registered=yes"));
+        assert!(parse_query(Some("groups=1")).unwrap().groups);
+        assert!(parse_query(Some("groups=true")).unwrap().groups);
+        assert!(!parse_query(Some("groups=0")).unwrap().groups);
+        assert!(!parse_query(Some("groups=false")).unwrap().groups);
+        assert!(parse_query(Some("groups=yes"))
+            .unwrap_err()
+            .contains("saw groups=yes"));
         assert!(percent_decode("%ZZ").is_err());
         assert!(percent_decode("%2").is_err());
         assert_eq!(parse_query(None).unwrap(), Params::default());

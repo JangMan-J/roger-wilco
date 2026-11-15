@@ -173,22 +173,33 @@ pub async fn request(dialer: &Dialer, req: &Value) -> io::Result<Value> {
     Ok(reply)
 }
 
-/// Short-lived `send` request to the host daemon (as `session::send_mail`).
-pub async fn send_mail(
+enum SendTarget<'a> {
+    Address(&'a str),
+    Group(&'a str),
+}
+
+async fn send(
     dialer: &Dialer,
     from: &str,
-    to: &str,
+    target: SendTarget<'_>,
     mail: &str,
     body: &str,
     headers: Option<&Value>,
-) -> io::Result<String> {
+) -> io::Result<Value> {
     let (mut reader, writer) = connect(dialer).await?;
     let mut ask = Map::new();
     ask.insert("type".into(), Value::String("send".into()));
     ask.insert("req".into(), Value::Number(1.into()));
     ask.insert("mail".into(), Value::String(mail.into()));
     ask.insert("from".into(), Value::String(from.into()));
-    ask.insert("to".into(), Value::String(to.into()));
+    match target {
+        SendTarget::Address(to) => {
+            ask.insert("to".into(), Value::String(to.into()));
+        }
+        SendTarget::Group(group) => {
+            ask.insert("group".into(), Value::String(group.into()));
+        }
+    }
     ask.insert("body".into(), Value::String(body.into()));
     if let Some(h) = headers {
         ask.insert("headers".into(), h.clone());
@@ -196,7 +207,7 @@ pub async fn send_mail(
     writer.send(&Value::Object(ask)).await?;
     while let Some(v) = reader.next_value().await? {
         match field(&v, "type")? {
-            "accepted" => return Ok(field(&v, "mail")?.to_string()),
+            "accepted" => return Ok(v),
             "error" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -210,6 +221,37 @@ pub async fn send_mail(
         }
     }
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
+}
+
+/// Short-lived directed or broadcast `send` request to the host daemon.
+pub async fn send_mail(
+    dialer: &Dialer,
+    from: &str,
+    to: &str,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> io::Result<String> {
+    let accepted = send(dialer, from, SendTarget::Address(to), mail, body, headers).await?;
+    Ok(field(&accepted, "mail")?.to_string())
+}
+
+/// Short-lived Group `send`; returns the accepted Mail id and article position.
+pub async fn send_group(
+    dialer: &Dialer,
+    from: &str,
+    group: &str,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> io::Result<(String, i64)> {
+    let accepted = send(dialer, from, SendTarget::Group(group), mail, body, headers).await?;
+    let mail = field(&accepted, "mail")?.to_string();
+    let article = accepted
+        .get("article")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing article"))?;
+    Ok((mail, article))
 }
 
 #[cfg(test)]
