@@ -2,8 +2,9 @@
 //! every declared text against the roster, as docs/CONVENTIONS.md describes.
 //!
 //! Only the audit's own timeline is read: `MAIL` with the `HEADERS` and `BODY`
-//! lines right after it, `DECLARED` and `UNDECLARED`. Daemon and Store lines
-//! are passed over. Addresses are compared as whole strings only.
+//! lines right after it, `DECLARED` and `UNDECLARED`. `POSITION`, `RECEIPT`,
+//! daemon and Store lines are passed over. Addresses and Group names are
+//! compared as whole strings only.
 
 use crate::canon;
 use crate::roster::Roster;
@@ -122,6 +123,7 @@ struct PendingMail {
     kind: String,
     from: String,
     to: String,
+    group: Option<String>,
     line: Value,
     headers: Headers,
     body: Option<String>,
@@ -139,7 +141,8 @@ pub struct Verifier<'a> {
     pending: Option<PendingMail>,
     declared: HashMap<String, DeclState>,
     nonces: HashMap<String, (String, Value)>,
-    /// Per `from`: seq -> the Mail id (Broadcast copies share one) and line.
+    /// Per `from`: seq -> the Mail id (Broadcast copies and multi-reader Group
+    /// rows share one).
     seqs: BTreeMap<String, BTreeMap<u64, String>>,
     pub out: Vec<Report>,
     mails: usize,
@@ -157,6 +160,50 @@ fn str_field<'v>(v: &'v Value, key: &str) -> Result<&'v str, String> {
             v.get(key).map_or("none".into(), Value::to_string)
         )
     })
+}
+
+fn opt_str_field<'v>(v: &'v Value, key: &str) -> Result<Option<&'v str>, String> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(format!(
+            "expected a string {key} on a {} line, saw {other}",
+            v.get("type").map_or("untyped".into(), Value::to_string)
+        )),
+    }
+}
+
+fn check_opt_int_field(v: &Value, key: &str) -> Result<(), String> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Number(n)) if n.is_i64() || n.is_u64() => Ok(()),
+        Some(other) => Err(format!(
+            "expected an integer {key} on a {} line, saw {other}",
+            v.get("type").map_or("untyped".into(), Value::to_string)
+        )),
+    }
+}
+
+/// Canonical `(mail_id, to)` for `roger-sig/1`:
+/// - `broadcast`: `<mail>/<to>` strips `/<to>`, and `to` is `*`.
+/// - `group`: `mail` verbatim, and `to` is the opaque Group name (`MAIL.group`
+///   when present and non-empty, otherwise `MAIL.to`).
+/// - `directed` (and any other kind): `mail` and `to` verbatim.
+fn signed_target(kind: &str, mail: &str, to: &str, group: Option<&str>) -> (String, String) {
+    match kind {
+        "broadcast" => {
+            let suffix = format!("/{to}");
+            (
+                mail.strip_suffix(&suffix).unwrap_or(mail).to_string(),
+                "*".to_string(),
+            )
+        }
+        "group" => (
+            mail.to_string(),
+            group.filter(|g| !g.is_empty()).unwrap_or(to).to_string(),
+        ),
+        _ => (mail.to_string(), to.to_string()),
+    }
 }
 
 fn decimal(s: &str) -> bool {
@@ -220,11 +267,24 @@ impl<'a> Verifier<'a> {
         self.flush();
         match word {
             "MAIL" => {
+                let mail = str_field(v, "mail")?.to_string();
+                let kind = str_field(v, "kind")?.to_string();
+                let from = str_field(v, "from")?.to_string();
+                let group = opt_str_field(v, "group")?.map(str::to_string);
+                check_opt_int_field(v, "article")?;
+                let to = match opt_str_field(v, "to")? {
+                    Some(t) => t.to_string(),
+                    None if kind == "group" => group
+                        .clone()
+                        .ok_or_else(|| str_field(v, "to").unwrap_err())?,
+                    None => str_field(v, "to")?.to_string(),
+                };
                 self.pending = Some(PendingMail {
-                    mail: str_field(v, "mail")?.to_string(),
-                    kind: str_field(v, "kind")?.to_string(),
-                    from: str_field(v, "from")?.to_string(),
-                    to: str_field(v, "to")?.to_string(),
+                    mail,
+                    kind,
+                    from,
+                    to,
+                    group,
                     line: v.get("line").cloned().unwrap_or(Value::Null),
                     headers: Headers::Empty,
                     body: None,
@@ -249,6 +309,7 @@ impl<'a> Verifier<'a> {
                     ],
                 });
             }
+            // POSITION, RECEIPT, STORE, daemon and summary records outside MAIL -> HEADERS -> BODY.
             _ => {}
         }
         Ok(())
@@ -410,17 +471,7 @@ impl<'a> Verifier<'a> {
             }
         }
 
-        // A Broadcast copy is listed as `<mail>/<address>`; the send named
-        // `<mail>` and signed with `to` = `*`.
-        let (mail_id, to) = if p.kind == "broadcast" {
-            let suffix = format!("/{}", p.to);
-            (
-                p.mail.strip_suffix(&suffix).unwrap_or(&p.mail).to_string(),
-                "*".to_string(),
-            )
-        } else {
-            (p.mail.clone(), p.to.clone())
-        };
+        let (mail_id, to) = signed_target(&p.kind, &p.mail, &p.to, p.group.as_deref());
 
         let headers = match &p.headers {
             Headers::Set(m) => Some(m),

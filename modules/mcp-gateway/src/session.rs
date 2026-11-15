@@ -141,6 +141,7 @@ pub struct GatewaySession {
     pub session_id: String,
     pub address: String,
     pub socket: DaemonSocket,
+    pub groups: bool,
     pub store_path: PathBuf,
     pub inbox: Arc<AsyncInbox>,
     reg_state: Mutex<RegistrationState>,
@@ -276,6 +277,7 @@ pub struct InitParams {
     /// Ask the host daemon for committed Board changes, forwarded over SSE
     /// as `notifications/roger/board`.
     pub watch: bool,
+    pub groups: bool,
 }
 
 impl SessionManager {
@@ -395,6 +397,7 @@ impl SessionManager {
             session_id: session_id.clone(),
             address: address.clone(),
             socket: self.socket.clone(),
+            groups: params.groups,
             store_path: s_path,
             inbox,
             reg_state: Mutex::new(RegistrationState::default()),
@@ -489,6 +492,11 @@ async fn reader_loop(
                         entry.insert("body".into(), Value::String(body.to_string()));
                         entry.insert("kind".into(), Value::String(kind));
                         entry.insert("headers".into(), headers);
+                        for key in ["group", "article"] {
+                            if let Some(value) = v.get(key) {
+                                entry.insert(key.into(), value.clone());
+                            }
+                        }
                         let entry_val = Value::Object(entry);
                         let Ok(line) = serde_json::to_string(&entry_val) else {
                             break;

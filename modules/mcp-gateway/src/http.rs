@@ -380,7 +380,7 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
                         StatusCode::OK,
                         Some(&session.session_id),
                         None,
-                        &mcp::reply_ok(&id, mcp::tools_list()),
+                        &mcp::reply_ok(&id, mcp::tools_list_groups(session.groups)),
                     ),
                     "tools/call" => {
                         let result = match mcp::call_tool(&session, &params).await {
@@ -664,12 +664,25 @@ fn extract_init_params(
             },
         },
     };
+    let groups = match header_utf8(headers, "x-roger-groups")? {
+        Some(v) => watch_flag(&v, "X-Roger-Groups")?,
+        None => match query_param(query, "groups")? {
+            Some(v) => watch_flag(&v, "query groups")?,
+            None => match params.get("_meta").and_then(|m| m.get("roger_groups")) {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(v)) => *v,
+                Some(Value::String(v)) => watch_flag(v, "_meta.roger_groups")?,
+                Some(v) => watch_flag(&v.to_string(), "_meta.roger_groups")?,
+            },
+        },
+    };
 
     Ok(InitParams {
         address,
         label,
         declared,
         watch,
+        groups,
     })
 }
 
@@ -837,5 +850,30 @@ mod tests {
             HeaderValue::from_static("text/event-stream;q=0"),
         );
         assert!(!accept_allows_sse(&h));
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    #[test]
+    fn group_negotiation() {
+        let mut h = HeaderMap::new();
+        assert!(!extract_init_params(&h, None, &Value::Null).unwrap().groups);
+        let meta = serde_json::json!({"_meta":{"roger_groups":true}});
+        assert!(extract_init_params(&h, None, &meta).unwrap().groups);
+        assert!(
+            !extract_init_params(&h, Some("groups=0"), &meta)
+                .unwrap()
+                .groups
+        );
+        h.insert("x-roger-groups", HeaderValue::from_static("1"));
+        assert!(
+            extract_init_params(&h, Some("groups=0"), &meta)
+                .unwrap()
+                .groups
+        );
+        h.insert("x-roger-groups", HeaderValue::from_static("bad"));
+        assert!(extract_init_params(&h, None, &meta).is_err());
     }
 }

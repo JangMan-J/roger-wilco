@@ -75,23 +75,30 @@ async fn close_with(out: &Out, code: CloseCode, reason: &str) {
     let _ = sink.close().await;
 }
 
-fn mail_line(
-    mail: &str,
-    from: &str,
-    body: &str,
-    record: &str,
-    kind: &str,
-    headers: Value,
-) -> Value {
-    obj(vec![
+fn push_group_fields<'a>(v: &'a Value, pairs: &mut Vec<(&'a str, Value)>) {
+    if let Some(group) = v.get("group").and_then(Value::as_str) {
+        pairs.push(("group", s(group)));
+    }
+    if let Some(article) = v.get("article").and_then(Value::as_i64) {
+        pairs.push(("article", Value::Number(article.into())));
+    }
+}
+
+fn mail_line(v: &Value, record: &str) -> Value {
+    let get = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default();
+    let mut pairs = vec![
         ("type", s("mail")),
-        ("mail", s(mail)),
-        ("from", s(from)),
-        ("body", s(body)),
+        ("mail", s(get("mail"))),
+        ("from", s(get("from"))),
+    ];
+    push_group_fields(v, &mut pairs);
+    pairs.extend([
+        ("body", s(get("body"))),
         ("record", s(record)),
-        ("kind", s(kind)),
-        ("headers", headers),
-    ])
+        ("kind", s(&daemon::kind_of(v))),
+        ("headers", daemon::headers_of(v)),
+    ]);
+    obj(pairs)
 }
 
 /// Serve one upgraded connection until the client or the host daemon ends it.
@@ -102,6 +109,7 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
         declared,
         confirm,
         superseded,
+        groups,
         after,
         store,
         entries,
@@ -156,14 +164,7 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
     {
         for e in &entries[start..] {
             let get = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or_default();
-            let line = mail_line(
-                get("mail"),
-                get("from"),
-                get("body"),
-                get("record"),
-                &daemon::kind_of(e),
-                daemon::headers_of(e),
-            );
+            let line = mail_line(e, get("record"));
             if send_line(&out, &line).await.is_err() {
                 unregister(&dwriter).await;
                 return;
@@ -204,7 +205,7 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let reply = match frame {
-                Ok(text) => client_request(&worker_ctx.dialer, &me, &text).await,
+                Ok(text) => client_request(&worker_ctx.dialer, &me, groups, &text).await,
                 Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
             };
             let reply = reply
@@ -297,14 +298,18 @@ async fn reader_loop(
                     Some(existing) => existing.clone(),
                     None => {
                         let candidate = format!("r-{next_record}");
-                        let entry = obj(vec![
+                        let mut fields = vec![
                             ("record", s(&candidate)),
                             ("mail", s(mail)),
                             ("from", s(from)),
+                        ];
+                        push_group_fields(&v, &mut fields);
+                        fields.extend([
                             ("body", s(body)),
                             ("kind", s(&kind)),
                             ("headers", headers.clone()),
                         ]);
+                        let entry = obj(fields);
                         let Ok(line) = serde_json::to_string(&entry) else {
                             return;
                         };
@@ -332,7 +337,7 @@ async fn reader_loop(
                     }
                 };
                 if !replayed.remove(mail) {
-                    let line = mail_line(mail, from, body, &record, &kind, headers);
+                    let line = mail_line(&v, &record);
                     if send_line(&out, &line).await.is_err() {
                         return;
                     }
@@ -398,8 +403,15 @@ async fn reader_loop(
     }
 }
 
+fn without_req(mut reply: Value) -> Value {
+    if let Some(fields) = reply.as_object_mut() {
+        fields.remove("req");
+    }
+    reply
+}
+
 /// One client request, answered by exactly one reply line.
-async fn client_request(dialer: &Dialer, me: &str, text: &str) -> io::Result<Value> {
+async fn client_request(dialer: &Dialer, me: &str, groups: bool, text: &str) -> io::Result<Value> {
     let v: Value = serde_json::from_str(text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     match daemon::field(&v, "type")? {
@@ -413,6 +425,36 @@ async fn client_request(dialer: &Dialer, me: &str, text: &str) -> io::Result<Val
                     })?
                     .to_string(),
             };
+            if groups && v.get("to").is_some() && v.get("group").is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "send accepts either to or group, not both",
+                ));
+            }
+            if groups && v.get("group").is_some() {
+                let group = daemon::field(&v, "group")?;
+                let (mail, article) = daemon::send_group(
+                    dialer,
+                    me,
+                    group,
+                    &mail,
+                    daemon::field(&v, "body")?,
+                    v.get("headers"),
+                )
+                .await?;
+                return Ok(obj(vec![
+                    ("type", s("accepted")),
+                    ("mail", s(&mail)),
+                    ("group", s(group)),
+                    ("article", Value::Number(article.into())),
+                ]));
+            }
+            if groups && v.get("to").is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "send requires either to or group",
+                ));
+            }
             let mail = daemon::send_mail(
                 dialer,
                 me,
@@ -463,9 +505,94 @@ async fn client_request(dialer: &Dialer, me: &str, text: &str) -> io::Result<Val
             )
             .await
         }
+        "subscribe" if groups => {
+            let mut request = vec![
+                ("type", s("subscribe")),
+                ("req", Value::Number(1.into())),
+                ("session", s(me)),
+                ("group", s(daemon::field(&v, "group")?)),
+            ];
+            if let Some(after) = v.get("after") {
+                let after = after.as_i64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "after must be an integer")
+                })?;
+                request.push(("after", Value::Number(after.into())));
+            }
+            if v.get("latest").and_then(Value::as_bool) == Some(true) {
+                request.push(("latest", Value::Bool(true)));
+            }
+            Ok(without_req(daemon::request(dialer, &obj(request)).await?))
+        }
+        "unsubscribe" if groups => Ok(without_req(
+            daemon::request(
+                dialer,
+                &obj(vec![
+                    ("type", s("unsubscribe")),
+                    ("req", Value::Number(1.into())),
+                    ("session", s(me)),
+                    ("group", s(daemon::field(&v, "group")?)),
+                ]),
+            )
+            .await?,
+        )),
+        "groups" if groups => Ok(without_req(
+            daemon::request(
+                dialer,
+                &obj(vec![
+                    ("type", s("groups")),
+                    ("req", Value::Number(1.into())),
+                    ("session", s(me)),
+                ]),
+            )
+            .await?,
+        )),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("expected request send, board, relabel, or claim; saw {other}"),
+            if groups {
+                format!(
+                    "expected request send, board, relabel, claim, subscribe, unsubscribe, or groups; saw {other}"
+                )
+            } else {
+                format!("expected request send, board, relabel, or claim; saw {other}")
+            },
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::DaemonSocket;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn default_connection_refuses_group_requests_and_still_requires_to() {
+        let dialer = Dialer {
+            socket: DaemonSocket::Unix(PathBuf::from("unused-daemon.socket")),
+            client_token: None,
+        };
+        let send = client_request(
+            &dialer,
+            "reader-1",
+            false,
+            r#"{"type":"send","group":"staff","body":"hello"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(send.to_string(), "missing to");
+        for request in ["subscribe", "unsubscribe", "groups"] {
+            let error = client_request(
+                &dialer,
+                "reader-1",
+                false,
+                &format!(r#"{{"type":"{request}","group":"staff"}}"#),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("expected request send, board, relabel, or claim; saw {request}")
+            );
+        }
     }
 }
