@@ -139,7 +139,7 @@ flowchart LR
 
 When `roger coordinator --slices <n>` runs with `n > 1`, `CoordinatorStore` opens `slice-00/hot.sqlite` through `slice-(n-1)/hot.sqlite`, each owned by its own independent group-commit `SliceWriter` thread (`sql::coord::writer_loop`). Streams (`m:<address>`, `g:<group>`) route to `sha256::hash_pair(stream.as_bytes()).0 % num_slices`, while `seen_ids` and `broadcasts` route to `sha256::hash_pair(mail_id.as_bytes()).0 % num_slices` so Mail id non-reuse holds globally across all slices while writes scale across independent `WAL` writers. Each slice directory `slice-NN/` is self-contained (`hot.sqlite` + `cold/`) and movable as files.
 
-Alongside the core, the standalone Optional module `modules/cold-shipper/` (`roger-cold-shipper`) scans `slice-*/cold/day-*.cold` via `archive::ship` (or event-driven `archive::watch_stdin`), verifies `format::parse_and_verify_cold` (`RWCOLD01`, per-record `digest`, and `SHA256:` trailer), atomically writes read-only copies plus `manifest.json` (`roger-cold-manifest/1`) to an archive destination, checks archive integrity via `archive::verify`, and restores missing local day files via `archive::restore`.
+Alongside the core, the standalone Optional module `modules/cold-shipper/` (`roger-cold-shipper`) scans `slice-*/cold/day-*.cold` via `archive::ship` (or event-driven `archive::watch_stdin`), verifies `format::verify_cold_file` (`RWCOLD01`, per-record `digest`, and `SHA256:` trailer), atomically writes read-only copies plus `manifest.json` (`roger-cold-manifest/1`) to an archive destination, checks archive integrity via `archive::verify_archive`, and restores missing local day files via `archive::restore`.
 
 ```mermaid
 flowchart LR
@@ -150,8 +150,8 @@ flowchart LR
     SW0 -- "ColdIndex::seal_day" --> C0[("slice-00/cold/day-<d>.cold")]
     SWK -- "ColdIndex::seal_day" --> CK[("slice-NN/cold/day-<d>.cold")]
 
-    C0 --> SHIP["roger-cold-shipper\narchive::ship / archive::watch_stdin\nformat::parse_and_verify_cold"]
+    C0 --> SHIP["roger-cold-shipper\narchive::ship / archive::watch_stdin\nformat::verify_cold_file"]
     CK --> SHIP
     SHIP -- "atomic write + readonly" --> ARCH[("Archive Destination\n<dest>/slice-NN/day-<d>.cold\n<dest>/manifest.json")]
-    ARCH -- "archive::verify / archive::restore" --> CK
+    ARCH -- "archive::verify_archive / archive::restore" --> CK
 ```
