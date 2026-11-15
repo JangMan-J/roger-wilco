@@ -7,8 +7,8 @@ from the core, and a consumer that follows it gains nothing from the core beyond
 already has: the record. The point of the page is that two consumers who follow it can
 verify each other's Mail mechanically, from the record alone, without trusting a body.
 
-Terms (Mail, Address, Register, Receipt, Store, Record id, Board, Header, Kind) are the
-core's, as the README uses them.
+Terms (Mail, Address, Register, Receipt, Store, Record id, Board, Header, Kind, Group,
+Article number, Position) are the core's, as the README uses them.
 
 ## What the record proves and what it does not
 
@@ -19,7 +19,8 @@ stamps itself is evidence; what it carries for a session is that session's word.
 | --- | --- | --- |
 | `accepted_at_ms` | coordinator clock at commit | when the core first held the Mail |
 | `receipted_at_ms` | coordinator clock at the Ack | when the recipient's durable record existed; `latency_ms` is the difference, one clock, no skew |
-| `kind` | coordinator | how the Mail was routed: `directed`, or a `broadcast` copy `<mail>/<address>` |
+| `kind` | coordinator | how the Mail was routed: `directed`, a `broadcast` copy `<mail>/<address>`, or a `group` article |
+| `group`, `article` | coordinator | on a `group` article, which Group it was committed to and its monotonic Article number in that Group |
 | `record` | the recipient's Store | which durable entry holds the body; the same id on a redelivery |
 | `host` on a Register | the host daemon's `--host-id` | which host daemon the session spoke to |
 | `at_ms` on a Register, unregister, label or declared line | coordinator clock at commit | when the registration event happened (absent on lines written before it existed) |
@@ -140,16 +141,24 @@ roger-sig/1
 
 `from`, `to` and the Mail id are the strings the send names. For a Broadcast, `to` is `*`
 and every copy carries the same headers, so a recipient verifies with `to` = `*`, not its own
-Address. The Mail id is in the form so a body replayed under a new id does not verify. The
-bounds hold easily: at most 32 headers, keys 1 to 128 bytes, values up to 4096 bytes.
+Address. For a Group post (`kind` = `group`), `to` is the opaque Group name (`MAIL.to`, or
+`MAIL.group` if present) and `<mail id>` is the article's `mail_id` (`MAIL.mail` verbatim);
+every subscribed reader receives the same signed headers and verifies against that Group name
+rather than its own Address. If an audit stream holds multiple `MAIL` rows for the same
+`(from, mail_id)` with the same `seq` (for example across concatenated per-reader audits),
+`seq` tracking treats matching `(mail_id, seq)` as the same send rather than a replay, while a
+different `mail_id` reusing the same `seq` fails with `replayed_seq`. The Mail id is in the
+form so a body replayed under a new id does not verify. The bounds hold easily: at most 32
+headers, keys 1 to 128 bytes, values up to 4096 bytes.
 
 **Verifying a Mail.** For a delivery (a `mail` line on the adapter stream, a `roger_inbox`
 entry, a Store entry): `from` names an Address; verify that Address's declaration (above) to
 learn whose key to expect; check `body_sha256`; recompute the canonical form from the
-delivery's own `from`, the recipient's Address (or `*` for kind `broadcast`), the Mail id and
-the headers; verify `sig`; check `seq` against the last one seen from that `from`. Then
-apply the consumer's own policy to `facts`. A Mail that fails any step is unverified mail
-from an unverified sender; what to do with it is the consumer's, not the core's.
+delivery's own `from`, the destination (`to` for `directed`, `*` for `broadcast`, or the
+opaque Group name `group` / `to` for `group`), the Mail id and the headers; verify `sig`;
+check `seq` against the last one seen from that `from`. Then apply the consumer's own policy
+to `facts`. A Mail that fails any step is unverified mail from an unverified sender; what to
+do with it is the consumer's, not the core's.
 
 ## Who is who: the authority, never the body
 

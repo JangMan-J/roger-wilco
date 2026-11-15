@@ -27,15 +27,19 @@ fn roger_bin() -> &'static Path {
             .and_then(Path::parent)
             .expect("modules/verify lives two levels under the repository root")
             .to_path_buf();
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let status = Command::new(cargo)
             .args(["build", "--offline", "--manifest-path"])
             .arg(root.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir)
             .status()
             .expect("failed to invoke cargo build for roger");
         assert!(status.success(), "building roger failed");
-        let bin = root
-            .join("target")
+        let bin = target_dir
             .join("debug")
             .join(format!("roger{}", std::env::consts::EXE_SUFFIX));
         assert!(bin.exists(), "expected built roger at {}", bin.display());
@@ -444,4 +448,219 @@ fn usage_and_input_errors_exit_two() {
     assert_eq!(out.status.code(), Some(2));
     let help = Command::new(VERIFY_BIN).arg("--help").output().unwrap();
     assert_eq!(help.status.code(), Some(0));
+}
+
+#[test]
+fn group_articles_positions_and_multi_reader_audits_verify_and_catch_tampering() {
+    let dir = tmpdir("groups");
+    let roster = write_roster(&dir);
+    let mut log = fleet();
+    log.mail(
+        "d-1",
+        A,
+        B,
+        "hello",
+        headers(2, "a-1", A, B, "d-1", 1, "hello"),
+    );
+    let coord = log.write(&dir);
+
+    // Start from real `roger audit --bodies --json` output (declarations + seq 1 directed mail),
+    // and append Group articles, multi-reader rows, POSITION records, and Group STORE records.
+    let base_listing = String::from_utf8(audit(&[
+        "--coordinator-log",
+        coord.to_str().unwrap(),
+        "--bodies",
+        "--json",
+    ]))
+    .unwrap();
+    let mut valid_lines: Vec<Value> = base_listing
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["type"] != "AUDIT")
+        .collect();
+
+    let g1_headers = headers(2, "a-1", A, "desk.intake", "g-art-1", 2, "dispatch one");
+    valid_lines.extend([
+        json!({
+            "type": "POSITION",
+            "group": "desk.intake",
+            "session": B,
+            "subscribed": true,
+            "position": 1,
+            "record": "r-b-g1",
+            "receipted_at_ms": 1793545147010i64
+        }),
+        // Reader B's audit row (`to` = Group name, `article` = 1).
+        json!({
+            "type": "MAIL",
+            "mail": "g-art-1",
+            "kind": "group",
+            "from": A,
+            "to": "desk.intake",
+            "article": 1,
+            "accepted_at_ms": 1793545147002i64,
+            "receipted_at_ms": 1793545147010i64,
+            "latency_ms": 8,
+            "record": "r-b-g1",
+            "receipt_line": 12,
+            "body_bytes": 12,
+            "line": 9
+        }),
+        json!({"type": "HEADERS", "mail": "g-art-1", "headers": g1_headers.clone()}),
+        json!({"type": "BODY", "mail": "g-art-1", "body": "dispatch one"}),
+        // Reader C's concatenated audit row for the same `(from, mail_id, seq)`.
+        json!({
+            "type": "MAIL",
+            "mail": "g-art-1",
+            "kind": "group",
+            "from": A,
+            "to": C,
+            "group": "desk.intake",
+            "article": 1,
+            "accepted_at_ms": 1793545147002i64,
+            "receipted_at_ms": 1793545147014i64,
+            "latency_ms": 12,
+            "record": "r-c-g1",
+            "receipt_line": 13,
+            "body_bytes": 12,
+            "line": 9
+        }),
+        json!({"type": "HEADERS", "mail": "g-art-1", "headers": g1_headers}),
+        json!({"type": "BODY", "mail": "g-art-1", "body": "dispatch one"}),
+        json!({
+            "type": "POSITION",
+            "group": "desk.intake",
+            "session": C,
+            "subscribed": true,
+            "position": 1,
+            "record": "r-c-g1",
+            "receipted_at_ms": 1793545147014i64
+        }),
+        // Second Group article (`seq` = 3).
+        json!({
+            "type": "MAIL",
+            "mail": "g-art-2",
+            "kind": "group",
+            "from": A,
+            "to": "desk.intake",
+            "group": "desk.intake",
+            "article": 2,
+            "accepted_at_ms": 1793545147020i64,
+            "receipted_at_ms": 1793545147025i64,
+            "latency_ms": 5,
+            "record": "r-b-g2",
+            "receipt_line": 15,
+            "body_bytes": 12,
+            "line": 14
+        }),
+        json!({
+            "type": "HEADERS",
+            "mail": "g-art-2",
+            "headers": headers(2, "a-1", A, "desk.intake", "g-art-2", 3, "dispatch two")
+        }),
+        json!({"type": "BODY", "mail": "g-art-2", "body": "dispatch two"}),
+        json!({
+            "type": "STORE",
+            "path": "b.store",
+            "record": "r-b-g1",
+            "mail": "g-art-1",
+            "from": A,
+            "kind": "group",
+            "group": "desk.intake",
+            "article": 1,
+            "line": 1
+        }),
+        json!({"type": "AUDIT", "sources": 1, "mails": 4}),
+    ]);
+
+    let valid_text: String = valid_lines.iter().map(|v| format!("{v}\n")).collect();
+    let out = verify(&roster, &["--json"], valid_text.as_bytes());
+    let rs = records(&out);
+    assert_eq!(out.status.code(), Some(0), "{rs:#?}");
+    let mail_rs: Vec<_> = rs.iter().filter(|r| r["type"] == "MAIL").collect();
+    assert_eq!(mail_rs.len(), 4);
+    assert!(mail_rs.iter().all(|r| r["status"] == "verified"));
+    assert!(!rs.iter().any(|r| r["type"] == "SEQ_GAP"));
+
+    // Text mode via `--audit <file>` also succeeds.
+    let audit_path = dir.join("group-audit.jsonl");
+    std::fs::write(&audit_path, &valid_text).unwrap();
+    let text_out = verify(&roster, &["--audit", audit_path.to_str().unwrap()], b"");
+    assert_eq!(text_out.status.code(), Some(0));
+    let rendered = String::from_utf8(text_out.stdout).unwrap();
+    assert!(rendered.contains(&format!(
+        "MAIL mail=g-art-1 kind=group from={A} to=desk.intake"
+    )));
+    assert!(rendered
+        .lines()
+        .last()
+        .unwrap()
+        .starts_with("VERIFY mails=4 mails_verified=4 mails_failed=0 "));
+
+    // Failure cases: tampered group name, tampered body, and distinct mail_id reusing seq 2.
+    let mut bad_lines = valid_lines;
+    bad_lines.pop(); // drop trailing AUDIT summary before appending
+    bad_lines.extend([
+        json!({
+            "type": "MAIL",
+            "mail": "g-tampered-group",
+            "kind": "group",
+            "from": A,
+            "to": "wrong.group",
+            "article": 3,
+            "line": 20
+        }),
+        json!({
+            "type": "HEADERS",
+            "mail": "g-tampered-group",
+            "headers": headers(2, "a-1", A, "desk.intake", "g-tampered-group", 4, "clean")
+        }),
+        json!({"type": "BODY", "mail": "g-tampered-group", "body": "clean"}),
+        json!({
+            "type": "MAIL",
+            "mail": "g-tampered-body",
+            "kind": "group",
+            "from": A,
+            "to": "desk.intake",
+            "article": 4,
+            "line": 21
+        }),
+        json!({
+            "type": "HEADERS",
+            "mail": "g-tampered-body",
+            "headers": headers(2, "a-1", A, "desk.intake", "g-tampered-body", 5, "clean")
+        }),
+        json!({"type": "BODY", "mail": "g-tampered-body", "body": "altered"}),
+        json!({
+            "type": "MAIL",
+            "mail": "g-replayed-seq",
+            "kind": "group",
+            "from": A,
+            "to": "desk.intake",
+            "article": 5,
+            "line": 22
+        }),
+        json!({
+            "type": "HEADERS",
+            "mail": "g-replayed-seq",
+            "headers": headers(2, "a-1", A, "desk.intake", "g-replayed-seq", 2, "dup seq")
+        }),
+        json!({"type": "BODY", "mail": "g-replayed-seq", "body": "dup seq"}),
+    ]);
+    let bad_text: String = bad_lines.iter().map(|v| format!("{v}\n")).collect();
+    let bad_out = verify(&roster, &["--json"], bad_text.as_bytes());
+    let bad_rs = records(&bad_out);
+    assert_eq!(bad_out.status.code(), Some(1), "{bad_rs:#?}");
+    assert_eq!(
+        failures(mail(&bad_rs, "g-tampered-group")),
+        vec!["invalid_signature"]
+    );
+    assert_eq!(
+        failures(mail(&bad_rs, "g-tampered-body")),
+        vec!["body_hash_mismatch"]
+    );
+    assert_eq!(
+        failures(mail(&bad_rs, "g-replayed-seq")),
+        vec!["replayed_seq"]
+    );
 }
