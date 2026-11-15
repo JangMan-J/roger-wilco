@@ -115,3 +115,22 @@ flowchart TD
     F --> G{"ColdFilter::may_contain(mail_id)?"}
     G -- "Hit" --> R["ColdIndex::read_body -> cold::read_cold_file\nVerify SHA256 trailer + record digest\nPush identical net::deliver_msg to Host Daemon"]
 ```
+
+## 4. Named Group Post Fanout and Per-Reader Positions
+
+A Group post (`session::send_group_mail` / `roger adapter --groups` / `roger mcp --groups` / `roger-mcp-gateway` / `roger-ws-gateway`) commits **one** `envelopes` row (`stream = "g:<group>"`, monotonic `article_num` from `streams.next_article`, `kind = "group"`) and **one** `hot_bodies` row via `CoordinatorStore::send_group`, then queries `sql::coord::subscribers_of` (`positions WHERE stream = ? AND subscribed = 1`) and pushes `coordinator::deliver_of` to each subscribed reader's connected `Host Daemon`. Each reader writes its local `.store` once (`DurLog::append`) and sends `ack`; `CoordinatorStore::record_ack` inserts `receipts(mail_id, reader, ...)` and calls `sql::coord::advance_position` to advance that reader's single `positions(stream, reader)` row across contiguous acked article numbers.
+
+```mermaid
+flowchart LR
+    P["Publisher\n(session::send_group / mcp / gateway)"] -- "send {group, mail, body}" --> CS["CoordinatorStore::send_group\n(src/sql/coord.rs)"]
+    CS -- "1 row in streams (next_article++)\n1 row in envelopes (kind='group')\n1 row in hot_bodies\n1 row in seen_ids" --> SDB[("slice-NN/hot.sqlite")]
+    SDB -- "sql::coord::subscribers_of\n(SELECT reader FROM positions\nWHERE stream='g:<group>' AND subscribed=1)" --> FAN["coordinator::send\npush deliver_of (kind='group', group, article)"]
+
+    FAN --> R1["Reader 1 Daemon -> session::serve\nDurLog::append(r-1) -> ack"]
+    FAN --> R2["Reader 2 Daemon -> mcp::run (--groups)\nDurLog::append(r-4) -> ack"]
+    FAN --> R3["Reader 3 Daemon -> roger-mcp-gateway / roger-ws-gateway\nStore::append(r-9) -> ack"]
+
+    R1 -- "CoordinatorStore::record_ack" --> POS1["positions('g:<group>', Reader 1)\nposition=article_num, record_id='r-1'"]
+    R2 -- "CoordinatorStore::record_ack" --> POS2["positions('g:<group>', Reader 2)\nposition=article_num, record_id='r-4'"]
+    R3 -- "CoordinatorStore::record_ack" --> POS3["positions('g:<group>', Reader 3)\nposition=article_num, record_id='r-9'"]
+```

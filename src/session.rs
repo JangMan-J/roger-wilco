@@ -107,6 +107,7 @@ enum InnerFace {
 }
 
 /// The Tracer: a session with no harness, reporting on its own stdout.
+#[allow(dead_code)]
 pub fn run(
     socket: PathBuf,
     id: String,
@@ -156,6 +157,7 @@ pub fn run_with_groups(
 /// each on as the `board_event` line the host daemon sent; without it that
 /// line is never sent.
 /// When the client's stdin closes, the session unregisters and the process exits.
+#[allow(dead_code)]
 pub fn adapter(
     socket: PathBuf,
     id: String,

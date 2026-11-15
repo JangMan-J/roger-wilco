@@ -23,6 +23,13 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
 
+fn args_named(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
 fn need(args: &[String], name: &str) -> io::Result<String> {
     arg(args, name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
@@ -61,14 +68,19 @@ Commands:
   daemon      --coordinator <address:port> --host-id <host> [--socket <path>] [--listen <address:port>] [--port-file <path>]
               [--client-token-env <NAME>] --data <log>
   session     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
+              [--subscribe <group>]...
   adapter     --socket <path> --store <path> [--id <address>] [--label <text>] [--declare <text>]
               [--registered]   (also tell the client `registered` once the coordinator holds the Register)
               [--superseded]   (also emit replacement notices on stdout; stderr always warns)
               [--watch]        (also emit committed Board changes as board_event lines)
+              [--groups]       (opt in to subscribe, unsubscribe, groups, and group sends)
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
-              [--label <text>] [--declare <text>]   (MCP server on stdio; a session)
-  send        --socket <path> --from <address> --to <address|*> --body <text> [--mail <id>]
-              [--header <key=value>]...
+              [--label <text>] [--declare <text>] [--groups]   (MCP server on stdio; a session)
+  send        --socket <path> --from <address> (--to <address|*> | --group <group>) --body <text>
+              [--mail <id>] [--header <key=value>]...
+  subscribe   --socket <path> --session <address> --group <group> [--after <n> | --latest]
+  unsubscribe --socket <path> --session <address> --group <group>
+  groups      --socket <path> [--session <address>]
   claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   renew       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   release     --socket <path> --owner <address> --key <text>
@@ -77,7 +89,7 @@ Commands:
   label       --socket <path> --from <address> --label <text>
   receipt     --socket <path> --mail <id>
   audit       [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
-              [--address <address>] [--bodies] [--json]   (read-only; no lock, no write)
+              [--address <address>] [--bodies] [--json]   (concurrent read-only)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
 Client --socket accepts a Unix socket path or tcp://<address:port>; over tcp:// a
@@ -147,7 +159,7 @@ fn main() -> io::Result<()> {
                 data: PathBuf::from(need(&args, "--data")?),
             })
         }
-        "session" => session::run(
+        "session" => session::run_with_groups(
             PathBuf::from(need(&args, "--socket")?),
             match arg(&args, "--id") {
                 Some(id) => id,
@@ -156,8 +168,9 @@ fn main() -> io::Result<()> {
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--declare"),
+            args_named(&args, "--subscribe"),
         ),
-        "adapter" => session::adapter(
+        "adapter" => session::adapter_with_groups(
             PathBuf::from(need(&args, "--socket")?),
             match arg(&args, "--id") {
                 Some(id) => id,
@@ -170,19 +183,64 @@ fn main() -> io::Result<()> {
                 args.iter().any(|a| a == "--registered"),
                 args.iter().any(|a| a == "--superseded"),
                 args.iter().any(|a| a == "--watch"),
+                args.iter().any(|a| a == "--groups"),
             ),
         ),
         "mcp" => mcp::run(&args),
-        "send" => session::send(
-            PathBuf::from(need(&args, "--socket")?),
-            need(&args, "--from")?,
-            need(&args, "--to")?,
-            match arg(&args, "--mail") {
+        "send" => {
+            let socket = PathBuf::from(need(&args, "--socket")?);
+            let from = need(&args, "--from")?;
+            let to = arg(&args, "--to");
+            let group = arg(&args, "--group");
+            let mail = match arg(&args, "--mail") {
                 Some(m) => m,
                 None => session::gen_uuid()?,
-            },
-            need(&args, "--body")?,
-            headers(&args)?,
+            };
+            let body = need(&args, "--body")?;
+            let hdrs = headers(&args)?;
+            match (to, group) {
+                (Some(_), Some(_)) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected either --to or --group, saw both",
+                )),
+                (Some(to), None) => session::send(socket, from, to, mail, body, hdrs),
+                (None, Some(grp)) => session::send_group(socket, from, grp, mail, body, hdrs),
+                (None, None) => Err(io::Error::new(io::ErrorKind::InvalidInput, "missing --to")),
+            }
+        }
+        "subscribe" => {
+            let after = match arg(&args, "--after") {
+                Some(n) => Some(n.parse::<i64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--after expects a non-negative integer, saw {n}"),
+                    )
+                })?),
+                None => None,
+            };
+            let latest = args.iter().any(|a| a == "--latest");
+            if after.is_some() && latest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected at most one of --after or --latest, saw both",
+                ));
+            }
+            session::subscribe(
+                PathBuf::from(need(&args, "--socket")?),
+                need(&args, "--session")?,
+                need(&args, "--group")?,
+                after,
+                latest,
+            )
+        }
+        "unsubscribe" => session::unsubscribe(
+            PathBuf::from(need(&args, "--socket")?),
+            need(&args, "--session")?,
+            need(&args, "--group")?,
+        ),
+        "groups" => session::groups(
+            PathBuf::from(need(&args, "--socket")?),
+            arg(&args, "--session"),
         ),
         "claim" | "renew" | "release" => {
             let op = claims::Op::parse(if cmd == "claim" { "acquire" } else { cmd })
