@@ -6,94 +6,44 @@
 //! ends by its own unregister or, once it has been disconnected for
 //! `unregister_after_ms`, at the next request that reads the registered set.
 //! Nothing here scans on a timer.
+//!
+//! Mail bodies, envelopes, receipts and Group positions live in the
+//! `sql::CoordinatorStore` alone: memory holds only the registered set, its
+//! presence, live host links and claims. A send commits through the store
+//! without the state lock, so concurrent sends share one group commit; the
+//! lock is taken only to find the host links to push to afterwards.
 
 use crate::claims::{Change, Claims, Held, Op};
-use crate::durlog::DurLog;
 use crate::headers;
-use crate::json::{self, obj, s, Value};
+use crate::json::{obj, s, Value};
 use crate::net::{self, Writer};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::sql::{
+    self, AckResult, CoordOpenConfig, CoordinatorStore, GroupSummary, PendingDelivery, ReceiptInfo,
+    SendBroadcastReq, SendDirectedReq, SendGroupReq, SendStatus, TimelineEvent,
+};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
-struct Mail {
-    from: String,
-    to: String,
-    /// Held until the Receipt and dropped with it: nothing sends a receipted
-    /// Mail again, and its body stays on the log.
-    body: Option<String>,
-    /// What a resend of this id is compared with once the body is gone.
-    mark: BodyMark,
-    /// This Mail's place in commit order among the Mail awaiting a Receipt.
-    seq: u64,
-    /// How the Mail reached its recipient: `net::DIRECTED` or `net::BROADCAST`.
-    kind: &'static str,
-    /// The sender's headers, validated once at the send and carried verbatim.
-    headers: Value,
-    /// When this coordinator committed the send and answered Accepted
-    /// (`accepted_at_ms`, coordinator epoch ms). None for a Mail replayed from
-    /// a log written before the stamp existed: absent, never zero.
-    accepted_at: Option<i64>,
-    /// The Receipt, once the recipient has acked.
-    receipt: Option<Receipt>,
-}
-
-/// The Receipt: the recipient's Record id, and when this coordinator recorded
-/// it (`receipted_at_ms`, the same clock as `accepted_at`, so the difference is
-/// end-to-end latency with no skew between hosts). None when replayed from a
-/// log written before the stamp existed.
-#[derive(Clone)]
-struct Receipt {
-    record: String,
-    at: Option<i64>,
-}
-
-/// A body's length and a hash of it, kept in memory only and never written:
-/// enough to tell a resend of a Mail from a different Mail under the same id
-/// after the body itself has been dropped.
-type BodyMark = (usize, u64);
-
-fn mark_of(body: &str) -> BodyMark {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut h);
-    (body.len(), h.finish())
-}
-
-/// What a second send under an existing Mail id differs in, if anything. A
-/// resend that repeats the sender, recipient and body commits nothing and is
-/// accepted again; one that differs would be dropped silently if it were
-/// accepted, so it is refused. Headers are not compared: the core reads none.
-fn resend_differs(
-    (from, to, mark): (&str, Option<&str>, BodyMark),
-    (new_from, new_to, new_body): (&str, Option<&str>, &str),
-) -> Option<String> {
-    let mut what = Vec::new();
-    if from != new_from {
-        what.push("sender");
-    }
-    if to != new_to {
-        what.push("recipient");
-    }
-    if mark != mark_of(new_body) {
-        what.push("body");
-    }
-    (!what.is_empty()).then(|| what.join(", "))
-}
-
-/// The refusal for such a send.
+/// The refusal for a second send under an accepted Mail id that differs from
+/// the first in `what` (sender, recipient or body).
 fn resend_refusal(mail: &str, what: &str) -> String {
     format!(
         "mail {mail}: expected a resend to repeat the Mail already accepted under this id, saw a different {what}"
     )
 }
 
-/// An optional stamp from a committed event: absent stays absent.
-fn stamp_of(v: &Value, key: &str) -> Option<i64> {
-    v.get(key).and_then(|x| x.as_i64())
+/// The store names what a conflicting resend differs in; a reason it already
+/// worded whole is passed on verbatim.
+fn conflict_reason(mail: &str, what: &str) -> String {
+    if what.contains("expected") {
+        what.to_string()
+    } else {
+        resend_refusal(mail, what)
+    }
 }
 
 /// The Address a send names to reach every registered session at once.
@@ -113,6 +63,101 @@ const HELLO_MAX: usize = 64 * 1024;
 /// unregistered: longer than a host daemon or coordinator restart takes.
 pub const UNREGISTER_AFTER_MS: i64 = 300_000;
 
+/// Set once a durable write fails: the store may then be ahead of memory, so
+/// the coordinator stops and a restart reads the store again.
+static STORE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A durable write's result, marking the coordinator failed on an error.
+fn written<T>(r: io::Result<T>) -> io::Result<T> {
+    if r.is_err() {
+        STORE_FAILED.store(true, Ordering::SeqCst);
+    }
+    r
+}
+
+/// Everything `roger coordinator` is started with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub bind: String,
+    pub data: PathBuf,
+    pub port_file: Option<PathBuf>,
+    pub token: String,
+    pub unregister_after_ms: i64,
+    /// Slice databases the store spreads Mail over, at least 1.
+    pub slices: usize,
+    /// How long a body stays hot before the cold sweep moves it to a day file.
+    pub cold_retain_ms: i64,
+    /// The length of one cold day file's bucket.
+    pub cold_day_ms: i64,
+    /// False with `--no-cold-sweep`: nothing moves bodies to cold files.
+    pub cold_sweep: bool,
+}
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+/// `name`'s value as an integer of at least `min`, or `default` when absent.
+fn int_flag(args: &[String], name: &str, min: i64, default: i64) -> io::Result<i64> {
+    let Some(text) = flag(args, name) else {
+        return Ok(default);
+    };
+    match text.parse::<i64>() {
+        Ok(n) if n >= min => Ok(n),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} expects an integer of at least {min}, saw {text}"),
+        )),
+    }
+}
+
+impl Config {
+    /// Read the coordinator's flags; the token comes from the environment.
+    pub fn from_args(args: &[String], token: String) -> io::Result<Config> {
+        let need = |name: &str| {
+            flag(args, name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}"))
+            })
+        };
+        let days = int_flag(args, "--cold-retain-days", 1, sql::DEFAULT_RETAIN_DAYS)?;
+        #[allow(unused_mut)]
+        let mut cold_retain_ms = days.saturating_mul(sql::DAY_MS);
+        #[allow(unused_mut)]
+        let mut cold_day_ms = sql::DAY_MS;
+        #[cfg(feature = "test-hooks")]
+        {
+            cold_retain_ms = int_flag(args, "--cold-retain-ms", 1, cold_retain_ms)?;
+            cold_day_ms = int_flag(args, "--cold-day-ms", 1, cold_day_ms)?;
+        }
+        Ok(Config {
+            bind: need("--bind")?,
+            data: PathBuf::from(need("--data")?),
+            port_file: flag(args, "--port-file").map(PathBuf::from),
+            token,
+            unregister_after_ms: int_flag(
+                args,
+                "--unregister-after-ms",
+                i64::MIN,
+                UNREGISTER_AFTER_MS,
+            )?,
+            slices: int_flag(args, "--slices", 1, 1)? as usize,
+            cold_retain_ms,
+            cold_day_ms,
+            cold_sweep: !args.iter().any(|a| a == "--no-cold-sweep"),
+        })
+    }
+
+    fn open_config(&self) -> CoordOpenConfig {
+        CoordOpenConfig {
+            data: self.data.clone(),
+            num_slices: self.slices,
+            retain_ms: self.cold_retain_ms,
+            day_ms: self.cold_day_ms,
+            sweep_enabled: self.cold_sweep,
+        }
+    }
+}
+
 /// One registered session.
 struct Session {
     host: String,
@@ -123,34 +168,25 @@ struct Session {
 }
 
 struct State {
-    log: DurLog,
+    store: Arc<CoordinatorStore>,
     sessions: HashMap<String, Session>,
-    /// When this coordinator started: a replayed session that never
+    /// When this coordinator started: a stored session that never
     /// re-registers counts as disconnected from then.
     started: i64,
     unregister_after_ms: i64,
     /// Presence: when each Address last acted (register, send, a live ack, a
-    /// Board read naming it) or disconnected, on the coordinator clock. Set at
-    /// the moment of the event and only read by the Board; memory only, since
-    /// every live session re-registers when its host daemon reconnects (and
-    /// that re-registration counts as a Register). Only registered Addresses
-    /// are stamped.
+    /// Board read naming it) or disconnected, on the coordinator clock. Memory
+    /// only, since every live session re-registers when its host daemon
+    /// reconnects. Only registered Addresses are stamped.
     seen: HashMap<String, i64>,
     /// Addresses whose session connection to their host daemon is open and
-    /// whose host daemon's link here is up. Set by Register, cleared by that
-    /// daemon's disconnect report or by its link dropping.
+    /// whose host daemon's link here is up.
     connected: HashSet<String>,
     // Daemon-generated registration identity, scoped to a host link. Not an Address token.
     registrations: HashMap<String, (u64, String)>,
-    takeovers: HashMap<String, Value>,
-    mails: HashMap<String, Mail>,
-    /// The Mail awaiting a Receipt, in commit order: what a Register or a
-    /// hello has to push. A Receipt takes its Mail out.
-    pending: BTreeMap<u64, String>,
-    next_seq: u64,
-    /// Broadcasts already committed, each with its sender and body mark, so a
-    /// resent broadcast fans out once and a different one under its id is refused.
-    broadcasts: HashMap<String, (String, BodyMark)>,
+    /// Takeovers already committed, by registration: the new host and stamp
+    /// when recorded by this process, None when read back from the store.
+    takeovers: HashMap<String, Option<(String, i64)>>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
     notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
@@ -158,31 +194,6 @@ struct State {
     /// id: each committed session or claim change is offered to them once.
     watchers: HashMap<u64, Writer>,
     claims: Claims,
-}
-
-impl State {
-    /// Nothing registered, accepted or claimed yet: what a replay starts from.
-    fn new(log: DurLog, unregister_after_ms: i64) -> State {
-        State {
-            log,
-            sessions: HashMap::new(),
-            started: now_ms(),
-            unregister_after_ms,
-            seen: HashMap::new(),
-            connected: HashSet::new(),
-            registrations: HashMap::new(),
-            takeovers: HashMap::new(),
-            mails: HashMap::new(),
-            pending: BTreeMap::new(),
-            next_seq: 0,
-            broadcasts: HashMap::new(),
-            hosts: HashMap::new(),
-            next_conn: 1,
-            notice_writers: HashMap::new(),
-            watchers: HashMap::new(),
-            claims: Claims::default(),
-        }
-    }
 }
 
 /// Coordinator wall clock in milliseconds since the Epoch: the one clock
@@ -199,28 +210,45 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn run(
-    bind: &str,
-    port_file: Option<PathBuf>,
-    data: PathBuf,
-    token: String,
-    unregister_after_ms: i64,
-) -> io::Result<()> {
-    let (log, prior) = DurLog::open(&data)?;
-    let mut state = State::new(log, unregister_after_ms);
-    // The replay drops a crash-truncated tail, so every line here was
-    // appended whole, and it hands them over one at a time. A line that is
-    // not JSON is skipped as before; a claim event that parses but lacks a
-    // field fails start-up (see `apply`).
-    for line in prior {
-        if let Ok(v) = json::parse(&line?) {
-            apply(&mut state, &v)?;
-        }
-    }
+pub fn run(cfg: Config) -> io::Result<()> {
+    let (store, startup) = CoordinatorStore::open(cfg.open_config())?;
+    let store = Arc::new(store);
+    let state = State {
+        store: Arc::clone(&store),
+        sessions: startup
+            .sessions
+            .into_iter()
+            .map(|(a, row)| {
+                (
+                    a,
+                    Session {
+                        host: row.host,
+                        label: row.label,
+                        declared: row.declared,
+                    },
+                )
+            })
+            .collect(),
+        started: now_ms(),
+        unregister_after_ms: cfg.unregister_after_ms,
+        seen: HashMap::new(),
+        connected: HashSet::new(),
+        registrations: HashMap::new(),
+        takeovers: startup
+            .takeover_registrations
+            .into_iter()
+            .map(|r| (r, None))
+            .collect(),
+        hosts: HashMap::new(),
+        next_conn: 1,
+        notice_writers: HashMap::new(),
+        watchers: HashMap::new(),
+        claims: startup.claims,
+    };
     let state = Arc::new(Mutex::new(state));
 
-    let listener = TcpListener::bind(bind)?;
-    if let Some(pf) = &port_file {
+    let listener = TcpListener::bind(&cfg.bind)?;
+    if let Some(pf) = &cfg.port_file {
         net::publish_port(pf, listener.local_addr()?.port())?;
     }
     eprintln!("coordinator listening on {}", listener.local_addr()?);
@@ -228,15 +256,16 @@ pub fn run(
     for conn in listener.incoming() {
         let conn = conn?;
         let state = Arc::clone(&state);
-        let token = token.clone();
+        let store = Arc::clone(&store);
+        let token = cfg.token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, Arc::clone(&state), &token) {
+            if let Err(e) = serve(conn, state, store, &token) {
                 eprintln!("coordinator connection ended: {e}");
-                // A failed append may have left the disk ahead of memory.
-                // The log refuses every later append; stop here so a
-                // restart replays the disk instead of serving a split view.
-                if state.lock().unwrap().log.is_poisoned() {
-                    eprintln!("coordinator stopping: durable log failed, restart to replay it");
+                // A failed write may have left the store ahead of memory.
+                // Stop here so a restart reads the store instead of serving
+                // a split view.
+                if STORE_FAILED.load(Ordering::SeqCst) {
+                    eprintln!("coordinator stopping: durable store failed, restart to read it");
                     std::process::exit(1);
                 }
             }
@@ -245,125 +274,57 @@ pub fn run(
     Ok(())
 }
 
-/// Replay one committed event. Claim events must be whole: a `claim` or
-/// `release` line missing a field is an `InvalidData` error that names the
-/// line, so start-up fails instead of silently freeing a held key. The
-/// `at_ms` on a session event is for a reader of the log: replay reads none
-/// of it, so a line written before the stamp existed applies the same.
-fn apply(state: &mut State, v: &Value) -> io::Result<()> {
-    match v.get("ev").and_then(|x| x.as_str()) {
-        Some("session") => {
-            if let (Ok(session), Ok(host)) = (net::field(v, "session"), net::field(v, "host")) {
-                state
-                    .sessions
-                    .entry(session.to_string())
-                    .and_modify(|s| s.host = host.to_string())
-                    .or_insert_with(|| Session {
-                        host: host.to_string(),
-                        label: String::new(),
-                        declared: None,
-                    });
+/// Apply one committed timeline event to memory.
+fn apply(st: &mut State, ev: &TimelineEvent) {
+    match ev {
+        TimelineEvent::Session { session, host, .. } => {
+            st.sessions
+                .entry(session.clone())
+                .and_modify(|s| s.host = host.clone())
+                .or_insert_with(|| Session {
+                    host: host.clone(),
+                    label: String::new(),
+                    declared: None,
+                });
+        }
+        TimelineEvent::Unregister { session, .. } => {
+            st.sessions.remove(session);
+        }
+        TimelineEvent::Label { session, label, .. } => {
+            if let Some(row) = st.sessions.get_mut(session) {
+                row.label = label.clone();
             }
         }
-        Some("takeover") => {
-            if let Ok(id) = net::field(v, "registration") {
-                state.takeovers.insert(id.to_string(), v.clone());
+        TimelineEvent::Declared {
+            session, declared, ..
+        } => {
+            if let Some(row) = st.sessions.get_mut(session) {
+                row.declared = declared.clone();
             }
         }
-        Some("unregister") => {
-            if let Ok(session) = net::field(v, "session") {
-                state.sessions.remove(session);
-            }
+        TimelineEvent::Takeover {
+            host,
+            at_ms,
+            registration: Some(r),
+            ..
+        } => {
+            st.takeovers
+                .insert(r.clone(), at_ms.map(|at| (host.clone(), at)));
         }
-        Some("declared") => {
-            if let Some(s) = net::field(v, "session")
-                .ok()
-                .and_then(|a| state.sessions.get_mut(a))
-            {
-                s.declared = net::declared_of(v);
-            }
-        }
-        Some("label") => {
-            if let (Some(s), Ok(label)) = (
-                net::field(v, "session")
-                    .ok()
-                    .and_then(|a| state.sessions.get_mut(a)),
-                net::field(v, "label"),
-            ) {
-                s.label = label.to_string();
-            }
-        }
-        Some("mail") => {
-            if let (Ok(mail), Ok(from), Ok(to), Ok(body)) = (
-                net::field(v, "mail"),
-                net::field(v, "from"),
-                net::field(v, "to"),
-                net::field(v, "body"),
-            ) {
-                let seq = state.next_seq;
-                state.next_seq += 1;
-                state.pending.insert(seq, mail.to_string());
-                let replaced = state.mails.insert(
-                    mail.to_string(),
-                    Mail {
-                        from: from.into(),
-                        to: to.into(),
-                        body: Some(body.into()),
-                        mark: mark_of(body),
-                        seq,
-                        kind: net::DIRECTED,
-                        // An event written before headers existed has none.
-                        headers: net::headers_of(v),
-                        accepted_at: stamp_of(v, "accepted_at_ms"),
-                        receipt: None,
-                    },
-                );
-                if let Some(old) = replaced {
-                    state.pending.remove(&old.seq);
-                }
-            }
-        }
-        Some("broadcast") => {
-            if let (Ok(mail), Ok(from), Ok(body), Some(Value::Arr(to))) = (
-                net::field(v, "mail"),
-                net::field(v, "from"),
-                net::field(v, "body"),
-                v.get("to"),
-            ) {
-                let to: Vec<String> = to
-                    .iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect();
-                let headers = net::headers_of(v);
-                fan_out(
-                    state,
-                    (mail, from, body, &headers),
-                    &to,
-                    stamp_of(v, "accepted_at_ms"),
-                );
-            }
-        }
-        Some("receipt") => {
-            if let (Ok(mail), Ok(record)) = (net::field(v, "mail"), net::field(v, "record")) {
-                if let Some(m) = state.mails.get_mut(mail) {
-                    if m.receipt.is_none() {
-                        m.receipt = Some(Receipt {
-                            record: record.to_string(),
-                            at: stamp_of(v, "receipted_at_ms"),
-                        });
-                        m.body = None;
-                        state.pending.remove(&m.seq);
-                    }
-                }
-            }
-        }
-        Some("claim" | "release") => {
-            let (key, change) = Change::from_event(v)?;
-            state.claims.apply(&key, &change);
-        }
+        TimelineEvent::Claim {
+            key,
+            owner,
+            expires_ms,
+        } => st.claims.apply(
+            key,
+            &Change::Grant(Held {
+                owner: owner.clone(),
+                expires_ms: *expires_ms,
+            }),
+        ),
+        TimelineEvent::Release { key } => st.claims.apply(key, &Change::Release),
         _ => {}
     }
-    Ok(())
 }
 
 /// Stamp `session` as seen now, for its own act. Only a registered Address is
@@ -374,49 +335,94 @@ fn stamp(st: &mut State, session: &str) {
     }
 }
 
-/// Record a session's label verbatim. The label is display only: it never
-/// touches the session's Address, host, or pending mail.
-fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
-    commit(
-        state,
-        obj(vec![
-            ("ev", s("label")),
-            ("session", s(session)),
-            ("label", s(label)),
-            ("at_ms", Value::Int(now_ms())),
-        ]),
-    )
-}
-
-/// Append one event durably, then apply it to memory: the one path every
-/// session event takes, so replay and live state agree.
-fn commit(state: &mut State, ev: Value) -> io::Result<()> {
-    state.log.append(&json::stringify(&ev))?;
-    apply(state, &ev)?;
-    if let Some(event) = board_event_of(&ev) {
-        observe(state, event);
+/// Commit events durably as one transaction, then apply each to memory and
+/// show each Board change to watchers: the one path every session event
+/// takes, so the store and live state agree.
+fn commit(st: &mut State, events: Vec<TimelineEvent>) -> io::Result<()> {
+    written(st.store.commit_timeline(events.clone(), now_ms()))?;
+    for ev in &events {
+        apply(st, ev);
+        if let Some(pairs) = board_event_of(ev) {
+            observe(st, pairs);
+        }
     }
     Ok(())
 }
 
-/// The `board_event` a committed session line is shown to watchers as, if
-/// any: `register`, `unregister`, `relabel`, `declared`. Mail, receipts and
-/// takeovers are not Board changes and show nothing.
-fn board_event_of(ev: &Value) -> Option<Vec<(&'static str, Value)>> {
-    let name = match ev.get("ev").and_then(|x| x.as_str())? {
-        "session" => "register",
-        "unregister" => "unregister",
-        "label" => "relabel",
-        "declared" => "declared",
+fn label_event(session: &str, label: &str) -> TimelineEvent {
+    TimelineEvent::Label {
+        session: session.to_string(),
+        label: label.to_string(),
+        at_ms: Some(now_ms()),
+    }
+}
+
+/// The `board_event` a committed timeline event is shown to watchers as, if
+/// any: `register`, `unregister`, `relabel`, `declared`. Takeovers, claims
+/// (shown by `claim`) and receipts show nothing here.
+fn board_event_of(ev: &TimelineEvent) -> Option<Vec<(&'static str, Value)>> {
+    let at = |at_ms: &Option<i64>| at_ms.map(|t| ("at_ms", Value::Int(t)));
+    let pairs = match ev {
+        TimelineEvent::Session {
+            session,
+            host,
+            at_ms,
+        } => {
+            let mut p = vec![
+                ("event", s("register")),
+                ("session", s(session)),
+                ("host", s(host)),
+            ];
+            p.extend(at(at_ms));
+            p
+        }
+        TimelineEvent::Unregister { session, at_ms } => {
+            let mut p = vec![("event", s("unregister")), ("session", s(session))];
+            p.extend(at(at_ms));
+            p
+        }
+        TimelineEvent::Label {
+            session,
+            label,
+            at_ms,
+        } => {
+            let mut p = vec![
+                ("event", s("relabel")),
+                ("session", s(session)),
+                ("label", s(label)),
+            ];
+            p.extend(at(at_ms));
+            p
+        }
+        TimelineEvent::Declared {
+            session,
+            declared,
+            at_ms,
+        } => {
+            let mut p = vec![("event", s("declared")), ("session", s(session))];
+            if let Some(d) = declared {
+                p.push(("declared", s(d)));
+            }
+            p.extend(at(at_ms));
+            p
+        }
         _ => return None,
     };
-    let mut pairs = vec![("event", s(name))];
-    for key in ["session", "host", "label", "declared", "at_ms"] {
-        if let Some(v) = ev.get(key) {
-            pairs.push((key, v.clone()));
-        }
-    }
     Some(pairs)
+}
+
+/// The committed timeline event for one claim change on `key`.
+fn claim_timeline(key: &str, change: &Change) -> TimelineEvent {
+    match change {
+        Change::Grant(h) => TimelineEvent::Claim {
+            key: key.to_string(),
+            owner: h.owner.clone(),
+            expires_ms: h.expires_ms,
+        },
+        Change::Release => TimelineEvent::Release {
+            key: key.to_string(),
+        },
+    }
 }
 
 /// Offer one committed change to every host link that asked for them. Best
@@ -440,22 +446,20 @@ fn observe(st: &State, pairs: Vec<(&str, Value)>) {
 fn unregister(st: &mut State, session: &str) -> io::Result<()> {
     commit(
         st,
-        obj(vec![
-            ("ev", s("unregister")),
-            ("session", s(session)),
-            ("at_ms", Value::Int(now_ms())),
-        ]),
+        vec![TimelineEvent::Unregister {
+            session: session.to_string(),
+            at_ms: Some(now_ms()),
+        }],
     )?;
     st.connected.remove(session);
     st.seen.remove(session);
     Ok(())
 }
 
-/// Unregister every session disconnected for `unregister_after_ms`, read
-/// against now. Called by each request that reads the registered set
-/// (Broadcast, Board, claim, relabel), as claim expiry is: no timer runs it.
-fn expire(st: &mut State) -> io::Result<()> {
-    let cutoff = now_ms() - st.unregister_after_ms;
+/// The registered sessions disconnected for `unregister_after_ms` at `now`,
+/// sorted.
+fn stale(st: &State, now: i64) -> Vec<String> {
+    let cutoff = now - st.unregister_after_ms;
     let mut gone: Vec<String> = st
         .sessions
         .keys()
@@ -466,7 +470,14 @@ fn expire(st: &mut State) -> io::Result<()> {
         .cloned()
         .collect();
     gone.sort();
-    for a in gone {
+    gone
+}
+
+/// Unregister every session disconnected for `unregister_after_ms`, read
+/// against now. Called by each request that reads the registered set
+/// (Broadcast, Board, claim, relabel), as claim expiry is: no timer runs it.
+fn expire(st: &mut State) -> io::Result<()> {
+    for a in stale(st, now_ms()) {
         unregister(st, &a)?;
     }
     Ok(())
@@ -476,37 +487,61 @@ fn host_of<'a>(state: &'a State, session: &str) -> Option<&'a str> {
     state.sessions.get(session).map(|s| s.host.as_str())
 }
 
-/// Pending deliveries for sessions on `host`, or for one session.
-fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<Value> {
-    let mut out = Vec::new();
-    for id in state.pending.values() {
-        let m = &state.mails[id];
-        let Some(body) = &m.body else { continue };
-        if let Some(want) = only_session {
-            if m.to != want {
-                continue;
-            }
-        } else if host_of(state, &m.to) != Some(host) {
-            continue;
+/// The live link to `session`'s host daemon, if it has one.
+fn link_of(st: &State, session: &str) -> Option<Writer> {
+    host_of(st, session)
+        .and_then(|h| st.hosts.get(h))
+        .map(|(_, w)| Arc::clone(w))
+}
+
+/// The `deliver` line for one pending delivery: a Group article also names
+/// its Group and article number, right after the recipient.
+fn deliver_of(p: &PendingDelivery) -> Value {
+    let mut v = net::deliver_msg(&p.mail_id, &p.from, &p.to, &p.body, &p.kind, &p.headers);
+    if let Value::Obj(pairs) = &mut v {
+        let mut at = pairs
+            .iter()
+            .position(|(k, _)| k == "to")
+            .map_or(0, |i| i + 1);
+        if let Some(g) = &p.group {
+            pairs.insert(at, ("group".to_string(), s(g)));
+            at += 1;
         }
-        out.push(net::deliver_msg(
-            id, &m.from, &m.to, body, m.kind, &m.headers,
-        ));
+        if let Some(n) = p.article_num {
+            pairs.insert(at, ("article".to_string(), Value::Int(n)));
+        }
     }
-    out
+    v
+}
+
+/// Push each pending delivery to its recipient's live host link.
+fn push_pending(state: &Mutex<State>, pending: &[PendingDelivery]) -> Vec<(Writer, Value)> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let st = state.lock().unwrap();
+    pending
+        .iter()
+        .filter_map(|p| link_of(&st, &p.to).map(|w| (w, deliver_of(p))))
+        .collect()
 }
 
 /// One connection, from accept to its end. Every line for the peer goes
 /// through its queue, so a host daemon that stops reading delays only its own
 /// lines; when the connection ends the queue is closed with it.
-fn serve(conn: TcpStream, state: Arc<Mutex<State>>, token: &str) -> io::Result<()> {
+fn serve(
+    conn: TcpStream,
+    state: Arc<Mutex<State>>,
+    store: Arc<CoordinatorStore>,
+    token: &str,
+) -> io::Result<()> {
     // One line is one segment, sent when it is written.
     conn.set_nodelay(true)?;
     let conn = Arc::new(conn);
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
     });
-    let result = serve_link(&conn, Arc::clone(&writer), state, token);
+    let result = serve_link(&conn, Arc::clone(&writer), state, &store, token);
     // What is already queued is owed to the peer: answers to requests this
     // coordinator has committed. It is written before the link ends, unless
     // the link ended because the peer went silent; then nothing can reach it,
@@ -527,10 +562,36 @@ fn answer_then_push(writer: &Writer, answer: &Value, push: Vec<(Writer, Value)>)
     answered
 }
 
+fn req_of(v: &Value) -> i64 {
+    v.get("req").and_then(|x| x.as_i64()).unwrap_or(0)
+}
+
+fn error_reply(req: i64, mail: Option<&str>, reason: &str) -> Value {
+    let mut pairs = vec![("type", s("error")), ("req", Value::Int(req))];
+    if let Some(m) = mail {
+        pairs.push(("mail", s(m)));
+    }
+    pairs.push(("reason", s(reason)));
+    obj(pairs)
+}
+
+/// Why a send's Mail id or Group cannot be accepted, if either is malformed.
+fn send_shape_error(mail: &str, group: Option<&str>) -> Option<String> {
+    if mail.contains(COPY_SEP) {
+        return Some(format!("mail id must not contain '{COPY_SEP}'"));
+    }
+    match group {
+        Some(_) if mail.is_empty() => Some("expected a non-empty mail id, saw none".to_string()),
+        Some("") => Some("expected a non-empty group, saw none".to_string()),
+        _ => None,
+    }
+}
+
 fn serve_link(
     conn: &TcpStream,
     writer: Writer,
     state: Arc<Mutex<State>>,
+    store: &CoordinatorStore,
     token: &str,
 ) -> io::Result<()> {
     let mut lines = net::lines(Box::new(conn.try_clone()?));
@@ -545,7 +606,7 @@ fn serve_link(
     }
     let host = net::field(&hello, "host")?.to_string();
     lines.set_cap(usize::MAX);
-    let conn_id = {
+    let (conn_id, host_sessions) = {
         let mut st = state.lock().unwrap();
         let id = st.next_conn;
         st.next_conn += 1;
@@ -564,7 +625,14 @@ fn serve_link(
         if hello.get("board_events") == Some(&Value::Bool(true)) {
             st.watchers.insert(id, Arc::clone(&writer));
         }
-        id
+        let mut on_host: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(_, row)| row.host == host)
+            .map(|(a, _)| a.clone())
+            .collect();
+        on_host.sort();
+        (id, on_host)
     };
     // However this connection ends (EOF, error, or a `?` below), the link drop
     // is handled once, when this guard goes.
@@ -583,12 +651,8 @@ fn serve_link(
             ("ping", Value::Bool(true)),
         ]),
     )?;
-    let pushes = {
-        let st = state.lock().unwrap();
-        pending_pushes(&st, &host, None)
-    };
-    for p in pushes {
-        let _ = net::send(&writer, &p);
+    for p in store.pending_for_host(&host_sessions)? {
+        let _ = net::send(&writer, &deliver_of(&p));
     }
 
     let mut pinged = false;
@@ -630,7 +694,7 @@ fn serve_link(
             }
             "register" => {
                 let session = net::field(&v, "session")?.to_string();
-                let pushes = {
+                {
                     let mut st = state.lock().unwrap();
                     let registration = net::field(&v, "registration").unwrap_or("");
                     let at = now_ms();
@@ -670,31 +734,28 @@ fn serve_link(
                         .insert(session.clone(), (conn_id, registration.to_string()));
                     st.seen.insert(session.clone(), at);
                     st.connected.insert(session.clone());
-                    // Every Register is one stamped line, so the log says
-                    // when an Address registered even when nothing changed.
-                    let ev = obj(vec![
-                        ("ev", s("session")),
-                        ("session", s(&session)),
-                        ("host", s(&host)),
-                        ("at_ms", Value::Int(now_ms())),
-                    ]);
-                    commit(&mut st, ev)?;
+                    // Every Register is one stamped event, so the timeline
+                    // says when an Address registered even when nothing changed.
+                    let mut events = vec![TimelineEvent::Session {
+                        session: session.clone(),
+                        host: host.clone(),
+                        at_ms: Some(now_ms()),
+                    }];
                     if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
-                        set_label(&mut st, &session, label)?;
+                        events.push(label_event(&session, label));
                     }
                     let declared = net::declared_of(&v);
-                    if st.sessions[&session].declared != declared {
-                        let mut ev = vec![("ev", s("declared")), ("session", s(&session))];
-                        if let Some(d) = &declared {
-                            ev.push(("declared", s(d)));
-                        }
-                        ev.push(("at_ms", Value::Int(now_ms())));
-                        commit(&mut st, obj(ev))?;
+                    if st.sessions.get(&session).map(|row| &row.declared) != Some(&declared) {
+                        events.push(TimelineEvent::Declared {
+                            session: session.clone(),
+                            declared,
+                            at_ms: Some(now_ms()),
+                        });
                     }
-                    pending_pushes(&st, &host, Some(&session))
-                };
-                for p in pushes {
-                    let _ = net::send(&writer, &p);
+                    commit(&mut st, events)?;
+                }
+                for p in store.pending_for_session(&session)? {
+                    let _ = net::send(&writer, &deliver_of(&p));
                 }
                 // The coordinator holds this Register now. A host daemon
                 // forwards it only to a session that asked.
@@ -710,102 +771,7 @@ fn serve_link(
                     ]),
                 );
             }
-            "send" => {
-                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
-                let mail = net::field(&v, "mail")?.to_string();
-                if mail.contains(COPY_SEP) {
-                    net::send(
-                        &writer,
-                        &obj(vec![
-                            ("type", s("error")),
-                            ("req", Value::Int(req)),
-                            ("mail", s(&mail)),
-                            (
-                                "reason",
-                                s(&format!("mail id must not contain '{COPY_SEP}'")),
-                            ),
-                        ]),
-                    )?;
-                    continue;
-                }
-                // The one place headers are bounded, before anything commits.
-                let headers = match headers::validate(v.get("headers")) {
-                    Ok(h) => h,
-                    Err(reason) => {
-                        net::send(
-                            &writer,
-                            &obj(vec![
-                                ("type", s("error")),
-                                ("req", Value::Int(req)),
-                                ("mail", s(&mail)),
-                                ("reason", s(&reason)),
-                            ]),
-                        )?;
-                        continue;
-                    }
-                };
-                let mut push: Vec<(Writer, Value)> = Vec::new();
-                let from = net::field(&v, "from")?;
-                let to = net::field(&v, "to")?;
-                let body = net::field(&v, "body")?;
-                let differs = {
-                    let mut st = state.lock().unwrap();
-                    stamp(&mut st, from);
-                    if to == BROADCAST {
-                        match st.broadcasts.get(&mail) {
-                            Some((sent_from, mark)) => {
-                                resend_differs((sent_from, None, *mark), (from, None, body))
-                            }
-                            None => {
-                                push = broadcast(&mut st, &mail, from, body, &headers)?;
-                                None
-                            }
-                        }
-                    } else if let Some(m) = st.mails.get(&mail) {
-                        resend_differs((&m.from, Some(&m.to), m.mark), (from, Some(to), body))
-                    } else {
-                        let ev = obj(vec![
-                            ("ev", s("mail")),
-                            ("mail", s(&mail)),
-                            ("from", s(from)),
-                            ("to", s(to)),
-                            ("body", s(body)),
-                            ("headers", headers),
-                            ("accepted_at_ms", Value::Int(now_ms())),
-                        ]);
-                        commit(&mut st, ev)?;
-                        let m = &st.mails[&mail];
-                        if let Some((_, w)) = host_of(&st, &m.to).and_then(|h| st.hosts.get(h)) {
-                            push.push((
-                                Arc::clone(w),
-                                net::deliver_msg(&mail, &m.from, &m.to, body, m.kind, &m.headers),
-                            ));
-                        }
-                        None
-                    }
-                };
-                if let Some(what) = differs {
-                    net::send(
-                        &writer,
-                        &obj(vec![
-                            ("type", s("error")),
-                            ("req", Value::Int(req)),
-                            ("mail", s(&mail)),
-                            ("reason", s(&resend_refusal(&mail, &what))),
-                        ]),
-                    )?;
-                    continue;
-                }
-                answer_then_push(
-                    &writer,
-                    &obj(vec![
-                        ("type", s("accepted")),
-                        ("req", Value::Int(req)),
-                        ("mail", s(&mail)),
-                    ]),
-                    push,
-                )?;
-            }
+            "send" => send(&v, &writer, &state, store)?,
             // The session's connection to this host daemon closed.
             "disconnect" => {
                 let session = net::field(&v, "session")?.to_string();
@@ -828,7 +794,7 @@ fn serve_link(
                 }
             }
             "relabel" => {
-                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let req = req_of(&v);
                 let session = net::field(&v, "session")?.to_string();
                 let label = net::field(&v, "label")?.to_string();
                 let reply = {
@@ -837,7 +803,7 @@ fn serve_link(
                     // A label belongs to a session: an Address that never
                     // registered gets none, so no label can be parked on it.
                     if st.sessions.contains_key(&session) {
-                        set_label(&mut st, &session, &label)?;
+                        commit(&mut st, vec![label_event(&session, &label)])?;
                         obj(vec![
                             ("type", s("relabeled")),
                             ("req", Value::Int(req)),
@@ -845,73 +811,102 @@ fn serve_link(
                             ("label", s(&label)),
                         ])
                     } else {
-                        obj(vec![
-                            ("type", s("error")),
-                            ("req", Value::Int(req)),
-                            (
-                                "reason",
-                                s(&format!(
-                                    "expected a registered session to relabel, saw {session}"
-                                )),
-                            ),
-                        ])
+                        error_reply(
+                            req,
+                            None,
+                            &format!("expected a registered session to relabel, saw {session}"),
+                        )
                     }
                 };
                 net::send(&writer, &reply)?;
             }
             "ack" => {
-                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let req = req_of(&v);
                 let mail = net::field(&v, "mail")?.to_string();
                 let session = net::field(&v, "session")?.to_string();
                 let record = net::field(&v, "record")?.to_string();
-                let known = {
-                    let mut st = state.lock().unwrap();
-                    // A replayed receipt was acked earlier, while this link
-                    // was down; it is not the session's activity now.
-                    if v.get("replay") != Some(&Value::Bool(true)) {
-                        stamp(&mut st, &session);
-                    }
-                    match st.mails.get(&mail) {
-                        None => None,
-                        Some(m) => {
-                            let already = m.receipt.is_some();
-                            if !already {
-                                let ev = obj(vec![
-                                    ("ev", s("receipt")),
-                                    ("mail", s(&mail)),
-                                    ("session", s(&session)),
-                                    ("record", s(&record)),
-                                    ("receipted_at_ms", Value::Int(now_ms())),
-                                ]);
-                                commit(&mut st, ev)?;
-                            }
-                            Some(already)
-                        }
-                    }
-                };
-                // Answering `acked` for a mail this coordinator never accepted
-                // would be a false confirmation: the host daemon trims that
-                // receipt from its replay list on the answer, and the receipt
-                // would never be stored upstream.
-                let reply = match known {
-                    Some(_) => obj(vec![
-                        ("type", s("acked")),
-                        ("req", Value::Int(req)),
-                        ("mail", s(&mail)),
-                        ("record", s(&record)),
-                    ]),
-                    None => obj(vec![
-                        ("type", s("error")),
-                        ("req", Value::Int(req)),
-                        ("mail", s(&mail)),
-                        ("reason", s("unknown mail")),
-                    ]),
-                };
-                net::send(&writer, &reply)?;
+                // A replayed receipt was acked earlier, while this link was
+                // down; it is not the session's activity now.
+                if v.get("replay") != Some(&Value::Bool(true)) {
+                    stamp(&mut state.lock().unwrap(), &session);
+                }
+                let result = written(store.record_ack(&mail, &session, &record, now_ms()))?;
+                net::send(&writer, &ack_reply(req, &mail, &session, &record, &result))?;
             }
             "receipt" => {
-                let reply = receipt(&state.lock().unwrap(), &v)?;
-                net::send(&writer, &reply)?;
+                let req = req_of(&v);
+                let mail = net::field(&v, "mail")?;
+                let reader = v.get("session").and_then(|x| x.as_str());
+                let info = store.query_receipt(mail, reader)?;
+                net::send(&writer, &receipt_reply(req, mail, info.as_ref()))?;
+            }
+            "subscribe" => {
+                let req = req_of(&v);
+                let session = net::field(&v, "session")?.to_string();
+                let group = net::field(&v, "group")?.to_string();
+                let after = v.get("after").map(|x| x.as_i64());
+                let latest = v.get("latest") == Some(&Value::Bool(true));
+                let refusal = if group.is_empty() {
+                    Some("expected a non-empty group, saw none".to_string())
+                } else {
+                    match after {
+                        Some(None) | Some(Some(i64::MIN..=-1)) => Some(
+                            "expected after to be an integer of at least 0, saw another value"
+                                .to_string(),
+                        ),
+                        Some(Some(_)) if latest => {
+                            Some("expected after or latest, saw both".to_string())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(reason) = refusal {
+                    net::send(&writer, &error_reply(req, None, &reason))?;
+                    continue;
+                }
+                stamp(&mut state.lock().unwrap(), &session);
+                let (position, high_water, catchup) = written(store.subscribe_group(
+                    &session,
+                    &group,
+                    after.flatten(),
+                    latest,
+                    now_ms(),
+                ))?;
+                answer_then_push(
+                    &writer,
+                    &obj(vec![
+                        ("type", s("subscribed")),
+                        ("req", Value::Int(req)),
+                        ("session", s(&session)),
+                        ("group", s(&group)),
+                        ("position", Value::Int(position)),
+                        ("high_water", Value::Int(high_water)),
+                    ]),
+                    push_pending(&state, &catchup),
+                )?;
+            }
+            "unsubscribe" => {
+                let req = req_of(&v);
+                let session = net::field(&v, "session")?.to_string();
+                let group = net::field(&v, "group")?.to_string();
+                stamp(&mut state.lock().unwrap(), &session);
+                let position = written(store.unsubscribe_group(&session, &group, now_ms()))?;
+                net::send(
+                    &writer,
+                    &obj(vec![
+                        ("type", s("unsubscribed")),
+                        ("req", Value::Int(req)),
+                        ("session", s(&session)),
+                        ("group", s(&group)),
+                        ("position", Value::Int(position)),
+                    ]),
+                )?;
+            }
+            "groups" => {
+                let req = req_of(&v);
+                let session = v.get("session").and_then(|x| x.as_str());
+                let list = store.list_groups(session)?;
+                net::send(&writer, &groups_reply(req, session.is_some(), &list))?;
             }
             "claim" => {
                 let reply = {
@@ -945,6 +940,169 @@ fn serve_link(
     Ok(())
 }
 
+/// One `send`: directed, Broadcast (`to` is `*`) or to a Group (`group`
+/// instead of `to`). The store commits without the state lock; the lock is
+/// taken briefly before (presence, the registered set) and after (the host
+/// links to push to).
+fn send(
+    v: &Value,
+    writer: &Writer,
+    state: &Mutex<State>,
+    store: &CoordinatorStore,
+) -> io::Result<()> {
+    let req = req_of(v);
+    let mail = net::field(v, "mail")?.to_string();
+    let group = v.get("group").and_then(|x| x.as_str());
+    if group.is_some() && v.get("to").is_some() {
+        let reason = "expected either to or group on a send, saw both";
+        return net::send(writer, &error_reply(req, Some(&mail), reason));
+    }
+    if let Some(reason) = send_shape_error(&mail, group) {
+        return net::send(writer, &error_reply(req, Some(&mail), &reason));
+    }
+    // The one place headers are bounded, before anything commits.
+    let headers = match headers::validate(v.get("headers")) {
+        Ok(h) => h,
+        Err(reason) => return net::send(writer, &error_reply(req, Some(&mail), &reason)),
+    };
+    let headers = Some(headers);
+    let from = net::field(v, "from")?.to_string();
+    let body = net::field(v, "body")?.to_string();
+    let accepted = |extra: Vec<(&'static str, Value)>| {
+        let mut pairs = vec![
+            ("type", s("accepted")),
+            ("req", Value::Int(req)),
+            ("mail", s(&mail)),
+        ];
+        pairs.extend(extra);
+        obj(pairs)
+    };
+    let refuse = |what: &str| {
+        net::send(
+            writer,
+            &error_reply(req, Some(&mail), &conflict_reason(&mail, what)),
+        )
+    };
+
+    if let Some(group) = group {
+        stamp(&mut state.lock().unwrap(), &from);
+        let status = written(store.send_group(SendGroupReq {
+            mail_id: mail.clone(),
+            from: from.clone(),
+            group: group.to_string(),
+            body: body.clone(),
+            headers: headers.clone(),
+            accepted_at_ms: Some(now_ms()),
+        }))?;
+        let (article, readers) = match status {
+            SendStatus::Committed {
+                article_num,
+                subscribers,
+            } => (article_num, subscribers),
+            SendStatus::DuplicateAccepted { article_num } => (article_num, Vec::new()),
+            SendStatus::Conflict(what) => return refuse(&what),
+        };
+        let pending: Vec<PendingDelivery> = readers
+            .into_iter()
+            .map(|to| PendingDelivery {
+                seq: 0,
+                mail_id: mail.clone(),
+                from: from.clone(),
+                to,
+                group: Some(group.to_string()),
+                article_num: Some(article),
+                body: body.clone(),
+                kind: net::GROUP.to_string(),
+                headers: headers.clone().unwrap_or(Value::Obj(Vec::new())),
+            })
+            .collect();
+        return answer_then_push(
+            writer,
+            &accepted(vec![("group", s(group)), ("article", Value::Int(article))]),
+            push_pending(state, &pending),
+        );
+    }
+
+    let to = net::field(v, "to")?.to_string();
+    let (status, recipients) = if to == BROADCAST {
+        let recipients = {
+            let mut st = state.lock().unwrap();
+            stamp(&mut st, &from);
+            expire(&mut st)?;
+            let mut all: Vec<String> = st.sessions.keys().cloned().collect();
+            all.sort();
+            all
+        };
+        let status = written(store.send_broadcast(SendBroadcastReq {
+            mail_id: mail.clone(),
+            from: from.clone(),
+            recipients: recipients.clone(),
+            body: body.clone(),
+            headers: headers.clone(),
+            accepted_at_ms: Some(now_ms()),
+        }))?;
+        (status, recipients)
+    } else {
+        stamp(&mut state.lock().unwrap(), &from);
+        let status = written(store.send_directed(SendDirectedReq {
+            mail_id: mail.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            body: body.clone(),
+            headers: headers.clone(),
+            accepted_at_ms: Some(now_ms()),
+        }))?;
+        (status, vec![to.clone()])
+    };
+    let recipients = match status {
+        SendStatus::Committed { .. } => recipients,
+        // A resend commits nothing and pushes nothing: the first send did.
+        SendStatus::DuplicateAccepted { .. } => Vec::new(),
+        SendStatus::Conflict(what) => return refuse(&what),
+    };
+    let (kind, copies) = if to == BROADCAST {
+        (net::BROADCAST, true)
+    } else {
+        (net::DIRECTED, false)
+    };
+    let pending: Vec<PendingDelivery> = recipients
+        .into_iter()
+        .map(|addr| PendingDelivery {
+            seq: 0,
+            mail_id: if copies {
+                copy_id(&mail, &addr)
+            } else {
+                mail.clone()
+            },
+            from: from.clone(),
+            to: addr,
+            group: None,
+            article_num: None,
+            body: body.clone(),
+            kind: kind.to_string(),
+            headers: headers.clone().unwrap_or(Value::Obj(Vec::new())),
+        })
+        .collect();
+    answer_then_push(writer, &accepted(Vec::new()), push_pending(state, &pending))
+}
+
+/// The answer to an ack. `acked` names the session whose receipt it confirms,
+/// so its host daemon trims exactly that one from its replay list. Answering
+/// `acked` for a Mail this coordinator never accepted would be a false
+/// confirmation: the receipt would never be stored upstream.
+fn ack_reply(req: i64, mail: &str, session: &str, record: &str, result: &AckResult) -> Value {
+    match result {
+        AckResult::Recorded { .. } => obj(vec![
+            ("type", s("acked")),
+            ("req", Value::Int(req)),
+            ("mail", s(mail)),
+            ("session", s(session)),
+            ("record", s(record)),
+        ]),
+        AckResult::UnknownMail => error_reply(req, Some(mail), "unknown mail"),
+    }
+}
+
 fn takeover(
     st: &mut State,
     session: &str,
@@ -953,30 +1111,36 @@ fn takeover(
     registration: &str,
     at: Option<i64>,
 ) -> io::Result<Value> {
-    let event = match st
+    let known = st
         .takeovers
         .get(registration)
         .filter(|_| !registration.is_empty() && at.is_none())
-    {
-        Some(event) => event.clone(),
+        .cloned();
+    let (new_host, at_ms) = match known {
+        Some(Some(recorded)) => recorded,
+        // Committed before this process started: the store holds the line,
+        // so nothing is committed again.
+        Some(None) => (host.to_string(), now_ms()),
         None => {
-            let event = obj(vec![
-                ("ev", s("takeover")),
-                ("session", s(session)),
-                ("old_host", s(old_host)),
-                ("host", s(host)),
-                ("at_ms", Value::Int(at.unwrap_or_else(now_ms))),
-                ("registration", s(registration)),
-            ]);
-            commit(st, event.clone())?;
-            event
+            let at_ms = at.unwrap_or_else(now_ms);
+            commit(
+                st,
+                vec![TimelineEvent::Takeover {
+                    session: session.to_string(),
+                    old_host: old_host.to_string(),
+                    host: host.to_string(),
+                    at_ms: Some(at_ms),
+                    registration: Some(registration.to_string()),
+                }],
+            )?;
+            (host.to_string(), at_ms)
         }
     };
     Ok(obj(vec![
         ("type", s("superseded")),
         ("session", s(session)),
-        ("host", event.get("host").unwrap().clone()),
-        ("at_ms", event.get("at_ms").unwrap().clone()),
+        ("host", s(&new_host)),
+        ("at_ms", Value::Int(at_ms)),
         ("registration", s(registration)),
     ]))
 }
@@ -1035,34 +1199,26 @@ fn holder_fields(pairs: &mut Vec<(&str, Value)>, holder: Option<&Held>, now: i64
 /// Decide one claim request, commit its change durably, then answer. The lock
 /// is held throughout, so two owners racing for one key see one order.
 fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
-    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+    let req = req_of(v);
     let op_name = net::field(v, "op")?;
     // A bad op is answered, not fatal: an error here would drop the whole
     // host daemon's link.
     let Some(op) = Op::parse(op_name) else {
-        return Ok(obj(vec![
-            ("type", s("error")),
-            ("req", Value::Int(req)),
-            (
-                "reason",
-                s(&format!(
-                    "expected op acquire, renew, or release; saw {op_name}"
-                )),
-            ),
-        ]));
+        return Ok(error_reply(
+            req,
+            None,
+            &format!("expected op acquire, renew, or release; saw {op_name}"),
+        ));
     };
     let key = net::field(v, "key")?.to_string();
     let owner = net::field(v, "owner")?.to_string();
     let ttl_ms = v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0);
     if op != Op::Release && ttl_ms <= 0 {
-        return Ok(obj(vec![
-            ("type", s("error")),
-            ("req", Value::Int(req)),
-            (
-                "reason",
-                s(&format!("ttl_ms must be positive, saw {ttl_ms}")),
-            ),
-        ]));
+        return Ok(error_reply(
+            req,
+            None,
+            &format!("ttl_ms must be positive, saw {ttl_ms}"),
+        ));
     }
     // A Claim is held by a session: an owner the coordinator has never seen
     // Register is refused before any decision, so a stray string can neither
@@ -1086,8 +1242,7 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
         // The grant this change replaces, live or not: every committed
         // deadline lies after i64::MIN, so this reads the stored entry.
         let before = st.claims.live(&key, i64::MIN).cloned();
-        st.log.append(&json::stringify(&change.to_event(&key)))?;
-        st.claims.apply(&key, change);
+        commit(st, vec![claim_timeline(&key, change)])?;
         let claim_event = |name: &str, h: &Held| {
             vec![
                 ("event", s(name)),
@@ -1129,7 +1284,7 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
 /// seen since this coordinator started. Which sessions count as present is
 /// the reader's choice.
 fn board(st: &State, v: &Value) -> Value {
-    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+    let req = req_of(v);
     let now = now_ms();
     let mut sessions: Vec<(&String, &Session)> = st.sessions.iter().collect();
     sessions.sort_by_key(|(a, _)| *a);
@@ -1177,20 +1332,14 @@ fn board(st: &State, v: &Value) -> Value {
     ])
 }
 
-/// One Mail's lifecycle as this coordinator recorded it: its recipient and
-/// sender, when it was Accepted, and, once acked, the Receipt's Record id and
-/// when it was recorded. A stamp the log never held is left out, never sent
-/// as zero. A Broadcast copy is read by its copy id.
-fn receipt(st: &State, v: &Value) -> io::Result<Value> {
-    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
-    let mail = net::field(v, "mail")?;
-    let Some(m) = st.mails.get(mail) else {
-        return Ok(obj(vec![
-            ("type", s("error")),
-            ("req", Value::Int(req)),
-            ("mail", s(mail)),
-            ("reason", s(&format!("unknown mail {mail}"))),
-        ]));
+/// One Mail's lifecycle as this coordinator recorded it: its recipient (a
+/// Group's name for an article) and sender, when it was Accepted, and, once
+/// acked, the Receipt's Record id and when it was recorded. A stamp the store
+/// never held is left out, never sent as zero. A Broadcast copy is read by
+/// its copy id.
+fn receipt_reply(req: i64, mail: &str, info: Option<&ReceiptInfo>) -> Value {
+    let Some(m) = info else {
+        return error_reply(req, Some(mail), &format!("unknown mail {mail}"));
     };
     let mut pairs = vec![
         ("type", s("receipt")),
@@ -1198,19 +1347,56 @@ fn receipt(st: &State, v: &Value) -> io::Result<Value> {
         ("mail", s(mail)),
         ("to", s(&m.to)),
         ("from", s(&m.from)),
-        ("kind", s(m.kind)),
-        ("headers", m.headers.clone()),
+        ("kind", s(&m.kind)),
+        (
+            "headers",
+            m.headers.clone().unwrap_or(Value::Obj(Vec::new())),
+        ),
     ];
-    if let Some(t) = m.accepted_at {
+    if m.kind == net::GROUP {
+        if let Some(g) = &m.group {
+            pairs.push(("group", s(g)));
+        }
+        if let Some(n) = m.article_num {
+            pairs.push(("article", Value::Int(n)));
+        }
+    }
+    if let Some(t) = m.accepted_at_ms {
         pairs.push(("accepted_at_ms", Value::Int(t)));
     }
-    if let Some(r) = &m.receipt {
-        pairs.push(("record", s(&r.record)));
-        if let Some(t) = r.at {
+    if let Some(r) = &m.record_id {
+        pairs.push(("record", s(r)));
+        if let Some(t) = m.receipted_at_ms {
             pairs.push(("receipted_at_ms", Value::Int(t)));
         }
     }
-    Ok(obj(pairs))
+    obj(pairs)
+}
+
+/// The answer to `groups`: every Group with its high-water article and
+/// subscriber count, and, when a session asked, its own subscription.
+fn groups_reply(req: i64, for_session: bool, list: &[GroupSummary]) -> Value {
+    let groups = list
+        .iter()
+        .map(|g| {
+            let mut pairs = vec![
+                ("group", s(&g.group)),
+                ("high_water", Value::Int(g.high_water)),
+                ("subscribers", Value::Int(g.subscribers as i64)),
+            ];
+            if for_session {
+                pairs.push(("subscribed", Value::Bool(g.subscribed)));
+                pairs.push(("position", g.position.map_or(Value::Null, Value::Int)));
+                pairs.push(("record", g.record_id.as_deref().map_or(Value::Null, s)));
+            }
+            obj(pairs)
+        })
+        .collect();
+    obj(vec![
+        ("type", s("groups")),
+        ("req", Value::Int(req)),
+        ("groups", Value::Arr(groups)),
+    ])
 }
 
 /// The Mail id of one Broadcast copy: the broadcast's id and the recipient's
@@ -1219,154 +1405,313 @@ fn copy_id(mail: &str, to: &str) -> String {
     format!("{mail}{COPY_SEP}{to}")
 }
 
-/// Expand a committed Broadcast `(id, from, body, headers)` into one Mail of
-/// kind `broadcast` per recipient, each carrying the Broadcast's headers.
-/// Used on commit and on replay, so both see the same copies.
-fn fan_out(
-    st: &mut State,
-    (mail, from, body, headers): (&str, &str, &str, &Value),
-    to: &[String],
-    accepted_at: Option<i64>,
-) {
-    if st.broadcasts.contains_key(mail) {
-        return;
-    }
-    let mark = mark_of(body);
-    st.broadcasts
-        .insert(mail.to_string(), (from.to_string(), mark));
-    for addr in to {
-        let id = copy_id(mail, addr);
-        if st.mails.contains_key(&id) {
-            continue;
-        }
-        let seq = st.next_seq;
-        st.next_seq += 1;
-        st.pending.insert(seq, id.clone());
-        st.mails.insert(
-            id,
-            Mail {
-                from: from.to_string(),
-                to: addr.clone(),
-                body: Some(body.to_string()),
-                mark,
-                seq,
-                kind: net::BROADCAST,
-                headers: headers.clone(),
-                accepted_at,
-                receipt: None,
-            },
-        );
-    }
-}
-
-/// Commit one Broadcast to every session registered at this moment, as a
-/// single durable event, then return the deliveries to push to connected
-/// host daemons. A resent broadcast id commits nothing.
-fn broadcast(
-    st: &mut State,
-    mail: &str,
-    from: &str,
-    body: &str,
-    headers: &Value,
-) -> io::Result<Vec<(Writer, Value)>> {
-    if st.broadcasts.contains_key(mail) {
-        return Ok(Vec::new());
-    }
-    expire(st)?;
-    let mut to: Vec<String> = st.sessions.keys().cloned().collect();
-    to.sort();
-    let ev = obj(vec![
-        ("ev", s("broadcast")),
-        ("mail", s(mail)),
-        ("from", s(from)),
-        ("body", s(body)),
-        ("to", Value::Arr(to.iter().map(|a| s(a)).collect())),
-        ("headers", headers.clone()),
-        ("accepted_at_ms", Value::Int(now_ms())),
-    ]);
-    commit(st, ev)?;
-    let mut push = Vec::new();
-    for addr in &to {
-        if let Some((_, w)) = host_of(st, addr).and_then(|h| st.hosts.get(h)) {
-            push.push((
-                Arc::clone(w),
-                net::deliver_msg(
-                    &copy_id(mail, addr),
-                    from,
-                    addr,
-                    body,
-                    net::BROADCAST,
-                    headers,
-                ),
-            ));
-        }
-    }
-    Ok(push)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::stringify;
 
-    /// A state on a fresh log, with `lines` applied as a replay would.
-    fn replayed(tag: &str, lines: &[&str]) -> State {
-        let path =
-            std::env::temp_dir().join(format!("roger-coord-{}-{tag}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let (log, mut prior) = DurLog::open(&path).unwrap();
-        assert!(prior.next().is_none());
-        let _ = std::fs::remove_file(&path);
-        let mut state = State::new(log, UNREGISTER_AFTER_MS);
-        for line in lines {
-            apply(&mut state, &json::parse(line).unwrap()).unwrap();
-        }
-        state
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
     }
 
-    fn pushed(state: &State, host: &str, only: Option<&str>) -> Vec<String> {
-        pending_pushes(state, host, only)
-            .iter()
-            .map(|v| net::field(v, "mail").unwrap().to_string())
-            .collect()
+    fn line(pairs: Vec<(&'static str, Value)>) -> String {
+        stringify(&obj(pairs))
     }
 
     #[test]
-    fn a_receipt_drops_the_body_and_takes_the_mail_out_of_what_is_pushed() {
-        let st = replayed(
-            "receipt",
-            &[
-                r#"{"ev":"session","session":"b","host":"h"}"#,
-                r#"{"ev":"session","session":"c","host":"h"}"#,
-                r#"{"ev":"mail","mail":"m1","from":"a","to":"b","body":"one","headers":{"k":"v"},"accepted_at_ms":5}"#,
-                r#"{"ev":"mail","mail":"m2","from":"a","to":"c","body":"two"}"#,
-                r#"{"ev":"mail","mail":"m3","from":"a","to":"b","body":"three"}"#,
-                r#"{"ev":"broadcast","mail":"all","from":"a","body":"four","to":["b","c"]}"#,
-                r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-1","receipted_at_ms":9}"#,
-                r#"{"ev":"receipt","mail":"all/c","session":"c","record":"r-1"}"#,
-                // A second receipt for a Mail changes nothing.
-                r#"{"ev":"receipt","mail":"m1","session":"b","record":"r-7"}"#,
-            ],
-        );
-        // Commit order, receipted Mail left out, for the host and for one session.
-        assert_eq!(pushed(&st, "h", None), ["m2", "m3", "all/b"]);
-        assert_eq!(pushed(&st, "h", Some("b")), ["m3", "all/b"]);
-        assert_eq!(pushed(&st, "other", None), Vec::<String>::new());
-        assert_eq!(st.pending.len(), 3);
-        for (mail, held) in [
-            ("m1", false),
-            ("m2", true),
-            ("m3", true),
-            ("all/b", true),
-            ("all/c", false),
-        ] {
-            assert_eq!(st.mails[mail].body.is_some(), held, "{mail}");
-        }
-        // The receipt reply needs no body: it reads as before.
-        let reply = receipt(&st, &json::parse(r#"{"req":3,"mail":"m1"}"#).unwrap()).unwrap();
+    fn coordinator_flags_default_and_bound() {
+        let base = ["--bind", "127.0.0.1:0", "--data", "/d/c.log"];
+        let cfg = Config::from_args(&args(&base), "t".into()).unwrap();
         assert_eq!(
-            json::stringify(&reply),
+            cfg,
+            Config {
+                bind: "127.0.0.1:0".into(),
+                data: PathBuf::from("/d/c.log"),
+                port_file: None,
+                token: "t".into(),
+                unregister_after_ms: UNREGISTER_AFTER_MS,
+                slices: 1,
+                cold_retain_ms: 30 * sql::DAY_MS,
+                cold_day_ms: sql::DAY_MS,
+                cold_sweep: true,
+            }
+        );
+        let mut more = base.to_vec();
+        more.extend([
+            "--slices",
+            "4",
+            "--cold-retain-days",
+            "2",
+            "--no-cold-sweep",
+            "--port-file",
+            "/p",
+            "--unregister-after-ms",
+            "7",
+        ]);
+        let cfg = Config::from_args(&args(&more), "t".into()).unwrap();
+        assert_eq!(
+            (
+                cfg.slices,
+                cfg.cold_retain_ms,
+                cfg.cold_sweep,
+                cfg.port_file,
+                cfg.unregister_after_ms
+            ),
+            (4, 2 * sql::DAY_MS, false, Some(PathBuf::from("/p")), 7)
+        );
+        let open = Config::from_args(&args(&more), "t".into())
+            .unwrap()
+            .open_config();
+        assert_eq!(
+            (open.num_slices, open.retain_ms, open.sweep_enabled),
+            (4, 2 * sql::DAY_MS, false)
+        );
+        for (name, bad) in [
+            ("--slices", "0"),
+            ("--slices", "x"),
+            ("--cold-retain-days", "0"),
+            ("--cold-retain-days", "-3"),
+        ] {
+            let mut a = base.to_vec();
+            a.extend([name, bad]);
+            let err = Config::from_args(&args(&a), "t".into()).unwrap_err();
+            assert!(err.to_string().contains(name), "{name} {bad}: {err}");
+        }
+        assert!(Config::from_args(&args(&["--bind", "x"]), "t".into())
+            .unwrap_err()
+            .to_string()
+            .contains("--data"));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_hooks_set_cold_retention_and_day_in_milliseconds() {
+        let a = args(&[
+            "--bind",
+            "b",
+            "--data",
+            "d",
+            "--cold-retain-days",
+            "3",
+            "--cold-retain-ms",
+            "250",
+            "--cold-day-ms",
+            "100",
+        ]);
+        let cfg = Config::from_args(&a, "t".into()).unwrap();
+        assert_eq!((cfg.cold_retain_ms, cfg.cold_day_ms), (250, 100));
+        let open = cfg.open_config();
+        assert_eq!((open.retain_ms, open.day_ms), (250, 100));
+    }
+
+    fn pending(kind: &str, group: Option<&str>, article: Option<i64>) -> PendingDelivery {
+        PendingDelivery {
+            seq: 3,
+            mail_id: "m".into(),
+            from: "a".into(),
+            to: "b".into(),
+            group: group.map(str::to_string),
+            article_num: article,
+            body: "hi".into(),
+            kind: kind.into(),
+            headers: obj(vec![("k", s("v"))]),
+        }
+    }
+
+    #[test]
+    fn a_group_article_delivers_with_its_group_and_article() {
+        assert_eq!(
+            stringify(&deliver_of(&pending(net::GROUP, Some("ops"), Some(7)))),
+            r#"{"type":"deliver","mail":"m","from":"a","to":"b","group":"ops","article":7,"body":"hi","kind":"group","headers":{"k":"v"}}"#
+        );
+        assert_eq!(
+            stringify(&deliver_of(&pending(net::DIRECTED, None, None))),
+            r#"{"type":"deliver","mail":"m","from":"a","to":"b","body":"hi","kind":"directed","headers":{"k":"v"}}"#
+        );
+    }
+
+    fn info(kind: &str) -> ReceiptInfo {
+        ReceiptInfo {
+            mail_id: "m1".into(),
+            from: "a".into(),
+            to: "b".into(),
+            group: Some("ops".into()),
+            article_num: Some(4),
+            kind: kind.into(),
+            headers: None,
+            accepted_at_ms: Some(5),
+            record_id: Some("r-1".into()),
+            receipted_at_ms: Some(9),
+        }
+    }
+
+    #[test]
+    fn receipt_reply_reads_as_before_and_names_a_group_article() {
+        let mut directed = info(net::DIRECTED);
+        directed.headers = Some(obj(vec![("k", s("v"))]));
+        assert_eq!(
+            stringify(&receipt_reply(3, "m1", Some(&directed))),
             r#"{"type":"receipt","req":3,"mail":"m1","to":"b","from":"a","kind":"directed","headers":{"k":"v"},"accepted_at_ms":5,"record":"r-1","receipted_at_ms":9}"#
         );
+        let mut group = info(net::GROUP);
+        group.to = "ops".into();
+        group.record_id = None;
+        group.accepted_at_ms = None;
+        assert_eq!(
+            stringify(&receipt_reply(3, "m1", Some(&group))),
+            r#"{"type":"receipt","req":3,"mail":"m1","to":"ops","from":"a","kind":"group","headers":{},"group":"ops","article":4}"#
+        );
+        assert_eq!(
+            stringify(&receipt_reply(3, "zz", None)),
+            r#"{"type":"error","req":3,"mail":"zz","reason":"unknown mail zz"}"#
+        );
+    }
+
+    #[test]
+    fn acked_names_the_session_and_an_unknown_mail_is_refused() {
+        assert_eq!(
+            stringify(&ack_reply(
+                2,
+                "m",
+                "b",
+                "r-1",
+                &AckResult::Recorded {
+                    newly_receipted: false
+                }
+            )),
+            r#"{"type":"acked","req":2,"mail":"m","session":"b","record":"r-1"}"#
+        );
+        assert_eq!(
+            stringify(&ack_reply(2, "m", "b", "r-1", &AckResult::UnknownMail)),
+            r#"{"type":"error","req":2,"mail":"m","reason":"unknown mail"}"#
+        );
+    }
+
+    #[test]
+    fn groups_reply_adds_the_session_view_only_when_asked() {
+        let list = [
+            GroupSummary {
+                group: "ops".into(),
+                high_water: 3,
+                subscribers: 2,
+                position: Some(1),
+                subscribed: true,
+                record_id: Some("r-2".into()),
+            },
+            GroupSummary {
+                group: "dev".into(),
+                high_water: 0,
+                subscribers: 0,
+                position: None,
+                subscribed: false,
+                record_id: None,
+            },
+        ];
+        assert_eq!(
+            stringify(&groups_reply(1, false, &list)),
+            r#"{"type":"groups","req":1,"groups":[{"group":"ops","high_water":3,"subscribers":2},{"group":"dev","high_water":0,"subscribers":0}]}"#
+        );
+        assert_eq!(
+            stringify(&groups_reply(1, true, &list)),
+            r#"{"type":"groups","req":1,"groups":[{"group":"ops","high_water":3,"subscribers":2,"subscribed":true,"position":1,"record":"r-2"},{"group":"dev","high_water":0,"subscribers":0,"subscribed":false,"position":null,"record":null}]}"#
+        );
+    }
+
+    #[test]
+    fn send_shape_refuses_copy_ids_empty_group_mail_and_empty_group() {
+        assert!(send_shape_error("a/b", None).unwrap().contains("'/'"));
+        assert!(send_shape_error("a/b", Some("g")).unwrap().contains("'/'"));
+        assert!(send_shape_error("", Some("g")).unwrap().contains("mail id"));
+        assert!(send_shape_error("m", Some("")).unwrap().contains("group"));
+        assert_eq!(send_shape_error("m", Some("g")), None);
+        assert_eq!(send_shape_error("m", None), None);
+    }
+
+    #[test]
+    fn a_conflicting_resend_is_worded_once() {
+        assert_eq!(
+            conflict_reason("m1", "body"),
+            "mail m1: expected a resend to repeat the Mail already accepted under this id, saw a different body"
+        );
+        let whole = resend_refusal("m1", "sender, recipient");
+        assert_eq!(conflict_reason("m1", &whole), whole);
+        assert_eq!(copy_id("all", "b"), "all/b");
+    }
+
+    #[test]
+    fn board_events_show_session_changes_only() {
+        let shown = |ev: TimelineEvent| board_event_of(&ev).map(line);
+        assert_eq!(
+            shown(TimelineEvent::Session {
+                session: "a".into(),
+                host: "h".into(),
+                at_ms: Some(4)
+            })
+            .as_deref(),
+            Some(r#"{"event":"register","session":"a","host":"h","at_ms":4}"#)
+        );
+        assert_eq!(
+            shown(TimelineEvent::Unregister {
+                session: "a".into(),
+                at_ms: Some(5)
+            })
+            .as_deref(),
+            Some(r#"{"event":"unregister","session":"a","at_ms":5}"#)
+        );
+        assert_eq!(
+            shown(TimelineEvent::Label {
+                session: "a".into(),
+                label: "x".into(),
+                at_ms: Some(6)
+            })
+            .as_deref(),
+            Some(r#"{"event":"relabel","session":"a","label":"x","at_ms":6}"#)
+        );
+        assert_eq!(
+            shown(TimelineEvent::Declared {
+                session: "a".into(),
+                declared: None,
+                at_ms: Some(7)
+            })
+            .as_deref(),
+            Some(r#"{"event":"declared","session":"a","at_ms":7}"#)
+        );
+        assert_eq!(
+            shown(TimelineEvent::Declared {
+                session: "a".into(),
+                declared: Some("d".into()),
+                at_ms: None
+            })
+            .as_deref(),
+            Some(r#"{"event":"declared","session":"a","declared":"d"}"#)
+        );
+        assert_eq!(shown(TimelineEvent::Release { key: "k".into() }), None);
+        assert_eq!(
+            shown(TimelineEvent::Takeover {
+                session: "a".into(),
+                old_host: "h".into(),
+                host: "g".into(),
+                at_ms: Some(1),
+                registration: Some("r".into())
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_claim_change_commits_as_its_timeline_event() {
+        let grant = Change::Grant(Held {
+            owner: "a".into(),
+            expires_ms: 99,
+        });
+        assert!(matches!(
+            claim_timeline("k", &grant),
+            TimelineEvent::Claim { key, owner, expires_ms: 99 } if key == "k" && owner == "a"
+        ));
+        assert!(matches!(
+            claim_timeline("k", &Change::Release),
+            TimelineEvent::Release { key } if key == "k"
+        ));
     }
 
     #[test]
@@ -1394,35 +1739,5 @@ mod tests {
         assert!(answered.is_err(), "the closed link takes no answer");
         let pushed = net::lines(Box::new(far)).next().unwrap().unwrap();
         assert_eq!(pushed, deliver);
-    }
-
-    #[test]
-    fn a_resend_is_told_from_a_different_mail_with_and_without_the_body_held() {
-        let st = replayed(
-            "resend",
-            &[
-                r#"{"ev":"mail","mail":"m1","from":"a","to":"b","body":"one"}"#,
-                r#"{"ev":"mail","mail":"m2","from":"a","to":"b","body":"one"}"#,
-                r#"{"ev":"receipt","mail":"m2","session":"b","record":"r-1"}"#,
-            ],
-        );
-        for mail in ["m1", "m2"] {
-            let m = &st.mails[mail];
-            let was = (m.from.as_str(), Some(m.to.as_str()), m.mark);
-            assert_eq!(resend_differs(was, ("a", Some("b"), "one")), None, "{mail}");
-            for (new, what) in [
-                (("a", Some("b"), "onf"), "body"),
-                (("a", Some("b"), "one "), "body"),
-                (("x", Some("b"), "one"), "sender"),
-                (("a", Some("x"), "one"), "recipient"),
-                (("x", Some("x"), ""), "sender, recipient, body"),
-            ] {
-                assert_eq!(resend_differs(was, new).as_deref(), Some(what), "{mail}");
-            }
-        }
-        assert_eq!(
-            resend_refusal("m1", "body"),
-            "mail m1: expected a resend to repeat the Mail already accepted under this id, saw a different body"
-        );
     }
 }
