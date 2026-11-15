@@ -276,7 +276,9 @@ pub fn entries_after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec
 /// Shape one Store entry keeping keys in `["record", "mail", "from", "body", "kind", "headers"]` order.
 pub fn shape_mail_entry(entry: &Value) -> Value {
     let mut out = Map::new();
-    for key in ["record", "mail", "from", "body", "kind", "headers"] {
+    for key in [
+        "record", "mail", "from", "body", "kind", "headers", "group", "article",
+    ] {
         if let Some(val) = entry.get(key) {
             out.insert(key.to_string(), val.clone());
         }

@@ -91,3 +91,15 @@ roger audit \
   --store /var/lib/roger/gateway-stores/<sha256_address>.store \
   --bodies
 ```
+
+## Named Groups and positions
+
+Opt in during initialize with `X-Roger-Groups: 1`, `?groups=1`, or
+`_meta.roger_groups: true`, in that precedence order. Each accepts `1`, `0`,
+`true`, or `false`; the default is false and retains the existing nine tools.
+Opted-in sessions additionally expose `roger_subscribe` (non-empty `group`,
+optional nonnegative `after` and boolean `latest`), `roger_unsubscribe`
+(non-empty `group`), and `roger_groups`. Positions are durable in the service.
+`roger_send` accepts exactly one of `to` and `group`; Group replies include
+`mail`, `group`, and `article`. Group deliveries retain `group` and `article`
+in the Store, inbox, and SSE mail notification, including event recovery.

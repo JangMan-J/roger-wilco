@@ -38,7 +38,10 @@ fn roger_bin() -> &'static Path {
             .and_then(Path::parent)
             .expect("modules/mcp-gateway lives two levels under repo root");
         let root_manifest = repo_root.join("Cargo.toml");
-        let target_dir = repo_root.join("target").join("roger-for-gateway-tests");
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.join("target"))
+            .join("roger-for-gateway-tests");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let status = Command::new(cargo)
             .args([
