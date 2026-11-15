@@ -259,8 +259,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         let store = Arc::clone(&store);
         let token = cfg.token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, state, store, &token) {
-                eprintln!("coordinator connection ended: {e}");
+            if let Err(_e) = serve(conn, state, store, &token) {
                 // A failed write may have left the store ahead of memory.
                 // Stop here so a restart reads the store instead of serving
                 // a split view.
@@ -546,6 +545,9 @@ fn serve(
     // coordinator has committed. It is written before the link ends, unless
     // the link ended because the peer went silent; then nothing can reach it,
     // and the link ends at once, under any write still waiting on it.
+    if let Err(e) = &result {
+        eprintln!("coordinator connection ended: {e}");
+    }
     let silent = matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut);
     net::close(&writer, !silent);
     result
