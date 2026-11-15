@@ -204,6 +204,10 @@ const TOOLS: [(&str, &str, &str); 9] = [
 ];
 
 pub fn tools_list() -> Value {
+    tools_list_groups(false)
+}
+
+pub fn tools_list_groups(groups: bool) -> Value {
     let tools: Vec<Value> = TOOLS
         .iter()
         .map(|(name, description, schema)| {
@@ -217,6 +221,29 @@ pub fn tools_list() -> Value {
             Value::Object(t)
         })
         .collect();
+    let mut tools = tools;
+    if groups {
+        tools[0]["inputSchema"]["properties"]["group"] =
+            serde_json::json!({"type":"string","minLength":1});
+        tools[0]["inputSchema"]["required"] = serde_json::json!(["body"]);
+        tools[0]["inputSchema"]["oneOf"] = serde_json::json!([{"required":["to"],"not":{"required":["group"]}},{"required":["group"],"not":{"required":["to"]}}]);
+        for (name, schema) in [
+            (
+                "roger_subscribe",
+                serde_json::json!({"type":"object","properties":{"group":{"type":"string","minLength":1},"after":{"type":"integer","minimum":0},"latest":{"type":"boolean"}},"required":["group"]}),
+            ),
+            (
+                "roger_unsubscribe",
+                serde_json::json!({"type":"object","properties":{"group":{"type":"string","minLength":1}},"required":["group"]}),
+            ),
+            (
+                "roger_groups",
+                serde_json::json!({"type":"object","properties":{}}),
+            ),
+        ] {
+            tools.push(serde_json::json!({"name":name,"description":"Named Group positions","inputSchema":schema}));
+        }
+    }
     let mut out = Map::new();
     out.insert("tools".into(), Value::Array(tools));
     Value::Object(out)
@@ -350,7 +377,10 @@ pub async fn call_tool(session: &GatewaySession, params: &Value) -> Result<Value
         Some(a @ Value::Object(_)) => a,
         other => return Err(wrong(name, "arguments", "an object", other)),
     };
-    let known: Vec<&str> = TOOLS.iter().map(|t| t.0).collect();
+    let mut known: Vec<&str> = TOOLS.iter().map(|t| t.0).collect();
+    if session.groups {
+        known.extend(["roger_subscribe", "roger_unsubscribe", "roger_groups"]);
+    }
     if !known.contains(&name) {
         return Err(format!(
             "expected a tool among {}, saw {name}",
@@ -361,6 +391,32 @@ pub async fn call_tool(session: &GatewaySession, params: &Value) -> Result<Value
 
     match name {
         "roger_send" => {
+            let group = if session.groups {
+                opt_str(name, args, "group")?
+            } else {
+                None
+            };
+            if session.groups && (args.get("to").is_some() == args.get("group").is_some()) {
+                return Err("roger_send: expected either to or group, saw both or neither".into());
+            }
+            if let Some(group) = group {
+                if group.is_empty() {
+                    return Err("expected non-empty group, saw empty string".into());
+                }
+                let body = need_str(name, args, "body")?;
+                let mail = match opt_str(name, args, "mail")? {
+                    Some(m) => m.to_owned(),
+                    None => blocking_io(gen_uuid).map_err(io_err)?,
+                };
+                let mut req = serde_json::json!({"type":"send","req":1,"from":session.address,"group":group,"mail":mail,"body":body});
+                if let Some(h) = args.get("headers") {
+                    req["headers"] = h.clone();
+                }
+                return daemon::request(&session.socket, &req)
+                    .await
+                    .map(without_envelope)
+                    .map_err(io_err);
+            }
             let to = need_str(name, args, "to")?;
             let body = need_str(name, args, "body")?;
             let mail = match opt_str(name, args, "mail")? {
@@ -380,6 +436,29 @@ pub async fn call_tool(session: &GatewaySession, params: &Value) -> Result<Value
             let mut out = Map::new();
             out.insert("mail".into(), Value::String(accepted));
             Ok(Value::Object(out))
+        }
+        "roger_subscribe" | "roger_unsubscribe" | "roger_groups" => {
+            let op = name.strip_prefix("roger_").unwrap();
+            let mut req = serde_json::json!({"type":op,"req":1,"session":session.address});
+            if op != "groups" {
+                let group = need_str(name, args, "group")?;
+                if group.is_empty() {
+                    return Err("expected non-empty group, saw empty string".into());
+                }
+                req["group"] = Value::String(group.into());
+            }
+            if op == "subscribe" {
+                if args.get("after").is_some() {
+                    req["after"] = opt_int(name, args, "after", 0, (0, i64::MAX), false)?.into();
+                }
+                if args.get("latest").is_some() {
+                    req["latest"] = opt_bool(name, args, "latest")?.into();
+                }
+            }
+            daemon::request(&session.socket, &req)
+                .await
+                .map(without_envelope)
+                .map_err(io_err)
         }
         "roger_inbox" => {
             let limit = opt_int(
