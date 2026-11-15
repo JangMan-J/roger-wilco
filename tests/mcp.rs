@@ -1356,3 +1356,246 @@ fn mcp_serves_over_tcp_via_roger_socket_env_and_default_store() {
     assert_eq!(b.wait_exit().code(), Some(0));
     assert!(store_b.exists());
 }
+
+#[test]
+fn mcp_process_groups_opt_in_and_full_lifecycle_against_mock_daemon() {
+    let dir = std::env::temp_dir().join(format!("roger-mcp-groups-proc-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let sock_path = dir.join("mock-daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+    let (push_tx, push_rx) = mpsc::channel::<String>();
+    let push_rx = std::sync::Mutex::new(Some(push_rx));
+    let (ack_tx, ack_rx) = mpsc::channel::<Value>();
+    let daemon_thread = std::thread::spawn(move || {
+        while let Ok((conn, _)) = listener.accept() {
+            let ack_tx = ack_tx.clone();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                continue;
+            }
+            let v = json::parse(first.trim()).unwrap();
+            let ty = s(&v, "type");
+            if ty == "stop_mock" {
+                break;
+            }
+            if ty == "register" {
+                let sess = s(&v, "session");
+                let mut w = conn.try_clone().unwrap();
+                let _ = writeln!(w, r#"{{"type":"registered","session":"{sess}"}}"#);
+                let _ = w.flush();
+                if sess == A2 {
+                    let rx_opt = push_rx.lock().unwrap().take();
+                    std::thread::spawn(move || {
+                        if let Some(rx) = rx_opt {
+                            if let Ok(line) = rx.recv() {
+                                let _ = writeln!(w, "{line}");
+                                let _ = w.flush();
+                            }
+                        }
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                            if let Ok(msg) = json::parse(line.trim()) {
+                                if msg.get("type") == Some(&json::s("ack")) {
+                                    let _ = ack_tx.send(msg);
+                                }
+                            }
+                            line.clear();
+                        }
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                            line.clear();
+                        }
+                    });
+                }
+                continue;
+            }
+            let req = v.get("req").and_then(Value::as_i64).unwrap_or(1);
+            let reply = match ty.as_str() {
+                "subscribe" => format!(
+                    r#"{{"type":"subscribed","req":{req},"session":"{}","group":"{}","position":{},"high_water":1}}"#,
+                    s(&v, "session"),
+                    s(&v, "group"),
+                    v.get("after").and_then(Value::as_i64).unwrap_or(0)
+                ),
+                "send" if v.get("group").is_some() => format!(
+                    r#"{{"type":"accepted","req":{req},"mail":"{}","group":"{}","article":1}}"#,
+                    s(&v, "mail"),
+                    s(&v, "group")
+                ),
+                "send" => format!(
+                    r#"{{"type":"accepted","req":{req},"mail":"{}"}}"#,
+                    s(&v, "mail")
+                ),
+                "unsubscribe" => format!(
+                    r#"{{"type":"unsubscribed","req":{req},"session":"{}","group":"{}","position":1}}"#,
+                    s(&v, "session"),
+                    s(&v, "group")
+                ),
+                "groups" => format!(
+                    r#"{{"type":"groups","req":{req},"groups":[{{"group":"ops","high_water":1,"subscribers":1,"subscribed":true,"position":1,"record":"r-1"}}]}}"#
+                ),
+                other => panic!("unexpected mock request: {other}"),
+            };
+            let mut w = conn;
+            writeln!(w, "{reply}").unwrap();
+            w.flush().unwrap();
+        }
+    });
+
+    // 1. Default MCP server (without --groups): 9 tools only, group calls refused
+    let mut cmd_def = Command::new(BIN);
+    cmd_def.args([
+        "mcp",
+        "--socket",
+        sock_path.to_str().unwrap(),
+        "--id",
+        A1,
+        "--store",
+        dir.join("def.store").to_str().unwrap(),
+    ]);
+    let mut def_mcp = Mcp::start(cmd_def, &dir.join("def.err"));
+    def_mcp.initialize();
+    let mut def_tools: Vec<String> = arr(
+        def_mcp.rpc("tools/list", "{}").get("result").unwrap(),
+        "tools",
+    )
+    .iter()
+    .map(|t| s(t, "name"))
+    .collect();
+    def_tools.sort();
+    assert_eq!(
+        def_tools,
+        [
+            "roger_board",
+            "roger_claim",
+            "roger_inbox",
+            "roger_label",
+            "roger_receipt",
+            "roger_registered",
+            "roger_release",
+            "roger_renew",
+            "roger_send"
+        ]
+    );
+    assert!(def_mcp
+        .fails("roger_subscribe", r#"{"group":"ops"}"#)
+        .contains("roger_subscribe"));
+    assert!(def_mcp
+        .fails("roger_send", r#"{"group":"ops","body":"blocked"}"#)
+        .contains("`to`"));
+    def_mcp.close_stdin();
+    assert_eq!(def_mcp.wait_exit().code(), Some(0));
+
+    // 2. Opt-in MCP server (--groups): 12 tools + full subscribe/send/deliver/inbox/groups/unsubscribe
+    let grp_store = dir.join("grp.store");
+    let mut cmd_grp = Command::new(BIN);
+    cmd_grp.args([
+        "mcp",
+        "--groups",
+        "--socket",
+        sock_path.to_str().unwrap(),
+        "--id",
+        A2,
+        "--store",
+        grp_store.to_str().unwrap(),
+    ]);
+    let mut grp_mcp = Mcp::start(cmd_grp, &dir.join("grp.err"));
+    grp_mcp.initialize();
+    assert_eq!(
+        grp_mcp
+            .ok("roger_registered", r#"{"wait_seconds":5}"#)
+            .get("registered"),
+        Some(&Value::Bool(true))
+    );
+    let mut grp_tools: Vec<String> = arr(
+        grp_mcp.rpc("tools/list", "{}").get("result").unwrap(),
+        "tools",
+    )
+    .iter()
+    .map(|t| s(t, "name"))
+    .collect();
+    grp_tools.sort();
+    assert_eq!(
+        grp_tools,
+        [
+            "roger_board",
+            "roger_claim",
+            "roger_groups",
+            "roger_inbox",
+            "roger_label",
+            "roger_receipt",
+            "roger_registered",
+            "roger_release",
+            "roger_renew",
+            "roger_send",
+            "roger_subscribe",
+            "roger_unsubscribe"
+        ]
+    );
+
+    let sub = grp_mcp.ok("roger_subscribe", r#"{"group":"ops","after":0}"#);
+    assert_eq!(s(&sub, "group"), "ops");
+    assert_eq!(sub.get("position"), Some(&Value::Int(0)));
+
+    let sent = grp_mcp.ok(
+        "roger_send",
+        r#"{"group":"ops","mail":"mg-proc-1","body":"article one","headers":{"x-k":"v"}}"#,
+    );
+    assert_eq!(s(&sent, "mail"), "mg-proc-1");
+    assert_eq!(s(&sent, "group"), "ops");
+    assert_eq!(sent.get("article"), Some(&Value::Int(1)));
+
+    push_tx
+        .send(format!(
+            r#"{{"type":"deliver","mail":"mg-proc-1","from":"{A1}","to":"{A2}","group":"ops","article":1,"body":"article one","kind":"group","headers":{{"x-k":"v"}}}}"#
+        ))
+        .unwrap();
+    drop(push_tx);
+
+    let inbox = grp_mcp.ok("roger_inbox", r#"{"wait_seconds":5}"#);
+    let item = &arr(&inbox, "mail")[0];
+    assert_eq!(s(item, "mail"), "mg-proc-1");
+    assert_eq!(s(item, "group"), "ops");
+    assert_eq!(item.get("article"), Some(&Value::Int(1)));
+    assert_eq!(s(item, "kind"), "group");
+    assert_eq!(
+        item.get("headers").and_then(|h| h.get("x-k")),
+        Some(&json::s("v"))
+    );
+
+    let ack = ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(s(&ack, "mail"), "mg-proc-1");
+    assert_eq!(s(&ack, "record"), "r-1");
+    assert_eq!(
+        store_lines(
+            &grp_store,
+            r#""from":"11111111-1111-4111-8111-111111111111","group":"ops","article":1"#
+        ),
+        1
+    );
+
+    let grps = grp_mcp.ok("roger_groups", "{}");
+    assert_eq!(s(&arr(&grps, "groups")[0], "group"), "ops");
+    assert_eq!(
+        arr(&grps, "groups")[0].get("position"),
+        Some(&Value::Int(1))
+    );
+
+    let unsub = grp_mcp.ok("roger_unsubscribe", r#"{"group":"ops"}"#);
+    assert_eq!(s(&unsub, "group"), "ops");
+    assert_eq!(unsub.get("position"), Some(&Value::Int(1)));
+
+    grp_mcp.close_stdin();
+    assert_eq!(grp_mcp.wait_exit().code(), Some(0));
+    if let Ok(mut stop) = std::os::unix::net::UnixStream::connect(&sock_path) {
+        let _ = writeln!(stop, r#"{{"type":"stop_mock"}}"#);
+    }
+    daemon_thread.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
