@@ -516,7 +516,7 @@ Streamable HTTP is not offered.
 | `roger_inbox` | `limit?` (50, max 200), `wait_seconds?` (10, max 60, 0 = no wait), `peek?` | `{"mail":[{"record","mail","from","body","kind","headers"}],"cursor"}` |
 | `roger_board` | `all?`, `window_seconds?` (600) | `{"me","sessions","claims","now_ms"}`, rows as the Board gave them; by default only sessions connected or seen within the window of `now_ms` |
 | `roger_label` | `label` | `{"session","label"}` |
-| `roger_claim` | `key`, `ttl_seconds?` (900) | `{"ok","op","key","holder"?,"remaining_ms"?,"reason"?}`; acquires, or refreshes a claim this session holds; a refusal is `"ok":false`, not an error |
+| `roger_claim` | `key`, `ttl_seconds?` (120) | `{"ok","op","key","holder"?,"remaining_ms"?,"reason"?}`; acquires, or refreshes a claim this session holds; a refusal is `"ok":false`, not an error |
 | `roger_renew` | `key`, `ttl_seconds` | the same claim result |
 | `roger_release` | `key` | the same claim result |
 | `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true,"superseded":null}` once confirmed; otherwise false after the bounded wait, or immediately with the sticky notice when superseded |

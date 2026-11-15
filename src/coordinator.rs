@@ -443,13 +443,36 @@ fn observe(st: &State, pairs: Vec<(&str, Value)>) {
 /// Broadcast. Mail already accepted for its Address stays pending and is
 /// delivered if that Address registers again.
 fn unregister(st: &mut State, session: &str) -> io::Result<()> {
-    commit(
-        st,
-        vec![TimelineEvent::Unregister {
-            session: session.to_string(),
-            at_ms: Some(now_ms()),
-        }],
-    )?;
+    let now = now_ms();
+    let freed = st.claims.release_owner(session, now);
+    let held: Vec<_> = freed
+        .iter()
+        .map(|(key, _)| st.claims.live(key, now).cloned())
+        .collect();
+    let mut events = vec![TimelineEvent::Unregister {
+        session: session.to_string(),
+        at_ms: Some(now),
+    }];
+    events.extend(
+        freed
+            .iter()
+            .map(|(key, change)| claim_timeline(key, change)),
+    );
+    commit(st, events)?;
+    for ((key, _), before) in freed.iter().zip(held) {
+        if let Some(h) = before {
+            observe(
+                st,
+                vec![
+                    ("event", s("release")),
+                    ("key", s(key)),
+                    ("owner", s(&h.owner)),
+                    ("expires_ms", Value::Int(h.expires_ms)),
+                    ("at_ms", Value::Int(now)),
+                ],
+            );
+        }
+    }
     st.connected.remove(session);
     st.seen.remove(session);
     Ok(())

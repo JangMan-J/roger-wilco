@@ -162,6 +162,16 @@ impl Claims {
         }
     }
 
+    /// Decide releases for this owner's live claims, in key order.
+    /// The caller commits these changes before applying them.
+    pub fn release_owner(&self, owner: &str, now: i64) -> Vec<(String, Change)> {
+        self.held
+            .iter()
+            .filter(|(_, h)| h.owner == owner && now < h.expires_ms)
+            .map(|(key, _)| (key.clone(), Change::Release))
+            .collect()
+    }
+
     /// Apply a committed change, whether just decided or replayed from the log.
     pub fn apply(&mut self, key: &str, change: &Change) {
         match change {
@@ -279,6 +289,33 @@ mod tests {
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{line}");
             assert!(e.to_string().contains("saw log line {"), "{line}: {e}");
         }
+    }
+
+    #[test]
+    fn release_owner_only_decides_live_owned_claims() {
+        let mut c = Claims::default();
+        for (key, owner, expires_ms) in [("a", "A", 10), ("b", "B", 20), ("c", "A", 20)] {
+            c.apply(
+                key,
+                &Change::Grant(Held {
+                    owner: owner.into(),
+                    expires_ms,
+                }),
+            );
+        }
+        assert_eq!(
+            c.release_owner("A", 0),
+            vec![("a".into(), Change::Release), ("c".into(), Change::Release)]
+        );
+        let freed = c.release_owner("A", 10);
+        assert_eq!(freed, vec![("c".into(), Change::Release)]);
+        assert!(c.live("c", 10).is_some());
+        let other = c.live("b", 10).cloned();
+        for (key, change) in freed {
+            c.apply(&key, &change);
+        }
+        assert!(c.live("c", 10).is_none());
+        assert_eq!(c.live("b", 10).cloned(), other);
     }
 
     #[test]
