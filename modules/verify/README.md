@@ -125,6 +125,12 @@ Where the page is silent, this module takes the most literal reading:
 - **Broadcast.** The audit lists each copy as `<mail>/<address>`. The send named
   `<mail>`, so the form uses that id (the copy id without its `/<to>` suffix) and `to`
   = `*`. All copies of one Broadcast share one `seq` and are not replays of each other.
+- **Group.** For `kind` = `group`, the send named the opaque Group name and the article's
+  Mail id, so the canonical form uses `MAIL.group` when present (otherwise `MAIL.to`) as
+  `to`, and `MAIL.mail` verbatim as the Mail id. Multiple `MAIL` rows for the same
+  `(from, mail_id, seq)` (such as concatenated per-reader audits) count as one send and
+  are not `replayed_seq`, while a distinct `mail_id` under the same `seq` is
+  `replayed_seq`.
 - **Required headers.** The page says to attach all five headers to every Mail, so a
   signed Mail that lacks any one of them is `malformed_headers`.
 - **Signer key.** The page says a sender's declaration tells "whose key to expect". It
@@ -140,10 +146,11 @@ Where the page is silent, this module takes the most literal reading:
 - **Nonce.** "Differs for every process start" is read as global: a nonce seen on any
   earlier declared line, for any Address, is `replayed_nonce`.
 - **Base64.** Standard alphabet, padding required (RFC 4648 §4), for signatures and keys.
-- **What is checked.** Only the coordinator timeline in the audit is checked: `MAIL` with
-  the `HEADERS`/`BODY` lines right after it, `DECLARED` and `UNDECLARED`. Daemon and
-  Store records in the same listing are passed over. A `MAIL` with no `HEADERS` line has
-  an explicitly empty header set.
+- **What is checked.** Only the coordinator timeline in the audit is checked: `MAIL` (with
+  optional `group` and `article` fields) and the `HEADERS`/`BODY` lines right after it,
+  `DECLARED` and `UNDECLARED`. `POSITION`, `RECEIPT`, daemon and Store records in the same
+  listing are passed over. A `MAIL` with no `HEADERS` line has an explicitly empty header
+  set.
 
 Nothing here changes what the core does. The core still carries every header and
 declared text byte-identical and checks none of them. This module is one consumer's

@@ -404,3 +404,250 @@ fn non_json_input_is_an_error() {
     let err = verify_text("MAIL mail=m1\n", &roster(), Options::default()).unwrap_err();
     assert!(err.contains("not JSON"));
 }
+
+#[test]
+fn group_articles_verify_with_group_target_optional_fields_and_positions() {
+    let mut l = base();
+    l.push(json!({
+        "type": "POSITION",
+        "group": "desk.intake",
+        "session": B,
+        "subscribed": true,
+        "position": 0,
+        "record": null,
+        "receipted_at_ms": null
+    }));
+
+    // Standard audit MAIL row for a Group article (`to` = Group name, `article` present).
+    let h1 = headers(2, "ka", A, "desk.intake", "g-1", 1, "post one");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-1",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "article": 1,
+        "accepted_at_ms": 10,
+        "receipted_at_ms": 12,
+        "latency_ms": 2,
+        "record": "r-1",
+        "receipt_line": 4,
+        "body_bytes": 8,
+        "line": 3
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-1", "headers": h1}));
+    l.push(json!({"type": "BODY", "mail": "g-1", "body": "post one"}));
+    l.push(json!({
+        "type": "POSITION",
+        "group": "desk.intake",
+        "session": B,
+        "subscribed": true,
+        "position": 1,
+        "record": "r-1",
+        "receipted_at_ms": 12
+    }));
+
+    // `MAIL.group` overrides `MAIL.to` when present, and a slash in `mail` or `group` stays verbatim.
+    let h2 = headers(2, "ka", A, "ops/alerts", "g-2/ops/alerts", 2, "post two");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-2/ops/alerts",
+        "kind": "group",
+        "from": A,
+        "to": B,
+        "group": "ops/alerts",
+        "article": 2,
+        "accepted_at_ms": 20,
+        "line": 6
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-2/ops/alerts", "headers": h2}));
+    l.push(json!({"type": "BODY", "mail": "g-2/ops/alerts", "body": "post two"}));
+
+    // `MAIL` with `group` only (no `to` field) and directed `MAIL` with null optional fields.
+    let h3 = headers(2, "ka", A, "desk.intake", "g-3", 3, "post three");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-3",
+        "kind": "group",
+        "from": A,
+        "group": "desk.intake",
+        "article": 3,
+        "line": 8
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-3", "headers": h3}));
+    l.push(json!({"type": "BODY", "mail": "g-3", "body": "post three"}));
+
+    let h4 = headers(2, "ka", A, B, "d-4", 4, "direct four");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "d-4",
+        "kind": "directed",
+        "from": A,
+        "to": B,
+        "group": null,
+        "article": null,
+        "line": 9
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "d-4", "headers": h4}));
+    l.push(json!({"type": "BODY", "mail": "d-4", "body": "direct four"}));
+    l.push(json!({
+        "type": "STORE",
+        "path": "b.store",
+        "record": "r-1",
+        "mail": "g-1",
+        "from": A,
+        "kind": "group",
+        "group": "desk.intake",
+        "article": 1,
+        "line": 1
+    }));
+
+    let (r, status) = run(&l);
+    assert_eq!(status, 0, "{r:?}");
+    let ms = mails(&r);
+    assert_eq!(ms.len(), 4);
+    assert!(ms.iter().all(|m| m.failures().is_empty()));
+    assert!(!r.iter().any(|x| x.word == "SEQ_GAP"));
+}
+
+#[test]
+fn group_tampered_group_or_body_fails_verification() {
+    let mut l = base();
+    // Signed for `desk.intake`, committed under `other.group` in `to`.
+    let h1 = headers(2, "ka", A, "desk.intake", "g-bad-to", 1, "body-1");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-bad-to",
+        "kind": "group",
+        "from": A,
+        "to": "other.group",
+        "article": 1,
+        "line": 3
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-bad-to", "headers": h1}));
+    l.push(json!({"type": "BODY", "mail": "g-bad-to", "body": "body-1"}));
+
+    // Signed for `desk.intake`, tampered in explicit `group` field.
+    let h2 = headers(2, "ka", A, "desk.intake", "g-bad-group", 2, "body-2");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-bad-group",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "group": "other.group",
+        "article": 2,
+        "line": 4
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-bad-group", "headers": h2}));
+    l.push(json!({"type": "BODY", "mail": "g-bad-group", "body": "body-2"}));
+
+    // Signed with `*` instead of the Group name.
+    let h3 = headers(2, "ka", A, "*", "g-star", 3, "body-3");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-star",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "article": 3,
+        "line": 5
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-star", "headers": h3}));
+    l.push(json!({"type": "BODY", "mail": "g-star", "body": "body-3"}));
+
+    // Signed for `desk.intake` with body `clean`, delivered with tampered body.
+    let h4 = headers(2, "ka", A, "desk.intake", "g-bad-body", 4, "clean");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-bad-body",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "article": 4,
+        "line": 6
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-bad-body", "headers": h4}));
+    l.push(json!({"type": "BODY", "mail": "g-bad-body", "body": "tampered"}));
+
+    let (r, status) = run(&l);
+    assert_eq!(status, 1);
+    let ms = mails(&r);
+    assert_eq!(ms.len(), 4);
+    assert_eq!(ms[0].failures(), vec![INVALID_SIGNATURE]);
+    assert_eq!(ms[1].failures(), vec![INVALID_SIGNATURE]);
+    assert_eq!(ms[2].failures(), vec![INVALID_SIGNATURE]);
+    assert_eq!(ms[3].failures(), vec![BODY_HASH_MISMATCH]);
+}
+
+#[test]
+fn group_multi_reader_rows_share_seq_while_distinct_mail_id_is_replayed_seq() {
+    let mut l = base();
+    l.push(decl_line(C, &declare(C, "n-c"), 3));
+    let h_art1 = headers(2, "ka", A, "desk.intake", "g-art-1", 1, "shared article");
+
+    // Reader B's audit row for g-art-1.
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-art-1",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "article": 1,
+        "record": "r-b-1",
+        "line": 10
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-art-1", "headers": h_art1.clone()}));
+    l.push(json!({"type": "BODY", "mail": "g-art-1", "body": "shared article"}));
+    l.push(json!({
+        "type": "POSITION",
+        "group": "desk.intake",
+        "session": B,
+        "subscribed": true,
+        "position": 1,
+        "record": "r-b-1"
+    }));
+
+    // Reader C's audit row for the same g-art-1 (`seq` = 1, `mail` = "g-art-1").
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-art-1",
+        "kind": "group",
+        "from": A,
+        "to": C,
+        "group": "desk.intake",
+        "article": 1,
+        "record": "r-c-1",
+        "line": 10
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-art-1", "headers": h_art1}));
+    l.push(json!({"type": "BODY", "mail": "g-art-1", "body": "shared article"}));
+
+    let (r_ok, status_ok) = run(&l);
+    assert_eq!(status_ok, 0, "{r_ok:?}");
+    assert_eq!(mails(&r_ok).len(), 2);
+    assert!(mails(&r_ok).iter().all(|m| m.failures().is_empty()));
+
+    // A distinct `mail_id` reusing `seq` = 1 from A fails with `replayed_seq`.
+    let h_dup = headers(2, "ka", A, "desk.intake", "g-art-2", 1, "distinct article");
+    l.push(json!({
+        "type": "MAIL",
+        "mail": "g-art-2",
+        "kind": "group",
+        "from": A,
+        "to": "desk.intake",
+        "article": 2,
+        "record": "r-b-2",
+        "line": 15
+    }));
+    l.push(json!({"type": "HEADERS", "mail": "g-art-2", "headers": h_dup}));
+    l.push(json!({"type": "BODY", "mail": "g-art-2", "body": "distinct article"}));
+
+    let (r_bad, status_bad) = run(&l);
+    assert_eq!(status_bad, 1);
+    let ms = mails(&r_bad);
+    assert_eq!(ms.len(), 3);
+    assert!(ms[0].failures().is_empty());
+    assert!(ms[1].failures().is_empty());
+    assert_eq!(ms[2].failures(), vec![REPLAYED_SEQ]);
+}
