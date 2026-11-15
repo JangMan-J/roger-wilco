@@ -547,7 +547,7 @@ fn collect_archive_cold_files(dir: &Path, acc: &mut BTreeSet<PathBuf>) -> Result
 }
 
 /// Verify `<dest_dir>/manifest.json` and every archived `day-*.cold` file's whole-file digest,
-/// `SHA256:` trailer, and per-record `body_sha256`, plus detect any missing or unlisted cold file.
+/// `SHA256:` trailer, and per-record `digest`, plus detect any missing or unlisted cold file.
 pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
     let manifest_path = dest_dir.join(MANIFEST_FILE);
     let mut issues = Vec::new();
@@ -778,7 +778,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
 }
 
 /// Verify archived cold day files for `slice_name` (optionally restricted to `day_filter`)
-/// against `manifest.json`, `SHA256:` trailer, and per-record `body_sha256`, then atomically
+/// against `manifest.json`, `SHA256:` trailer, and per-record `digest`, then atomically
 /// restore missing `day-<bucket>.cold` files into `cold_dir`.
 pub fn restore(
     dest_dir: &Path,
@@ -1071,7 +1071,7 @@ mod tests {
             to: "ops".to_string(),
             headers: None,
             body: body.to_string(),
-            body_sha256: sha256_hex(body.as_bytes()),
+            digest: sha256_hex(body.as_bytes()),
             accepted_at_ms: Some(1_700_000_123_000),
         };
         let bytes = encode_cold_bytes(&[rec]).unwrap();

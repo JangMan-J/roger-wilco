@@ -55,7 +55,7 @@ fn build_core_rwcold01_file(records: &[RawColdRow<'_>]) -> Vec<u8> {
             None => "null".to_string(),
         };
         let line = format!(
-            "{{\"mail\":{mail_j},\"stream\":{stream_j},\"article\":{article},\"kind\":{kind_j},\"from\":{from_j},\"to\":{to_j},\"headers\":{hdr_json},\"body\":{body_j},\"body_sha256\":\"{body_digest}\",\"accepted_at_ms\":{ts_json}}}",
+            "{{\"mail\":{mail_j},\"stream\":{stream_j},\"article\":{article},\"kind\":{kind_j},\"from\":{from_j},\"to\":{to_j},\"headers\":{hdr_json},\"body\":{body_j},\"digest\":\"{body_digest}\",\"accepted_at_ms\":{ts_json}}}",
             mail_j = serde_json::to_string(mail).unwrap(),
             stream_j = serde_json::to_string(stream).unwrap(),
             kind_j = serde_json::to_string(kind).unwrap(),
@@ -223,7 +223,7 @@ fn tampered_local_cold_file_rejected_before_shipping() {
     )]);
     write_file(&slices.join("slice-00/cold/day-19000.cold"), &valid);
 
-    // Case 1: Tamper with record body and recompute trailer so ONLY per-record body_sha256 fails.
+    // Case 1: Tamper with record body and recompute trailer so ONLY per-record digest fails.
     let bad_rec = ColdRecord {
         mail: "m-bad".to_string(),
         stream: "m:r".to_string(),
@@ -233,7 +233,7 @@ fn tampered_local_cold_file_rejected_before_shipping() {
         to: "r".to_string(),
         headers: None,
         body: "tampered payload".to_string(),
-        body_sha256: sha256_hex(b"original payload"),
+        digest: sha256_hex(b"original payload"),
         accepted_at_ms: None,
     };
     let bad_bytes = encode_cold_bytes(&[bad_rec]).unwrap();

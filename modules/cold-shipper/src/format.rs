@@ -21,7 +21,7 @@ pub struct ColdRecord {
     #[serde(default)]
     pub headers: Option<String>,
     pub body: String,
-    pub body_sha256: String,
+    pub digest: String,
     #[serde(default)]
     pub accepted_at_ms: Option<i64>,
 }
@@ -129,19 +129,19 @@ pub fn verify_cold_bytes(raw: &[u8], origin: &Path) -> Result<VerifiedColdFile, 
                 idx + 2
             )
         })?;
-        if !is_lower_hex_64(&rec.body_sha256) {
+        if !is_lower_hex_64(&rec.digest) {
             return Err(format!(
                 "expected 64-hex body digest for mail {} in {}, saw {}",
                 rec.mail,
                 origin.display(),
-                rec.body_sha256
+                rec.digest
             ));
         }
         let actual_body_digest = sha256_hex(rec.body.as_bytes());
-        if actual_body_digest != rec.body_sha256 {
+        if actual_body_digest != rec.digest {
             return Err(format!(
                 "expected body digest {} for mail {} in {}, saw {actual_body_digest}",
-                rec.body_sha256,
+                rec.digest,
                 rec.mail,
                 origin.display()
             ));
@@ -201,7 +201,7 @@ mod tests {
             to: "recipient-b".to_string(),
             headers: hdrs.map(str::to_string),
             body: body.to_string(),
-            body_sha256: sha256_hex(body.as_bytes()),
+            digest: sha256_hex(body.as_bytes()),
             accepted_at_ms: Some(1_700_000_000_000 + art),
         }
     }

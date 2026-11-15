@@ -29,7 +29,7 @@ roger-cold-shipper watch-stdin --slices-dir <path> --dest <archive-dir> [--json]
 - `ship`: scans `<slices-dir>/slice-*/cold/day-*.cold` (and single-slice
   `<slices-dir>/cold/day-*.cold`, mapped to `slice-00` unless `<slices-dir>` itself is
   named `slice-*`). Before writing anything to `<dest>`, verifies every candidate cold
-  file's `RWCOLD01\n` header, every JSON record's `body_sha256` against its `body`, and
+  file's `RWCOLD01\n` header, every JSON record's `digest` against its `body`, and
   the trailing `SHA256:<64-hex>\n` digest over all preceding bytes (matching `src/cold.rs`).
   Atomically copies unshipped verified files to `<dest>/<slice-name>/day-<bucket>.cold`
   with read-only permissions, skipping an already-present destination file **only** after
@@ -37,12 +37,12 @@ roger-cold-shipper watch-stdin --slices-dir <path> --dest <archive-dir> [--json]
   source SHA-256 digest. Atomically updates `<dest>/manifest.json`.
 - `restore`: validates `<dest>/manifest.json` and verifies every requested archived cold
   day file for `--slice <slice-name>` (restricted to `--day <bucket>` when given) against
-  both `manifest.json` and its `RWCOLD01` trailer and per-record `body_sha256`, then
+  both `manifest.json` and its `RWCOLD01` trailer and per-record `digest`, then
   atomically restores missing `day-<bucket>.cold` files into `<local-cold-dir>` with
   read-only permissions.
 - `verify`: checks `<dest>/manifest.json`, verifies every listed `day-*.cold` file's
   whole-file SHA-256, `SHA256:` trailer, byte size, record count, and per-record
-  `body_sha256`, and flags any missing or unlisted `.cold` file in `<dest>`. Exits `0`
+  `digest`, and flags any missing or unlisted `.cold` file in `<dest>`. Exits `0`
   when intact and `1` on any missing or corrupted file or manifest.
 - `watch-stdin`: event-driven line reader on `stdin`. Each input line triggers one
   incremental `ship` pass and flushes one summary line to `stdout`, exiting `0` on `stdin`
