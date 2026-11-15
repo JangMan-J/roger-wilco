@@ -6,7 +6,7 @@ keys. A session can be an application, a script, or a person behind some front e
 knows sessions, not the programs behind them. It routes and stores. It does not schedule work,
 assign tasks, or interpret what it carries.
 
-The core is one Rust binary, `roger`, with no external crates. One coordinator holds the
+The core is one standalone Rust binary, `roger`, satisfying every proof without any Optional module, with vendored offline crates and per-slice SQLite hot/cold storage. One coordinator holds the
 durable state, one host daemon per machine serves sessions on a Unix socket, a TCP listener,
 or both, and anything else (a command-line client, a test session, an adapter for a particular
 agent program) connects through that listener. Optional modules may live under `modules/`
@@ -22,6 +22,7 @@ landing changes on main (see [Checks](#checks)).
 | Core contract: commands, delivery, claims, checks | this file |
 | Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
 | The gate and the review rules | [AGENTS.md § Coding standards](AGENTS.md#coding-standards) |
+| Storage architecture and Mermaid diagrams | [docs/STORAGE.md](docs/STORAGE.md) |
 | A later direction: what a Usenet-like, peered core will need | [docs/USENET-MODEL.md](docs/USENET-MODEL.md) |
 
 ## Requirements
@@ -74,11 +75,14 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
-| `coordinator` | `--bind <addr:port> --data <log> [--port-file <file>] [--unregister-after-ms <n>]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
+| `coordinator` | `--bind <addr:port> --data <path> [--port-file <file>] [--unregister-after-ms <n>] [--slices <n>] [--cold-retain-days <d>] [--no-cold-sweep]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
 | `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] [--client-token-env <NAME>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically; `--client-token-env` requires TCP clients to present `ROGER_CLIENT_TOKEN`) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session`, plus `[--registered] [--superseded] [--watch]` (also send `{"type":"registered"}`, see Faces; `board_event` lines, see Watching the Board) | the same session, fronted by a stdin/stdout line stream for a client |
-| `send` | `--socket --from <address> --to <address or '*'> --body <text> [--mail <id>] [--header <key=value>]...` | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
+| `send` | `--socket --from <address> (--to <address or '*'> \| --group <group>) --body <text> [--mail <id>] [--header <key=value>]...` |
+| `subscribe` | `--socket --session <address> --group <group> [--after <n> \| --latest]` | subscribe `session` to `group` at durable reader Position |
+| `unsubscribe` | `--socket --session <address> --group <group>` | stop Group deliveries while keeping durable Position |
+| `groups` | `--socket [--session <address>]` | list Groups, high-water marks, subscriber counts, and optional session Position | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
 | `audit` | `[--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
@@ -128,7 +132,7 @@ after the Mail is receipted and after a coordinator restart.
 ## Kind and headers
 
 Every delivery carries a `kind`: `directed` for a Mail sent to one Address, `broadcast` for a
-copy of a Broadcast. It says how the Mail reached the recipient and nothing about what the
+copy of a Broadcast, or `group` for an article delivered to a subscribed reader of a Group. It says how the Mail reached the recipient and nothing about what the
 recipient does with it. The same hop carries `headers`: a JSON object of string keys to
 string values that the sender set with `send` (`--header key=value`, repeatable, or
 `"headers"` on the adapter's `send`); `{}` when there are none. The core never reads, compares
@@ -588,6 +592,7 @@ core log grows while nobody asks.
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket or TCP listener |
 | `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
+| `src/sql/`, `src/cold.rs` | isolated SQLite slice/daemon storage and sealed `RWCOLD01` cold day files ([docs/STORAGE.md](docs/STORAGE.md)) |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing, per-peer outgoing queues and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
@@ -596,6 +601,9 @@ core log grows while nobody asks.
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
 | `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
 | `modules/mcp-gateway/` | optional multi-session MCP Streamable HTTP and SSE push gateway ([modules/mcp-gateway/README.md](modules/mcp-gateway/README.md)) |
+| `modules/ws-gateway/` | optional WebSocket adapter face ([modules/ws-gateway/README.md](modules/ws-gateway/README.md)) |
+| `modules/verify/` | optional offline provenance verifier over `roger audit` ([modules/verify/README.md](modules/verify/README.md)) |
+| `modules/cold-shipper/` | optional archive shipper and verifier for sealed `RWCOLD01` cold day files ([modules/cold-shipper/README.md](modules/cold-shipper/README.md)) |
 | `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
 | `VECTORS/` | read-only history of what was tried; no new vectors are written here |
 | `docs/reviews/` | historical review evidence |
