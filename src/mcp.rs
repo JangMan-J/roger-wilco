@@ -35,6 +35,7 @@ pub struct Config {
     pub store_is_default: bool,
     pub label: Option<String>,
     pub declared: Option<String>,
+    pub groups: bool,
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -114,6 +115,7 @@ pub fn resolve(
         store_is_default,
         label: flag(args, "--label"),
         declared: flag(args, "--declare"),
+        groups: args.iter().any(|a| a == "--groups"),
     })
 }
 
@@ -294,9 +296,44 @@ const TOOLS: [(&str, &str, &str); 9] = [
     ),
 ];
 
-fn tools_list() -> Value {
-    let tools = TOOLS
-        .iter()
+const SEND_WITH_GROUPS: (&str, &str, &str) = (
+    "roger_send",
+    "Send one Mail to an Address, to every session with \"*\", or to a Group with `group`. Give either `to` or `group`, never both. Headers are opaque strings the sender attaches.",
+    r#"{"type":"object","properties":{"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["body"]}"#,
+);
+
+const GROUP_TOOLS: [(&str, &str, &str); 3] = [
+    (
+        "roger_subscribe",
+        "Subscribe this session to a Group. Optional `after` sets the article position (>= 0); `latest` starts at the Group's current high-water mark.",
+        r#"{"type":"object","properties":{"group":{"type":"string"},"after":{"type":"integer","minimum":0},"latest":{"type":"boolean"}},"required":["group"]}"#,
+    ),
+    (
+        "roger_unsubscribe",
+        "Unsubscribe this session from a Group while keeping its durable position.",
+        r#"{"type":"object","properties":{"group":{"type":"string"}},"required":["group"]}"#,
+    ),
+    (
+        "roger_groups",
+        "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
+        r#"{"type":"object","properties":{}}"#,
+    ),
+];
+
+fn tool_defs(groups: bool) -> Vec<(&'static str, &'static str, &'static str)> {
+    if !groups {
+        return TOOLS.to_vec();
+    }
+    let mut out = Vec::with_capacity(TOOLS.len() + GROUP_TOOLS.len());
+    out.push(SEND_WITH_GROUPS);
+    out.extend_from_slice(&TOOLS[1..]);
+    out.extend_from_slice(&GROUP_TOOLS);
+    out
+}
+
+fn tools_list(groups: bool) -> Value {
+    let tools = tool_defs(groups)
+        .into_iter()
         .map(|(name, description, schema)| {
             obj(vec![
                 ("name", s(name)),
@@ -383,6 +420,7 @@ struct Ctx {
     socket: PathBuf,
     me: String,
     inbox: Inbox,
+    groups: bool,
     /// True once the coordinator's `registered` has arrived.
     confirmed: Mutex<(bool, Option<Value>)>,
     confirmed_cv: Condvar,
@@ -399,7 +437,7 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
         Some(a @ Value::Obj(_)) => a,
         other => return Err(wrong(name, "arguments", "an object", other)),
     };
-    let known: Vec<&str> = TOOLS.iter().map(|t| t.0).collect();
+    let known: Vec<&str> = tool_defs(ctx.groups).into_iter().map(|t| t.0).collect();
     if !known.contains(&name) {
         return Err(format!(
             "expected a tool among {}, saw {name}",
@@ -409,16 +447,76 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
     let io = |e: io::Error| e.to_string();
     match name {
         "roger_send" => {
-            let to = need_str(name, args, "to")?;
+            if !ctx.groups {
+                let to = need_str(name, args, "to")?;
+                let body = need_str(name, args, "body")?;
+                let mail = match opt_str(name, args, "mail")? {
+                    Some(m) => m.to_string(),
+                    None => session::gen_uuid().map_err(io)?,
+                };
+                let mail =
+                    session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
+                        .map_err(io)?;
+                return Ok(obj(vec![("mail", s(&mail))]));
+            }
+            let to = opt_str(name, args, "to")?;
+            let group = opt_str(name, args, "group")?;
+            if to.is_some() && group.is_some() {
+                return Err("roger_send: expected either `to` or `group`, saw both".into());
+            }
+            if to.is_none() && group.is_none() {
+                return Err("roger_send: expected `to` or `group`, saw neither".into());
+            }
             let body = need_str(name, args, "body")?;
             let mail = match opt_str(name, args, "mail")? {
                 Some(m) => m.to_string(),
                 None => session::gen_uuid().map_err(io)?,
             };
-            let mail =
-                session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
-                    .map_err(io)?;
-            Ok(obj(vec![("mail", s(&mail))]))
+            if let Some(to) = to {
+                let mail =
+                    session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
+                        .map_err(io)?;
+                Ok(obj(vec![("mail", s(&mail))]))
+            } else {
+                let group = group.expect("checked group.is_some()");
+                let (mail, grp, article) = session::send_group_mail(
+                    &ctx.socket,
+                    &ctx.me,
+                    group,
+                    &mail,
+                    body,
+                    args.get("headers"),
+                )
+                .map_err(io)?;
+                Ok(obj(vec![
+                    ("mail", s(&mail)),
+                    ("group", s(&grp)),
+                    ("article", Value::Int(article)),
+                ]))
+            }
+        }
+        "roger_subscribe" => {
+            let group = need_str(name, args, "group")?;
+            let after = match args.get("after") {
+                None => None,
+                Some(_) => Some(opt_int(name, args, "after", 0, (0, i64::MAX), false)?),
+            };
+            let latest = opt_bool(name, args, "latest")?;
+            if after.is_some() && latest {
+                return Err("roger_subscribe: expected `after` or `latest`, saw both".into());
+            }
+            let reply =
+                session::subscribe_req(&ctx.socket, &ctx.me, group, after, latest).map_err(io)?;
+            Ok(without_envelope(reply))
+        }
+        "roger_unsubscribe" => {
+            let group = need_str(name, args, "group")?;
+            let reply = session::unsubscribe_req(&ctx.socket, &ctx.me, group).map_err(io)?;
+            Ok(without_envelope(reply))
+        }
+        "roger_groups" => {
+            let reply = session::groups_req(&ctx.socket, Some(&ctx.me)).map_err(io)?;
+            Ok(without_envelope(reply))
         }
         "roger_inbox" => {
             let limit = opt_int(
@@ -760,7 +858,8 @@ fn entries(store: &Path) -> io::Result<Vec<Value>> {
 /// The entries after the one named `consumed`, at most `limit`, shaped as the
 /// inbox returns them. A read position that names no entry (a Store that was
 /// replaced) starts from the first. A `kind` or `headers` the entry lacks is
-/// left out, never guessed.
+/// left out, never guessed. When the Store entry carries `group` and `article`,
+/// both are projected onto the returned `mail` entry.
 fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
     let start = consumed
         .and_then(|c| {
@@ -772,9 +871,17 @@ fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
         .iter()
         .take(limit)
         .map(|e| {
+            let has_group = e.get("group").and_then(Value::as_str).is_some()
+                && e.get("article").and_then(Value::as_i64).is_some();
+            let keys: &[&str] = if has_group {
+                &[
+                    "record", "mail", "from", "group", "article", "body", "kind", "headers",
+                ]
+            } else {
+                &["record", "mail", "from", "body", "kind", "headers"]
+            };
             Value::Obj(
-                ["record", "mail", "from", "body", "kind", "headers"]
-                    .iter()
+                keys.iter()
                     .filter_map(|k| e.get(k).map(|v| (k.to_string(), v.clone())))
                     .collect(),
             )
@@ -822,6 +929,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         socket: cfg.socket.clone(),
         me: cfg.address.clone(),
         inbox: Inbox::open(&cfg.store)?,
+        groups: cfg.groups,
         confirmed: Mutex::new((false, None)),
         confirmed_cv: Condvar::new(),
     });
@@ -924,7 +1032,7 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
                 let _ = net::send(out, &reply_ok(&id, obj(vec![])));
             }
             "tools/list" => {
-                let _ = net::send(out, &reply_ok(&id, tools_list()));
+                let _ = net::send(out, &reply_ok(&id, tools_list(ctx.groups)));
             }
             // Each call runs on its own thread, so a waiting inbox read never
             // holds up another call.
@@ -973,6 +1081,7 @@ fn finish(cfg: &Config, gate: &Mutex<bool>, daemon: Option<&net::Writer>, code: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -1190,7 +1299,7 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_valid_schema() {
-        let list = tools_list();
+        let list = tools_list(false);
         let Some(Value::Arr(tools)) = list.get("tools") else {
             panic!("no tools");
         };
@@ -1310,6 +1419,331 @@ mod tests {
         assert_eq!((page.len(), cur.as_deref()), (1, Some("r-2")));
         let (page, cur) = again.read(10, Duration::from_millis(50), false).unwrap();
         assert!(page.is_empty() && cur.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_and_tools_list_isolate_default_nine_tools_from_groups_flag() {
+        let base_env = [("ROGER_SOCKET", "/s"), ("HOME", "/h")];
+        assert!(!resolved(&[], &base_env).unwrap().groups);
+        assert!(resolved(&["--groups"], &base_env).unwrap().groups);
+
+        let names_of = |v: Value| -> Vec<String> {
+            let mut ns: Vec<String> = v
+                .get("tools")
+                .and_then(|x| match x {
+                    Value::Arr(a) => Some(a),
+                    _ => None,
+                })
+                .unwrap()
+                .iter()
+                .map(|t| t.get("name").unwrap().as_str().unwrap().to_string())
+                .collect();
+            ns.sort();
+            ns
+        };
+        assert_eq!(
+            names_of(tools_list(false)),
+            vec![
+                "roger_board",
+                "roger_claim",
+                "roger_inbox",
+                "roger_label",
+                "roger_receipt",
+                "roger_registered",
+                "roger_release",
+                "roger_renew",
+                "roger_send",
+            ]
+        );
+        let default_send = tools_list(false)
+            .get("tools")
+            .and_then(|v| match v {
+                Value::Arr(a) => a.iter().find(|t| t.get("name") == Some(&s("roger_send"))),
+                _ => None,
+            })
+            .cloned()
+            .unwrap();
+        assert!(default_send
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("group"))
+            .is_none());
+        assert_eq!(
+            default_send
+                .get("inputSchema")
+                .and_then(|s| s.get("required")),
+            Some(&Value::Arr(vec![s("to"), s("body")]))
+        );
+
+        let opt_in = tools_list(true);
+        assert_eq!(
+            names_of(opt_in.clone()),
+            vec![
+                "roger_board",
+                "roger_claim",
+                "roger_groups",
+                "roger_inbox",
+                "roger_label",
+                "roger_receipt",
+                "roger_registered",
+                "roger_release",
+                "roger_renew",
+                "roger_send",
+                "roger_subscribe",
+                "roger_unsubscribe",
+            ]
+        );
+        let group_send = opt_in
+            .get("tools")
+            .and_then(|v| match v {
+                Value::Arr(a) => a.iter().find(|t| t.get("name") == Some(&s("roger_send"))),
+                _ => None,
+            })
+            .cloned()
+            .unwrap();
+        assert!(group_send
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("group"))
+            .is_some());
+        assert_eq!(
+            group_send
+                .get("inputSchema")
+                .and_then(|s| s.get("required")),
+            Some(&Value::Arr(vec![s("body")]))
+        );
+
+        let dir = std::env::temp_dir().join(format!("roger-mcp-isolate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx_default = Ctx {
+            socket: PathBuf::from("tcp://127.0.0.1:1"),
+            me: "s1".into(),
+            inbox: Inbox::open(&dir.join("d.store")).unwrap(),
+            groups: false,
+            confirmed: Mutex::new((true, None)),
+            confirmed_cv: Condvar::new(),
+        };
+        for tool in ["roger_subscribe", "roger_unsubscribe", "roger_groups"] {
+            let err = call_tool(
+                &ctx_default,
+                &json::parse(&format!(r#"{{"name":"{tool}","arguments":{{}}}}"#)).unwrap(),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("expected a tool among") && err.contains(tool),
+                "{err}"
+            );
+        }
+        let err = call_tool(
+            &ctx_default,
+            &json::parse(r#"{"name":"roger_send","arguments":{"group":"ops","body":"hi"}}"#)
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "roger_send: expected `to` to be a string, saw nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_groups_tools_and_inbox_projection_over_mock_daemon() {
+        let dir =
+            std::env::temp_dir().join(format!("roger-mcp-groups-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("g.store");
+        std::fs::write(
+            &store,
+            concat!(
+                r#"{"record":"r-1","mail":"md-1","from":"peer","body":"direct","kind":"directed","headers":{}}"#,
+                "\n",
+                r#"{"record":"r-2","mail":"mg-4","from":"peer","group":"ops","article":4,"body":"post","kind":"group","headers":{"x-h":"1"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+        let daemon = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (conn, _) = listener.accept().unwrap();
+                let mut lines = net::lines(Box::new(conn.try_clone().unwrap()));
+                let w = net::writer(Box::new(conn));
+                let req = lines.next().unwrap().unwrap();
+                let r = req.get("req").and_then(Value::as_i64).unwrap_or(1);
+                let resp = match net::field(&req, "type").unwrap() {
+                    "subscribe" => obj(vec![
+                        ("type", s("subscribed")),
+                        ("req", Value::Int(r)),
+                        ("session", s(net::field(&req, "session").unwrap())),
+                        ("group", s(net::field(&req, "group").unwrap())),
+                        (
+                            "position",
+                            Value::Int(req.get("after").and_then(Value::as_i64).unwrap_or(4)),
+                        ),
+                        ("high_water", Value::Int(4)),
+                    ]),
+                    "send" if req.get("group").is_some() => obj(vec![
+                        ("type", s("accepted")),
+                        ("req", Value::Int(r)),
+                        ("mail", s(net::field(&req, "mail").unwrap())),
+                        ("group", s(net::field(&req, "group").unwrap())),
+                        ("article", Value::Int(5)),
+                    ]),
+                    "send" => obj(vec![
+                        ("type", s("accepted")),
+                        ("req", Value::Int(r)),
+                        ("mail", s(net::field(&req, "mail").unwrap())),
+                    ]),
+                    "unsubscribe" => obj(vec![
+                        ("type", s("unsubscribed")),
+                        ("req", Value::Int(r)),
+                        ("session", s(net::field(&req, "session").unwrap())),
+                        ("group", s(net::field(&req, "group").unwrap())),
+                        ("position", Value::Int(5)),
+                    ]),
+                    "groups" => obj(vec![
+                        ("type", s("groups")),
+                        ("req", Value::Int(r)),
+                        (
+                            "groups",
+                            Value::Arr(vec![obj(vec![
+                                ("group", s("ops")),
+                                ("high_water", Value::Int(5)),
+                                ("subscribers", Value::Int(0)),
+                                ("subscribed", Value::Bool(false)),
+                                ("position", Value::Int(5)),
+                                ("record", s("r-2")),
+                            ])]),
+                        ),
+                    ]),
+                    other => panic!("unexpected {other}"),
+                };
+                net::send(&w, &resp).unwrap();
+            }
+        });
+
+        let ctx = Ctx {
+            socket: target,
+            me: "me-g".into(),
+            inbox: Inbox::open(&store).unwrap(),
+            groups: true,
+            confirmed: Mutex::new((true, None)),
+            confirmed_cv: Condvar::new(),
+        };
+
+        let inbox_res = call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_inbox","arguments":{"wait_seconds":0}}"#).unwrap(),
+        )
+        .unwrap();
+        let Some(Value::Arr(items)) = inbox_res.get("mail") else {
+            panic!("expected mail array");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items[0].get("group").is_none() && items[0].get("article").is_none());
+        assert_eq!(items[1].get("group"), Some(&s("ops")));
+        assert_eq!(items[1].get("article"), Some(&Value::Int(4)));
+        assert_eq!(items[1].get("kind"), Some(&s("group")));
+
+        assert!(call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_send","arguments":{"to":"x","group":"ops","body":"b"}}"#
+            )
+            .unwrap()
+        )
+        .unwrap_err()
+        .contains("either `to` or `group`"));
+        assert!(call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_send","arguments":{"body":"b"}}"#).unwrap()
+        )
+        .unwrap_err()
+        .contains("expected `to` or `group`"));
+
+        assert!(call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_subscribe","arguments":{"group":"ops","after":1,"latest":true}}"#
+            )
+            .unwrap()
+        )
+        .unwrap_err()
+        .contains("expected `after` or `latest`"));
+        assert!(call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_subscribe","arguments":{"group":"ops","after":-1}}"#)
+                .unwrap()
+        )
+        .is_err());
+
+        let sub1 = call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_subscribe","arguments":{"group":"ops","after":1}}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sub1,
+            json::parse(r#"{"session":"me-g","group":"ops","position":1,"high_water":4}"#).unwrap()
+        );
+        let sub2 = call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_subscribe","arguments":{"group":"ops","latest":true}}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sub2.get("position"), Some(&Value::Int(4)));
+
+        let sent_g = call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_send","arguments":{"group":"ops","mail":"mg-5","body":"hi"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sent_g,
+            json::parse(r#"{"mail":"mg-5","group":"ops","article":5}"#).unwrap()
+        );
+        let sent_d = call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_send","arguments":{"to":"peer","mail":"md-2","body":"hi"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent_d, json::parse(r#"{"mail":"md-2"}"#).unwrap());
+
+        let unsub = call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_unsubscribe","arguments":{"group":"ops"}}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            unsub,
+            json::parse(r#"{"session":"me-g","group":"ops","position":5}"#).unwrap()
+        );
+
+        let grps = call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_groups","arguments":{}}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            grps,
+            json::parse(
+                r#"{"groups":[{"group":"ops","high_water":5,"subscribers":0,"subscribed":false,"position":5,"record":"r-2"}]}"#
+            )
+            .unwrap()
+        );
+
+        daemon.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
