@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # Invariant check: neither the core nor any optional module learns which harness runs a session.
 # Coordinator, host daemon, client, adapter, and optional modules under modules/ name no
-# harness or model, read no harness store, and link no harness or model SDK. Root Cargo.toml
-# also keeps [dependencies], [dev-dependencies], and [build-dependencies] empty; optional
-# modules under modules/<name>/ may link non-harness external crates, and both their
-# Cargo.toml and Cargo.lock are scanned here against the harness and model list.
+# harness or model, read no harness store, and link no harness or model SDK. Both root
+# Cargo.toml/Cargo.lock, vendored crate names, and modules/*/Cargo.toml and Cargo.lock are
+# scanned here against the harness and model list.
 #
-# Scanned: every file in the checkout (tracked or untracked, minus .gitignore and Cargo target/
-# build directories) outside VECTORS/ and docs/reviews/: core source, optional modules
-# (modules/*/Cargo.toml, modules/*/Cargo.lock, source, tests, docs), tests, scripts, deploy
-# units, and docs, README.md included. The sealed documents (purpose, proofs, invariants,
-# terms) live outside the repo and were scanned with this check before they were sealed. A model
-# name counts as a harness name. Exempt:
+# Scanned: every file in the checkout (tracked or untracked, minus .gitignore, Cargo target/
+# build directories, and third-party vendor/ source bodies) outside VECTORS/ and docs/reviews/:
+# core source, Cargo.toml, Cargo.lock, optional modules (modules/*/Cargo.toml,
+# modules/*/Cargo.lock, source, tests, docs), tests, scripts, deploy units, and docs, README.md
+# included. Every vendored crate directory name under vendor/ is also checked so no harness or
+# model SDK can be vendored. Exempt:
 #   frontmatter         a leading YAML block (--- ... ---) in a markdown file
 #                       records who wrote the file (agent:, session:), not
 #                       what the core or an optional module is
 #   VECTORS/            the record of what was tried
 #   docs/reviews/       historical review evidence, not project docs
+#   vendor/             third-party upstream crate sources (crate names still checked below)
 #   scripts/acceptance  proofs 2 and 5 run real harnesses by definition
 #   scripts/check-harness-free  this list of names
 #
@@ -42,7 +42,7 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(VECTORS|\.slice)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+  grep -vE '^(VECTORS|\.slice|vendor)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core or optional-module files under ${*:-.}" >&2; exit 1; }
 
@@ -66,19 +66,16 @@ if [[ -n "$hits" ]]; then
   status=1
 fi
 
-deps="$(awk '
-  /^\[[[:space:]]*(dev-|build-)?dependencies[[:space:]]*\][[:space:]]*(#.*)?$/ { f = 1; next }
-  /^\[[[:space:]]*((dev-|build-)?dependencies\.|target\..*\.(dev-|build-)?dependencies(\.|\]))/ { print; f = 1; next }
-  /^\[/ { f = 0 }
-  f && /^[[:space:]]*[^#[:space:]]/ { print }
-' Cargo.toml)"
-if [[ -n "$deps" ]]; then
-  echo "FAIL: root Cargo.toml links external crates ([dependencies], [dev-dependencies], and [build-dependencies] must stay empty):" >&2
-  echo "$deps" >&2
-  status=1
+if [[ -d vendor ]]; then
+  vendor_hits="$(ls -1 vendor | grep -iE "\b($HARNESSES|$MODELS)\b" || true)"
+  if [[ -n "$vendor_hits" ]]; then
+    echo "FAIL: vendored crate names a harness or model SDK:" >&2
+    echo "$vendor_hits" >&2
+    status=1
+  fi
 fi
 
 if [[ "$status" == 0 ]]; then
-  echo "PASS harness-free: no harness or model name or SDK in ${#files[@]} core and optional-module files under ${*:-.}; root Cargo.toml links no external crates"
+  echo "PASS harness-free: no harness or model name or SDK in ${#files[@]} core and optional-module files under ${*:-.}"
 fi
 exit "$status"

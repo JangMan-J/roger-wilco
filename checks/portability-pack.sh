@@ -4,7 +4,7 @@
 # the real binaries. Also fails if a tracked file names a machine-specific path.
 # Usage: checks/portability-pack.sh
 set -euo pipefail
-if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (build, test, install in a clean HOME under /tmp)"; exit 0; fi
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (build, test, install in a clean HOME under TMPDIR or /tmp)"; exit 0; fi
 [[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -12,11 +12,11 @@ cd "$ROOT"
 step() { echo "== $*"; "$@"; }
 
 echo "== no machine-specific paths in tracked files"
-if git grep -nI -e '/home/[a-z]' -e 'Projects/' -e 'roger-wilco-rebuild' -- . ':!checks/portability-pack.sh'; then
+if git grep -nI -e '/home/[a-z]' -e 'Projects/' -e 'roger-wilco-rebuild' -- . ':!checks/portability-pack.sh' ':!vendor'; then
   echo "FAIL portability: machine-specific path above" >&2; exit 1
 fi
 
-tmp="$(mktemp -d /tmp/roger-portability.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/roger-portability.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/home" "$tmp/src"
 # Tracked files as the working tree has them (uncommitted edits included).

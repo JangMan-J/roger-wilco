@@ -1,5 +1,11 @@
 mod audit;
 mod claims;
+#[allow(dead_code)]
+mod cold;
+#[allow(dead_code)]
+mod sha256;
+#[allow(dead_code)]
+pub mod sql;
 mod coordinator;
 mod daemon;
 mod durlog;

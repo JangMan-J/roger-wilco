@@ -90,6 +90,26 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Acquire a non-blocking exclusive process lock on `path`, creating parent
+/// directories when needed. Held for the lifetime of the returned `File`.
+pub fn open_exclusive_lock(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let existed = path.exists();
+    let file = open_exclusive(path)?;
+    if !existed {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                sync_dir(parent)?;
+            }
+        }
+    }
+    Ok(file)
+}
+
 fn open_exclusive(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
