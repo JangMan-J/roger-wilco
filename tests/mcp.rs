@@ -462,6 +462,57 @@ impl Mcp {
         self.response(id, 20)
     }
 
+    fn send_modern(&mut self, method: &str, extra_fields: &str) -> i64 {
+        let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/events":{}}},"io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"}}"#;
+        let params = if extra_fields.trim().is_empty() {
+            format!("{{{meta}}}")
+        } else {
+            format!("{{{meta},{extra_fields}}}")
+        };
+        self.send_request(method, &params)
+    }
+
+    fn rpc_modern(&mut self, method: &str, extra_fields: &str) -> Value {
+        let id = self.send_modern(method, extra_fields);
+        self.response(id, 20)
+    }
+
+    fn next_notif_for(&mut self, sub_id: i64, method: &str, secs: u64) -> Value {
+        if let Some(i) = self.seen.iter().position(|v| {
+            v.get("method").and_then(Value::as_str) == Some(method)
+                && v.get("params")
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|m| m.get("io.modelcontextprotocol/subscriptionId"))
+                    == Some(&Value::Int(sub_id))
+        }) {
+            return self.seen.remove(i);
+        }
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            let left = end
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(1);
+            if let Some(v) = self.next_line(left) {
+                let matches = v.get("method").and_then(Value::as_str) == Some(method)
+                    && v.get("params")
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("io.modelcontextprotocol/subscriptionId"))
+                        == Some(&Value::Int(sub_id));
+                if matches {
+                    return v;
+                }
+                self.seen.push(v);
+            } else {
+                break;
+            }
+        }
+        panic!(
+            "timed out waiting for {method} for sub {sub_id}; seen: {:?}",
+            self.seen
+        );
+    }
+
     fn initialize(&mut self) -> Value {
         let r = self.rpc(
             "initialize",
@@ -1598,4 +1649,291 @@ fn mcp_process_groups_opt_in_and_full_lifecycle_against_mock_daemon() {
     }
     daemon_thread.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mcp_2026_07_28_discover_meta_validation_and_subscriptions() {
+    let rig = Rig::new("modern-discover");
+    let mut a = rig.mcp(
+        "a",
+        &["--id", A1, "--store", rig.p("a.store").to_str().unwrap()],
+        &[],
+    );
+
+    // ping is removed in 2026-07-28 (when not in legacy initialize mode).
+    let ping_err = a.rpc("ping", "{}");
+    assert_eq!(
+        ping_err.get("error").and_then(|e| e.get("code")),
+        Some(&Value::Int(-32601))
+    );
+
+    // Missing _meta -> -32602 InvalidParams.
+    let no_meta = a.rpc("server/discover", "{}");
+    assert_eq!(
+        no_meta.get("error").and_then(|e| e.get("code")),
+        Some(&Value::Int(-32602))
+    );
+
+    // Unsupported protocolVersion -> -32022 with supported list.
+    let bad_ver = a.rpc(
+        "server/discover",
+        r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01","io.modelcontextprotocol/clientCapabilities":{}}}"#,
+    );
+    assert_eq!(
+        bad_ver.get("error").and_then(|e| e.get("code")),
+        Some(&Value::Int(-32022))
+    );
+    assert_eq!(
+        bad_ver
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .and_then(|d| d.get("supported")),
+        Some(&Value::Arr(vec![json::s("2026-07-28")]))
+    );
+
+    // Valid server/discover.
+    let disc = a.rpc_modern("server/discover", "");
+    let res = disc.get("result").unwrap();
+    assert_eq!(s(res, "resultType"), "complete");
+    assert_eq!(
+        res.get("supportedVersions"),
+        Some(&Value::Arr(vec![json::s("2026-07-28")]))
+    );
+    assert!(res
+        .get("capabilities")
+        .and_then(|c| c.get("extensions"))
+        .and_then(|e| e.get("io.modelcontextprotocol/events"))
+        .is_some());
+    assert_eq!(res.get("ttlMs"), Some(&Value::Int(300_000)));
+    assert_eq!(s(res, "cacheScope"), "public");
+    assert_eq!(
+        res.get("_meta")
+            .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+            .map(|i| s(i, "name")),
+        Some("roger".to_string())
+    );
+
+    // tools/list in 2026-07-28 mode includes caching hints and resultType.
+    let tl = a.rpc_modern("tools/list", "");
+    let tl_res = tl.get("result").unwrap();
+    assert_eq!(s(tl_res, "resultType"), "complete");
+    assert_eq!(tl_res.get("ttlMs"), Some(&Value::Int(300_000)));
+    assert_eq!(s(tl_res, "cacheScope"), "public");
+
+    // Wrong session handle on tools/call returns isError=true.
+    let bad_sess_id = a.send_modern(
+        "tools/call",
+        r#""name":"roger_board","arguments":{"session":"not-me"}"#,
+    );
+    let bad_sess_resp = a.response(bad_sess_id, 10);
+    let (is_err, err_txt) = Mcp::result_of(&bad_sess_resp);
+    assert!(is_err && err_txt.contains("not-me"), "{err_txt}");
+
+    // subscriptions/listen -> acknowledged, then cancel via notifications/cancelled.
+    let sub1 = a.send_modern(
+        "subscriptions/listen",
+        r#""notifications":{"toolsListChanged":true}"#,
+    );
+    let ack1 = a.next_notif_for(sub1, "notifications/subscriptions/acknowledged", 10);
+    assert_eq!(
+        ack1.get("params").and_then(|p| p.get("notifications")),
+        Some(&Value::Obj(vec![]))
+    );
+    a.write(&format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{sub1}}}}}"#
+    ));
+
+    // Second subscription stays open until stdin closes -> receives graceful completion result.
+    let sub2 = a.send_modern("subscriptions/listen", r#""notifications":{}"#);
+    a.next_notif_for(sub2, "notifications/subscriptions/acknowledged", 10);
+    a.close_stdin();
+    let final_resp = a.response(sub2, 10);
+    assert_eq!(
+        s(final_resp.get("result").unwrap(), "resultType"),
+        "complete"
+    );
+    assert!(
+        !a.seen
+            .iter()
+            .any(|v| v.get("id") == Some(&Value::Int(sub1))),
+        "cancelled subscription must not emit a result"
+    );
+    assert_eq!(a.wait_exit().code(), Some(0));
+}
+
+#[test]
+fn mcp_sep3415_events_list_poll_and_stream_replay_live_heartbeat_cancel() {
+    let rig = Rig::new("sep3415");
+    let mut a = rig.mcp(
+        "a",
+        &["--id", A1, "--store", rig.p("a.store").to_str().unwrap()],
+        &[],
+    );
+    let mut b = rig.mcp(
+        "b",
+        &[
+            "--groups",
+            "--id",
+            A2,
+            "--store",
+            rig.p("b.store").to_str().unwrap(),
+        ],
+        &[],
+    );
+    for (sess, name) in [(&mut a, "a"), (&mut b, "b")] {
+        let id = sess.send_modern(
+            "tools/call",
+            r#""name":"roger_registered","arguments":{"wait_seconds":20}"#,
+        );
+        let resp = sess.response(id, 20);
+        let (is_err, txt) = Mcp::result_of(&resp);
+        assert!(!is_err, "{name} registered failed: {txt}");
+    }
+
+    // events/list
+    let listed = b.rpc_modern("events/list", "");
+    let evs = arr(listed.get("result").unwrap(), "events");
+    let ev_names: Vec<String> = evs.iter().map(|e| s(e, "name")).collect();
+    assert_eq!(
+        ev_names,
+        ["roger.mail", "roger.board", "roger.registration"]
+    );
+
+    // Unsupported poll on roger.board -> -32026; unknown event -> -32023.
+    let board_poll = b.rpc_modern("events/poll", r#""name":"roger.board""#);
+    assert_eq!(
+        board_poll.get("error").and_then(|e| e.get("code")),
+        Some(&Value::Int(-32026))
+    );
+    let unk_poll = b.rpc_modern("events/poll", r#""name":"roger.unknown""#);
+    assert_eq!(
+        unk_poll.get("error").and_then(|e| e.get("code")),
+        Some(&Value::Int(-32023))
+    );
+
+    // Send m-1 from A -> B before B opens stream, so replay catches m-1.
+    let send1 = a.send_modern(
+        "tools/call",
+        &format!(
+            r#""name":"roger_send","arguments":{{"to":"{A2}","mail":"m-ev-1","body":"first","headers":{{"h":"1"}}}}"#
+        ),
+    );
+    assert!(!Mcp::result_of(&a.response(send1, 10)).0);
+    until("m-ev-1 in b.store", 10, || {
+        (store_lines(&rig.p("b.store"), "m-ev-1") == 1).then_some(())
+    });
+
+    // Poll from null -> empty + tail cursor; poll from r-0 -> m-ev-1; roger_inbox cursor stays independent.
+    let p_now = b.rpc_modern("events/poll", r#""name":"roger.mail""#);
+    assert_eq!(s(p_now.get("result").unwrap(), "cursor"), "r-1");
+    assert!(arr(p_now.get("result").unwrap(), "events").is_empty());
+
+    let p_all = b.rpc_modern("events/poll", r#""name":"roger.mail","cursor":"r-0""#);
+    let p_evs = arr(p_all.get("result").unwrap(), "events");
+    assert_eq!(p_evs.len(), 1);
+    assert_eq!(s(&p_evs[0], "eventId"), "m-ev-1");
+    assert!(!rig.p("b.store.cursor").exists());
+
+    // Open events/stream for roger.mail from r-0 with heartbeatMs=1000.
+    let mail_sub = b.send_modern(
+        "events/stream",
+        r#""name":"roger.mail","cursor":"r-0","heartbeatMs":1000"#,
+    );
+    let active = b.next_notif_for(mail_sub, "notifications/events/active", 10);
+    assert_eq!(
+        active
+            .get("params")
+            .and_then(|p| p.get("heartbeatMs"))
+            .and_then(Value::as_i64),
+        Some(1000)
+    );
+    let ev1 = b.next_notif_for(mail_sub, "notifications/events/event", 10);
+    assert_eq!(s(ev1.get("params").unwrap(), "eventId"), "m-ev-1");
+    assert_eq!(s(ev1.get("params").unwrap(), "cursor"), "r-1");
+
+    // Live mail m-ev-2 arrives on the stream without duplicating m-ev-1.
+    let send2 = a.send_modern(
+        "tools/call",
+        &format!(
+            r#""name":"roger_send","arguments":{{"to":"{A2}","mail":"m-ev-2","body":"second"}}"#
+        ),
+    );
+    assert!(!Mcp::result_of(&a.response(send2, 10)).0);
+    let ev2 = b.next_notif_for(mail_sub, "notifications/events/event", 10);
+    assert_eq!(s(ev2.get("params").unwrap(), "eventId"), "m-ev-2");
+    assert_eq!(s(ev2.get("params").unwrap(), "cursor"), "r-2");
+
+    // Wait for heartbeat on the quiet mail stream (~1s).
+    let hb = b.next_notif_for(mail_sub, "notifications/events/heartbeat", 5);
+    assert_eq!(s(hb.get("params").unwrap(), "cursor"), "r-2");
+
+    // Open roger.board stream (triggers on-demand watch), relabel A, observe board event.
+    let board_sub = b.send_modern(
+        "events/stream",
+        r#""name":"roger.board","heartbeatMs":5000"#,
+    );
+    b.next_notif_for(board_sub, "notifications/events/active", 10);
+    let lbl = a.send_modern(
+        "tools/call",
+        r#""name":"roger_label","arguments":{"label":"watcher-target"}"#,
+    );
+    assert!(!Mcp::result_of(&a.response(lbl, 10)).0);
+    let bev = b.next_notif_for(board_sub, "notifications/events/event", 10);
+    let bdata = bev.get("params").unwrap().get("data").unwrap();
+    assert_eq!(s(bdata, "event"), "relabel");
+    assert_eq!(s(bdata, "label"), "watcher-target");
+
+    // Open roger.registration stream -> immediately observes registered state, and superseded on takeover.
+    let reg_sub = b.send_modern(
+        "events/stream",
+        r#""name":"roger.registration","heartbeatMs":5000"#,
+    );
+    b.next_notif_for(reg_sub, "notifications/events/active", 10);
+    let reg_ev = b.next_notif_for(reg_sub, "notifications/events/event", 10);
+    assert_eq!(
+        s(reg_ev.get("params").unwrap().get("data").unwrap(), "event"),
+        "registered"
+    );
+
+    // Cancel mail_sub and board_sub cleanly.
+    b.write(&format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{mail_sub}}}}}"#
+    ));
+    b.write(&format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{board_sub}}}}}"#
+    ));
+
+    // Takeover A2 from a third session -> B receives superseded on roger.registration stream.
+    let mut b2 = rig.mcp(
+        "b2",
+        &["--id", A2, "--store", rig.p("b2.store").to_str().unwrap()],
+        &[],
+    );
+    let reg2 = b2.send_modern(
+        "tools/call",
+        r#""name":"roger_registered","arguments":{"wait_seconds":20}"#,
+    );
+    assert!(!Mcp::result_of(&b2.response(reg2, 20)).0);
+    let sup_ev = b.next_notif_for(reg_sub, "notifications/events/event", 10);
+    assert_eq!(
+        s(sup_ev.get("params").unwrap().get("data").unwrap(), "event"),
+        "superseded"
+    );
+
+    // roger_inbox still sees m-ev-1 and m-ev-2 because events/poll & events/stream never touched .store.cursor.
+    let inb = b.send_modern(
+        "tools/call",
+        r#""name":"roger_inbox","arguments":{"wait_seconds":0}"#,
+    );
+    let inb_resp = b.response(inb, 10);
+    let (_, inb_txt) = Mcp::result_of(&inb_resp);
+    let inb_val = json::parse(&inb_txt).unwrap();
+    assert_eq!(mails(&inb_val), ["m-ev-1", "m-ev-2"]);
+
+    a.close_stdin();
+    b.close_stdin();
+    b2.close_stdin();
+    assert_eq!(a.wait_exit().code(), Some(0));
+    assert_eq!(b.wait_exit().code(), Some(0));
+    assert_eq!(b2.wait_exit().code(), Some(0));
 }

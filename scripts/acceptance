@@ -1094,6 +1094,28 @@ mcp() {
   [[ ! -e "$state/roger/mcp/$env_id.store" && ! -e "$state/roger/mcp/$env_id.store.cursor" ]] || fail "an empty default Store was left behind"
   [[ -e "$work/a.store" ]] || fail "an explicit Store was removed"
 
+  # ---- 2026-07-28 modern discovery, subscriptions/listen, and SEP-3415 events ----
+  local m26='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/events":{}}}}'
+  mcp_start m --id "modern-$$" --store "$work/m.store"
+  r="$(mcp_rpc m "server/discover" "$(jq -cn --argjson m "$m26" '{_meta:$m}')")"
+  jq -e '.result.resultType == "complete" and (.result.supportedVersions | index("2026-07-28") != null) and .result.capabilities.extensions["io.modelcontextprotocol/events"] != null' <<<"$r" >/dev/null || fail "server/discover: $r"
+  mcp_rpc m "ping" '{}' | jq -e '.error.code == -32601' >/dev/null || fail "ping in 2026-07-28 mode must be -32601"
+  mcp_rpc m "tools/list" '{}' | jq -e '.error.code == -32602' >/dev/null || fail "missing _meta in 2026-07-28 mode must be -32602"
+  mcp_rpc m "events/list" "$(jq -cn --argjson m "$m26" '{_meta:$m}')" | jq -e '[.result.events[].name] == ["roger.mail","roger.board","roger.registration"]' >/dev/null || fail "events/list"
+  mcp_rpc m "events/poll" "$(jq -cn --argjson m "$m26" '{_meta:$m,name:"roger.board"}')" | jq -e '.error.code == -32026' >/dev/null || fail "roger.board poll must be -32026"
+  local s_id; s_id=$(( $(cat "$work/m.id") + 1 )); echo "$s_id" >"$work/m.id"
+  mcp_send m "$(jq -cn --argjson id "$s_id" --argjson m "$m26" '{jsonrpc:"2.0",id:$id,method:"events/stream",params:{_meta:$m,name:"roger.mail",cursor:"r-0",heartbeatMs:5000}}')"
+  wait_for 10 "events/active" bash -c "jq -e 'select(.method == \"notifications/events/active\")' '$work/m.out'"
+  mcp_tool a roger_send "$(jq -cn --arg to "modern-$$" '{to:$to,mail:"m26-1",body:"streamed"}')" >/dev/null
+  wait_for 10 "events/event" bash -c "jq -e 'select(.method == \"notifications/events/event\" and .params.eventId == \"m26-1\")' '$work/m.out'"
+  mcp_rpc m "events/poll" "$(jq -cn --argjson m "$m26" '{_meta:$m,name:"roger.mail",cursor:"r-0"}')" | jq -e '(.result.events | length) == 1 and .result.events[0].eventId == "m26-1"' >/dev/null || fail "events/poll m26-1"
+  mcp_send m "$(jq -cn --argjson id "$s_id" '{jsonrpc:"2.0",method:"notifications/cancelled",params:{requestId:$id}}')"
+  local sub_id; sub_id=$(( $(cat "$work/m.id") + 1 )); echo "$sub_id" >"$work/m.id"
+  mcp_send m "$(jq -cn --argjson id "$sub_id" --argjson m "$m26" '{jsonrpc:"2.0",id:$id,method:"subscriptions/listen",params:{_meta:$m,notifications:{toolsListChanged:true}}}')"
+  wait_for 10 "subscriptions/acknowledged" bash -c "jq -e 'select(.method == \"notifications/subscriptions/acknowledged\")' '$work/m.out'"
+  mcp_close m; mcp_wait_id m "$sub_id" 10 | jq -e '.result.resultType == "complete"' >/dev/null || fail "subscriptions/listen graceful closure"
+  wait "${MPID[m]}" || fail "modern mcp exit"
+
   # ---- a lost daemon connection ends the process nonzero with the reason on stderr ----
   kill "${pids[0]}"
   local st=0; wait "${MPID[a]}" || st=$?

@@ -8,20 +8,32 @@
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use crate::session::{self, Face, McpHooks};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-// no-poll: the one clock read is the bound on an inbox wait, never a scan.
+use std::thread::JoinHandle;
+// no-poll: the clock reads bound inbox/heartbeat waits, never a periodic scan.
 use std::time::{Duration, Instant};
 
-const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+pub const VERSION: &str = "2026-07-28";
+const LEGACY_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_INBOX_LIMIT: i64 = 50;
 const MAX_INBOX_LIMIT: i64 = 200;
 const DEFAULT_WAIT_SECONDS: i64 = 10;
 const MAX_WAIT_SECONDS: i64 = 60;
 const DEFAULT_CLAIM_TTL_SECONDS: i64 = 120;
 const DEFAULT_BOARD_WINDOW_SECONDS: i64 = 600;
+const DISCOVER_TTL_MS: i64 = 300_000;
+const DEFAULT_POLL_MAX_EVENTS: usize = 100;
+const MAX_POLL_MAX_EVENTS: usize = 500;
+const DEFAULT_POLL_NEXT_MS: i64 = 5_000;
+const DEFAULT_HEARTBEAT_MS: i64 = 30_000;
+const MIN_HEARTBEAT_MS: i64 = 1_000;
+const MAX_HEARTBEAT_MS: i64 = 60_000;
+const MAX_RING_EVENTS: usize = 256;
 
 // ---- configuration ----
 
@@ -130,7 +142,7 @@ pub enum Parsed {
         params: Value,
     },
     /// A message with a method and no id: never answered.
-    Notification,
+    Notification { method: String, params: Value },
     /// A response from the client to something this server never asked.
     Ignore,
     /// Not a usable request: answer with this error.
@@ -185,12 +197,16 @@ pub fn parse_message(line: &str) -> Parsed {
             ),
         );
     };
+    let params = v.get("params").cloned().unwrap_or(Value::Obj(Vec::new()));
     match id {
-        None => Parsed::Notification,
+        None => Parsed::Notification {
+            method: method.to_string(),
+            params,
+        },
         Some(id @ (Value::Int(_) | Value::Str(_))) => Parsed::Request {
             id,
             method: method.to_string(),
-            params: v.get("params").cloned().unwrap_or(Value::Obj(Vec::new())),
+            params,
         },
         Some(other) => bad(
             Value::Null,
@@ -203,6 +219,38 @@ pub fn parse_message(line: &str) -> Parsed {
     }
 }
 
+struct RpcErr {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+impl RpcErr {
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn not_found(kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: -32023,
+            message: message.into(),
+            data: Some(obj(vec![("kind", s(kind))])),
+        }
+    }
+
+    fn unsupported(feature: &str, value: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: -32026,
+            message: message.into(),
+            data: Some(obj(vec![("feature", s(feature)), ("value", s(value))])),
+        }
+    }
+}
+
 fn reply_ok(id: &Value, result: Value) -> Value {
     obj(vec![
         ("jsonrpc", s("2.0")),
@@ -212,23 +260,110 @@ fn reply_ok(id: &Value, result: Value) -> Value {
 }
 
 fn reply_err(id: &Value, code: i64, message: &str) -> Value {
+    reply_err_data(id, code, message, None)
+}
+
+fn reply_err_data(id: &Value, code: i64, message: &str, data: Option<Value>) -> Value {
+    let mut err_pairs = vec![("code", Value::Int(code)), ("message", s(message))];
+    if let Some(d) = data {
+        err_pairs.push(("data", d));
+    }
     obj(vec![
         ("jsonrpc", s("2.0")),
         ("id", id.clone()),
-        (
-            "error",
-            obj(vec![("code", Value::Int(code)), ("message", s(message))]),
-        ),
+        ("error", obj(err_pairs)),
     ])
 }
 
-/// The protocol version to answer an `initialize` with.
+fn server_info_meta() -> Value {
+    obj(vec![(
+        "io.modelcontextprotocol/serverInfo",
+        obj(vec![
+            ("name", s("roger")),
+            ("version", s(env!("CARGO_PKG_VERSION"))),
+        ]),
+    )])
+}
+
+fn has_modern_meta(params: &Value) -> bool {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+        .is_some()
+}
+
+fn validate_meta(params: &Value) -> Result<(), RpcErr> {
+    if !matches!(params, Value::Obj(_)) {
+        return Err(RpcErr::invalid_params(format!(
+            "expected params to be an object, saw {}",
+            type_name(Some(params))
+        )));
+    }
+    let Some(meta) = params.get("_meta") else {
+        return Err(RpcErr::invalid_params(
+            "expected params._meta object carrying io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities, saw nothing",
+        ));
+    };
+    if !matches!(meta, Value::Obj(_)) {
+        return Err(RpcErr::invalid_params(format!(
+            "expected params._meta to be an object, saw {}",
+            type_name(Some(meta))
+        )));
+    }
+    let pv = match meta.get("io.modelcontextprotocol/protocolVersion") {
+        Some(Value::Str(v)) => v.as_str(),
+        other => {
+            return Err(RpcErr::invalid_params(format!(
+            "expected _meta[\"io.modelcontextprotocol/protocolVersion\"] to be a string, saw {}",
+            type_name(other)
+        )))
+        }
+    };
+    match meta.get("io.modelcontextprotocol/clientCapabilities") {
+        Some(Value::Obj(_)) => {}
+        other => {
+            return Err(RpcErr::invalid_params(format!(
+                "expected _meta[\"io.modelcontextprotocol/clientCapabilities\"] to be an object, saw {}",
+                type_name(other)
+            )))
+        }
+    }
+    if let Some(info) = meta.get("io.modelcontextprotocol/clientInfo") {
+        if !matches!(info, Value::Obj(_)) {
+            return Err(RpcErr::invalid_params(format!(
+                "expected _meta[\"io.modelcontextprotocol/clientInfo\"] to be an object, saw {}",
+                type_name(Some(info))
+            )));
+        }
+    }
+    if let Some(level) = meta.get("io.modelcontextprotocol/logLevel") {
+        if !matches!(level, Value::Str(_)) {
+            return Err(RpcErr::invalid_params(format!(
+                "expected _meta[\"io.modelcontextprotocol/logLevel\"] to be a string, saw {}",
+                type_name(Some(level))
+            )));
+        }
+    }
+    if pv != VERSION {
+        return Err(RpcErr {
+            code: -32022,
+            message: "Unsupported protocol version".into(),
+            data: Some(obj(vec![
+                ("supported", Value::Arr(vec![s(VERSION)])),
+                ("requested", s(pv)),
+            ])),
+        });
+    }
+    Ok(())
+}
+
+/// The legacy protocol version to answer an `initialize` with.
 pub fn negotiate(params: &Value) -> &'static str {
     let asked = params.get("protocolVersion").and_then(|v| v.as_str());
-    VERSIONS
+    LEGACY_VERSIONS
         .iter()
         .find(|v| Some(**v) == asked)
-        .unwrap_or(&VERSIONS[0])
+        .unwrap_or(&"2025-06-18")
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -245,6 +380,29 @@ fn initialize_result(params: &Value) -> Value {
     ])
 }
 
+fn discover_result() -> Value {
+    obj(vec![
+        ("resultType", s("complete")),
+        ("supportedVersions", Value::Arr(vec![s(VERSION)])),
+        (
+            "capabilities",
+            obj(vec![
+                ("tools", obj(vec![("listChanged", Value::Bool(false))])),
+                (
+                    "extensions",
+                    obj(vec![(
+                        "io.modelcontextprotocol/events",
+                        obj(vec![("listChanged", Value::Bool(false))]),
+                    )]),
+                ),
+            ]),
+        ),
+        ("_meta", server_info_meta()),
+        ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+        ("cacheScope", s("public")),
+    ])
+}
+
 // ---- tools ----
 
 /// (name, description, input schema)
@@ -252,71 +410,71 @@ const TOOLS: [(&str, &str, &str); 9] = [
     (
         "roger_send",
         "Send one Mail to an Address, or to every session with \"*\". Headers are opaque strings the sender attaches.",
-        r#"{"type":"object","properties":{"to":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["to","body"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"to":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["to","body"]}"#,
     ),
     (
         "roger_inbox",
         "Read the Mail in this session's Store after its read position, oldest first, and move the read position past what is returned. With none, wait up to wait_seconds for the next delivery.",
-        r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":200},"wait_seconds":{"type":"integer","minimum":0,"maximum":60},"peek":{"type":"boolean"}}}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200},"wait_seconds":{"type":"integer","minimum":0,"maximum":60},"peek":{"type":"boolean"}}}"#,
     ),
     (
         "roger_board",
         "Read the Board: registered sessions and active claims. By default only sessions connected or seen within window_seconds.",
-        r#"{"type":"object","properties":{"all":{"type":"boolean"},"window_seconds":{"type":"integer","minimum":0}}}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"all":{"type":"boolean"},"window_seconds":{"type":"integer","minimum":0}}}"#,
     ),
     (
         "roger_label",
         "Set this session's display label. Its Address does not change.",
-        r#"{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"label":{"type":"string"}},"required":["label"]}"#,
     ),
     (
         "roger_claim",
         "Claim a key for this session, or refresh the claim it holds.",
-        r#"{"type":"object","properties":{"key":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}},"required":["key"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"key":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}},"required":["key"]}"#,
     ),
     (
         "roger_renew",
         "Renew a claim this session holds.",
-        r#"{"type":"object","properties":{"key":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}},"required":["key","ttl_seconds"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"key":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}},"required":["key","ttl_seconds"]}"#,
     ),
     (
         "roger_release",
         "Release a claim this session holds.",
-        r#"{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"key":{"type":"string"}},"required":["key"]}"#,
     ),
     (
         "roger_receipt",
         "Read one Mail's Receipt: its recipient, when it was Accepted, and the recipient's Record id once acked.",
-        r#"{"type":"object","properties":{"mail":{"type":"string"}},"required":["mail"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"mail":{"type":"string"}},"required":["mail"]}"#,
     ),
     (
         "roger_registered",
         "Say whether the coordinator confirmed this Register and no superseded notice arrived. Returns registered and sticky superseded (null or the notice). With wait_seconds, wait for confirmation or supersession. A superseded client should stop sending as this Address, tell its supervisor/user, and not automatically re-register; tools remain usable.",
-        r#"{"type":"object","properties":{"wait_seconds":{"type":"integer","minimum":0,"maximum":60}}}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"wait_seconds":{"type":"integer","minimum":0,"maximum":60}}}"#,
     ),
 ];
 
 const SEND_WITH_GROUPS: (&str, &str, &str) = (
     "roger_send",
     "Send one Mail to an Address, to every session with \"*\", or to a Group with `group`. Give either `to` or `group`, never both. Headers are opaque strings the sender attaches.",
-    r#"{"type":"object","properties":{"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["body"]}"#,
+    r#"{"type":"object","properties":{"session":{"type":"string"},"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["body"]}"#,
 );
 
 const GROUP_TOOLS: [(&str, &str, &str); 3] = [
     (
         "roger_subscribe",
         "Subscribe this session to a Group. Optional `after` sets the article position (>= 0); `latest` starts at the Group's current high-water mark.",
-        r#"{"type":"object","properties":{"group":{"type":"string"},"after":{"type":"integer","minimum":0},"latest":{"type":"boolean"}},"required":["group"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"after":{"type":"integer","minimum":0},"latest":{"type":"boolean"}},"required":["group"]}"#,
     ),
     (
         "roger_unsubscribe",
         "Unsubscribe this session from a Group while keeping its durable position.",
-        r#"{"type":"object","properties":{"group":{"type":"string"}},"required":["group"]}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"}},"required":["group"]}"#,
     ),
     (
         "roger_groups",
         "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
-        r#"{"type":"object","properties":{}}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}"#,
     ),
 ];
 
@@ -331,7 +489,7 @@ fn tool_defs(groups: bool) -> Vec<(&'static str, &'static str, &'static str)> {
     out
 }
 
-fn tools_list(groups: bool) -> Value {
+fn tools_list(groups: bool, modern: bool) -> Value {
     let tools = tool_defs(groups)
         .into_iter()
         .map(|(name, description, schema)| {
@@ -345,7 +503,14 @@ fn tools_list(groups: bool) -> Value {
             ])
         })
         .collect();
-    obj(vec![("tools", Value::Arr(tools))])
+    let mut pairs = vec![("tools", Value::Arr(tools))];
+    if modern {
+        pairs.push(("resultType", s("complete")));
+        pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+        pairs.push(("cacheScope", s("public")));
+        pairs.push(("_meta", server_info_meta()));
+    }
+    obj(pairs)
 }
 
 fn type_name(v: Option<&Value>) -> &'static str {
@@ -415,15 +580,178 @@ fn seconds_to_ms(tool: &str, name: &str, secs: i64) -> Result<i64, String> {
         .ok_or_else(|| format!("{tool}: expected `{name}` to be a smaller number, saw {secs}"))
 }
 
-/// Everything a tool call needs.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SubKey {
+    Int(i64),
+    Str(String),
+}
+
+impl SubKey {
+    fn from_id(id: &Value) -> Option<Self> {
+        match id {
+            Value::Int(n) => Some(Self::Int(*n)),
+            Value::Str(t) => Some(Self::Str(t.clone())),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamCtrl {
+    cancelled: bool,
+    shutting_down: bool,
+    terminated: Option<String>,
+}
+
+type SubHandle = Arc<(Mutex<StreamCtrl>, Condvar)>;
+
+struct EventFeed<T> {
+    items: Vec<(u64, T)>,
+    next_seq: u64,
+}
+
+impl<T> Default for EventFeed<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            next_seq: 0,
+        }
+    }
+}
+
+impl<T> EventFeed<T> {
+    fn push(&mut self, item: T) -> u64 {
+        let seq = self.next_seq + 1;
+        self.next_seq = seq;
+        self.items.push((seq, item));
+        if self.items.len() > MAX_RING_EVENTS {
+            let drain = self.items.len() - MAX_RING_EVENTS;
+            self.items.drain(..drain);
+        }
+        seq
+    }
+}
+
+struct BoardNotice {
+    at_ms: i64,
+    data: Value,
+}
+
+struct RegNotice {
+    at_ms: i64,
+    data: Value,
+}
+
+/// Everything a tool call or event subscription needs.
 struct Ctx {
     socket: PathBuf,
     me: String,
     inbox: Inbox,
     groups: bool,
+    legacy: AtomicBool,
     /// True once the coordinator's `registered` has arrived.
     confirmed: Mutex<(bool, Option<Value>)>,
     confirmed_cv: Condvar,
+    daemon: Mutex<Option<net::Writer>>,
+    watching: AtomicBool,
+    mail_seq: AtomicU64,
+    mail_wait: (Mutex<()>, Condvar),
+    board_feed: Mutex<EventFeed<BoardNotice>>,
+    board_cv: Condvar,
+    reg_feed: Mutex<EventFeed<RegNotice>>,
+    reg_cv: Condvar,
+    subs: Mutex<HashMap<SubKey, SubHandle>>,
+    sub_handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Ctx {
+    fn new(socket: PathBuf, me: String, inbox: Inbox, groups: bool) -> Self {
+        Self {
+            socket,
+            me,
+            inbox,
+            groups,
+            legacy: AtomicBool::new(false),
+            confirmed: Mutex::new((false, None)),
+            confirmed_cv: Condvar::new(),
+            daemon: Mutex::new(None),
+            watching: AtomicBool::new(false),
+            mail_seq: AtomicU64::new(0),
+            mail_wait: (Mutex::new(()), Condvar::new()),
+            board_feed: Mutex::new(EventFeed::default()),
+            board_cv: Condvar::new(),
+            reg_feed: Mutex::new(EventFeed::default()),
+            reg_cv: Condvar::new(),
+            subs: Mutex::new(HashMap::new()),
+            sub_handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record_mail(&self) {
+        let _g = self.mail_wait.0.lock().unwrap();
+        self.mail_seq.fetch_add(1, Ordering::SeqCst);
+        self.mail_wait.1.notify_all();
+        self.inbox.notify();
+    }
+
+    fn record_reg(&self, event_name: &str, host: Option<&str>, at_ms: Option<i64>) {
+        let ts = at_ms.unwrap_or_else(now_ms);
+        let mut pairs = vec![("event", s(event_name)), ("session", s(&self.me))];
+        if let Some(h) = host {
+            pairs.push(("host", s(h)));
+        }
+        if let Some(at) = at_ms {
+            pairs.push(("at_ms", Value::Int(at)));
+        }
+        let mut feed = self.reg_feed.lock().unwrap();
+        feed.push(RegNotice {
+            at_ms: ts,
+            data: obj(pairs),
+        });
+        self.reg_cv.notify_all();
+    }
+
+    fn record_board(&self, mut raw: Value) {
+        let ts = raw
+            .get("at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(now_ms);
+        if let Value::Obj(ref mut pairs) = raw {
+            pairs.retain(|(k, _)| k != "type");
+        }
+        let mut feed = self.board_feed.lock().unwrap();
+        feed.push(BoardNotice {
+            at_ms: ts,
+            data: raw,
+        });
+        self.board_cv.notify_all();
+    }
+
+    fn ensure_watch(&self) -> Result<(), String> {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let guard = self.daemon.lock().unwrap();
+        if let Some(w) = guard.as_ref() {
+            if let Err(e) = net::send(w, &obj(vec![("type", s("watch")), ("req", Value::Int(1))])) {
+                self.watching.store(false, Ordering::SeqCst);
+                return Err(format!("failed to enable watch on host daemon: {e}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_optional_session(ctx: &Ctx, args: &Value, tool: &str) -> Result<(), String> {
+    match args.get("session") {
+        None => Ok(()),
+        Some(Value::Str(sess)) if sess == &ctx.me => Ok(()),
+        Some(Value::Str(sess)) => Err(format!(
+            "{tool}: unknown session handle {sess}; expected {}",
+            ctx.me
+        )),
+        other => Err(wrong(tool, "session", "a string", other)),
+    }
 }
 
 fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
@@ -444,6 +772,7 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             known.join(", ")
         ));
     }
+    check_optional_session(ctx, args, name)?;
     let io = |e: io::Error| e.to_string();
     match name {
         "roger_send" => {
@@ -705,7 +1034,7 @@ fn present(row: &Value, now: i64, window_ms: i64) -> bool {
     }
 }
 
-fn tool_result(text: &str, is_error: bool) -> Value {
+fn tool_result(text: &str, is_error: bool, modern: bool) -> Value {
     let mut pairs = vec![(
         "content",
         Value::Arr(vec![obj(vec![("type", s("text")), ("text", s(text))])]),
@@ -713,7 +1042,1007 @@ fn tool_result(text: &str, is_error: bool) -> Value {
     if is_error {
         pairs.push(("isError", Value::Bool(true)));
     }
+    if modern {
+        pairs.push(("resultType", s("complete")));
+        pairs.push(("_meta", server_info_meta()));
+    }
     obj(pairs)
+}
+
+// ---- SEP-3415 events & subscriptions ----
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+pub fn format_iso8601_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let day_secs = secs.rem_euclid(86_400);
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+fn events_list_result() -> Value {
+    let mail_event = obj(vec![
+        ("name", s("roger.mail")),
+        (
+            "description",
+            s("Fires when Mail is durably stored in the session Store."),
+        ),
+        (
+            "delivery",
+            Value::Arr(vec![s("push"), s("poll")]),
+        ),
+        (
+            "inputSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"kind":{"type":"string","enum":["directed","broadcast","group"]}},"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        ),
+        (
+            "payloadSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"record":{"type":"string"},"mail":{"type":"string"},"from":{"type":"string"},"group":{"type":"string"},"article":{"type":"integer"},"body":{"type":"string"},"kind":{"type":"string","enum":["directed","broadcast","group"]},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["record","mail","from","body","kind","headers"]}"#,
+            )
+            .unwrap(),
+        ),
+    ]);
+    let board_event = obj(vec![
+        ("name", s("roger.board")),
+        (
+            "description",
+            s("Fires on committed Board session and claim changes."),
+        ),
+        ("delivery", Value::Arr(vec![s("push")])),
+        (
+            "inputSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        ),
+        (
+            "payloadSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"event":{"type":"string"},"session":{"type":"string"},"host":{"type":"string"},"label":{"type":"string"},"declared":{"type":"string"},"key":{"type":"string"},"owner":{"type":"string"},"expires_ms":{"type":"integer"},"at_ms":{"type":"integer"}},"required":["event"]}"#,
+            )
+            .unwrap(),
+        ),
+    ]);
+    let reg_event = obj(vec![
+        ("name", s("roger.registration")),
+        (
+            "description",
+            s("Fires when the session Register is confirmed or superseded."),
+        ),
+        ("delivery", Value::Arr(vec![s("push")])),
+        (
+            "inputSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        ),
+        (
+            "payloadSchema",
+            json::parse(
+                r#"{"type":"object","properties":{"event":{"type":"string","enum":["registered","superseded"]},"session":{"type":"string"},"host":{"type":"string"},"at_ms":{"type":"integer"}},"required":["event","session"]}"#,
+            )
+            .unwrap(),
+        ),
+    ]);
+    obj(vec![
+        ("resultType", s("complete")),
+        (
+            "events",
+            Value::Arr(vec![mail_event, board_event, reg_event]),
+        ),
+        ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+        ("cacheScope", s("public")),
+        ("_meta", server_info_meta()),
+    ])
+}
+
+#[derive(Clone, Default)]
+struct MailFilter {
+    group: Option<String>,
+    kind: Option<String>,
+}
+
+impl MailFilter {
+    fn matches(&self, entry: &Value) -> bool {
+        if let Some(g) = &self.group {
+            if entry.get("group").and_then(Value::as_str) != Some(g.as_str()) {
+                return false;
+            }
+        }
+        if let Some(k) = &self.kind {
+            if entry.get("kind").and_then(Value::as_str) != Some(k.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn shape_mail_entry(e: &Value) -> Value {
+    let has_group = e.get("group").and_then(Value::as_str).is_some()
+        && e.get("article").and_then(Value::as_i64).is_some();
+    let keys: &[&str] = if has_group {
+        &[
+            "record", "mail", "from", "group", "article", "body", "kind", "headers",
+        ]
+    } else {
+        &["record", "mail", "from", "body", "kind", "headers"]
+    };
+    Value::Obj(
+        keys.iter()
+            .filter_map(|k| e.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect(),
+    )
+}
+
+fn parse_event_args(ctx: &Ctx, event_name: &str, params: &Value) -> Result<MailFilter, RpcErr> {
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => return Ok(MailFilter::default()),
+        Some(Value::Obj(pairs)) => pairs,
+        Some(other) => {
+            return Err(RpcErr::invalid_params(format!(
+                "expected arguments to be an object, saw {}",
+                type_name(Some(other))
+            )))
+        }
+    };
+    let mut filter = MailFilter::default();
+    for (k, v) in args {
+        match (event_name, k.as_str()) {
+            (_, "session") => {
+                let Value::Str(sess) = v else {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.session to be a string, saw {}",
+                        type_name(Some(v))
+                    )));
+                };
+                if sess != &ctx.me {
+                    return Err(RpcErr::not_found(
+                        "session",
+                        format!("unknown session handle {sess}"),
+                    ));
+                }
+            }
+            ("roger.mail", "group") => {
+                let Value::Str(g) = v else {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.group to be a string, saw {}",
+                        type_name(Some(v))
+                    )));
+                };
+                filter.group = Some(g.clone());
+            }
+            ("roger.mail", "kind") => {
+                let Value::Str(kind) = v else {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.kind to be a string, saw {}",
+                        type_name(Some(v))
+                    )));
+                };
+                if !matches!(kind.as_str(), "directed" | "broadcast" | "group") {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.kind to be directed, broadcast, or group, saw {kind}"
+                    )));
+                }
+                filter.kind = Some(kind.clone());
+            }
+            (_, unknown) => {
+                return Err(RpcErr::invalid_params(format!(
+                    "unexpected argument {unknown} for event {event_name}"
+                )));
+            }
+        }
+    }
+    Ok(filter)
+}
+
+fn parse_opt_cursor(params: &Value) -> Result<Option<String>, RpcErr> {
+    match params.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Str(c)) => Ok(Some(c.clone())),
+        Some(other) => Err(RpcErr::invalid_params(format!(
+            "expected cursor to be a string or null, saw {}",
+            type_name(Some(other))
+        ))),
+    }
+}
+
+fn parse_opt_max_age_ms(params: &Value) -> Result<Option<i64>, RpcErr> {
+    match params.get("maxAgeMs") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Int(n)) if *n >= 0 => Ok(Some(*n)),
+        Some(Value::Int(n)) => Err(RpcErr::invalid_params(format!(
+            "expected maxAgeMs >= 0, saw {n}"
+        ))),
+        Some(other) => Err(RpcErr::invalid_params(format!(
+            "expected maxAgeMs to be an integer, saw {}",
+            type_name(Some(other))
+        ))),
+    }
+}
+
+fn parse_opt_max_events(params: &Value) -> Result<usize, RpcErr> {
+    match params.get("maxEvents") {
+        None | Some(Value::Null) => Ok(DEFAULT_POLL_MAX_EVENTS),
+        Some(Value::Int(n)) if *n >= 1 => Ok((*n as usize).min(MAX_POLL_MAX_EVENTS)),
+        Some(Value::Int(n)) => Err(RpcErr::invalid_params(format!(
+            "expected maxEvents >= 1, saw {n}"
+        ))),
+        Some(other) => Err(RpcErr::invalid_params(format!(
+            "expected maxEvents to be an integer, saw {}",
+            type_name(Some(other))
+        ))),
+    }
+}
+
+fn parse_opt_heartbeat_ms(params: &Value) -> Result<i64, RpcErr> {
+    match params.get("heartbeatMs") {
+        None | Some(Value::Null) => Ok(DEFAULT_HEARTBEAT_MS),
+        Some(Value::Int(n)) if *n >= 1 => Ok((*n).clamp(MIN_HEARTBEAT_MS, MAX_HEARTBEAT_MS)),
+        Some(Value::Int(n)) => Err(RpcErr::invalid_params(format!(
+            "expected heartbeatMs >= 1, saw {n}"
+        ))),
+        Some(other) => Err(RpcErr::invalid_params(format!(
+            "expected heartbeatMs to be an integer, saw {}",
+            type_name(Some(other))
+        ))),
+    }
+}
+
+fn record_of(e: &Value) -> &str {
+    e.get("record").and_then(Value::as_str).unwrap_or("")
+}
+
+fn tail_cursor(all: &[Value]) -> String {
+    all.last()
+        .map(|e| record_of(e).to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "r-0".to_string())
+}
+
+/// Resolve `(start_index, truncated, reset_cursor)` for `roger.mail` replay.
+fn resolve_mail_window(
+    all: &[Value],
+    cursor: Option<&str>,
+    max_age_ms: Option<i64>,
+    now: i64,
+) -> (usize, bool, String) {
+    let tail = tail_cursor(all);
+    let Some(cur) = cursor else {
+        return (all.len(), false, tail);
+    };
+    let base_start = if cur == "r-0" {
+        0
+    } else if let Some(idx) = all.iter().position(|e| record_of(e) == cur) {
+        idx + 1
+    } else {
+        return (all.len(), true, tail);
+    };
+    let mut start = base_start;
+    let mut truncated = false;
+    if let Some(age) = max_age_ms {
+        let floor = now.saturating_sub(age);
+        while start < all.len() {
+            let ts = all[start]
+                .get("stored_at_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if ts >= floor {
+                break;
+            }
+            start += 1;
+            truncated = true;
+        }
+    }
+    let start_cursor = if start == 0 {
+        "r-0".to_string()
+    } else {
+        record_of(&all[start - 1]).to_string()
+    };
+    (start, truncated, start_cursor)
+}
+
+fn mail_occurrence(e: &Value, include_cursor: bool) -> Value {
+    let ts_ms = e.get("stored_at_ms").and_then(Value::as_i64).unwrap_or(0);
+    let event_id = e
+        .get("mail")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| record_of(e));
+    let mut pairs = vec![
+        ("eventId", s(event_id)),
+        ("name", s("roger.mail")),
+        ("timestamp", s(&format_iso8601_utc(ts_ms))),
+        ("data", shape_mail_entry(e)),
+    ];
+    if include_cursor {
+        pairs.push(("cursor", s(record_of(e))));
+    }
+    obj(pairs)
+}
+
+fn events_poll(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
+    let name = match params.get("name") {
+        Some(Value::Str(n)) => n.as_str(),
+        other => {
+            return Err(RpcErr::invalid_params(format!(
+                "expected name to be a string, saw {}",
+                type_name(other)
+            )))
+        }
+    };
+    match name {
+        "roger.mail" => {}
+        "roger.board" | "roger.registration" => {
+            let _ = parse_event_args(ctx, name, params)?;
+            return Err(RpcErr::unsupported(
+                "deliveryMode",
+                "poll",
+                format!("event {name} supports only push delivery"),
+            ));
+        }
+        other => return Err(RpcErr::not_found("event", format!("unknown event {other}"))),
+    }
+    let filter = parse_event_args(ctx, name, params)?;
+    let cursor = parse_opt_cursor(params)?;
+    let max_age_ms = parse_opt_max_age_ms(params)?;
+    let max_events = parse_opt_max_events(params)?;
+
+    let all = entries(&ctx.inbox.store).map_err(|e| RpcErr {
+        code: -32603,
+        message: e.to_string(),
+        data: None,
+    })?;
+    let now = now_ms();
+    let (start, truncated, start_cursor) =
+        resolve_mail_window(&all, cursor.as_deref(), max_age_ms, now);
+
+    let mut matched = Vec::new();
+    let mut last_idx = None;
+    let mut has_more = false;
+    for (offset, entry) in all[start..].iter().enumerate() {
+        if !filter.matches(entry) {
+            continue;
+        }
+        if matched.len() == max_events {
+            has_more = true;
+            break;
+        }
+        matched.push(mail_occurrence(entry, false));
+        last_idx = Some(start + offset);
+    }
+    let next_cursor = if has_more {
+        last_idx
+            .map(|i| record_of(&all[i]).to_string())
+            .unwrap_or(start_cursor)
+    } else if start < all.len() {
+        tail_cursor(&all)
+    } else {
+        start_cursor
+    };
+    Ok(obj(vec![
+        ("resultType", s("complete")),
+        ("events", Value::Arr(matched)),
+        ("cursor", s(&next_cursor)),
+        ("truncated", Value::Bool(truncated)),
+        ("hasMore", Value::Bool(has_more)),
+        ("nextPollMs", Value::Int(DEFAULT_POLL_NEXT_MS)),
+        ("_meta", server_info_meta()),
+    ]))
+}
+
+fn sub_meta(id: &Value) -> Value {
+    obj(vec![("io.modelcontextprotocol/subscriptionId", id.clone())])
+}
+
+fn send_event_notif(
+    out: &net::Writer,
+    method: &str,
+    mut pairs: Vec<(&'static str, Value)>,
+    id: &Value,
+) -> io::Result<()> {
+    pairs.push(("_meta", sub_meta(id)));
+    net::send(
+        out,
+        &obj(vec![
+            ("jsonrpc", s("2.0")),
+            ("method", s(method)),
+            ("params", obj(pairs)),
+        ]),
+    )
+}
+
+fn finish_sub_result(out: &net::Writer, id: &Value) {
+    let _ = net::send(
+        out,
+        &reply_ok(
+            id,
+            obj(vec![
+                ("resultType", s("complete")),
+                (
+                    "_meta",
+                    obj(vec![
+                        ("io.modelcontextprotocol/subscriptionId", id.clone()),
+                        (
+                            "io.modelcontextprotocol/serverInfo",
+                            obj(vec![
+                                ("name", s("roger")),
+                                ("version", s(env!("CARGO_PKG_VERSION"))),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+    );
+}
+
+fn finish_sub_terminated(out: &net::Writer, id: &Value, reason: &str) {
+    let _ = send_event_notif(
+        out,
+        "notifications/events/terminated",
+        vec![(
+            "error",
+            obj(vec![
+                ("code", Value::Int(-32023)),
+                ("message", s("NotFound")),
+                (
+                    "data",
+                    obj(vec![("kind", s("session")), ("reason", s(reason))]),
+                ),
+            ]),
+        )],
+        id,
+    );
+}
+
+fn register_sub(ctx: &Ctx, id: &Value) -> Result<(SubKey, SubHandle), RpcErr> {
+    let Some(key) = SubKey::from_id(id) else {
+        return Err(RpcErr::invalid_params("expected integer or string id"));
+    };
+    let ctrl = Arc::new((Mutex::new(StreamCtrl::default()), Condvar::new()));
+    let mut map = ctx.subs.lock().unwrap();
+    if map.contains_key(&key) {
+        return Err(RpcErr::invalid_params("duplicate active subscription id"));
+    }
+    map.insert(key.clone(), Arc::clone(&ctrl));
+    Ok((key, ctrl))
+}
+
+fn unregister_sub(ctx: &Ctx, key: &SubKey) {
+    ctx.subs.lock().unwrap().remove(key);
+}
+
+fn start_subscriptions_listen(
+    ctx: &Arc<Ctx>,
+    out: &net::Writer,
+    id: Value,
+    params: &Value,
+) -> Result<(), RpcErr> {
+    match params.get("notifications") {
+        None | Some(Value::Obj(_)) => {}
+        Some(other) => {
+            return Err(RpcErr::invalid_params(format!(
+                "expected notifications to be an object, saw {}",
+                type_name(Some(other))
+            )))
+        }
+    }
+    let (key, ctrl) = register_sub(ctx, &id)?;
+    let _ = send_event_notif(
+        out,
+        "notifications/subscriptions/acknowledged",
+        vec![("notifications", obj(vec![]))],
+        &id,
+    );
+    let ctx_c = Arc::clone(ctx);
+    let out_c = out.clone();
+    let handle = std::thread::spawn(move || {
+        let (m, cv) = &*ctrl;
+        let mut g = m.lock().unwrap();
+        while !g.cancelled && !g.shutting_down && g.terminated.is_none() {
+            g = cv.wait(g).unwrap();
+        }
+        let graceful = !g.cancelled && g.shutting_down;
+        drop(g);
+        unregister_sub(&ctx_c, &key);
+        if graceful {
+            finish_sub_result(&out_c, &id);
+        }
+    });
+    let mut handles = ctx.sub_handles.lock().unwrap();
+    handles.retain(|h| !h.is_finished());
+    handles.push(handle);
+    Ok(())
+}
+
+fn start_events_stream(
+    ctx: &Arc<Ctx>,
+    out: &net::Writer,
+    id: Value,
+    params: &Value,
+) -> Result<(), RpcErr> {
+    let name = match params.get("name") {
+        Some(Value::Str(n)) => n.clone(),
+        other => {
+            return Err(RpcErr::invalid_params(format!(
+                "expected name to be a string, saw {}",
+                type_name(other)
+            )))
+        }
+    };
+    if !matches!(
+        name.as_str(),
+        "roger.mail" | "roger.board" | "roger.registration"
+    ) {
+        return Err(RpcErr::not_found("event", format!("unknown event {name}")));
+    }
+    let filter = parse_event_args(ctx, &name, params)?;
+    let cursor = parse_opt_cursor(params)?;
+    let max_age_ms = parse_opt_max_age_ms(params)?;
+    let heartbeat_ms = parse_opt_heartbeat_ms(params)?;
+    if name == "roger.board" {
+        if let Err(reason) = ctx.ensure_watch() {
+            return Err(RpcErr {
+                code: -32603,
+                message: reason,
+                data: None,
+            });
+        }
+    }
+    let (key, ctrl) = register_sub(ctx, &id)?;
+    let ctx_c = Arc::clone(ctx);
+    let out_c = out.clone();
+    let handle = std::thread::spawn(move || {
+        match name.as_str() {
+            "roger.mail" => run_mail_stream(
+                &ctx_c,
+                &out_c,
+                &id,
+                &ctrl,
+                &filter,
+                cursor.as_deref(),
+                max_age_ms,
+                heartbeat_ms,
+            ),
+            "roger.board" => run_board_stream(&ctx_c, &out_c, &id, &ctrl, heartbeat_ms),
+            _ => run_reg_stream(&ctx_c, &out_c, &id, &ctrl, heartbeat_ms),
+        }
+        unregister_sub(&ctx_c, &key);
+    });
+    let mut handles = ctx.sub_handles.lock().unwrap();
+    handles.retain(|h| !h.is_finished());
+    handles.push(handle);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mail_stream(
+    ctx: &Ctx,
+    out: &net::Writer,
+    id: &Value,
+    ctrl: &Arc<(Mutex<StreamCtrl>, Condvar)>,
+    filter: &MailFilter,
+    cursor: Option<&str>,
+    max_age_ms: Option<i64>,
+    heartbeat_ms: i64,
+) {
+    let mut seen_seq = ctx.mail_seq.load(Ordering::SeqCst);
+    let all = match entries(&ctx.inbox.store) {
+        Ok(a) => a,
+        Err(e) => {
+            finish_sub_terminated(out, id, &e.to_string());
+            return;
+        }
+    };
+    let (start, truncated, start_cursor) = resolve_mail_window(&all, cursor, max_age_ms, now_ms());
+    let mut latest_cursor = tail_cursor(&all);
+    if start >= all.len() {
+        latest_cursor = start_cursor.clone();
+    }
+    if send_event_notif(
+        out,
+        "notifications/events/active",
+        vec![
+            ("cursor", s(&start_cursor)),
+            ("truncated", Value::Bool(truncated)),
+            ("heartbeatMs", Value::Int(heartbeat_ms)),
+        ],
+        id,
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    let mut emitted_records: BTreeSet<String> = all[..start]
+        .iter()
+        .map(|e| record_of(e).to_string())
+        .collect();
+    for entry in &all[start..] {
+        let rec = record_of(entry).to_string();
+        emitted_records.insert(rec.clone());
+        latest_cursor = rec;
+        if filter.matches(entry) {
+            let mut pairs = match mail_occurrence(entry, true) {
+                Value::Obj(p) => p,
+                _ => Vec::new(),
+            };
+            pairs.push(("_meta".to_string(), sub_meta(id)));
+            if net::send(
+                out,
+                &obj(vec![
+                    ("jsonrpc", s("2.0")),
+                    ("method", s("notifications/events/event")),
+                    ("params", Value::Obj(pairs)),
+                ]),
+            )
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    let hb_dur = Duration::from_millis(heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound when no Mail arrives.
+    let mut next_hb = Instant::now() + hb_dur;
+
+    loop {
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled {
+                return;
+            }
+            if let Some(reason) = &g.terminated {
+                finish_sub_terminated(out, id, reason);
+                return;
+            }
+            if g.shutting_down {
+                finish_sub_result(out, id);
+                return;
+            }
+        }
+        let cur_seq = ctx.mail_seq.load(Ordering::SeqCst);
+        if cur_seq != seen_seq {
+            seen_seq = cur_seq;
+            if let Ok(now_all) = entries(&ctx.inbox.store) {
+                let mut sent_any = false;
+                for entry in now_all {
+                    let rec = record_of(&entry).to_string();
+                    if rec.is_empty() || !emitted_records.insert(rec.clone()) {
+                        continue;
+                    }
+                    latest_cursor = rec;
+                    if filter.matches(&entry) {
+                        let mut pairs = match mail_occurrence(&entry, true) {
+                            Value::Obj(p) => p,
+                            _ => Vec::new(),
+                        };
+                        pairs.push(("_meta".to_string(), sub_meta(id)));
+                        if net::send(
+                            out,
+                            &obj(vec![
+                                ("jsonrpc", s("2.0")),
+                                ("method", s("notifications/events/event")),
+                                ("params", Value::Obj(pairs)),
+                            ]),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                        sent_any = true;
+                    }
+                }
+                if sent_any {
+                    // no-poll: reset heartbeat bound after sending an event.
+                    next_hb = Instant::now() + hb_dur;
+                }
+            }
+            continue;
+        }
+        // no-poll: SEP-3415 stream heartbeat bound.
+        let now_inst = Instant::now();
+        if now_inst >= next_hb {
+            if send_event_notif(
+                out,
+                "notifications/events/heartbeat",
+                vec![("cursor", s(&latest_cursor))],
+                id,
+            )
+            .is_err()
+            {
+                return;
+            }
+            // no-poll: schedule next SEP-3415 heartbeat.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+        let wait_for = next_hb.saturating_duration_since(now_inst);
+        let guard = ctx.mail_wait.0.lock().unwrap();
+        if ctx.mail_seq.load(Ordering::SeqCst) != seen_seq {
+            continue;
+        }
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled || g.shutting_down || g.terminated.is_some() {
+                continue;
+            }
+        }
+        // no-poll: waits for Store commit or SEP-3415 heartbeat bound.
+        let _ = ctx.mail_wait.1.wait_timeout(guard, wait_for);
+    }
+}
+
+fn run_board_stream(
+    ctx: &Ctx,
+    out: &net::Writer,
+    id: &Value,
+    ctrl: &Arc<(Mutex<StreamCtrl>, Condvar)>,
+    heartbeat_ms: i64,
+) {
+    let mut seq_cursor = ctx.board_feed.lock().unwrap().next_seq;
+    let mut evt_counter = 0u64;
+    if send_event_notif(
+        out,
+        "notifications/events/active",
+        vec![
+            ("cursor", Value::Null),
+            ("truncated", Value::Bool(false)),
+            ("heartbeatMs", Value::Int(heartbeat_ms)),
+        ],
+        id,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let hb_dur = Duration::from_millis(heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound.
+    let mut next_hb = Instant::now() + hb_dur;
+    loop {
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled {
+                return;
+            }
+            if let Some(reason) = &g.terminated {
+                finish_sub_terminated(out, id, reason);
+                return;
+            }
+            if g.shutting_down {
+                finish_sub_result(out, id);
+                return;
+            }
+        }
+        let batch: Vec<(u64, i64, Value)> = {
+            let feed = ctx.board_feed.lock().unwrap();
+            feed.items
+                .iter()
+                .filter(|(s, _)| *s > seq_cursor)
+                .map(|(s, n)| (*s, n.at_ms, n.data.clone()))
+                .collect()
+        };
+        if !batch.is_empty() {
+            for (seq, at_ms, data) in batch {
+                seq_cursor = seq;
+                evt_counter += 1;
+                if send_event_notif(
+                    out,
+                    "notifications/events/event",
+                    vec![
+                        ("eventId", s(&format!("board-{seq}-{evt_counter}"))),
+                        ("name", s("roger.board")),
+                        ("timestamp", s(&format_iso8601_utc(at_ms))),
+                        ("data", data),
+                        ("cursor", Value::Null),
+                    ],
+                    id,
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            // no-poll: reset heartbeat bound after sending an event.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+        // no-poll: SEP-3415 stream heartbeat bound.
+        let now_inst = Instant::now();
+        if now_inst >= next_hb {
+            if send_event_notif(
+                out,
+                "notifications/events/heartbeat",
+                vec![("cursor", Value::Null)],
+                id,
+            )
+            .is_err()
+            {
+                return;
+            }
+            // no-poll: schedule next SEP-3415 heartbeat.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+        let wait_for = next_hb.saturating_duration_since(now_inst);
+        let guard = ctx.board_feed.lock().unwrap();
+        if guard.next_seq != seq_cursor {
+            continue;
+        }
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled || g.shutting_down || g.terminated.is_some() {
+                continue;
+            }
+        }
+        // no-poll: waits for board_event or SEP-3415 heartbeat bound.
+        let _ = ctx.board_cv.wait_timeout(guard, wait_for);
+    }
+}
+
+fn run_reg_stream(
+    ctx: &Ctx,
+    out: &net::Writer,
+    id: &Value,
+    ctrl: &Arc<(Mutex<StreamCtrl>, Condvar)>,
+    heartbeat_ms: i64,
+) {
+    let mut seq_cursor = 0u64;
+    if send_event_notif(
+        out,
+        "notifications/events/active",
+        vec![
+            ("cursor", Value::Null),
+            ("truncated", Value::Bool(false)),
+            ("heartbeatMs", Value::Int(heartbeat_ms)),
+        ],
+        id,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let hb_dur = Duration::from_millis(heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound.
+    let mut next_hb = Instant::now() + hb_dur;
+    loop {
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled {
+                return;
+            }
+            if let Some(reason) = &g.terminated {
+                finish_sub_terminated(out, id, reason);
+                return;
+            }
+            if g.shutting_down {
+                finish_sub_result(out, id);
+                return;
+            }
+        }
+        let batch: Vec<(u64, i64, Value)> = {
+            let feed = ctx.reg_feed.lock().unwrap();
+            feed.items
+                .iter()
+                .filter(|(s, _)| *s > seq_cursor)
+                .map(|(s, n)| (*s, n.at_ms, n.data.clone()))
+                .collect()
+        };
+        if !batch.is_empty() {
+            for (seq, at_ms, data) in batch {
+                seq_cursor = seq;
+                if send_event_notif(
+                    out,
+                    "notifications/events/event",
+                    vec![
+                        ("eventId", s(&format!("reg-{seq}"))),
+                        ("name", s("roger.registration")),
+                        ("timestamp", s(&format_iso8601_utc(at_ms))),
+                        ("data", data),
+                        ("cursor", Value::Null),
+                    ],
+                    id,
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            // no-poll: reset heartbeat bound after sending an event.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+        // no-poll: SEP-3415 stream heartbeat bound.
+        let now_inst = Instant::now();
+        if now_inst >= next_hb {
+            if send_event_notif(
+                out,
+                "notifications/events/heartbeat",
+                vec![("cursor", Value::Null)],
+                id,
+            )
+            .is_err()
+            {
+                return;
+            }
+            // no-poll: schedule next SEP-3415 heartbeat.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+        let wait_for = next_hb.saturating_duration_since(now_inst);
+        let guard = ctx.reg_feed.lock().unwrap();
+        if guard.next_seq != seq_cursor {
+            continue;
+        }
+        {
+            let g = ctrl.0.lock().unwrap();
+            if g.cancelled || g.shutting_down || g.terminated.is_some() {
+                continue;
+            }
+        }
+        // no-poll: waits for registration transition or SEP-3415 heartbeat bound.
+        let _ = ctx.reg_cv.wait_timeout(guard, wait_for);
+    }
+}
+
+fn cancel_sub(ctx: &Ctx, request_id: &Value) {
+    let Some(key) = SubKey::from_id(request_id) else {
+        return;
+    };
+    let ctrl = ctx.subs.lock().unwrap().get(&key).cloned();
+    if let Some(ctrl) = ctrl {
+        ctrl.0.lock().unwrap().cancelled = true;
+        ctrl.1.notify_all();
+        ctx.mail_wait.1.notify_all();
+        ctx.board_cv.notify_all();
+        ctx.reg_cv.notify_all();
+    }
+}
+
+fn close_all_subs(ctx: &Ctx, terminated_reason: Option<&str>) {
+    let all: Vec<_> = ctx.subs.lock().unwrap().values().cloned().collect();
+    for ctrl in all {
+        let mut g = ctrl.0.lock().unwrap();
+        if let Some(r) = terminated_reason {
+            g.terminated = Some(r.to_string());
+        } else {
+            g.shutting_down = true;
+        }
+        ctrl.1.notify_all();
+    }
+    ctx.mail_wait.1.notify_all();
+    ctx.board_cv.notify_all();
+    ctx.reg_cv.notify_all();
+    let handles = std::mem::take(&mut *ctx.sub_handles.lock().unwrap());
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 // ---- the inbox ----
@@ -925,14 +2254,12 @@ pub fn run(args: &[String]) -> io::Result<()> {
         ));
     }
     let store_existed = cfg.store.exists();
-    let ctx = Arc::new(Ctx {
-        socket: cfg.socket.clone(),
-        me: cfg.address.clone(),
-        inbox: Inbox::open(&cfg.store)?,
-        groups: cfg.groups,
-        confirmed: Mutex::new((false, None)),
-        confirmed_cv: Condvar::new(),
-    });
+    let ctx = Arc::new(Ctx::new(
+        cfg.socket.clone(),
+        cfg.address.clone(),
+        Inbox::open(&cfg.store)?,
+        cfg.groups,
+    ));
     let gate = Arc::new(Mutex::new(false));
     let (tx, rx) = mpsc::channel::<Event>();
 
@@ -940,8 +2267,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
         superseded: Box::new({
             let ctx = Arc::clone(&ctx);
             move |notice| {
-                ctx.confirmed.lock().unwrap().1 = Some(notice);
+                let host = notice.get("host").and_then(Value::as_str);
+                let at_ms = notice.get("at_ms").and_then(Value::as_i64);
+                ctx.confirmed.lock().unwrap().1 = Some(notice.clone());
                 ctx.confirmed_cv.notify_all();
+                ctx.record_reg("superseded", host, at_ms);
             }
         }),
         confirmed: Box::new({
@@ -949,6 +2279,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             move || {
                 ctx.confirmed.lock().unwrap().0 = true;
                 ctx.confirmed_cv.notify_all();
+                ctx.record_reg("registered", None, Some(now_ms()));
             }
         }),
         registered: Some(Box::new({
@@ -959,7 +2290,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
         })),
         stored: Box::new({
             let ctx = Arc::clone(&ctx);
-            move || ctx.inbox.notify()
+            move || ctx.record_mail()
+        }),
+        board_event: Box::new({
+            let ctx = Arc::clone(&ctx);
+            move |ev| ctx.record_board(ev)
         }),
         gate: Arc::clone(&gate),
     };
@@ -988,14 +2323,16 @@ pub fn run(args: &[String]) -> io::Result<()> {
             ))
         }
     };
+    *ctx.daemon.lock().unwrap() = Some(daemon.clone());
     let cfg = Arc::new(cfg);
     let lost = {
-        let (cfg, gate) = (Arc::clone(&cfg), Arc::clone(&gate));
+        let (cfg, gate, ctx) = (Arc::clone(&cfg), Arc::clone(&gate), Arc::clone(&ctx));
         move || {
             let reason = match rx.recv() {
                 Ok(Event::Ended(Err(e))) => e.to_string(),
                 _ => "its connection closed".to_string(),
             };
+            close_all_subs(&ctx, Some(&reason));
             eprintln!("roger mcp: expected the host daemon connection to stay up, saw {reason}");
             finish(&cfg, &gate, None, 1)
         }
@@ -1013,6 +2350,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         handle_line(&ctx, &out, &line);
     }
+    close_all_subs(&ctx, None);
     // Stdin closed: the client is gone, so this session is too. It leaves the
     // Board and later Broadcasts; Mail accepted for its Address stays pending.
     finish(&cfg, &gate, Some(&daemon), 0)
@@ -1020,45 +2358,97 @@ pub fn run(args: &[String]) -> io::Result<()> {
 
 fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
     match parse_message(line) {
-        Parsed::Notification | Parsed::Ignore => {}
+        Parsed::Ignore => {}
+        Parsed::Notification { method, params } => {
+            if method == "notifications/cancelled" {
+                if let Some(req_id) = params.get("requestId") {
+                    cancel_sub(ctx, req_id);
+                }
+            }
+        }
         Parsed::Bad { id, code, message } => {
             let _ = net::send(out, &reply_err(&id, code, &message));
         }
-        Parsed::Request { id, method, params } => match method.as_str() {
-            "initialize" => {
+        Parsed::Request { id, method, params } => {
+            if method == "initialize" {
+                ctx.legacy.store(true, Ordering::SeqCst);
                 let _ = net::send(out, &reply_ok(&id, initialize_result(&params)));
+                return;
             }
-            "ping" => {
-                let _ = net::send(out, &reply_ok(&id, obj(vec![])));
+            if method == "ping" {
+                if ctx.legacy.load(Ordering::SeqCst) {
+                    let _ = net::send(out, &reply_ok(&id, obj(vec![])));
+                } else {
+                    let _ = net::send(out, &reply_err(&id, -32601, "Method not found: ping"));
+                }
+                return;
             }
-            "tools/list" => {
-                let _ = net::send(out, &reply_ok(&id, tools_list(ctx.groups)));
+            let modern = !ctx.legacy.load(Ordering::SeqCst)
+                || method == "server/discover"
+                || method == "subscriptions/listen"
+                || method.starts_with("events/")
+                || has_modern_meta(&params);
+            if modern {
+                if let Err(err) = validate_meta(&params) {
+                    let _ = net::send(out, &reply_err_data(&id, err.code, &err.message, err.data));
+                    return;
+                }
             }
-            // Each call runs on its own thread, so a waiting inbox read never
-            // holds up another call.
-            "tools/call" => {
-                let (ctx, out) = (Arc::clone(ctx), out.clone());
-                std::thread::spawn(move || {
-                    let result = match call_tool(&ctx, &params) {
-                        Ok(v) => tool_result(&json::stringify(&v), false),
-                        Err(reason) => tool_result(&reason, true),
+            match method.as_str() {
+                "server/discover" => {
+                    let _ = net::send(out, &reply_ok(&id, discover_result()));
+                }
+                "tools/list" => {
+                    let _ = net::send(out, &reply_ok(&id, tools_list(ctx.groups, modern)));
+                }
+                // Each call runs on its own thread, so a waiting inbox read never
+                // holds up another call.
+                "tools/call" => {
+                    let (ctx, out) = (Arc::clone(ctx), out.clone());
+                    std::thread::spawn(move || {
+                        let result = match call_tool(&ctx, &params) {
+                            Ok(v) => tool_result(&json::stringify(&v), false, modern),
+                            Err(reason) => tool_result(&reason, true, modern),
+                        };
+                        let _ = net::send(&out, &reply_ok(&id, result));
+                    });
+                }
+                "subscriptions/listen" => {
+                    if let Err(err) = start_subscriptions_listen(ctx, out, id.clone(), &params) {
+                        let _ =
+                            net::send(out, &reply_err_data(&id, err.code, &err.message, err.data));
+                    }
+                }
+                "events/list" => {
+                    let _ = net::send(out, &reply_ok(&id, events_list_result()));
+                }
+                "events/poll" => {
+                    let res = match events_poll(ctx, &params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
                     };
-                    let _ = net::send(&out, &reply_ok(&id, result));
-                });
-            }
-            other => {
-                let _ = net::send(
-                    out,
-                    &reply_err(
-                        &id,
-                        -32601,
-                        &format!(
-                            "expected initialize, ping, tools/list, or tools/call, saw {other}"
+                    let _ = net::send(out, &res);
+                }
+                "events/stream" => {
+                    if let Err(err) = start_events_stream(ctx, out, id.clone(), &params) {
+                        let _ =
+                            net::send(out, &reply_err_data(&id, err.code, &err.message, err.data));
+                    }
+                }
+                other => {
+                    let _ = net::send(
+                        out,
+                        &reply_err(
+                            &id,
+                            -32601,
+                            &format!(
+                                "expected server/discover, tools/list, tools/call, subscriptions/listen, or events/*, saw {other}"
+                            ),
                         ),
-                    ),
-                );
+                    );
+                }
             }
-        },
+        }
     }
 }
 
@@ -1262,7 +2652,10 @@ mod tests {
         );
         assert_eq!(
             parse_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
-            Parsed::Notification
+            Parsed::Notification {
+                method: "notifications/initialized".into(),
+                params: Value::Obj(vec![]),
+            }
         );
         assert_eq!(
             parse_message(r#"{"jsonrpc":"2.0","id":"a","result":{}}"#),
@@ -1299,11 +2692,14 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_valid_schema() {
-        let list = tools_list(false);
+        let list = tools_list(false, true);
         let Some(Value::Arr(tools)) = list.get("tools") else {
             panic!("no tools");
         };
         assert_eq!(tools.len(), 9);
+        assert_eq!(list.get("resultType"), Some(&s("complete")));
+        assert_eq!(list.get("ttlMs"), Some(&Value::Int(DISCOVER_TTL_MS)));
+        assert_eq!(list.get("cacheScope"), Some(&s("public")));
         assert!(tools
             .iter()
             .all(|t| t.get("inputSchema").is_some() && t.get("description").is_some()));
@@ -1443,7 +2839,7 @@ mod tests {
             ns
         };
         assert_eq!(
-            names_of(tools_list(false)),
+            names_of(tools_list(false, true)),
             vec![
                 "roger_board",
                 "roger_claim",
@@ -1456,7 +2852,7 @@ mod tests {
                 "roger_send",
             ]
         );
-        let default_send = tools_list(false)
+        let default_send = tools_list(false, true)
             .get("tools")
             .and_then(|v| match v {
                 Value::Arr(a) => a.iter().find(|t| t.get("name") == Some(&s("roger_send"))),
@@ -1476,7 +2872,7 @@ mod tests {
             Some(&Value::Arr(vec![s("to"), s("body")]))
         );
 
-        let opt_in = tools_list(true);
+        let opt_in = tools_list(true, true);
         assert_eq!(
             names_of(opt_in.clone()),
             vec![
@@ -1517,14 +2913,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("roger-mcp-isolate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ctx_default = Ctx {
-            socket: PathBuf::from("tcp://127.0.0.1:1"),
-            me: "s1".into(),
-            inbox: Inbox::open(&dir.join("d.store")).unwrap(),
-            groups: false,
-            confirmed: Mutex::new((true, None)),
-            confirmed_cv: Condvar::new(),
-        };
+        let ctx_default = Ctx::new(
+            PathBuf::from("tcp://127.0.0.1:1"),
+            "s1".into(),
+            Inbox::open(&dir.join("d.store")).unwrap(),
+            false,
+        );
         for tool in ["roger_subscribe", "roger_unsubscribe", "roger_groups"] {
             let err = call_tool(
                 &ctx_default,
@@ -1625,14 +3019,7 @@ mod tests {
             }
         });
 
-        let ctx = Ctx {
-            socket: target,
-            me: "me-g".into(),
-            inbox: Inbox::open(&store).unwrap(),
-            groups: true,
-            confirmed: Mutex::new((true, None)),
-            confirmed_cv: Condvar::new(),
-        };
+        let ctx = Ctx::new(target, "me-g".into(), Inbox::open(&store).unwrap(), true);
 
         let inbox_res = call_tool(
             &ctx,
@@ -1744,6 +3131,155 @@ mod tests {
         );
 
         daemon.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_meta_validation_and_iso8601_format() {
+        let d = discover_result();
+        assert_eq!(d.get("resultType"), Some(&s("complete")));
+        assert_eq!(
+            d.get("supportedVersions"),
+            Some(&Value::Arr(vec![s(VERSION)]))
+        );
+        assert_eq!(d.get("ttlMs"), Some(&Value::Int(DISCOVER_TTL_MS)));
+        assert_eq!(d.get("cacheScope"), Some(&s("public")));
+        assert!(d
+            .get("capabilities")
+            .and_then(|c| c.get("extensions"))
+            .and_then(|e| e.get("io.modelcontextprotocol/events"))
+            .is_some());
+
+        let missing = json::parse(r#"{}"#).unwrap();
+        assert_eq!(validate_meta(&missing).unwrap_err().code, -32602);
+        let bad_ver = json::parse(
+            r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01","io.modelcontextprotocol/clientCapabilities":{}}}"#,
+        )
+        .unwrap();
+        let err = validate_meta(&bad_ver).unwrap_err();
+        assert_eq!(err.code, -32022);
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("supported")),
+            Some(&Value::Arr(vec![s(VERSION)]))
+        );
+        let ok = json::parse(
+            r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}"#,
+        )
+        .unwrap();
+        assert!(validate_meta(&ok).is_ok());
+
+        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_iso8601_utc(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z"
+        );
+    }
+
+    #[test]
+    fn events_list_and_poll_cursors_filters_and_isolation_from_inbox_cursor() {
+        let listed = events_list_result();
+        let Some(Value::Arr(evts)) = listed.get("events") else {
+            panic!("missing events");
+        };
+        assert_eq!(evts.len(), 3);
+
+        let dir =
+            std::env::temp_dir().join(format!("roger-mcp-events-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("ev.store");
+        let now = now_ms();
+        let old_ts = now - 600_000;
+        let fresh_ts = now - 1_000;
+        std::fs::write(
+            &store,
+            format!(
+                concat!(
+                    "{{\"record\":\"r-1\",\"mail\":\"m-1\",\"from\":\"a\",\"body\":\"b1\",\"kind\":\"directed\",\"headers\":{{}},\"stored_at_ms\":{old}}}\n",
+                    "{{\"record\":\"r-2\",\"mail\":\"m-2\",\"from\":\"a\",\"group\":\"ops\",\"article\":1,\"body\":\"b2\",\"kind\":\"group\",\"headers\":{{}},\"stored_at_ms\":{fresh}}}\n",
+                    "{{\"record\":\"r-3\",\"mail\":\"m-3\",\"from\":\"a\",\"group\":\"dev\",\"article\":1,\"body\":\"b3\",\"kind\":\"group\",\"headers\":{{}},\"stored_at_ms\":{fresh}}}\n"
+                ),
+                old = old_ts,
+                fresh = fresh_ts
+            ),
+        )
+        .unwrap();
+        let ctx = Ctx::new(
+            PathBuf::from("tcp://127.0.0.1:1"),
+            "me".into(),
+            Inbox::open(&store).unwrap(),
+            true,
+        );
+
+        // null cursor -> start from now (empty, returns tail cursor)
+        let p0 = events_poll(&ctx, &json::parse(r#"{"name":"roger.mail"}"#).unwrap())
+            .unwrap_or_else(|e| panic!("poll failed: {}", e.message));
+        assert_eq!(p0.get("cursor"), Some(&s("r-3")));
+        assert_eq!(p0.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(p0.get("hasMore"), Some(&Value::Bool(false)));
+        assert_eq!(p0.get("events"), Some(&Value::Arr(vec![])));
+
+        // r-0 with maxEvents=1 -> returns r-1, hasMore=true
+        let p1 = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-0","maxEvents":1}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(p1.get("cursor"), Some(&s("r-1")));
+        assert_eq!(p1.get("hasMore"), Some(&Value::Bool(true)));
+
+        // r-0 with maxAgeMs=60_000 -> skips r-1, sets truncated=true
+        let p_age = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-0","maxAgeMs":60000}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(p_age.get("truncated"), Some(&Value::Bool(true)));
+        let Some(Value::Arr(ev_age)) = p_age.get("events") else {
+            panic!("events");
+        };
+        assert_eq!(ev_age.len(), 2);
+        assert_eq!(ev_age[0].get("eventId"), Some(&s("m-2")));
+
+        // group filter
+        let p_grp = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-0","arguments":{"group":"dev"}}"#)
+                .unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        let Some(Value::Arr(ev_grp)) = p_grp.get("events") else {
+            panic!("events");
+        };
+        assert_eq!(ev_grp.len(), 1);
+        assert_eq!(ev_grp[0].get("eventId"), Some(&s("m-3")));
+        assert_eq!(p_grp.get("cursor"), Some(&s("r-3")));
+
+        // unknown cursor -> truncated=true and reset to tail
+        let p_bad = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-999"}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(p_bad.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(p_bad.get("cursor"), Some(&s("r-3")));
+
+        // roger.board poll -> -32026 Unsupported; unknown event -> -32023 NotFound
+        assert_eq!(
+            events_poll(&ctx, &json::parse(r#"{"name":"roger.board"}"#).unwrap())
+                .err()
+                .map(|e| e.code),
+            Some(-32026)
+        );
+        assert_eq!(
+            events_poll(&ctx, &json::parse(r#"{"name":"no.such"}"#).unwrap())
+                .err()
+                .map(|e| e.code),
+            Some(-32023)
+        );
+        // Inbox cursor file was never created/modified by events/poll.
+        assert!(!position_path(&store).exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

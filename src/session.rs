@@ -74,9 +74,18 @@ pub struct McpHooks {
     pub registered: Option<Box<dyn FnOnce(net::Writer) + Send>>,
     /// Called after each delivery has reached the Store, never before.
     pub stored: Box<dyn Fn() + Send>,
+    /// Called when a `board_event` arrives (after `watch` is enabled).
+    pub board_event: Box<dyn Fn(Value) + Send>,
     /// Held across a Store write; true once the face is closing, after which
     /// a delivery is left unstored and unacked so it stays pending.
     pub gate: Arc<Mutex<bool>>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// How a client reaches this session: the Tracer's own stdout, the adapter's
@@ -554,6 +563,9 @@ fn serve_inner(
                         entry_pairs.push(("body", s(net::field(&v, "body")?)));
                         entry_pairs.push(("kind", s(&kind)));
                         entry_pairs.push(("headers", headers.clone()));
+                        if mcp.is_some() {
+                            entry_pairs.push(("stored_at_ms", Value::Int(now_ms())));
+                        }
                         let entry = obj(entry_pairs);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
@@ -667,9 +679,13 @@ fn serve_inner(
                     }
                 }
             }
-            "board_event" if watch => {
+            "board_event" => {
                 if let Some(w) = &client {
-                    let _ = net::send(w, &v);
+                    if watch {
+                        let _ = net::send(w, &v);
+                    }
+                } else if let Some(h) = &mcp {
+                    (h.board_event)(v);
                 }
             }
             "acked" => {

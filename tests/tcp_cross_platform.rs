@@ -182,6 +182,24 @@ fn pure_tcp_fleet_runs_without_unix_sockets_across_all_client_faces() {
     );
     assert!(inbox.contains("reply-xplat"), "{inbox}");
 
+    // Modern 2026-07-28 discovery + SEP-3415 events/list and events/poll over TCP.
+    let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/events":{}}}}"#;
+    let disc = rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"server/discover","params":{{{meta}}}}}"#
+    ));
+    assert!(
+        disc.contains(r#""supportedVersions":["2026-07-28"]"#),
+        "{disc}"
+    );
+    let ev_list = rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"events/list","params":{{{meta}}}}}"#
+    ));
+    assert!(ev_list.contains("roger.mail"), "{ev_list}");
+    let ev_poll = rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"events/poll","params":{{{meta},"name":"roger.mail","cursor":"r-0"}}}}"#
+    ));
+    assert!(ev_poll.contains("reply-xplat"), "{ev_poll}");
+
     // Claim + Board + Receipt + live read-only Audit (works while Stores are held open!)
     let claim = Command::new(BIN)
         .args([
