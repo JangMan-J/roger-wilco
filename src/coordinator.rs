@@ -8,7 +8,7 @@
 //! Nothing here scans on a timer.
 //!
 //! Mail bodies, envelopes, receipts and Group positions live in the
-//! `sql::CoordinatorStore` alone: memory holds only the registered set, its
+//! `sql::coord::Store` alone: memory holds only the registered set, its
 //! presence, live host links and claims. A send commits through the store
 //! without the state lock, so concurrent sends share one group commit; the
 //! lock is taken only to find the host links to push to afterwards.
@@ -18,8 +18,9 @@ use crate::headers;
 use crate::json::{obj, s, Value};
 use crate::net::{self, Writer};
 use crate::sql::{
-    self, AckResult, CoordOpenConfig, CoordinatorStore, GroupSummary, PendingDelivery, ReceiptInfo,
-    SendBroadcastReq, SendDirectedReq, SendGroupReq, SendStatus, TimelineEvent,
+    self,
+    coord::{self, Broadcast, Directed, GroupMail, Status, Store},
+    AckResult, Delivery, Event, Group, Receipt,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -147,8 +148,8 @@ impl Config {
         })
     }
 
-    fn open_config(&self) -> CoordOpenConfig {
-        CoordOpenConfig {
+    fn open_config(&self) -> coord::Config {
+        coord::Config {
             data: self.data.clone(),
             num_slices: self.slices,
             retain_ms: self.cold_retain_ms,
@@ -168,7 +169,7 @@ struct Session {
 }
 
 struct State {
-    store: Arc<CoordinatorStore>,
+    store: Arc<Store>,
     sessions: HashMap<String, Session>,
     /// When this coordinator started: a stored session that never
     /// re-registers counts as disconnected from then.
@@ -211,7 +212,7 @@ fn now_ms() -> i64 {
 }
 
 pub fn run(cfg: Config) -> io::Result<()> {
-    let (store, startup) = CoordinatorStore::open(cfg.open_config())?;
+    let (store, startup) = Store::open(cfg.open_config())?;
     let store = Arc::new(store);
     let state = State {
         store: Arc::clone(&store),
@@ -274,9 +275,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
 }
 
 /// Apply one committed timeline event to memory.
-fn apply(st: &mut State, ev: &TimelineEvent) {
+fn apply(st: &mut State, ev: &Event) {
     match ev {
-        TimelineEvent::Session { session, host, .. } => {
+        Event::Session { session, host, .. } => {
             st.sessions
                 .entry(session.clone())
                 .and_modify(|s| s.host = host.clone())
@@ -286,22 +287,22 @@ fn apply(st: &mut State, ev: &TimelineEvent) {
                     declared: None,
                 });
         }
-        TimelineEvent::Unregister { session, .. } => {
+        Event::Unregister { session, .. } => {
             st.sessions.remove(session);
         }
-        TimelineEvent::Label { session, label, .. } => {
+        Event::Label { session, label, .. } => {
             if let Some(row) = st.sessions.get_mut(session) {
                 row.label = label.clone();
             }
         }
-        TimelineEvent::Declared {
+        Event::Declared {
             session, declared, ..
         } => {
             if let Some(row) = st.sessions.get_mut(session) {
                 row.declared = declared.clone();
             }
         }
-        TimelineEvent::Takeover {
+        Event::Takeover {
             host,
             at_ms,
             registration: Some(r),
@@ -310,7 +311,7 @@ fn apply(st: &mut State, ev: &TimelineEvent) {
             st.takeovers
                 .insert(r.clone(), at_ms.map(|at| (host.clone(), at)));
         }
-        TimelineEvent::Claim {
+        Event::Claim {
             key,
             owner,
             expires_ms,
@@ -321,7 +322,7 @@ fn apply(st: &mut State, ev: &TimelineEvent) {
                 expires_ms: *expires_ms,
             }),
         ),
-        TimelineEvent::Release { key } => st.claims.apply(key, &Change::Release),
+        Event::Release { key } => st.claims.apply(key, &Change::Release),
         _ => {}
     }
 }
@@ -337,7 +338,7 @@ fn stamp(st: &mut State, session: &str) {
 /// Commit events durably as one transaction, then apply each to memory and
 /// show each Board change to watchers: the one path every session event
 /// takes, so the store and live state agree.
-fn commit(st: &mut State, events: Vec<TimelineEvent>) -> io::Result<()> {
+fn commit(st: &mut State, events: Vec<Event>) -> io::Result<()> {
     written(st.store.commit_timeline(events.clone(), now_ms()))?;
     for ev in &events {
         apply(st, ev);
@@ -348,8 +349,8 @@ fn commit(st: &mut State, events: Vec<TimelineEvent>) -> io::Result<()> {
     Ok(())
 }
 
-fn label_event(session: &str, label: &str) -> TimelineEvent {
-    TimelineEvent::Label {
+fn label_event(session: &str, label: &str) -> Event {
+    Event::Label {
         session: session.to_string(),
         label: label.to_string(),
         at_ms: Some(now_ms()),
@@ -359,10 +360,10 @@ fn label_event(session: &str, label: &str) -> TimelineEvent {
 /// The `board_event` a committed timeline event is shown to watchers as, if
 /// any: `register`, `unregister`, `relabel`, `declared`. Takeovers, claims
 /// (shown by `claim`) and receipts show nothing here.
-fn board_event_of(ev: &TimelineEvent) -> Option<Vec<(&'static str, Value)>> {
+fn board_event_of(ev: &Event) -> Option<Vec<(&'static str, Value)>> {
     let at = |at_ms: &Option<i64>| at_ms.map(|t| ("at_ms", Value::Int(t)));
     let pairs = match ev {
-        TimelineEvent::Session {
+        Event::Session {
             session,
             host,
             at_ms,
@@ -375,12 +376,12 @@ fn board_event_of(ev: &TimelineEvent) -> Option<Vec<(&'static str, Value)>> {
             p.extend(at(at_ms));
             p
         }
-        TimelineEvent::Unregister { session, at_ms } => {
+        Event::Unregister { session, at_ms } => {
             let mut p = vec![("event", s("unregister")), ("session", s(session))];
             p.extend(at(at_ms));
             p
         }
-        TimelineEvent::Label {
+        Event::Label {
             session,
             label,
             at_ms,
@@ -393,7 +394,7 @@ fn board_event_of(ev: &TimelineEvent) -> Option<Vec<(&'static str, Value)>> {
             p.extend(at(at_ms));
             p
         }
-        TimelineEvent::Declared {
+        Event::Declared {
             session,
             declared,
             at_ms,
@@ -411,14 +412,14 @@ fn board_event_of(ev: &TimelineEvent) -> Option<Vec<(&'static str, Value)>> {
 }
 
 /// The committed timeline event for one claim change on `key`.
-fn claim_timeline(key: &str, change: &Change) -> TimelineEvent {
+fn claim_timeline(key: &str, change: &Change) -> Event {
     match change {
-        Change::Grant(h) => TimelineEvent::Claim {
+        Change::Grant(h) => Event::Claim {
             key: key.to_string(),
             owner: h.owner.clone(),
             expires_ms: h.expires_ms,
         },
-        Change::Release => TimelineEvent::Release {
+        Change::Release => Event::Release {
             key: key.to_string(),
         },
     }
@@ -449,7 +450,7 @@ fn unregister(st: &mut State, session: &str) -> io::Result<()> {
         .iter()
         .map(|(key, _)| st.claims.live(key, now).cloned())
         .collect();
-    let mut events = vec![TimelineEvent::Unregister {
+    let mut events = vec![Event::Unregister {
         session: session.to_string(),
         at_ms: Some(now),
     }];
@@ -518,7 +519,7 @@ fn link_of(st: &State, session: &str) -> Option<Writer> {
 
 /// The `deliver` line for one pending delivery: a Group article also names
 /// its Group and article number, right after the recipient.
-fn deliver_of(p: &PendingDelivery) -> Value {
+fn deliver_of(p: &Delivery) -> Value {
     let mut v = net::deliver_msg(&p.mail_id, &p.from, &p.to, &p.body, &p.kind, &p.headers);
     if let Value::Obj(pairs) = &mut v {
         let mut at = pairs
@@ -537,7 +538,7 @@ fn deliver_of(p: &PendingDelivery) -> Value {
 }
 
 /// Push each pending delivery to its recipient's live host link.
-fn push_pending(state: &Mutex<State>, pending: &[PendingDelivery]) -> Vec<(Writer, Value)> {
+fn push_pending(state: &Mutex<State>, pending: &[Delivery]) -> Vec<(Writer, Value)> {
     if pending.is_empty() {
         return Vec::new();
     }
@@ -554,7 +555,7 @@ fn push_pending(state: &Mutex<State>, pending: &[PendingDelivery]) -> Vec<(Write
 fn serve(
     conn: TcpStream,
     state: Arc<Mutex<State>>,
-    store: Arc<CoordinatorStore>,
+    store: Arc<Store>,
     token: &str,
 ) -> io::Result<()> {
     // One line is one segment, sent when it is written.
@@ -616,7 +617,7 @@ fn serve_link(
     conn: &TcpStream,
     writer: Writer,
     state: Arc<Mutex<State>>,
-    store: &CoordinatorStore,
+    store: &Store,
     token: &str,
 ) -> io::Result<()> {
     let mut lines = net::lines(Box::new(conn.try_clone()?));
@@ -626,7 +627,9 @@ fn serve_link(
     let hello = lines
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no hello"))??;
-    if net::field(&hello, "type")? != "hello" || net::field(&hello, "token")? != token {
+    if net::field(&hello, "type")? != "hello"
+        || !net::same_secret(net::field(&hello, "token")?, token)
+    {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "bad hello"));
     }
     let host = net::field(&hello, "host")?.to_string();
@@ -676,7 +679,7 @@ fn serve_link(
             ("ping", Value::Bool(true)),
         ]),
     )?;
-    for p in store.pending_for_host(&host_sessions)? {
+    for p in store.pending_host(&host_sessions)? {
         let _ = net::send(&writer, &deliver_of(&p));
     }
 
@@ -761,7 +764,7 @@ fn serve_link(
                     st.connected.insert(session.clone());
                     // Every Register is one stamped event, so the timeline
                     // says when an Address registered even when nothing changed.
-                    let mut events = vec![TimelineEvent::Session {
+                    let mut events = vec![Event::Session {
                         session: session.clone(),
                         host: host.clone(),
                         at_ms: Some(now_ms()),
@@ -776,7 +779,7 @@ fn serve_link(
                         .and_then(|row| row.declared.as_ref())
                         != declared.as_ref()
                     {
-                        events.push(TimelineEvent::Declared {
+                        events.push(Event::Declared {
                             session: session.clone(),
                             declared,
                             at_ms: Some(now_ms()),
@@ -784,7 +787,7 @@ fn serve_link(
                     }
                     commit(&mut st, events)?;
                 }
-                for p in store.pending_for_session(&session)? {
+                for p in store.pending_session(&session)? {
                     let _ = net::send(&writer, &deliver_of(&p));
                 }
                 // The coordinator holds this Register now. A host daemon
@@ -860,14 +863,14 @@ fn serve_link(
                 if v.get("replay") != Some(&Value::Bool(true)) {
                     stamp(&mut state.lock().unwrap(), &session);
                 }
-                let result = written(store.record_ack(&mail, &session, &record, now_ms()))?;
+                let result = written(store.ack(&mail, &session, &record, now_ms()))?;
                 net::send(&writer, &ack_reply(req, &mail, &session, &record, &result))?;
             }
             "receipt" => {
                 let req = req_of(&v);
                 let mail = net::field(&v, "mail")?;
                 let reader = v.get("session").and_then(|x| x.as_str());
-                let info = store.query_receipt(mail, reader)?;
+                let info = store.receipt(mail, reader)?;
                 net::send(&writer, &receipt_reply(req, mail, info.as_ref()))?;
             }
             "subscribe" => {
@@ -895,13 +898,8 @@ fn serve_link(
                     continue;
                 }
                 stamp(&mut state.lock().unwrap(), &session);
-                let (position, high_water, catchup) = written(store.subscribe_group(
-                    &session,
-                    &group,
-                    after.flatten(),
-                    latest,
-                    now_ms(),
-                ))?;
+                let (position, high_water, catchup) =
+                    written(store.subscribe(&session, &group, after.flatten(), latest, now_ms()))?;
                 answer_then_push(
                     &writer,
                     &obj(vec![
@@ -920,7 +918,7 @@ fn serve_link(
                 let session = net::field(&v, "session")?.to_string();
                 let group = net::field(&v, "group")?.to_string();
                 stamp(&mut state.lock().unwrap(), &session);
-                let position = written(store.unsubscribe_group(&session, &group, now_ms()))?;
+                let position = written(store.unsubscribe(&session, &group, now_ms()))?;
                 net::send(
                     &writer,
                     &obj(vec![
@@ -935,7 +933,7 @@ fn serve_link(
             "groups" => {
                 let req = req_of(&v);
                 let session = v.get("session").and_then(|x| x.as_str());
-                let list = store.list_groups(session)?;
+                let list = store.groups(session)?;
                 net::send(&writer, &groups_reply(req, session.is_some(), &list))?;
             }
             "claim" => {
@@ -974,12 +972,7 @@ fn serve_link(
 /// instead of `to`). The store commits without the state lock; the lock is
 /// taken briefly before (presence, the registered set) and after (the host
 /// links to push to).
-fn send(
-    v: &Value,
-    writer: &Writer,
-    state: &Mutex<State>,
-    store: &CoordinatorStore,
-) -> io::Result<()> {
+fn send(v: &Value, writer: &Writer, state: &Mutex<State>, store: &Store) -> io::Result<()> {
     let req = req_of(v);
     let mail = net::field(v, "mail")?.to_string();
     let group = v.get("group").and_then(|x| x.as_str());
@@ -1016,7 +1009,7 @@ fn send(
 
     if let Some(group) = group {
         stamp(&mut state.lock().unwrap(), &from);
-        let status = written(store.send_group(SendGroupReq {
+        let status = written(store.send_group(GroupMail {
             mail_id: mail.clone(),
             from: from.clone(),
             group: group.to_string(),
@@ -1025,16 +1018,16 @@ fn send(
             accepted_at_ms: Some(now_ms()),
         }))?;
         let (article, readers) = match status {
-            SendStatus::Committed {
+            Status::Committed {
                 article_num,
                 subscribers,
             } => (article_num, subscribers),
-            SendStatus::DuplicateAccepted { article_num } => (article_num, Vec::new()),
-            SendStatus::Conflict(what) => return refuse(&what),
+            Status::DuplicateAccepted { article_num } => (article_num, Vec::new()),
+            Status::Conflict(what) => return refuse(&what),
         };
-        let pending: Vec<PendingDelivery> = readers
+        let pending: Vec<Delivery> = readers
             .into_iter()
-            .map(|to| PendingDelivery {
+            .map(|to| Delivery {
                 seq: 0,
                 mail_id: mail.clone(),
                 from: from.clone(),
@@ -1063,7 +1056,7 @@ fn send(
             all.sort();
             all
         };
-        let status = written(store.send_broadcast(SendBroadcastReq {
+        let status = written(store.send_broadcast(Broadcast {
             mail_id: mail.clone(),
             from: from.clone(),
             recipients: recipients.clone(),
@@ -1074,7 +1067,7 @@ fn send(
         (status, recipients)
     } else {
         stamp(&mut state.lock().unwrap(), &from);
-        let status = written(store.send_directed(SendDirectedReq {
+        let status = written(store.send_directed(Directed {
             mail_id: mail.clone(),
             from: from.clone(),
             to: to.clone(),
@@ -1085,19 +1078,19 @@ fn send(
         (status, vec![to.clone()])
     };
     let recipients = match status {
-        SendStatus::Committed { .. } => recipients,
+        Status::Committed { .. } => recipients,
         // A resend commits nothing and pushes nothing: the first send did.
-        SendStatus::DuplicateAccepted { .. } => Vec::new(),
-        SendStatus::Conflict(what) => return refuse(&what),
+        Status::DuplicateAccepted { .. } => Vec::new(),
+        Status::Conflict(what) => return refuse(&what),
     };
     let (kind, copies) = if to == BROADCAST {
         (net::BROADCAST, true)
     } else {
         (net::DIRECTED, false)
     };
-    let pending: Vec<PendingDelivery> = recipients
+    let pending: Vec<Delivery> = recipients
         .into_iter()
-        .map(|addr| PendingDelivery {
+        .map(|addr| Delivery {
             seq: 0,
             mail_id: if copies {
                 copy_id(&mail, &addr)
@@ -1155,7 +1148,7 @@ fn takeover(
             let at_ms = at.unwrap_or_else(now_ms);
             commit(
                 st,
-                vec![TimelineEvent::Takeover {
+                vec![Event::Takeover {
                     session: session.to_string(),
                     old_host: old_host.to_string(),
                     host: host.to_string(),
@@ -1367,7 +1360,7 @@ fn board(st: &State, v: &Value) -> Value {
 /// acked, the Receipt's Record id and when it was recorded. A stamp the store
 /// never held is left out, never sent as zero. A Broadcast copy is read by
 /// its copy id.
-fn receipt_reply(req: i64, mail: &str, info: Option<&ReceiptInfo>) -> Value {
+fn receipt_reply(req: i64, mail: &str, info: Option<&Receipt>) -> Value {
     let Some(m) = info else {
         return error_reply(req, Some(mail), &format!("unknown mail {mail}"));
     };
@@ -1405,7 +1398,7 @@ fn receipt_reply(req: i64, mail: &str, info: Option<&ReceiptInfo>) -> Value {
 
 /// The answer to `groups`: every Group with its high-water article and
 /// subscriber count, and, when a session asked, its own subscription.
-fn groups_reply(req: i64, for_session: bool, list: &[GroupSummary]) -> Value {
+fn groups_reply(req: i64, for_session: bool, list: &[Group]) -> Value {
     let groups = list
         .iter()
         .map(|g| {
@@ -1534,8 +1527,8 @@ mod tests {
         assert_eq!((open.retain_ms, open.day_ms), (250, 100));
     }
 
-    fn pending(kind: &str, group: Option<&str>, article: Option<i64>) -> PendingDelivery {
-        PendingDelivery {
+    fn pending(kind: &str, group: Option<&str>, article: Option<i64>) -> Delivery {
+        Delivery {
             seq: 3,
             mail_id: "m".into(),
             from: "a".into(),
@@ -1560,8 +1553,8 @@ mod tests {
         );
     }
 
-    fn info(kind: &str) -> ReceiptInfo {
-        ReceiptInfo {
+    fn info(kind: &str) -> Receipt {
+        Receipt {
             mail_id: "m1".into(),
             from: "a".into(),
             to: "b".into(),
@@ -1620,7 +1613,7 @@ mod tests {
     #[test]
     fn groups_reply_adds_the_session_view_only_when_asked() {
         let list = [
-            GroupSummary {
+            Group {
                 group: "ops".into(),
                 high_water: 3,
                 subscribers: 2,
@@ -1628,7 +1621,7 @@ mod tests {
                 subscribed: true,
                 record_id: Some("r-2".into()),
             },
-            GroupSummary {
+            Group {
                 group: "dev".into(),
                 high_water: 0,
                 subscribers: 0,
@@ -1670,9 +1663,9 @@ mod tests {
 
     #[test]
     fn board_events_show_session_changes_only() {
-        let shown = |ev: TimelineEvent| board_event_of(&ev).map(line);
+        let shown = |ev: Event| board_event_of(&ev).map(line);
         assert_eq!(
-            shown(TimelineEvent::Session {
+            shown(Event::Session {
                 session: "a".into(),
                 host: "h".into(),
                 at_ms: Some(4)
@@ -1681,7 +1674,7 @@ mod tests {
             Some(r#"{"event":"register","session":"a","host":"h","at_ms":4}"#)
         );
         assert_eq!(
-            shown(TimelineEvent::Unregister {
+            shown(Event::Unregister {
                 session: "a".into(),
                 at_ms: Some(5)
             })
@@ -1689,7 +1682,7 @@ mod tests {
             Some(r#"{"event":"unregister","session":"a","at_ms":5}"#)
         );
         assert_eq!(
-            shown(TimelineEvent::Label {
+            shown(Event::Label {
                 session: "a".into(),
                 label: "x".into(),
                 at_ms: Some(6)
@@ -1698,7 +1691,7 @@ mod tests {
             Some(r#"{"event":"relabel","session":"a","label":"x","at_ms":6}"#)
         );
         assert_eq!(
-            shown(TimelineEvent::Declared {
+            shown(Event::Declared {
                 session: "a".into(),
                 declared: None,
                 at_ms: Some(7)
@@ -1707,7 +1700,7 @@ mod tests {
             Some(r#"{"event":"declared","session":"a","at_ms":7}"#)
         );
         assert_eq!(
-            shown(TimelineEvent::Declared {
+            shown(Event::Declared {
                 session: "a".into(),
                 declared: Some("d".into()),
                 at_ms: None
@@ -1715,9 +1708,9 @@ mod tests {
             .as_deref(),
             Some(r#"{"event":"declared","session":"a","declared":"d"}"#)
         );
-        assert_eq!(shown(TimelineEvent::Release { key: "k".into() }), None);
+        assert_eq!(shown(Event::Release { key: "k".into() }), None);
         assert_eq!(
-            shown(TimelineEvent::Takeover {
+            shown(Event::Takeover {
                 session: "a".into(),
                 old_host: "h".into(),
                 host: "g".into(),
@@ -1736,11 +1729,11 @@ mod tests {
         });
         assert!(matches!(
             claim_timeline("k", &grant),
-            TimelineEvent::Claim { key, owner, expires_ms: 99 } if key == "k" && owner == "a"
+            Event::Claim { key, owner, expires_ms: 99 } if key == "k" && owner == "a"
         ));
         assert!(matches!(
             claim_timeline("k", &Change::Release),
-            TimelineEvent::Release { key } if key == "k"
+            Event::Release { key } if key == "k"
         ));
     }
 

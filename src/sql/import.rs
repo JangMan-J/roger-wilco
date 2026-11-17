@@ -343,10 +343,7 @@ fn advance_position(conn: &Connection, stream: &str, reader: &str) -> io::Result
 
 /// Read-only import of a legacy JSONL `coordinator.log` into initialized slice
 /// connections (slice 0..N-1). Leaves `legacy_log` untouched on disk.
-pub fn maybe_import_coordinator_log(
-    legacy_log: &Path,
-    slices: &mut [Connection],
-) -> io::Result<bool> {
+pub fn coord_log(legacy_log: &Path, slices: &mut [Connection]) -> io::Result<bool> {
     if slices.is_empty() || !legacy_log.is_file() || super::is_sqlite_file(legacy_log) {
         return Ok(false);
     }
@@ -739,7 +736,7 @@ struct ReplayedReceipt {
 
 /// Read-only import of a legacy JSONL `daemon.log` into `conn`.
 /// Leaves `legacy_log` untouched on disk.
-pub fn maybe_import_daemon_log(legacy_log: &Path, conn: &mut Connection) -> io::Result<bool> {
+pub fn daemon_log(legacy_log: &Path, conn: &mut Connection) -> io::Result<bool> {
     if !legacy_log.is_file() || super::is_sqlite_file(legacy_log) {
         return Ok(false);
     }
@@ -899,10 +896,10 @@ mod tests {
         let mut slices = coord_slices(1);
         let mut dconn = daemon_conn();
 
-        assert!(!maybe_import_coordinator_log(&missing, &mut slices).unwrap());
-        assert!(!maybe_import_coordinator_log(&subdir, &mut slices).unwrap());
-        assert!(!maybe_import_daemon_log(&missing, &mut dconn).unwrap());
-        assert!(!maybe_import_daemon_log(&subdir, &mut dconn).unwrap());
+        assert!(!coord_log(&missing, &mut slices).unwrap());
+        assert!(!coord_log(&subdir, &mut slices).unwrap());
+        assert!(!daemon_log(&missing, &mut dconn).unwrap());
+        assert!(!daemon_log(&subdir, &mut dconn).unwrap());
 
         let sqlite_path = dir.path("already.sqlite");
         {
@@ -911,36 +908,36 @@ mod tests {
                 .unwrap();
         }
         let sqlite_before = fs::read(&sqlite_path).unwrap();
-        assert!(!maybe_import_coordinator_log(&sqlite_path, &mut slices).unwrap());
-        assert!(!maybe_import_daemon_log(&sqlite_path, &mut dconn).unwrap());
+        assert!(!coord_log(&sqlite_path, &mut slices).unwrap());
+        assert!(!daemon_log(&sqlite_path, &mut dconn).unwrap());
         assert_eq!(fs::read(&sqlite_path).unwrap(), sqlite_before);
 
-        let coord_log = dir.path("coord.log");
+        let coord_log_path = dir.path("coord.log");
         fs::write(
-            &coord_log,
+            &coord_log_path,
             format!(
                 "{{\"ev\":\"session\",\"session\":\"{ADDR_A}\",\"host\":\"h1\",\"at_ms\":10}}\n"
             ),
         )
         .unwrap();
-        assert!(!maybe_import_coordinator_log(&coord_log, &mut []).unwrap());
-        assert!(maybe_import_coordinator_log(&coord_log, &mut slices).unwrap());
-        assert!(!maybe_import_coordinator_log(&coord_log, &mut slices).unwrap());
+        assert!(!coord_log(&coord_log_path, &mut []).unwrap());
+        assert!(coord_log(&coord_log_path, &mut slices).unwrap());
+        assert!(!coord_log(&coord_log_path, &mut slices).unwrap());
         let timeline_count: i64 = slices[0]
             .query_row("SELECT COUNT(*) FROM timeline", [], |r| r.get(0))
             .unwrap();
         assert_eq!(timeline_count, 1);
 
-        let daemon_log = dir.path("daemon.log");
+        let daemon_log_path = dir.path("daemon.log");
         fs::write(
-            &daemon_log,
+            &daemon_log_path,
             format!(
                 "{{\"ev\":\"deliver\",\"mail\":\"m1\",\"from\":\"{ADDR_A}\",\"to\":\"{ADDR_B}\",\"body\":\"hi\"}}\n"
             ),
         )
         .unwrap();
-        assert!(maybe_import_daemon_log(&daemon_log, &mut dconn).unwrap());
-        assert!(!maybe_import_daemon_log(&daemon_log, &mut dconn).unwrap());
+        assert!(daemon_log(&daemon_log_path, &mut dconn).unwrap());
+        assert!(!daemon_log(&daemon_log_path, &mut dconn).unwrap());
         let pending_count: i64 = dconn
             .query_row("SELECT COUNT(*) FROM pending_deliveries", [], |r| r.get(0))
             .unwrap();
@@ -969,7 +966,7 @@ mod tests {
         let before = fs::read(&log_path).unwrap();
 
         let mut slices = coord_slices(1);
-        assert!(maybe_import_coordinator_log(&log_path, &mut slices).unwrap());
+        assert!(coord_log(&log_path, &mut slices).unwrap());
 
         let after = fs::read(&log_path).unwrap();
         assert_eq!(
@@ -1028,7 +1025,7 @@ mod tests {
         )
         .unwrap();
         let mut bad_slices = coord_slices(1);
-        let err = maybe_import_coordinator_log(&bad_log, &mut bad_slices).unwrap_err();
+        let err = coord_log(&bad_log, &mut bad_slices).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let rolled_back: i64 = bad_slices[0]
             .query_row("SELECT COUNT(*) FROM timeline", [], |r| r.get(0))
@@ -1067,7 +1064,7 @@ mod tests {
         fs::write(&log_path, lines.join("\n") + "\n").unwrap();
 
         let mut slices = coord_slices(1);
-        assert!(maybe_import_coordinator_log(&log_path, &mut slices).unwrap());
+        assert!(coord_log(&log_path, &mut slices).unwrap());
 
         let (host_a, label_a, decl_a, at_a): (String, String, Option<String>, Option<i64>) = slices
             [0]
@@ -1187,7 +1184,7 @@ mod tests {
         fs::write(&log_path, lines.join("\n") + "\n").unwrap();
 
         let mut slices = coord_slices(1);
-        assert!(maybe_import_coordinator_log(&log_path, &mut slices).unwrap());
+        assert!(coord_log(&log_path, &mut slices).unwrap());
 
         type EnvRow = (
             String,
@@ -1292,7 +1289,7 @@ mod tests {
         fs::write(&log_path, lines.join("\n") + "\n").unwrap();
 
         let mut slices = coord_slices(1);
-        assert!(maybe_import_coordinator_log(&log_path, &mut slices).unwrap());
+        assert!(coord_log(&log_path, &mut slices).unwrap());
 
         let (b_sender, b_rcpts, b_at): (String, String, Option<i64>) = slices[0]
             .query_row(
@@ -1399,7 +1396,7 @@ mod tests {
         fs::write(&log_path, lines.join("\n") + "\n").unwrap();
 
         let mut slices = coord_slices(4);
-        assert!(maybe_import_coordinator_log(&log_path, &mut slices).unwrap());
+        assert!(coord_log(&log_path, &mut slices).unwrap());
         assert!(is_already_imported(&slices[0]).unwrap());
 
         let mut used_stream_slices = HashSet::new();
@@ -1497,7 +1494,7 @@ mod tests {
         let before = fs::read(&log_path).unwrap();
 
         let mut conn = daemon_conn();
-        assert!(maybe_import_daemon_log(&log_path, &mut conn).unwrap());
+        assert!(daemon_log(&log_path, &mut conn).unwrap());
         assert_eq!(
             fs::read(&log_path).unwrap(),
             before,

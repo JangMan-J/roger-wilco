@@ -2,9 +2,9 @@
 
 A recap of the functional requirements for a later direction: many coordinators that are
 peers, with the fleet's state divided into slices and pools of peers able to own them.
-Nothing here is built. Today's core is one coordinator, one host daemon per machine, and a
-Receipt per Mail; this page says what has to be true before that changes, so that work done
-now does not work against it.
+Single-coordinator Groups and reader Positions are built; peering and pools are not.
+Today's core is one coordinator and one host daemon per machine; this page says what has
+to be true before peering arrives, so that work done now does not work against it.
 
 ## The shape
 

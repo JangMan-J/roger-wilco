@@ -1,5 +1,5 @@
 use roger_cold_shipper::archive::{load_manifest, MANIFEST_SCHEME};
-use roger_cold_shipper::format::{encode_cold_bytes, sha256_hex, verify_cold_file, ColdRecord};
+use roger_cold_shipper::format::{encode_bytes, sha256_hex, verify_file, Record};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -224,7 +224,7 @@ fn tampered_local_cold_file_rejected_before_shipping() {
     write_file(&slices.join("slice-00/cold/day-19000.cold"), &valid);
 
     // Case 1: Tamper with record body and recompute trailer so ONLY per-record digest fails.
-    let bad_rec = ColdRecord {
+    let bad_rec = Record {
         mail: "m-bad".to_string(),
         stream: "m:r".to_string(),
         article: 1,
@@ -236,7 +236,7 @@ fn tampered_local_cold_file_rejected_before_shipping() {
         digest: sha256_hex(b"original payload"),
         accepted_at_ms: None,
     };
-    let bad_bytes = encode_cold_bytes(&[bad_rec]).unwrap();
+    let bad_bytes = encode_bytes(&[bad_rec]).unwrap();
     write_file(&slices.join("slice-01/cold/day-19001.cold"), &bad_bytes);
 
     let out = run_cli(&[
@@ -480,7 +480,7 @@ fn restore_round_trip_matches_core_rwcold01_format_and_rejects_corrupt_archive()
         .unwrap()
         .permissions()
         .readonly());
-    let (_, parsed0) = verify_cold_file(&restored_cold.join("day-19000.cold")).unwrap();
+    let (_, parsed0) = verify_file(&restored_cold.join("day-19000.cold")).unwrap();
     assert_eq!(parsed0.records[0].from, composite_addr);
     assert_eq!(parsed0.records[0].headers.as_deref(), Some(hdr_raw));
 

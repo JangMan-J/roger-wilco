@@ -1,6 +1,5 @@
 use roger_cold_shipper::archive::{
-    format_restore_output, format_ship_output, format_verify_output, restore, ship, verify_archive,
-    watch_stdin,
+    format_restore, format_ship, format_verify, restore, ship, verify_archive, watch_stdin,
 };
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -174,7 +173,7 @@ fn execute(cmd: Command) -> Result<u8, String> {
             json,
         } => {
             let summary = ship(&slices_dir, &dest)?;
-            let text = format_ship_output(&summary, json)?;
+            let text = format_ship(&summary, json)?;
             write_stdout_line(&text)?;
             Ok(0)
         }
@@ -186,13 +185,13 @@ fn execute(cmd: Command) -> Result<u8, String> {
             json,
         } => {
             let summary = restore(&dest, &slice, &cold_dir, day)?;
-            let text = format_restore_output(&summary, json)?;
+            let text = format_restore(&summary, json)?;
             write_stdout_line(&text)?;
             Ok(0)
         }
         Command::Verify { dest, json } => {
             let summary = verify_archive(&dest);
-            let text = format_verify_output(&summary, json)?;
+            let text = format_verify(&summary, json)?;
             write_stdout_line(&text)?;
             Ok(if summary.intact { 0 } else { 1 })
         }

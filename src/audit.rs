@@ -15,7 +15,7 @@
 
 use crate::json::{self, s, Value};
 use crate::net;
-use crate::sql::{self, AuditCoordItem, CoordAuditSnapshot, DaemonAuditSnapshot};
+use crate::sql::audit_ro::{self, Coord, Daemon};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::Path;
@@ -102,8 +102,8 @@ enum Records {
         /// The trailing fragment's byte length; 0 when the file ends in `\n`.
         torn: usize,
     },
-    Coord(CoordAuditSnapshot),
-    Daemon(DaemonAuditSnapshot),
+    Coord(Coord),
+    Daemon(Daemon),
 }
 
 /// One input, read whole.
@@ -133,12 +133,10 @@ impl Input {
 fn read_input(source: Source, path: &str, bodies: bool) -> io::Result<Input> {
     let at = Path::new(path);
     let records = match source {
-        Source::Coordinator if sql::has_coordinator_sqlite(at) => {
-            Some(Records::Coord(sql::read_coordinator_records(at, bodies)?))
+        Source::Coordinator if audit_ro::has_coord(at) => {
+            Some(Records::Coord(audit_ro::coord(at, bodies)?))
         }
-        Source::Daemon if sql::has_daemon_sqlite(at) => {
-            Some(Records::Daemon(sql::read_daemon_records(at)?))
-        }
+        Source::Daemon if audit_ro::has_daemon(at) => Some(Records::Daemon(audit_ro::daemon(at)?)),
         _ => None,
     };
     if let Some(records) = records {
@@ -572,13 +570,13 @@ fn coordinator_lines(input: &Input) -> (Vec<Item>, Vec<MailRow>) {
 }
 
 /// The timeline and Mail of a coordinator's slice databases, in `seq` order.
-fn coordinator_snapshot(snapshot: &CoordAuditSnapshot) -> (Vec<Item>, Vec<MailRow>) {
+fn coordinator_snapshot(snapshot: &Coord) -> (Vec<Item>, Vec<MailRow>) {
     let mut items: Vec<Item> = Vec::new();
     let mut mails: Vec<MailRow> = Vec::new();
     let mut last_owner: HashMap<String, String> = HashMap::new();
     for entry in &snapshot.items {
         let t = match entry {
-            AuditCoordItem::Envelope(e) => {
+            audit_ro::Item::Envelope(e) => {
                 mails.push(MailRow {
                     id: e.mail_id.clone(),
                     kind: e.kind.clone(),
@@ -605,7 +603,7 @@ fn coordinator_snapshot(snapshot: &CoordAuditSnapshot) -> (Vec<Item>, Vec<MailRo
                 items.push(Item::Mail(mails.len() - 1));
                 continue;
             }
-            AuditCoordItem::Timeline(t) => t,
+            audit_ro::Item::Timeline(t) => t,
         };
         let n = Value::Int(t.line);
         let addr = t.addr.as_deref();
@@ -1147,7 +1145,7 @@ fn listing(inputs: &[Input], opts: &Opts) -> Vec<Line> {
         match &input.records {
             Records::Coord(snapshot) => {
                 for item in &snapshot.items {
-                    if let AuditCoordItem::Envelope(e) = item {
+                    if let audit_ro::Item::Envelope(e) = item {
                         note(
                             &mut kept_mail,
                             &mut group_mail,

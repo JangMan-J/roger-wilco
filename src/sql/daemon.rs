@@ -3,7 +3,32 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::io;
 use std::sync::Mutex;
 
-pub struct DaemonStore {
+#[derive(Clone, Debug)]
+pub struct Delivery {
+    pub mail_id: String,
+    pub from: String,
+    pub to: String,
+    pub group: Option<String>,
+    pub article_num: Option<i64>,
+    pub body: String,
+    pub kind: String,
+    pub headers: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct Receipt {
+    pub mail_id: String,
+    pub session: String,
+    pub record_id: String,
+}
+
+#[derive(Default)]
+pub struct Startup {
+    pub pending: Vec<Delivery>,
+    pub receipts: Vec<Receipt>,
+}
+
+pub struct Store {
     conn: Mutex<Connection>,
     _lock: File,
 }
@@ -11,9 +36,9 @@ pub struct DaemonStore {
 fn err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
 }
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonDeliverRow> {
+fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Delivery> {
     let headers: String = r.get(8)?;
-    Ok(DaemonDeliverRow {
+    Ok(Delivery {
         mail_id: r.get(0)?,
         from: r.get(1)?,
         to: r.get(2)?,
@@ -30,8 +55,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonDeliverRow> {
         })?,
     })
 }
-impl DaemonStore {
-    pub fn open(data: &Path) -> io::Result<(Self, DaemonStartup)> {
+impl Store {
+    pub fn open(data: &Path) -> io::Result<(Self, Startup)> {
         if let Some(p) = data.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -50,7 +75,7 @@ impl DaemonStore {
             .map_err(err)?;
         if data.is_file() && !is_sqlite_file(data) && imported.as_deref() != Some("1") {
             conn.execute_batch("BEGIN IMMEDIATE").map_err(err)?;
-            super::import::maybe_import_daemon_log(data, &mut conn)?;
+            super::import::daemon_log(data, &mut conn)?;
             conn.execute_batch(
                 "INSERT OR REPLACE INTO meta VALUES ('imported_legacy','1'); COMMIT;",
             )
@@ -61,7 +86,7 @@ impl DaemonStore {
             .prepare("SELECT mail_id,session,record_id FROM unconfirmed_receipts ORDER BY seq")
             .map_err(err)?
             .query_map([], |r| {
-                Ok(DaemonReceiptRow {
+                Ok(Receipt {
                     mail_id: r.get(0)?,
                     session: r.get(1)?,
                     record_id: r.get(2)?,
@@ -75,10 +100,10 @@ impl DaemonStore {
                 conn: Mutex::new(conn),
                 _lock: lock,
             },
-            DaemonStartup { pending, receipts },
+            Startup { pending, receipts },
         ))
     }
-    pub fn insert_deliver(&self, r: &DaemonDeliverRow) -> io::Result<bool> {
+    pub fn insert_deliver(&self, r: &Delivery) -> io::Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA synchronous=FULL;")
             .map_err(err)?;
@@ -89,7 +114,7 @@ impl DaemonStore {
         tx.commit().map_err(err)?;
         Ok(changed != 0)
     }
-    pub fn pending_for_session(&self, session: &str) -> io::Result<Vec<DaemonDeliverRow>> {
+    pub fn pending_for_session(&self, session: &str) -> io::Result<Vec<Delivery>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.prepare("SELECT mail_id,sender,recipient,group_name,article_num,body,kind,seq,headers_json FROM pending_deliveries WHERE recipient=?1 ORDER BY seq").map_err(err)?.query_map([session], row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err);
         result
@@ -137,7 +162,7 @@ mod tests {
         let dir = std::env::temp_dir().join(crate::session::gen_uuid().unwrap());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("daemon");
-        let r = DaemonDeliverRow {
+        let r = Delivery {
             mail_id: "m".into(),
             from: "a".into(),
             to: "b".into(),
@@ -147,22 +172,22 @@ mod tests {
             kind: "group".into(),
             headers: crate::json::obj(vec![]),
         };
-        let (s, _) = DaemonStore::open(&path).unwrap();
+        let (s, _) = Store::open(&path).unwrap();
         assert!(s.insert_deliver(&r).unwrap());
         assert!(!s.insert_deliver(&r).unwrap());
         drop(s);
-        let (s, startup) = DaemonStore::open(&path).unwrap();
+        let (s, startup) = Store::open(&path).unwrap();
         assert_eq!(startup.pending.len(), 1);
         assert_eq!(startup.pending[0].article_num, Some(7));
         assert!(s.settle_ack("m", "b", "r").unwrap());
         assert!(!s.insert_deliver(&r).unwrap());
         drop(s);
-        let (s, startup) = DaemonStore::open(&path).unwrap();
+        let (s, startup) = Store::open(&path).unwrap();
         assert!(startup.pending.is_empty());
         assert_eq!(startup.receipts.len(), 1);
         s.confirm_receipt("m", Some("b")).unwrap();
         drop(s);
-        let (s, startup) = DaemonStore::open(&path).unwrap();
+        let (s, startup) = Store::open(&path).unwrap();
         assert!(startup.receipts.is_empty());
         drop(s);
         std::fs::remove_dir_all(dir).unwrap();

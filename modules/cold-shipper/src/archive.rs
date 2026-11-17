@@ -1,4 +1,4 @@
-use crate::format::{is_lower_hex_64, parse_day_filename, verify_cold_file};
+use crate::format::{is_lower_hex_64, parse_day, verify_file};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -47,7 +47,7 @@ impl ShipAction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShipFileReport {
+pub struct ShipFile {
     pub slice: String,
     pub day_bucket: i64,
     pub action: ShipAction,
@@ -65,7 +65,7 @@ pub struct ShipSummary {
     pub total_files: usize,
     pub total_bytes: u64,
     pub total_records: usize,
-    pub files: Vec<ShipFileReport>,
+    pub files: Vec<ShipFile>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,7 +85,7 @@ impl RestoreAction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RestoreFileReport {
+pub struct RestoreFile {
     pub slice: String,
     pub day_bucket: i64,
     pub action: RestoreAction,
@@ -99,11 +99,11 @@ pub struct RestoreSummary {
     pub slice: String,
     pub restored: usize,
     pub skipped: usize,
-    pub files: Vec<RestoreFileReport>,
+    pub files: Vec<RestoreFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VerifyFileReport {
+pub struct VerifyFile {
     pub slice: String,
     pub day_bucket: i64,
     pub status: String,
@@ -115,7 +115,7 @@ pub struct VerifyFileReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VerifyIssue {
+pub struct Issue {
     pub kind: String,
     pub file: String,
     pub detail: String,
@@ -130,8 +130,8 @@ pub struct VerifySummary {
     pub files_failed: usize,
     pub bytes: u64,
     pub records: usize,
-    pub files: Vec<VerifyFileReport>,
-    pub issues: Vec<VerifyIssue>,
+    pub files: Vec<VerifyFile>,
+    pub issues: Vec<Issue>,
 }
 
 pub fn is_safe_component(name: &str) -> bool {
@@ -244,7 +244,7 @@ fn collect_cold_dir(
         if !path.is_file() {
             continue;
         }
-        if let Some(day) = parse_day_filename(&path) {
+        if let Some(day) = parse_day(&path) {
             out.insert((slice_name.to_string(), day), path);
         }
     }
@@ -252,7 +252,7 @@ fn collect_cold_dir(
 }
 
 /// Discover `slice-*/cold/day-*.cold` and/or single-slice `cold/day-*.cold` under `slices_dir`.
-pub fn scan_slices_dir(slices_dir: &Path) -> Result<Vec<(String, i64, PathBuf)>, String> {
+pub fn scan_shards(slices_dir: &Path) -> Result<Vec<(String, i64, PathBuf)>, String> {
     let meta = fs::metadata(slices_dir).map_err(|e| {
         format!(
             "expected readable slices directory {}, saw {e}",
@@ -421,13 +421,13 @@ fn build_manifest_from_map(map: BTreeMap<(String, i64), ManifestDay>) -> Manifes
 /// mismatched files into `dest_dir/<slice>/day-<bucket>.cold` with read-only permissions,
 /// and atomically update `dest_dir/manifest.json`.
 pub fn ship(slices_dir: &Path, dest_dir: &Path) -> Result<ShipSummary, String> {
-    let candidates = scan_slices_dir(slices_dir)?;
+    let candidates = scan_shards(slices_dir)?;
 
     // Verify EVERY candidate source cold file before mutating dest_dir so any tampered
     // local cold file is rejected cleanly with zero partial archive writes.
     let mut verified_sources = Vec::with_capacity(candidates.len());
     for (slice, day_bucket, src_path) in candidates {
-        let (raw, verified) = verify_cold_file(&src_path)?;
+        let (raw, verified) = verify_file(&src_path)?;
         verified_sources.push((slice, day_bucket, raw, verified));
     }
 
@@ -463,7 +463,7 @@ pub fn ship(slices_dir: &Path, dest_dir: &Path) -> Result<ShipSummary, String> {
         let dest_file = dest_dir.join(&slice).join(format!("day-{day_bucket}.cold"));
 
         let already_matches = if dest_file.exists() {
-            match verify_cold_file(&dest_file) {
+            match verify_file(&dest_file) {
                 Ok((_, dest_verified)) => dest_verified.file_sha256 == verified.file_sha256,
                 Err(_) => false,
             }
@@ -493,7 +493,7 @@ pub fn ship(slices_dir: &Path, dest_dir: &Path) -> Result<ShipSummary, String> {
             },
         );
 
-        reports.push(ShipFileReport {
+        reports.push(ShipFile {
             slice,
             day_bucket,
             action,
@@ -554,7 +554,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
     let mut files = Vec::new();
 
     if !dest_dir.exists() {
-        issues.push(VerifyIssue {
+        issues.push(Issue {
             kind: "missing_archive".to_string(),
             file: dest_dir.display().to_string(),
             detail: format!(
@@ -576,7 +576,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
     }
 
     if !manifest_path.exists() {
-        issues.push(VerifyIssue {
+        issues.push(Issue {
             kind: "missing_manifest".to_string(),
             file: MANIFEST_FILE.to_string(),
             detail: format!(
@@ -600,7 +600,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
     let manifest = match load_manifest(dest_dir) {
         Ok(m) => m,
         Err(detail) => {
-            issues.push(VerifyIssue {
+            issues.push(Issue {
                 kind: "invalid_manifest".to_string(),
                 file: MANIFEST_FILE.to_string(),
                 detail,
@@ -640,12 +640,12 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
                     file_path.display()
                 );
                 files_failed += 1;
-                issues.push(VerifyIssue {
+                issues.push(Issue {
                     kind: "missing_file".to_string(),
                     file: entry.file.clone(),
                     detail: detail.clone(),
                 });
-                files.push(VerifyFileReport {
+                files.push(VerifyFile {
                     slice: slice.clone(),
                     day_bucket: entry.day_bucket,
                     status: "failed".to_string(),
@@ -657,15 +657,15 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
                 continue;
             }
 
-            match verify_cold_file(&file_path) {
+            match verify_file(&file_path) {
                 Err(detail) => {
                     files_failed += 1;
-                    issues.push(VerifyIssue {
+                    issues.push(Issue {
                         kind: "corrupt_file".to_string(),
                         file: entry.file.clone(),
                         detail: detail.clone(),
                     });
-                    files.push(VerifyFileReport {
+                    files.push(VerifyFile {
                         slice: slice.clone(),
                         day_bucket: entry.day_bucket,
                         status: "failed".to_string(),
@@ -706,7 +706,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
                         files_verified += 1;
                         verified_bytes += verified.byte_size;
                         verified_records += verified.record_count;
-                        files.push(VerifyFileReport {
+                        files.push(VerifyFile {
                             slice: slice.clone(),
                             day_bucket: entry.day_bucket,
                             status: "verified".to_string(),
@@ -718,12 +718,12 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
                     } else {
                         let detail = mismatches.join("; ");
                         files_failed += 1;
-                        issues.push(VerifyIssue {
+                        issues.push(Issue {
                             kind: "manifest_mismatch".to_string(),
                             file: entry.file.clone(),
                             detail: detail.clone(),
                         });
-                        files.push(VerifyFileReport {
+                        files.push(VerifyFile {
                             slice: slice.clone(),
                             day_bucket: entry.day_bucket,
                             status: "failed".to_string(),
@@ -747,7 +747,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
                     .unwrap_or(extra.as_path())
                     .display()
                     .to_string();
-                issues.push(VerifyIssue {
+                issues.push(Issue {
                     kind: "unlisted_file".to_string(),
                     file: rel.clone(),
                     detail: format!("archived cold file {rel} is absent from {MANIFEST_FILE}"),
@@ -755,7 +755,7 @@ pub fn verify_archive(dest_dir: &Path) -> VerifySummary {
             }
         }
         Err(detail) => {
-            issues.push(VerifyIssue {
+            issues.push(Issue {
                 kind: "scan_failed".to_string(),
                 file: dest_dir.display().to_string(),
                 detail,
@@ -820,7 +820,7 @@ pub fn restore(
         let archive_path = dest_dir
             .join(slice_name)
             .join(format!("day-{}.cold", entry.day_bucket));
-        let (raw, verified) = verify_cold_file(&archive_path)?;
+        let (raw, verified) = verify_file(&archive_path)?;
         if verified.file_sha256 != entry.sha256
             || verified.trailer_sha256 != entry.trailer_sha256
             || verified.byte_size != entry.bytes
@@ -852,7 +852,7 @@ pub fn restore(
     for (entry, raw) in verified_targets {
         let local_path = cold_dir.join(format!("day-{}.cold", entry.day_bucket));
         let action = if local_path.exists() {
-            let (_, local_verified) = verify_cold_file(&local_path)?;
+            let (_, local_verified) = verify_file(&local_path)?;
             if local_verified.file_sha256 != entry.sha256 {
                 return Err(format!(
                     "expected existing local cold file {} to match archived sha256 {}, saw {}",
@@ -869,7 +869,7 @@ pub fn restore(
             RestoreAction::Restored
         };
 
-        reports.push(RestoreFileReport {
+        reports.push(RestoreFile {
             slice: slice_name.to_string(),
             day_bucket: entry.day_bucket,
             action,
@@ -887,7 +887,7 @@ pub fn restore(
     })
 }
 
-pub fn format_ship_output(summary: &ShipSummary, json_out: bool) -> Result<String, String> {
+pub fn format_ship(summary: &ShipSummary, json_out: bool) -> Result<String, String> {
     if json_out {
         let v = serde_json::json!({
             "type": "ship",
@@ -926,7 +926,7 @@ pub fn format_ship_output(summary: &ShipSummary, json_out: bool) -> Result<Strin
     Ok(lines.join("\n"))
 }
 
-pub fn format_restore_output(summary: &RestoreSummary, json_out: bool) -> Result<String, String> {
+pub fn format_restore(summary: &RestoreSummary, json_out: bool) -> Result<String, String> {
     if json_out {
         let v = serde_json::json!({
             "type": "restore",
@@ -957,7 +957,7 @@ pub fn format_restore_output(summary: &RestoreSummary, json_out: bool) -> Result
     Ok(lines.join("\n"))
 }
 
-pub fn format_verify_output(summary: &VerifySummary, json_out: bool) -> Result<String, String> {
+pub fn format_verify(summary: &VerifySummary, json_out: bool) -> Result<String, String> {
     let status_word = if summary.intact { "ok" } else { "failed" };
     if json_out {
         let v = serde_json::json!({
@@ -1021,7 +1021,7 @@ pub fn watch_stdin<R: BufRead, W: Write>(
         let _trigger = line_res.map_err(|e| format!("reading trigger line from stdin: {e}"))?;
         let summary = ship(slices_dir, dest_dir)?;
         let rendered = if json_out {
-            format_ship_output(&summary, true)?
+            format_ship(&summary, true)?
         } else {
             format!(
                 "SHIP status=ok pass={} shipped={} skipped={} slices={} files={} bytes={} records={}",
@@ -1045,7 +1045,7 @@ pub fn watch_stdin<R: BufRead, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{encode_cold_bytes, sha256_hex, ColdRecord};
+    use crate::format::{encode_bytes, sha256_hex, Record};
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1062,7 +1062,7 @@ mod tests {
         if let Some(p) = path.parent() {
             fs::create_dir_all(p).unwrap();
         }
-        let rec = ColdRecord {
+        let rec = Record {
             mail: mail.to_string(),
             stream: "g:ops".to_string(),
             article: 1,
@@ -1074,7 +1074,7 @@ mod tests {
             digest: sha256_hex(body.as_bytes()),
             accepted_at_ms: Some(1_700_000_123_000),
         };
-        let bytes = encode_cold_bytes(&[rec]).unwrap();
+        let bytes = encode_bytes(&[rec]).unwrap();
         fs::write(path, &bytes).unwrap();
         bytes
     }
@@ -1090,7 +1090,7 @@ mod tests {
         )
         .unwrap();
 
-        let scanned = scan_slices_dir(&multi).unwrap();
+        let scanned = scan_shards(&multi).unwrap();
         assert_eq!(scanned.len(), 2);
         assert_eq!(scanned[0].0, "slice-00");
         assert_eq!(scanned[0].1, 19_001);
@@ -1099,7 +1099,7 @@ mod tests {
 
         let single = temp_dir("scan-single");
         write_sample_cold(&single.join("cold/day-19010.cold"), "m10", "b10");
-        let scanned_single = scan_slices_dir(&single).unwrap();
+        let scanned_single = scan_shards(&single).unwrap();
         assert_eq!(scanned_single.len(), 1);
         assert_eq!(scanned_single[0].0, "slice-00");
         assert_eq!(scanned_single[0].1, 19_010);

@@ -7,7 +7,7 @@
 
 use crate::json::{obj, s, Value};
 use crate::net::{self, Writer};
-use crate::sql::{DaemonDeliverRow, DaemonStore};
+use crate::sql::daemon::{Delivery, Store};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -39,7 +39,7 @@ struct Registration {
 }
 
 struct State {
-    store: Arc<DaemonStore>,
+    store: Arc<Store>,
     /// Receipts committed locally and not yet confirmed upstream, in commit
     /// order. Replayed after every reconnect, because the coordinator's ack
     /// handler is idempotent and a locally committed receipt that never
@@ -62,7 +62,7 @@ struct State {
 
 impl State {
     /// Nothing delivered or acked yet: what a replay starts from.
-    fn new(store: DaemonStore) -> State {
+    fn new(store: Store) -> State {
         State {
             store: Arc::new(store),
             receipts: Vec::new(),
@@ -114,7 +114,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             "expected --listen with --client-token-env, saw none",
         ));
     }
-    let (store, prior) = DaemonStore::open(&cfg.data)?;
+    let (store, prior) = Store::open(&cfg.data)?;
     let mut state = State::new(store);
     state.receipts = prior
         .receipts
@@ -559,7 +559,7 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
     let mut push: Option<(Writer, Value)> = None;
     {
         let st = state.lock().unwrap();
-        let row = DaemonDeliverRow {
+        let row = Delivery {
             mail_id: mail_id.clone(),
             from: net::field(v, "from")?.into(),
             to: net::field(v, "to")?.into(),
@@ -990,7 +990,7 @@ fn local_loop(
     Ok(())
 }
 
-fn delivery(m: &DaemonDeliverRow) -> Value {
+fn delivery(m: &Delivery) -> Value {
     let mut v = net::deliver_msg(&m.mail_id, &m.from, &m.to, &m.body, &m.kind, &m.headers);
     if let Value::Obj(pairs) = &mut v {
         if let Some(g) = &m.group {
@@ -1007,7 +1007,7 @@ mod tests {
     use super::*;
     #[test]
     fn group_delivery_fields() {
-        let m = DaemonDeliverRow {
+        let m = Delivery {
             mail_id: "m".into(),
             from: "a".into(),
             to: "b".into(),

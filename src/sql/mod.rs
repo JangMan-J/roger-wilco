@@ -19,14 +19,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub use audit_ro::{
-    has_coordinator_sqlite, has_daemon_sqlite, read_coordinator_records, read_daemon_records,
-    AuditCoordItem, AuditEnvelope, AuditReceipt, AuditTimelineRow, CoordAuditSnapshot,
-    DaemonAuditSnapshot,
-};
-pub use coord::CoordinatorStore;
-pub use daemon::DaemonStore;
-
 pub const DAY_MS: i64 = 86_400_000;
 pub const DEFAULT_RETAIN_DAYS: i64 = 30;
 pub const DEFAULT_RETAIN_MS: i64 = DEFAULT_RETAIN_DAYS * DAY_MS;
@@ -34,7 +26,7 @@ pub const DEFAULT_RETAIN_MS: i64 = DEFAULT_RETAIN_DAYS * DAY_MS;
 /// Resolve the coordinator slice root directory from `--data <path>`.
 /// Never overwrites `<path>` itself so a pre-cutover JSONL `coordinator.log`
 /// at `<path>` remains intact on disk.
-pub fn coordinator_root(data: &Path) -> PathBuf {
+pub fn coord_root(data: &Path) -> PathBuf {
     if data.is_dir() {
         if data.join("slice-00").exists()
             || data.extension().and_then(|s| s.to_str()) == Some("slices")
@@ -51,7 +43,7 @@ pub fn coordinator_root(data: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-pub fn slice_dir(root: &Path, idx: usize) -> PathBuf {
+pub fn shard_dir(root: &Path, idx: usize) -> PathBuf {
     if root.join("hot.sqlite").exists() && idx == 0 {
         return root.to_path_buf();
     }
@@ -84,27 +76,6 @@ pub fn is_sqlite_file(path: &Path) -> bool {
     f.read_exact(&mut magic).is_ok() && &magic == b"SQLite format 3\0"
 }
 
-#[derive(Clone, Debug)]
-pub struct CoordOpenConfig {
-    pub data: PathBuf,
-    pub num_slices: usize,
-    pub retain_ms: i64,
-    pub day_ms: i64,
-    pub sweep_enabled: bool,
-}
-
-impl CoordOpenConfig {
-    pub fn new(data: PathBuf) -> Self {
-        Self {
-            data,
-            num_slices: 1,
-            retain_ms: DEFAULT_RETAIN_MS,
-            day_ms: DAY_MS,
-            sweep_enabled: true,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct StoredSession {
     pub host: String,
@@ -112,15 +83,8 @@ pub struct StoredSession {
     pub declared: Option<String>,
 }
 
-#[derive(Default)]
-pub struct CoordStartup {
-    pub sessions: HashMap<String, StoredSession>,
-    pub claims: Claims,
-    pub takeover_registrations: HashSet<String>,
-}
-
 #[derive(Clone, Debug)]
-pub enum TimelineEvent {
+pub enum Event {
     Session {
         session: String,
         host: String,
@@ -163,49 +127,7 @@ pub enum TimelineEvent {
 }
 
 #[derive(Clone, Debug)]
-pub struct SendDirectedReq {
-    pub mail_id: String,
-    pub from: String,
-    pub to: String,
-    pub body: String,
-    pub headers: Option<Value>,
-    pub accepted_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SendBroadcastReq {
-    pub mail_id: String,
-    pub from: String,
-    pub recipients: Vec<String>,
-    pub body: String,
-    pub headers: Option<Value>,
-    pub accepted_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SendGroupReq {
-    pub mail_id: String,
-    pub from: String,
-    pub group: String,
-    pub body: String,
-    pub headers: Option<Value>,
-    pub accepted_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-pub enum SendStatus {
-    Committed {
-        article_num: i64,
-        subscribers: Vec<String>,
-    },
-    DuplicateAccepted {
-        article_num: i64,
-    },
-    Conflict(String),
-}
-
-#[derive(Clone, Debug)]
-pub struct PendingDelivery {
+pub struct Delivery {
     pub seq: i64,
     pub mail_id: String,
     pub from: String,
@@ -224,7 +146,7 @@ pub enum AckResult {
 }
 
 #[derive(Clone, Debug)]
-pub struct ReceiptInfo {
+pub struct Receipt {
     pub mail_id: String,
     pub from: String,
     pub to: String,
@@ -238,38 +160,13 @@ pub struct ReceiptInfo {
 }
 
 #[derive(Clone, Debug)]
-pub struct GroupSummary {
+pub struct Group {
     pub group: String,
     pub high_water: i64,
     pub subscribers: usize,
     pub position: Option<i64>,
     pub subscribed: bool,
     pub record_id: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DaemonDeliverRow {
-    pub mail_id: String,
-    pub from: String,
-    pub to: String,
-    pub group: Option<String>,
-    pub article_num: Option<i64>,
-    pub body: String,
-    pub kind: String,
-    pub headers: Value,
-}
-
-#[derive(Clone, Debug)]
-pub struct DaemonReceiptRow {
-    pub mail_id: String,
-    pub session: String,
-    pub record_id: String,
-}
-
-#[derive(Default)]
-pub struct DaemonStartup {
-    pub pending: Vec<DaemonDeliverRow>,
-    pub receipts: Vec<DaemonReceiptRow>,
 }
 
 /// Shared schema DDL for each coordinator slice `hot.sqlite` so `coord`,

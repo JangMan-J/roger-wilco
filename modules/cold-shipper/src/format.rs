@@ -11,7 +11,7 @@ pub const TRAILER_PREFIX: &str = "SHA256:";
 /// Opaque fields (`headers`, `from`, `to`, `body`) are carried and verified as raw values
 /// without inspecting any token or header entry.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ColdRecord {
+pub struct Record {
     pub mail: String,
     pub stream: String,
     pub article: i64,
@@ -27,12 +27,12 @@ pub struct ColdRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedColdFile {
+pub struct Verified {
     pub byte_size: u64,
     pub record_count: usize,
     pub file_sha256: String,
     pub trailer_sha256: String,
-    pub records: Vec<ColdRecord>,
+    pub records: Vec<Record>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -50,7 +50,7 @@ pub fn is_lower_hex_64(s: &str) -> bool {
 }
 
 /// Parse strictly canonical `day-<i64>.cold` filenames (ignoring `.tmp` or unrelated files).
-pub fn parse_day_filename(path: &Path) -> Option<i64> {
+pub fn parse_day(path: &Path) -> Option<i64> {
     if path.extension().and_then(|e| e.to_str()) != Some("cold") {
         return None;
     }
@@ -65,7 +65,7 @@ pub fn parse_day_filename(path: &Path) -> Option<i64> {
 
 /// Verify `RWCOLD01\n` header, `SHA256:<64-hex>\n` trailer digest over all preceding bytes,
 /// and every JSON record's body digest against its `body`.
-pub fn verify_cold_bytes(raw: &[u8], origin: &Path) -> Result<VerifiedColdFile, String> {
+pub fn verify_bytes(raw: &[u8], origin: &Path) -> Result<Verified, String> {
     let text = std::str::from_utf8(raw).map_err(|e| {
         format!(
             "expected UTF-8 cold file at {}, saw invalid UTF-8: {e}",
@@ -122,7 +122,7 @@ pub fn verify_cold_bytes(raw: &[u8], origin: &Path) -> Result<VerifiedColdFile, 
                 idx + 2
             ));
         }
-        let rec: ColdRecord = serde_json::from_str(line).map_err(|e| {
+        let rec: Record = serde_json::from_str(line).map_err(|e| {
             format!(
                 "expected valid JSON record at {}:{}, saw {e}",
                 origin.display(),
@@ -149,7 +149,7 @@ pub fn verify_cold_bytes(raw: &[u8], origin: &Path) -> Result<VerifiedColdFile, 
         records.push(rec);
     }
 
-    Ok(VerifiedColdFile {
+    Ok(Verified {
         byte_size: raw.len() as u64,
         record_count: records.len(),
         file_sha256: sha256_hex(raw),
@@ -158,17 +158,17 @@ pub fn verify_cold_bytes(raw: &[u8], origin: &Path) -> Result<VerifiedColdFile, 
     })
 }
 
-pub fn verify_cold_file(path: &Path) -> Result<(Vec<u8>, VerifiedColdFile), String> {
+pub fn verify_file(path: &Path) -> Result<(Vec<u8>, Verified), String> {
     let raw = fs::read(path)
         .map_err(|e| format!("expected readable cold file {}, saw {e}", path.display()))?;
-    let verified = verify_cold_bytes(&raw, path)?;
+    let verified = verify_bytes(&raw, path)?;
     Ok((raw, verified))
 }
 
 /// Encode records into the exact `RWCOLD01\n` + sorted-by-mail JSONL + `SHA256:<hex>\n`
 /// representation produced by `src/cold.rs`.
-pub fn encode_cold_bytes(records: &[ColdRecord]) -> Result<Vec<u8>, String> {
-    let mut sorted: BTreeMap<&str, &ColdRecord> = BTreeMap::new();
+pub fn encode_bytes(records: &[Record]) -> Result<Vec<u8>, String> {
+    let mut sorted: BTreeMap<&str, &Record> = BTreeMap::new();
     for rec in records {
         sorted.insert(rec.mail.as_str(), rec);
     }
@@ -191,8 +191,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn sample_rec(mail: &str, art: i64, body: &str, hdrs: Option<&str>) -> ColdRecord {
-        ColdRecord {
+    fn sample_rec(mail: &str, art: i64, body: &str, hdrs: Option<&str>) -> Record {
+        Record {
             mail: mail.to_string(),
             stream: "m:dest".to_string(),
             article: art,
@@ -217,8 +217,8 @@ mod tests {
         let mut r1 = sample_rec("m-01", 1, "first payload", None);
         r1.accepted_at_ms = None;
 
-        let encoded = encode_cold_bytes(&[r2.clone(), r1.clone()]).unwrap();
-        let verified = verify_cold_bytes(&encoded, Path::new("day-19000.cold")).unwrap();
+        let encoded = encode_bytes(&[r2.clone(), r1.clone()]).unwrap();
+        let verified = verify_bytes(&encoded, Path::new("day-19000.cold")).unwrap();
 
         assert_eq!(verified.byte_size, encoded.len() as u64);
         assert_eq!(verified.record_count, 2);
@@ -229,25 +229,25 @@ mod tests {
     #[test]
     fn rejects_bad_header_missing_trailer_and_trailer_mismatch() {
         let p = Path::new("day-19000.cold");
-        let err_hdr = verify_cold_bytes(b"RWCOLD00\nSHA256:00\n", p).unwrap_err();
+        let err_hdr = verify_bytes(b"RWCOLD00\nSHA256:00\n", p).unwrap_err();
         assert!(err_hdr.contains("RWCOLD01"), "{err_hdr}");
 
-        let err_nl = verify_cold_bytes(b"RWCOLD01\nSHA256:00", p).unwrap_err();
+        let err_nl = verify_bytes(b"RWCOLD01\nSHA256:00", p).unwrap_err();
         assert!(err_nl.contains("trailing newline"), "{err_nl}");
 
-        let err_no_trailer = verify_cold_bytes(b"RWCOLD01\n", p).unwrap_err();
+        let err_no_trailer = verify_bytes(b"RWCOLD01\n", p).unwrap_err();
         assert!(
             err_no_trailer.contains("SHA256 trailer"),
             "{err_no_trailer}"
         );
 
         let rec = sample_rec("m-01", 1, "hello", None);
-        let mut bytes = encode_cold_bytes(&[rec]).unwrap();
+        let mut bytes = encode_bytes(&[rec]).unwrap();
         let text = String::from_utf8(bytes)
             .unwrap()
             .replacen("hello", "hallo", 1);
         bytes = text.into_bytes();
-        let err_ck = verify_cold_bytes(&bytes, p).unwrap_err();
+        let err_ck = verify_bytes(&bytes, p).unwrap_err();
         assert!(err_ck.contains("checksum"), "{err_ck}");
     }
 
@@ -255,27 +255,24 @@ mod tests {
     fn rejects_tampered_record_body_digest_even_with_matching_trailer() {
         let mut rec = sample_rec("m-tamper", 1, "original body", None);
         rec.body = "modified body".to_string();
-        let forged = encode_cold_bytes(&[rec]).unwrap();
-        let err = verify_cold_bytes(&forged, Path::new("day-19001.cold")).unwrap_err();
+        let forged = encode_bytes(&[rec]).unwrap();
+        let err = verify_bytes(&forged, Path::new("day-19001.cold")).unwrap_err();
         assert!(err.contains("body digest"), "{err}");
     }
 
     #[test]
-    fn parse_day_filename_accepts_canonical_and_ignores_temp_files() {
-        assert_eq!(parse_day_filename(&PathBuf::from("day-0.cold")), Some(0));
+    fn parse_day_accepts_canonical_and_ignores_temp_files() {
+        assert_eq!(parse_day(&PathBuf::from("day-0.cold")), Some(0));
         assert_eq!(
-            parse_day_filename(&PathBuf::from("/tmp/slice-00/cold/day-19500.cold")),
+            parse_day(&PathBuf::from("/tmp/slice-00/cold/day-19500.cold")),
             Some(19_500)
         );
+        assert_eq!(parse_day(&PathBuf::from("day-19500.cold.tmp.1234")), None);
         assert_eq!(
-            parse_day_filename(&PathBuf::from("day-19500.cold.tmp.1234")),
+            parse_day(&PathBuf::from(".day-19500.cold.tmp.1234.1")),
             None
         );
-        assert_eq!(
-            parse_day_filename(&PathBuf::from(".day-19500.cold.tmp.1234.1")),
-            None
-        );
-        assert_eq!(parse_day_filename(&PathBuf::from("day-01.cold")), None);
-        assert_eq!(parse_day_filename(&PathBuf::from("day-abc.cold")), None);
+        assert_eq!(parse_day(&PathBuf::from("day-01.cold")), None);
+        assert_eq!(parse_day(&PathBuf::from("day-abc.cold")), None);
     }
 }

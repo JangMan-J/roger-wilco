@@ -4,14 +4,16 @@
 //! auditors run beside a live writer and none of them blocks it. Bodies moved
 //! to cold day files are read from the slice's sealed `cold/` files.
 
-use super::*;
-use crate::cold::ColdIndex;
+use super::{coord_root, daemon_db_path, is_sqlite_file};
+use crate::cold::Index;
+use crate::json::Value;
 use rusqlite::{Connection, OpenFlags};
+use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
-pub struct AuditTimelineRow {
+pub struct Event {
     pub seq: i64,
     pub kind: String,
     pub addr: Option<String>,
@@ -28,7 +30,7 @@ pub struct AuditTimelineRow {
 }
 
 #[derive(Clone, Debug)]
-pub struct AuditReceipt {
+pub struct Receipt {
     pub mail_id: String,
     pub reader: String,
     pub record_id: String,
@@ -37,7 +39,7 @@ pub struct AuditReceipt {
 }
 
 #[derive(Clone, Debug)]
-pub struct AuditEnvelope {
+pub struct Envelope {
     pub seq: i64,
     pub line: i64,
     pub mail_id: String,
@@ -50,47 +52,47 @@ pub struct AuditEnvelope {
     pub body_len: i64,
     pub body: Option<String>,
     pub accepted_at_ms: Option<i64>,
-    pub receipts: Vec<AuditReceipt>,
+    pub receipts: Vec<Receipt>,
     /// Readers holding a position on this envelope's stream (Group articles).
     pub subscribers: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-pub enum AuditCoordItem {
-    Timeline(AuditTimelineRow),
-    Envelope(AuditEnvelope),
+pub enum Item {
+    Timeline(Event),
+    Envelope(Envelope),
 }
 
-impl AuditCoordItem {
+impl Item {
     fn seq(&self) -> i64 {
         match self {
-            AuditCoordItem::Timeline(t) => t.seq,
-            AuditCoordItem::Envelope(e) => e.seq,
+            Item::Timeline(t) => t.seq,
+            Item::Envelope(e) => e.seq,
         }
     }
 }
 
 #[derive(Default)]
-pub struct CoordAuditSnapshot {
+pub struct Coord {
     pub record_count: usize,
-    pub items: Vec<AuditCoordItem>,
+    pub items: Vec<Item>,
 }
 
 #[derive(Default)]
-pub struct DaemonAuditSnapshot {
+pub struct Daemon {
     pub record_count: usize,
-    pub pending: Vec<(i64, DaemonDeliverRow)>,
-    pub unconfirmed_receipts: Vec<(i64, DaemonReceiptRow)>,
+    pub pending: Vec<(i64, super::daemon::Delivery)>,
+    pub unconfirmed_receipts: Vec<(i64, super::daemon::Receipt)>,
 }
 
-pub fn has_coordinator_sqlite(data: &Path) -> bool {
-    let root = coordinator_root(data);
+pub fn has_coord(data: &Path) -> bool {
+    let root = coord_root(data);
     root.join("slice-00").join("hot.sqlite").exists()
         || root.join("hot.sqlite").exists()
         || is_sqlite_file(data)
 }
 
-pub fn has_daemon_sqlite(data: &Path) -> bool {
+pub fn has_daemon(data: &Path) -> bool {
     let db = daemon_db_path(data);
     db.exists() && is_sqlite_file(&db)
 }
@@ -118,7 +120,7 @@ fn slice_dbs(data: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
         let dir = data.parent().unwrap_or(Path::new(".")).to_path_buf();
         return Ok(vec![(data.to_path_buf(), dir)]);
     }
-    let root = coordinator_root(data);
+    let root = coord_root(data);
     if root.join("hot.sqlite").exists() {
         return Ok(vec![(root.join("hot.sqlite"), root)]);
     }
@@ -138,12 +140,7 @@ fn slice_dbs(data: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
         .collect())
 }
 
-fn read_slice(
-    db: &Path,
-    dir: &Path,
-    include_bodies: bool,
-    out: &mut CoordAuditSnapshot,
-) -> io::Result<()> {
+fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> io::Result<()> {
     let conn = open_ro(db)?;
     let e = |err| sql_err(db, err);
     // One deferred read transaction: every query below sees one snapshot.
@@ -158,7 +155,7 @@ fn read_slice(
     let timeline = stmt
         .query_map([], |r| {
             let seq: i64 = r.get(0)?;
-            Ok(AuditTimelineRow {
+            Ok(Event {
                 seq,
                 kind: r.get(1)?,
                 addr: r.get(2)?,
@@ -179,7 +176,7 @@ fn read_slice(
         .map_err(e)?;
     drop(stmt);
 
-    let mut receipts: HashMap<String, Vec<AuditReceipt>> = HashMap::new();
+    let mut receipts: HashMap<String, Vec<Receipt>> = HashMap::new();
     let mut stmt = conn
         .prepare(
             "SELECT mail_id, reader, record_id, receipted_at_ms, receipt_seq, raw_line \
@@ -189,7 +186,7 @@ fn read_slice(
     let rows = stmt
         .query_map([], |r| {
             let receipt_seq: i64 = r.get(4)?;
-            Ok(AuditReceipt {
+            Ok(Receipt {
                 mail_id: r.get(0)?,
                 reader: r.get(1)?,
                 record_id: r.get(2)?,
@@ -234,7 +231,7 @@ fn read_slice(
             let stream: String = r.get(3)?;
             let mail_id: String = r.get(2)?;
             Ok((
-                AuditEnvelope {
+                Envelope {
                     seq,
                     line: r.get::<_, Option<i64>>(1)?.unwrap_or(seq),
                     receipts: receipts.remove(&mail_id).unwrap_or_default(),
@@ -263,7 +260,7 @@ fn read_slice(
     // Loaded inside the snapshot, after it is fixed: any row this snapshot
     // marks cold names a day file that was sealed before that commit.
     if include_bodies && envelopes.iter().any(|(_, _, cold)| *cold != 0) {
-        let cold = ColdIndex::load(&dir.join("cold"))?;
+        let cold = Index::load(&dir.join("cold"))?;
         for (env, day, in_cold) in envelopes.iter_mut() {
             if *in_cold != 0 {
                 env.body = cold.read_body(*day, &env.mail_id)?;
@@ -273,22 +270,15 @@ fn read_slice(
     conn.execute_batch("COMMIT").map_err(e)?;
 
     out.record_count += timeline.len() + envelopes.len() + receipt_count;
+    out.items.extend(timeline.into_iter().map(Item::Timeline));
     out.items
-        .extend(timeline.into_iter().map(AuditCoordItem::Timeline));
-    out.items.extend(
-        envelopes
-            .into_iter()
-            .map(|(env, _, _)| AuditCoordItem::Envelope(env)),
-    );
+        .extend(envelopes.into_iter().map(|(env, _, _)| Item::Envelope(env)));
     Ok(())
 }
 
 /// Timeline rows and envelopes (with their receipts, oldest first) of every
 /// slice under `data`, merged in global `seq` order.
-pub fn read_coordinator_records(
-    data: &Path,
-    include_bodies: bool,
-) -> io::Result<CoordAuditSnapshot> {
+pub fn coord(data: &Path, include_bodies: bool) -> io::Result<Coord> {
     let slices = slice_dbs(data)?;
     if slices.is_empty() {
         return Err(io::Error::new(
@@ -299,16 +289,16 @@ pub fn read_coordinator_records(
             ),
         ));
     }
-    let mut snapshot = CoordAuditSnapshot::default();
+    let mut snapshot = Coord::default();
     for (db, dir) in &slices {
         read_slice(db, dir, include_bodies, &mut snapshot)?;
     }
-    snapshot.items.sort_by_key(AuditCoordItem::seq);
+    snapshot.items.sort_by_key(Item::seq);
     Ok(snapshot)
 }
 
 /// The host daemon's pending deliveries and unconfirmed receipts, in order.
-pub fn read_daemon_records(data: &Path) -> io::Result<DaemonAuditSnapshot> {
+pub fn daemon(data: &Path) -> io::Result<Daemon> {
     let db = daemon_db_path(data);
     let conn = open_ro(&db)?;
     let e = |err| sql_err(&db, err);
@@ -324,7 +314,7 @@ pub fn read_daemon_records(data: &Path) -> io::Result<DaemonAuditSnapshot> {
             let headers: String = r.get(8)?;
             Ok((
                 r.get::<_, i64>(0)?,
-                DaemonDeliverRow {
+                super::daemon::Delivery {
                     mail_id: r.get(1)?,
                     from: r.get(2)?,
                     to: r.get(3)?,
@@ -347,7 +337,7 @@ pub fn read_daemon_records(data: &Path) -> io::Result<DaemonAuditSnapshot> {
         .query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                DaemonReceiptRow {
+                super::daemon::Receipt {
                     mail_id: r.get(1)?,
                     session: r.get(2)?,
                     record_id: r.get(3)?,
@@ -359,7 +349,7 @@ pub fn read_daemon_records(data: &Path) -> io::Result<DaemonAuditSnapshot> {
         .map_err(e)?;
     drop(stmt);
     conn.execute_batch("COMMIT").map_err(e)?;
-    Ok(DaemonAuditSnapshot {
+    Ok(Daemon {
         record_count: pending.len() + unconfirmed_receipts.len(),
         pending,
         unconfirmed_receipts,
@@ -373,9 +363,10 @@ pub fn read_daemon_records(data: &Path) -> io::Result<DaemonAuditSnapshot> {
 /// unconfirmed receipt. Returns (coordinator data path, daemon data path).
 #[cfg(test)]
 pub fn write_test_fixture(dir: &Path) -> (PathBuf, PathBuf) {
-    use crate::cold::ColdRecord;
+    use super::super::cold::Record;
+    use super::{COORD_SLICE_SCHEMA, DAEMON_SCHEMA};
     let data = dir.join("coord");
-    let slice = coordinator_root(&data).join("slice-00");
+    let slice = coord_root(&data).join("slice-00");
     std::fs::create_dir_all(&slice).unwrap();
     let conn = Connection::open(slice.join("hot.sqlite")).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
@@ -394,12 +385,12 @@ pub fn write_test_fixture(dir: &Path) -> (PathBuf, PathBuf) {
          INSERT INTO timeline(seq, kind, addr, mail_id, label) VALUES (8, 'receipt', 'r1', 'lost', 'r-9');",
     )
     .unwrap();
-    ColdIndex::load(&slice.join("cold"))
+    Index::load(&slice.join("cold"))
         .unwrap()
         .seal_day(
             &slice.join("cold"),
             0,
-            &[ColdRecord {
+            &[Record {
                 mail_id: "cold-1".into(),
                 stream: "d:r1".into(),
                 article_num: 2,

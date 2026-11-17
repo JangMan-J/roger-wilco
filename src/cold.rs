@@ -9,7 +9,7 @@
 //! Every cold file is written aside (`.tmp`), fsynced, atomically renamed into
 //! place, marked read-only, and directory-fsynced before hot bodies are removed.
 //! Reading any cold file verifies its SHA-256 trailer first, and `read_body`
-//! consults the file's in-memory `ColdFilter` before touching the filesystem.
+//! consults the file's in-memory `Filter` before touching the filesystem.
 
 use crate::durlog;
 use crate::json::{self, obj, s, Value};
@@ -25,7 +25,7 @@ pub const COLD_HEADER: &str = "RWCOLD01\n";
 const TRAILER_PREFIX: &str = "SHA256:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ColdRecord {
+pub struct Record {
     pub mail_id: String,
     pub stream: String,
     pub article_num: i64,
@@ -41,12 +41,12 @@ pub struct ColdRecord {
 /// Compact 6-probe Bloom filter over a cold day file's Mail ids.
 /// Zero false negatives; a cold file is opened on disk only on a filter hit.
 #[derive(Clone, Debug)]
-pub struct ColdFilter {
+pub struct Filter {
     bits: Vec<u64>,
     num_bits: u64,
 }
 
-impl ColdFilter {
+impl Filter {
     pub fn build<'a>(ids: impl IntoIterator<Item = &'a str>, count_hint: usize) -> Self {
         // At least 2048 bits (256 B), or ~16 bits per entry rounded up to 64-bit words.
         let words = ((count_hint.saturating_mul(16)).div_ceil(64)).max(32);
@@ -82,18 +82,18 @@ impl ColdFilter {
 }
 
 #[derive(Clone, Debug)]
-pub struct ColdDayEntry {
+pub struct Day {
     pub day_bucket: i64,
     pub path: PathBuf,
-    pub filter: ColdFilter,
+    pub filter: Filter,
 }
 
-pub struct ColdIndex {
-    days: RwLock<BTreeMap<i64, ColdDayEntry>>,
+pub struct Index {
+    days: RwLock<BTreeMap<i64, Day>>,
     opens: AtomicU64,
 }
 
-impl ColdIndex {
+impl Index {
     pub fn load(cold_dir: &Path) -> io::Result<Self> {
         let mut map = BTreeMap::new();
         if cold_dir.exists() {
@@ -106,15 +106,13 @@ impl ColdIndex {
             }
             entries.sort();
             for path in entries {
-                if let Some(day) = parse_day_filename(&path) {
-                    let records = read_cold_file(&path)?;
-                    let filter = ColdFilter::build(
-                        records.iter().map(|r| r.mail_id.as_str()),
-                        records.len(),
-                    );
+                if let Some(day) = parse_day(&path) {
+                    let records = read_file(&path)?;
+                    let filter =
+                        Filter::build(records.iter().map(|r| r.mail_id.as_str()), records.len());
                     map.insert(
                         day,
-                        ColdDayEntry {
+                        Day {
                             day_bucket: day,
                             path,
                             filter,
@@ -142,13 +140,13 @@ impl ColdIndex {
         &self,
         cold_dir: &Path,
         day_bucket: i64,
-        records: &[ColdRecord],
+        records: &[Record],
     ) -> io::Result<PathBuf> {
         fs::create_dir_all(cold_dir)?;
-        let final_path = cold_file_path(cold_dir, day_bucket);
-        let mut merged: BTreeMap<String, ColdRecord> = BTreeMap::new();
+        let final_path = file_path(cold_dir, day_bucket);
+        let mut merged: BTreeMap<String, Record> = BTreeMap::new();
         if final_path.exists() {
-            for existing in read_cold_file(&final_path)? {
+            for existing in read_file(&final_path)? {
                 merged.insert(existing.mail_id.clone(), existing);
             }
         }
@@ -195,10 +193,10 @@ impl ColdIndex {
             return Err(e);
         }
 
-        let filter = ColdFilter::build(merged.keys().map(String::as_str), merged.len());
+        let filter = Filter::build(merged.keys().map(String::as_str), merged.len());
         self.days.write().unwrap().insert(
             day_bucket,
-            ColdDayEntry {
+            Day {
                 day_bucket,
                 path: final_path.clone(),
                 filter,
@@ -209,7 +207,7 @@ impl ColdIndex {
 
     /// Look up `mail_id`'s body in `day_bucket` (or across all cold days if
     /// `day_bucket` is not in the index), opening a cold file only when its
-    /// in-memory `ColdFilter` reports a hit.
+    /// in-memory `Filter` reports a hit.
     pub fn read_body(&self, day_bucket: i64, mail_id: &str) -> io::Result<Option<String>> {
         let candidates: Vec<PathBuf> = {
             let guard = self.days.read().unwrap();
@@ -229,7 +227,7 @@ impl ColdIndex {
         };
         for path in candidates {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            let records = read_cold_file(&path)?;
+            let records = read_file(&path)?;
             for rec in records {
                 if rec.mail_id == mail_id {
                     return Ok(Some(rec.body));
@@ -240,8 +238,8 @@ impl ColdIndex {
     }
 
     /// Check exact membership of `mail_id` across all sealed cold day files,
-    /// opening a cold file on disk only when its `ColdFilter` hits.
-    pub fn find_record(&self, mail_id: &str) -> io::Result<Option<ColdRecord>> {
+    /// opening a cold file on disk only when its `Filter` hits.
+    pub fn find_record(&self, mail_id: &str) -> io::Result<Option<Record>> {
         let candidates: Vec<PathBuf> = {
             let guard = self.days.read().unwrap();
             guard
@@ -252,7 +250,7 @@ impl ColdIndex {
         };
         for path in candidates {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            for rec in read_cold_file(&path)? {
+            for rec in read_file(&path)? {
                 if rec.mail_id == mail_id {
                     return Ok(Some(rec));
                 }
@@ -271,11 +269,11 @@ impl ColdIndex {
     }
 }
 
-pub fn cold_file_path(cold_dir: &Path, day_bucket: i64) -> PathBuf {
+pub fn file_path(cold_dir: &Path, day_bucket: i64) -> PathBuf {
     cold_dir.join(format!("day-{day_bucket}.cold"))
 }
 
-pub fn parse_day_filename(path: &Path) -> Option<i64> {
+pub fn parse_day(path: &Path) -> Option<i64> {
     let stem = path.file_stem()?.to_str()?;
     let rest = stem.strip_prefix("day-")?;
     rest.parse::<i64>().ok()
@@ -283,7 +281,7 @@ pub fn parse_day_filename(path: &Path) -> Option<i64> {
 
 /// Verify the `RWCOLD01` header, the whole-payload `SHA256:` trailer, and each
 /// record's `body_sha256` before returning any record.
-pub fn read_cold_file(path: &Path) -> io::Result<Vec<ColdRecord>> {
+pub fn read_file(path: &Path) -> io::Result<Vec<Record>> {
     let raw = fs::read_to_string(path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -369,7 +367,7 @@ pub fn read_cold_file(path: &Path) -> io::Result<Vec<ColdRecord>> {
     Ok(out)
 }
 
-fn encode_record(r: &ColdRecord) -> Value {
+fn encode_record(r: &Record) -> Value {
     obj(vec![
         ("mail", s(&r.mail_id)),
         ("stream", s(&r.stream)),
@@ -408,7 +406,7 @@ fn req_str<'a>(v: &'a Value, key: &str, path: &Path) -> io::Result<&'a str> {
     })
 }
 
-fn decode_record(v: &Value, path: &Path) -> io::Result<ColdRecord> {
+fn decode_record(v: &Value, path: &Path) -> io::Result<Record> {
     let mail_id = req_str(v, "mail", path)?.to_string();
     let stream = req_str(v, "stream", path)?.to_string();
     let article_num = v.get("article").and_then(|x| x.as_i64()).ok_or_else(|| {
@@ -448,7 +446,7 @@ fn decode_record(v: &Value, path: &Path) -> io::Result<ColdRecord> {
             ))
         }
     };
-    Ok(ColdRecord {
+    Ok(Record {
         mail_id,
         stream,
         article_num,
@@ -466,8 +464,8 @@ fn decode_record(v: &Value, path: &Path) -> io::Result<ColdRecord> {
 mod tests {
     use super::*;
 
-    fn sample_record(id: &str, art: i64, body: &str) -> ColdRecord {
-        ColdRecord {
+    fn sample_record(id: &str, art: i64, body: &str) -> Record {
+        Record {
             mail_id: id.to_string(),
             stream: "m:dest".to_string(),
             article_num: art,
@@ -485,7 +483,7 @@ mod tests {
     fn seal_verify_filter_skip_and_tamper_detection() {
         let dir = std::env::temp_dir().join(format!("roger-cold-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let idx = ColdIndex::load(&dir).unwrap();
+        let idx = Index::load(&dir).unwrap();
         let recs = vec![
             sample_record("cold-m1", 1, "hello cold tier"),
             sample_record("cold-m2", 2, "second payload ✓"),

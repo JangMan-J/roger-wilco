@@ -14,7 +14,7 @@
 //! second one instead of losing or doubling the Mail.
 
 use super::*;
-use crate::cold::{ColdIndex, ColdRecord};
+use crate::cold::{Index, Record};
 use crate::json::{self, Value};
 use crate::sha256::{hash_pair, hex_digest};
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -54,8 +54,8 @@ struct QueueState {
 
 type Queue = (Mutex<QueueState>, Condvar);
 
-/// One slice's writer thread and its command queue.
-struct SliceWriter {
+/// One shard's writer thread and its command queue.
+struct Writer {
     queue: Arc<Queue>,
     commits: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
@@ -72,13 +72,13 @@ impl<R> Pending<R> {
     }
 }
 
-impl SliceWriter {
+impl Writer {
     fn spawn(conn: Connection, idx: usize) -> io::Result<Self> {
         let queue: Arc<Queue> = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
         let commits = Arc::new(AtomicU64::new(0));
         let (q, c) = (Arc::clone(&queue), Arc::clone(&commits));
         let thread = std::thread::Builder::new()
-            .name(format!("roger-slice-{idx:02}"))
+            .name(format!("roger-shard-{idx:02}"))
             .spawn(move || writer_loop(conn, &q, &c))?;
         Ok(Self {
             queue,
@@ -134,7 +134,7 @@ impl SliceWriter {
     }
 }
 
-impl Drop for SliceWriter {
+impl Drop for Writer {
     fn drop(&mut self) {
         {
             let (m, cv) = &*self.queue;
@@ -207,16 +207,86 @@ fn meta(c: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
         .optional()
 }
 
-struct Slice {
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub data: PathBuf,
+    pub num_slices: usize,
+    pub retain_ms: i64,
+    pub day_ms: i64,
+    pub sweep_enabled: bool,
+}
+
+impl Config {
+    pub fn new(data: PathBuf) -> Self {
+        Self {
+            data,
+            num_slices: 1,
+            retain_ms: DEFAULT_RETAIN_MS,
+            day_ms: DAY_MS,
+            sweep_enabled: true,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Startup {
+    pub sessions: HashMap<String, StoredSession>,
+    pub claims: Claims,
+    pub takeover_registrations: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Directed {
+    pub mail_id: String,
+    pub from: String,
+    pub to: String,
+    pub body: String,
+    pub headers: Option<Value>,
+    pub accepted_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Broadcast {
+    pub mail_id: String,
+    pub from: String,
+    pub recipients: Vec<String>,
+    pub body: String,
+    pub headers: Option<Value>,
+    pub accepted_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupMail {
+    pub mail_id: String,
+    pub from: String,
+    pub group: String,
+    pub body: String,
+    pub headers: Option<Value>,
+    pub accepted_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Status {
+    Committed {
+        article_num: i64,
+        subscribers: Vec<String>,
+    },
+    DuplicateAccepted {
+        article_num: i64,
+    },
+    Conflict(String),
+}
+
+struct Shard {
     cold_dir: PathBuf,
-    cold: Arc<ColdIndex>,
+    cold: Arc<Index>,
     read: Mutex<Connection>,
-    writer: SliceWriter,
+    writer: Writer,
 }
 
 struct Inner {
-    cfg: CoordOpenConfig,
-    slices: Vec<Slice>,
+    cfg: Config,
+    slices: Vec<Shard>,
     next_seq: AtomicI64,
     in_flight: (Mutex<HashSet<String>>, Condvar),
     last_swept_day: AtomicI64,
@@ -225,7 +295,7 @@ struct Inner {
     _lock: File,
 }
 
-pub struct CoordinatorStore {
+pub struct Store {
     inner: Arc<Inner>,
 }
 
@@ -538,7 +608,7 @@ impl Inner {
         })
     }
 
-    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<PendingDelivery> {
+    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<Delivery> {
         let body = match raw.body {
             Some(b) => b,
             None if raw.in_cold => self.slices[idx]
@@ -561,7 +631,7 @@ impl Inner {
             }
         };
         let group = raw.kind == "group";
-        Ok(PendingDelivery {
+        Ok(Delivery {
             seq: raw.seq,
             mail_id: raw.mail_id,
             from: raw.sender,
@@ -585,7 +655,7 @@ impl Inner {
         idx: usize,
         reader: &str,
         stream: Option<&str>,
-    ) -> io::Result<Vec<PendingDelivery>> {
+    ) -> io::Result<Vec<Delivery>> {
         let raws = self.read(idx, |c| {
             let mut st = c.prepare(&format!(
                 "SELECT {PENDING_COLS} FROM positions p
@@ -604,7 +674,7 @@ impl Inner {
             .collect()
     }
 
-    fn pending_for(&self, session: &str) -> io::Result<Vec<PendingDelivery>> {
+    fn pending_for(&self, session: &str) -> io::Result<Vec<Delivery>> {
         let stream = format!("m:{session}");
         let idx = self.shard(&stream);
         let raws = self.read(idx, |c| {
@@ -681,7 +751,7 @@ impl Inner {
                 let rows = st.query_map([cutoff], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
-                        ColdRecord {
+                        Record {
                             mail_id: r.get(1)?,
                             stream: r.get(2)?,
                             article_num: r.get(3)?,
@@ -700,7 +770,7 @@ impl Inner {
             if rows.is_empty() {
                 continue;
             }
-            let mut days: BTreeMap<i64, Vec<ColdRecord>> = BTreeMap::new();
+            let mut days: BTreeMap<i64, Vec<Record>> = BTreeMap::new();
             for (day, rec) in rows {
                 days.entry(day).or_default().push(rec);
             }
@@ -721,7 +791,7 @@ impl Inner {
     }
 }
 
-fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> rusqlite::Result<()> {
+fn insert_timeline(c: &Connection, seq: i64, ev: &Event, now: i64) -> rusqlite::Result<()> {
     // (kind, addr, host, old_host, label, declared, registration, claim_key, expires_ms, mail_id, at_ms)
     type Cols<'a> = (
         &'a str,
@@ -737,7 +807,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
         Option<i64>,
     );
     let cols: Cols = match ev {
-        TimelineEvent::Session {
+        Event::Session {
             session,
             host,
             at_ms,
@@ -761,7 +831,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
                 *at_ms,
             )
         }
-        TimelineEvent::Unregister { session, at_ms } => {
+        Event::Unregister { session, at_ms } => {
             c.execute("DELETE FROM live_sessions WHERE address = ?1", [session])?;
             (
                 "unregister",
@@ -777,7 +847,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
                 *at_ms,
             )
         }
-        TimelineEvent::Label {
+        Event::Label {
             session,
             label,
             at_ms,
@@ -800,7 +870,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
                 *at_ms,
             )
         }
-        TimelineEvent::Declared {
+        Event::Declared {
             session,
             declared,
             at_ms,
@@ -823,7 +893,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
                 *at_ms,
             )
         }
-        TimelineEvent::Takeover {
+        Event::Takeover {
             session,
             old_host,
             host,
@@ -842,7 +912,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
             None,
             *at_ms,
         ),
-        TimelineEvent::Claim {
+        Event::Claim {
             key,
             owner,
             expires_ms,
@@ -865,7 +935,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
                 Some(now),
             )
         }
-        TimelineEvent::Release { key } => {
+        Event::Release { key } => {
             c.execute("DELETE FROM live_claims WHERE claim_key = ?1", [key])?;
             (
                 "release",
@@ -882,7 +952,7 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
             )
         }
         // A receipt for Mail the coordinator never accepted: the record id rides in `label`.
-        TimelineEvent::StrayReceipt {
+        Event::StrayReceipt {
             mail_id,
             session,
             record_id,
@@ -908,8 +978,8 @@ fn insert_timeline(c: &Connection, seq: i64, ev: &TimelineEvent, now: i64) -> ru
     Ok(())
 }
 
-fn load_startup(c: &Connection) -> rusqlite::Result<CoordStartup> {
-    let mut out = CoordStartup::default();
+fn load_startup(c: &Connection) -> rusqlite::Result<Startup> {
+    let mut out = Startup::default();
     let mut st = c.prepare("SELECT address, host, label, declared FROM live_sessions")?;
     let rows = st.query_map([], |r| {
         Ok((
@@ -961,8 +1031,8 @@ fn max_seq(c: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
-impl CoordinatorStore {
-    pub fn open(cfg: CoordOpenConfig) -> io::Result<(Self, CoordStartup)> {
+impl Store {
+    pub fn open(cfg: Config) -> io::Result<(Self, Startup)> {
         if cfg.num_slices == 0 || cfg.day_ms <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -972,13 +1042,13 @@ impl CoordinatorStore {
                 ),
             ));
         }
-        let root = coordinator_root(&cfg.data);
+        let root = coord_root(&cfg.data);
         fs::create_dir_all(&root)?;
         let lock = crate::durlog::open_exclusive_lock(&root.join("LOCK"))?;
         let mut dirs = Vec::with_capacity(cfg.num_slices);
         let mut conns = Vec::with_capacity(cfg.num_slices);
         for idx in 0..cfg.num_slices {
-            let dir = slice_dir(&root, idx);
+            let dir = shard_dir(&root, idx);
             fs::create_dir_all(dir.join("cold"))?;
             conns.push(open_conn(&dir.join("hot.sqlite"), true)?);
             dirs.push(dir);
@@ -986,7 +1056,7 @@ impl CoordinatorStore {
         if cfg.data.is_file()
             && !is_sqlite_file(&cfg.data)
             && meta(&conns[0], "imported_legacy").map_err(sq)?.as_deref() != Some("1")
-            && super::import::maybe_import_coordinator_log(&cfg.data, &mut conns)?
+            && super::import::coord_log(&cfg.data, &mut conns)?
         {
             conns[0]
                 .execute(
@@ -1003,11 +1073,11 @@ impl CoordinatorStore {
         let mut slices = Vec::with_capacity(cfg.num_slices);
         for (idx, (conn, dir)) in conns.into_iter().zip(dirs).enumerate() {
             let cold_dir = dir.join("cold");
-            slices.push(Slice {
-                cold: Arc::new(ColdIndex::load(&cold_dir)?),
+            slices.push(Shard {
+                cold: Arc::new(Index::load(&cold_dir)?),
                 cold_dir,
                 read: Mutex::new(open_conn(&dir.join("hot.sqlite"), false)?),
-                writer: SliceWriter::spawn(conn, idx)?,
+                writer: Writer::spawn(conn, idx)?,
             });
         }
         let inner = Inner {
@@ -1028,9 +1098,8 @@ impl CoordinatorStore {
         ))
     }
 
-    pub fn commit_timeline(&self, events: Vec<TimelineEvent>, now_ms: i64) -> io::Result<()> {
-        let rows: Vec<(i64, TimelineEvent)> =
-            events.into_iter().map(|e| (self.inner.seq(), e)).collect();
+    pub fn commit_timeline(&self, events: Vec<Event>, now_ms: i64) -> io::Result<()> {
+        let rows: Vec<(i64, Event)> = events.into_iter().map(|e| (self.inner.seq(), e)).collect();
         self.inner.slices[0].writer.exec(move |c| {
             for (seq, ev) in &rows {
                 insert_timeline(c, *seq, ev, now_ms)?;
@@ -1107,7 +1176,7 @@ impl CoordinatorStore {
         }
     }
 
-    pub fn send_directed(&self, req: SendDirectedReq) -> io::Result<SendStatus> {
+    pub fn send_directed(&self, req: Directed) -> io::Result<Status> {
         self.send_single(
             req.mail_id,
             req.from,
@@ -1119,7 +1188,7 @@ impl CoordinatorStore {
         )
     }
 
-    pub fn send_group(&self, req: SendGroupReq) -> io::Result<SendStatus> {
+    pub fn send_group(&self, req: GroupMail) -> io::Result<Status> {
         self.send_single(
             req.mail_id,
             req.from,
@@ -1141,7 +1210,7 @@ impl CoordinatorStore {
         headers: Option<Value>,
         accepted_at_ms: Option<i64>,
         group: bool,
-    ) -> io::Result<SendStatus> {
+    ) -> io::Result<Status> {
         let inner = &self.inner;
         let _flight = inner.hold(&mail_id);
         let kind = if group { "group" } else { "directed" };
@@ -1150,14 +1219,14 @@ impl CoordinatorStore {
         let (seen, bcast) = inner.seen(&mail_id)?;
         if let Some(s) = seen {
             return Ok(match s.differs(kind, &from, Some(&target), len, &sha) {
-                None => SendStatus::DuplicateAccepted {
+                None => Status::DuplicateAccepted {
                     article_num: s.article_num,
                 },
-                Some(w) => SendStatus::Conflict(resend_refusal(&mail_id, &w)),
+                Some(w) => Status::Conflict(resend_refusal(&mail_id, &w)),
             });
         }
         if bcast.is_some() {
-            return Ok(SendStatus::Conflict(resend_refusal(&mail_id, "recipient")));
+            return Ok(Status::Conflict(resend_refusal(&mail_id, "recipient")));
         }
         let env = NewEnvelope {
             seq: inner.seq(),
@@ -1183,8 +1252,8 @@ impl CoordinatorStore {
             body_sha256: sha,
         };
         let status = match self.write_single(env, seen)? {
-            Err(w) => return Ok(SendStatus::Conflict(resend_refusal(&mail_id, &w))),
-            Ok((article_num, subscribers)) => SendStatus::Committed {
+            Err(w) => return Ok(Status::Conflict(resend_refusal(&mail_id, &w))),
+            Ok((article_num, subscribers)) => Status::Committed {
                 article_num,
                 subscribers,
             },
@@ -1194,7 +1263,7 @@ impl CoordinatorStore {
         Ok(status)
     }
 
-    pub fn send_broadcast(&self, req: SendBroadcastReq) -> io::Result<SendStatus> {
+    pub fn send_broadcast(&self, req: Broadcast) -> io::Result<Status> {
         let inner = &self.inner;
         let _flight = inner.hold(&req.mail_id);
         let sha = hex_digest(req.body.as_bytes());
@@ -1202,15 +1271,12 @@ impl CoordinatorStore {
         let (seen, bcast) = inner.seen(&req.mail_id)?;
         if let Some(b) = bcast {
             return Ok(match b.differs("broadcast", &req.from, None, len, &sha) {
-                None => SendStatus::DuplicateAccepted { article_num: 0 },
-                Some(w) => SendStatus::Conflict(resend_refusal(&req.mail_id, &w)),
+                None => Status::DuplicateAccepted { article_num: 0 },
+                Some(w) => Status::Conflict(resend_refusal(&req.mail_id, &w)),
             });
         }
         if seen.is_some() {
-            return Ok(SendStatus::Conflict(resend_refusal(
-                &req.mail_id,
-                "recipient",
-            )));
+            return Ok(Status::Conflict(resend_refusal(&req.mail_id, "recipient")));
         }
         let headers_json = req.headers.as_ref().map(json::stringify);
         let n = inner.slices.len();
@@ -1223,7 +1289,7 @@ impl CoordinatorStore {
             // partial write; anything else under the copy id is a conflict.
             if let Some(s) = copy_seen {
                 if let Some(w) = s.differs("broadcast", &req.from, Some(rcpt), len, &sha) {
-                    return Ok(SendStatus::Conflict(resend_refusal(&copy, &w)));
+                    return Ok(Status::Conflict(resend_refusal(&copy, &w)));
                 }
             }
             let stream = format!("m:{rcpt}");
@@ -1275,7 +1341,7 @@ impl CoordinatorStore {
             }
         }
         if let Some(c) = conflict {
-            return Ok(SendStatus::Conflict(c));
+            return Ok(Status::Conflict(c));
         }
         // Phase 2: Mail-id records for every copy, then the broadcast itself.
         let bseq = inner.seq();
@@ -1325,13 +1391,13 @@ impl CoordinatorStore {
         }
         drop(_flight);
         self.after_send(req.accepted_at_ms);
-        Ok(SendStatus::Committed {
+        Ok(Status::Committed {
             article_num: 0,
             subscribers: req.recipients,
         })
     }
 
-    pub fn record_ack(
+    pub fn ack(
         &self,
         mail_id: &str,
         session: &str,
@@ -1380,11 +1446,11 @@ impl CoordinatorStore {
         })
     }
 
-    pub fn pending_for_session(&self, session: &str) -> io::Result<Vec<PendingDelivery>> {
+    pub fn pending_session(&self, session: &str) -> io::Result<Vec<Delivery>> {
         self.inner.pending_for(session)
     }
 
-    pub fn pending_for_host(&self, sessions: &[String]) -> io::Result<Vec<PendingDelivery>> {
+    pub fn pending_host(&self, sessions: &[String]) -> io::Result<Vec<Delivery>> {
         let mut out = Vec::new();
         for s in sessions {
             out.extend(self.inner.pending_for(s)?);
@@ -1393,11 +1459,7 @@ impl CoordinatorStore {
         Ok(out)
     }
 
-    pub fn query_receipt(
-        &self,
-        mail_id: &str,
-        reader: Option<&str>,
-    ) -> io::Result<Option<ReceiptInfo>> {
+    pub fn receipt(&self, mail_id: &str, reader: Option<&str>) -> io::Result<Option<Receipt>> {
         let inner = &self.inner;
         let Some((
             idx,
@@ -1426,7 +1488,7 @@ impl CoordinatorStore {
             Some((r, at)) => (Some(r), at),
             None => (None, None),
         };
-        Ok(Some(ReceiptInfo {
+        Ok(Some(Receipt {
             mail_id: mail_id.to_string(),
             from: sender,
             to: recipient.clone(),
@@ -1440,14 +1502,14 @@ impl CoordinatorStore {
         }))
     }
 
-    pub fn subscribe_group(
+    pub fn subscribe(
         &self,
         session: &str,
         group: &str,
         after_article: Option<i64>,
         from_latest: bool,
         now_ms: i64,
-    ) -> io::Result<(i64, i64, Vec<PendingDelivery>)> {
+    ) -> io::Result<(i64, i64, Vec<Delivery>)> {
         let inner = &self.inner;
         let stream = format!("g:{group}");
         let idx = inner.shard(&stream);
@@ -1485,7 +1547,7 @@ impl CoordinatorStore {
         Ok((position, high_water, pending))
     }
 
-    pub fn unsubscribe_group(&self, session: &str, group: &str, now_ms: i64) -> io::Result<i64> {
+    pub fn unsubscribe(&self, session: &str, group: &str, now_ms: i64) -> io::Result<i64> {
         let stream = format!("g:{group}");
         let idx = self.inner.shard(&stream);
         let reader = session.to_string();
@@ -1504,7 +1566,7 @@ impl CoordinatorStore {
         })
     }
 
-    pub fn list_groups(&self, session: Option<&str>) -> io::Result<Vec<GroupSummary>> {
+    pub fn groups(&self, session: Option<&str>) -> io::Result<Vec<Group>> {
         let mut out = Vec::new();
         for idx in 0..self.inner.slices.len() {
             out.extend(self.inner.read(idx, |c| {
@@ -1518,7 +1580,7 @@ impl CoordinatorStore {
                 )?;
                 let rows = st.query_map([session], |r| {
                     let stream: String = r.get(0)?;
-                    Ok(GroupSummary {
+                    Ok(Group {
                         group: stream.strip_prefix("g:").unwrap_or(&stream).to_string(),
                         high_water: r.get(1)?,
                         subscribers: r.get::<_, i64>(2)? as usize,
@@ -1535,7 +1597,7 @@ impl CoordinatorStore {
     }
 
     /// Wait for every background sweep started so far, then sweep once more now.
-    pub fn flush_cold_sweeps_for_test(&self) -> io::Result<()> {
+    pub fn flush_cold(&self) -> io::Result<()> {
         let handles = std::mem::take(&mut *self.inner.sweeps.lock().unwrap());
         for h in handles {
             let _ = h.join();
@@ -1566,13 +1628,13 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         TempDir(p)
     }
-    fn cfg(dir: &TempDir, slices: usize) -> CoordOpenConfig {
-        let mut c = CoordOpenConfig::new(dir.0.join("coordinator.db"));
+    fn cfg(dir: &TempDir, slices: usize) -> Config {
+        let mut c = Config::new(dir.0.join("coordinator.db"));
         c.num_slices = slices;
         c
     }
-    fn directed(id: &str, from: &str, to: &str, body: &str) -> SendDirectedReq {
-        SendDirectedReq {
+    fn directed(id: &str, from: &str, to: &str, body: &str) -> Directed {
+        Directed {
             mail_id: id.into(),
             from: from.into(),
             to: to.into(),
@@ -1581,8 +1643,8 @@ mod tests {
             accepted_at_ms: Some(now_ms()),
         }
     }
-    fn group(id: &str, from: &str, g: &str, body: &str) -> SendGroupReq {
-        SendGroupReq {
+    fn group(id: &str, from: &str, g: &str, body: &str) -> GroupMail {
+        GroupMail {
             mail_id: id.into(),
             from: from.into(),
             group: g.into(),
@@ -1591,8 +1653,8 @@ mod tests {
             accepted_at_ms: Some(now_ms()),
         }
     }
-    fn bcast(id: &str, from: &str, to: &[&str], body: &str) -> SendBroadcastReq {
-        SendBroadcastReq {
+    fn bcast(id: &str, from: &str, to: &[&str], body: &str) -> Broadcast {
+        Broadcast {
             mail_id: id.into(),
             from: from.into(),
             recipients: to.iter().map(|s| s.to_string()).collect(),
@@ -1601,21 +1663,21 @@ mod tests {
             accepted_at_ms: Some(now_ms()),
         }
     }
-    fn count(store: &CoordinatorStore, idx: usize, sql: &str) -> i64 {
+    fn count(store: &Store, idx: usize, sql: &str) -> i64 {
         store
             .inner
             .read(idx, |c| c.query_row(sql, [], |r| r.get(0)))
             .unwrap()
     }
-    fn committed(s: SendStatus) -> i64 {
+    fn committed(s: Status) -> i64 {
         match s {
-            SendStatus::Committed { article_num, .. } => article_num,
+            Status::Committed { article_num, .. } => article_num,
             other => panic!("expected Committed, saw {other:?}"),
         }
     }
-    fn conflict(s: SendStatus) -> String {
+    fn conflict(s: Status) -> String {
         match s {
-            SendStatus::Conflict(r) => r,
+            Status::Conflict(r) => r,
             other => panic!("expected Conflict, saw {other:?}"),
         }
     }
@@ -1623,7 +1685,7 @@ mod tests {
     #[test]
     fn queued_sends_commit_in_one_transaction_and_answer_after_it() {
         let dir = tempdir("batch");
-        let (store, _) = CoordinatorStore::open(cfg(&dir, 1)).unwrap();
+        let (store, _) = Store::open(cfg(&dir, 1)).unwrap();
         let store = Arc::new(store);
         let w = &store.inner.slices[0].writer;
         let (entered_tx, entered_rx) = sync_channel::<()>(1);
@@ -1665,14 +1727,14 @@ mod tests {
             2,
             "gate transaction plus one group commit for all eight sends"
         );
-        assert_eq!(store.pending_for_session("r").unwrap().len(), 8);
+        assert_eq!(store.pending_session("r").unwrap().len(), 8);
     }
 
     #[test]
     fn mail_ids_are_never_reused_across_kinds_slices_or_restarts() {
         let dir = tempdir("ids");
         for round in 0..2 {
-            let (store, _) = CoordinatorStore::open(cfg(&dir, 4)).unwrap();
+            let (store, _) = Store::open(cfg(&dir, 4)).unwrap();
             let r = store
                 .send_directed(directed("m1", "a", "b", "hello"))
                 .unwrap();
@@ -1680,7 +1742,7 @@ mod tests {
                 assert_eq!(committed(r), 1);
             } else {
                 assert!(
-                    matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                    matches!(r, Status::DuplicateAccepted { article_num: 1 }),
                     "{r:?}"
                 );
             }
@@ -1688,7 +1750,7 @@ mod tests {
                 .send_directed(directed("m1", "a", "b", "hello"))
                 .unwrap();
             assert!(
-                matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                matches!(r, Status::DuplicateAccepted { article_num: 1 }),
                 "{r:?}"
             );
             let c = conflict(
@@ -1719,7 +1781,7 @@ mod tests {
             if round == 0 {
                 committed(r);
             } else {
-                assert!(matches!(r, SendStatus::DuplicateAccepted { .. }), "{r:?}");
+                assert!(matches!(r, Status::DuplicateAccepted { .. }), "{r:?}");
             }
             conflict(
                 store
@@ -1743,7 +1805,7 @@ mod tests {
             }
             let r = store.send_group(group("g1", "a", "G", "post")).unwrap();
             assert!(
-                matches!(r, SendStatus::DuplicateAccepted { article_num: 1 }),
+                matches!(r, Status::DuplicateAccepted { article_num: 1 }),
                 "{r:?}"
             );
             conflict(store.send_group(group("g1", "z", "G", "post")).unwrap());
@@ -1753,7 +1815,7 @@ mod tests {
                     .unwrap(),
             );
 
-            assert_eq!(store.pending_for_session("b").unwrap().len(), 1);
+            assert_eq!(store.pending_session("b").unwrap().len(), 1);
             let total: i64 = (0..4)
                 .map(|i| count(&store, i, "SELECT COUNT(*) FROM envelopes"))
                 .sum();
@@ -1767,10 +1829,8 @@ mod tests {
         let mut c = cfg(&dir, 2);
         c.retain_ms = 60_000;
         c.day_ms = 1_000;
-        let (store, _) = CoordinatorStore::open(c).unwrap();
-        store
-            .subscribe_group("reader", "G", None, false, 1)
-            .unwrap();
+        let (store, _) = Store::open(c).unwrap();
+        store.subscribe("reader", "G", None, false, 1).unwrap();
         let mut old = directed("old", "s", "a", "ancient body");
         old.accepted_at_ms = Some(5_000);
         committed(store.send_directed(old).unwrap());
@@ -1782,7 +1842,7 @@ mod tests {
                 .send_directed(directed("new", "s", "a", "fresh body"))
                 .unwrap(),
         );
-        store.flush_cold_sweeps_for_test().unwrap();
+        store.flush_cold().unwrap();
 
         let cold: i64 = (0..2)
             .map(|i| {
@@ -1807,44 +1867,41 @@ mod tests {
             .iter()
             .any(|s| s.cold_dir.join("day-5.cold").exists()));
 
-        let a = store.pending_for_session("a").unwrap();
+        let a = store.pending_session("a").unwrap();
         let bodies: Vec<&str> = a.iter().map(|p| p.body.as_str()).collect();
         assert_eq!(bodies, ["ancient body", "fresh body"]);
-        let r = store.pending_for_session("reader").unwrap();
+        let r = store.pending_session("reader").unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].body, "ancient post");
         assert_eq!(r[0].group.as_deref(), Some("G"));
 
         // A late subscriber restores the cold article too.
-        let (_, hw, late) = store.subscribe_group("late", "G", None, false, 2).unwrap();
+        let (_, hw, late) = store.subscribe("late", "G", None, false, 2).unwrap();
         assert_eq!(hw, 1);
         assert_eq!(late[0].body, "ancient post");
         drop(store);
-        let (store, _) = CoordinatorStore::open({
+        let (store, _) = Store::open({
             let mut c = cfg(&dir, 2);
             c.day_ms = 1_000;
             c
         })
         .unwrap();
-        assert_eq!(
-            store.pending_for_session("a").unwrap()[0].body,
-            "ancient body"
-        );
+        assert_eq!(store.pending_session("a").unwrap()[0].body, "ancient body");
     }
 
     #[test]
     fn group_article_has_one_body_and_one_position_per_reader() {
         let dir = tempdir("group");
-        let (store, _) = CoordinatorStore::open(cfg(&dir, 3)).unwrap();
+        let (store, _) = Store::open(cfg(&dir, 3)).unwrap();
         for r in ["r1", "r2"] {
-            assert_eq!(store.subscribe_group(r, "G", None, false, 1).unwrap().0, 0);
+            assert_eq!(store.subscribe(r, "G", None, false, 1).unwrap().0, 0);
         }
         committed(store.send_group(group("p1", "s", "G", "one")).unwrap());
-        let (pos, hw, pend) = store.subscribe_group("r3", "G", None, true, 2).unwrap();
+        let (pos, hw, pend) = store.subscribe("r3", "G", None, true, 2).unwrap();
         assert_eq!((pos, hw, pend.len()), (1, 1, 0));
         committed(store.send_group(group("p2", "s", "G", "two")).unwrap());
         match store.send_group(group("p3", "s", "G", "three")).unwrap() {
-            SendStatus::Committed {
+            Status::Committed {
                 article_num,
                 subscribers,
             } => {
@@ -1859,7 +1916,7 @@ mod tests {
 
         let pos = |r: &str| {
             store
-                .list_groups(Some(r))
+                .groups(Some(r))
                 .unwrap()
                 .into_iter()
                 .find(|g| g.group == "G")
@@ -1868,29 +1925,29 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            store.record_ack("p2", "r1", "r-2", 10).unwrap(),
+            store.ack("p2", "r1", "r-2", 10).unwrap(),
             AckResult::Recorded {
                 newly_receipted: true
             }
         );
         assert_eq!(pos("r1"), 0, "a gap holds the position");
-        store.record_ack("p1", "r1", "r-1", 11).unwrap();
+        store.ack("p1", "r1", "r-1", 11).unwrap();
         assert_eq!(pos("r1"), 2);
         assert_eq!(
-            store.record_ack("p1", "r1", "r-9", 12).unwrap(),
+            store.ack("p1", "r1", "r-9", 12).unwrap(),
             AckResult::Recorded {
                 newly_receipted: false
             }
         );
-        store.record_ack("p1", "r2", "r-1", 13).unwrap();
+        store.ack("p1", "r2", "r-1", 13).unwrap();
         assert_eq!(pos("r2"), 1);
         assert_eq!(
-            store.record_ack("nope", "r1", "r-1", 1).unwrap(),
+            store.ack("nope", "r1", "r-1", 1).unwrap(),
             AckResult::UnknownMail
         );
         let arts = |r: &str| -> Vec<i64> {
             store
-                .pending_for_session(r)
+                .pending_session(r)
                 .unwrap()
                 .iter()
                 .map(|p| p.article_num.unwrap())
@@ -1899,21 +1956,19 @@ mod tests {
         assert_eq!(arts("r1"), [3]);
         assert_eq!(arts("r2"), [2, 3]);
         assert_eq!(arts("r3"), [2, 3]);
-        let q = store.query_receipt("p1", Some("r1")).unwrap().unwrap();
+        let q = store.receipt("p1", Some("r1")).unwrap().unwrap();
         assert_eq!(
             (q.record_id.as_deref(), q.group.as_deref()),
             (Some("r-1"), Some("G"))
         );
 
-        assert_eq!(store.unsubscribe_group("r3", "G", 20).unwrap(), 1);
+        assert_eq!(store.unsubscribe("r3", "G", 20).unwrap(), 1);
         assert!(arts("r3").is_empty());
-        let g = &store.list_groups(None).unwrap()[0];
+        let g = &store.groups(None).unwrap()[0];
         assert_eq!((g.high_water, g.subscribers), (3, 2));
-        let (p, _, back) = store.subscribe_group("r3", "G", None, false, 21).unwrap();
+        let (p, _, back) = store.subscribe("r3", "G", None, false, 21).unwrap();
         assert_eq!((p, back.len()), (1, 2), "re-subscribe keeps the position");
-        let (_, _, all) = store
-            .subscribe_group("r3", "G", Some(0), false, 22)
-            .unwrap();
+        let (_, _, all) = store.subscribe("r3", "G", Some(0), false, 22).unwrap();
         assert_eq!(all.len(), 3);
     }
 
@@ -1923,7 +1978,7 @@ mod tests {
         let n = 4;
         let addrs: Vec<String> = (0..24).map(|i| format!("[[x:{i}]]addr-{i}")).collect();
         {
-            let (store, _) = CoordinatorStore::open(cfg(&dir, n)).unwrap();
+            let (store, _) = Store::open(cfg(&dir, n)).unwrap();
             for (i, a) in addrs.iter().enumerate() {
                 committed(
                     store
@@ -1960,8 +2015,8 @@ mod tests {
             }
             assert!(used.len() > 1, "streams spread over slices");
         }
-        let (store, _) = CoordinatorStore::open(cfg(&dir, n)).unwrap();
-        let all = store.pending_for_host(&addrs).unwrap();
+        let (store, _) = Store::open(cfg(&dir, n)).unwrap();
+        let all = store.pending_host(&addrs).unwrap();
         assert_eq!(all.len(), addrs.len());
         assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
         let top = all.last().unwrap().seq;
@@ -1970,14 +2025,14 @@ mod tests {
                 .send_directed(directed("after", "s", &addrs[0], "x"))
                 .unwrap(),
         );
-        let p = store.pending_for_session(&addrs[0]).unwrap();
+        let p = store.pending_session(&addrs[0]).unwrap();
         assert!(
             p.last().unwrap().seq > top,
             "sequence continues after reopen"
         );
-        store.record_ack("id-0", &addrs[0], "r-1", 5).unwrap();
-        assert_eq!(store.pending_for_session(&addrs[0]).unwrap().len(), 1);
-        let q = store.query_receipt("id-0", None).unwrap().unwrap();
+        store.ack("id-0", &addrs[0], "r-1", 5).unwrap();
+        assert_eq!(store.pending_session(&addrs[0]).unwrap().len(), 1);
+        let q = store.receipt("id-0", None).unwrap().unwrap();
         assert_eq!(q.record_id.as_deref(), Some("r-1"));
     }
 
@@ -1985,50 +2040,47 @@ mod tests {
     fn timeline_reloads_sessions_claims_and_takeovers_under_one_lock() {
         let dir = tempdir("timeline");
         {
-            let (store, _) = CoordinatorStore::open(cfg(&dir, 2)).unwrap();
-            assert!(
-                CoordinatorStore::open(cfg(&dir, 2)).is_err(),
-                "second open is refused"
-            );
+            let (store, _) = Store::open(cfg(&dir, 2)).unwrap();
+            assert!(Store::open(cfg(&dir, 2)).is_err(), "second open is refused");
             store
                 .commit_timeline(
                     vec![
-                        TimelineEvent::Session {
+                        Event::Session {
                             session: "a".into(),
                             host: "h1".into(),
                             at_ms: Some(1),
                         },
-                        TimelineEvent::Label {
+                        Event::Label {
                             session: "a".into(),
                             label: "L".into(),
                             at_ms: Some(2),
                         },
-                        TimelineEvent::Declared {
+                        Event::Declared {
                             session: "a".into(),
                             declared: Some("d".into()),
                             at_ms: Some(3),
                         },
-                        TimelineEvent::Session {
+                        Event::Session {
                             session: "b".into(),
                             host: "h1".into(),
                             at_ms: Some(4),
                         },
-                        TimelineEvent::Unregister {
+                        Event::Unregister {
                             session: "b".into(),
                             at_ms: Some(5),
                         },
-                        TimelineEvent::Claim {
+                        Event::Claim {
                             key: "k".into(),
                             owner: "a".into(),
                             expires_ms: 1_000,
                         },
-                        TimelineEvent::Claim {
+                        Event::Claim {
                             key: "k2".into(),
                             owner: "a".into(),
                             expires_ms: 1_000,
                         },
-                        TimelineEvent::Release { key: "k2".into() },
-                        TimelineEvent::Takeover {
+                        Event::Release { key: "k2".into() },
+                        Event::Takeover {
                             session: "a".into(),
                             old_host: "h1".into(),
                             host: "h2".into(),
@@ -2040,7 +2092,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (_store, st) = CoordinatorStore::open(cfg(&dir, 2)).unwrap();
+        let (_store, st) = Store::open(cfg(&dir, 2)).unwrap();
         let a = &st.sessions["a"];
         assert_eq!(
             (a.host.as_str(), a.label.as_str(), a.declared.as_deref()),
