@@ -763,7 +763,7 @@ json_obj() { # json_obj key=value...: the headers as one JSON object, keys in th
 header_source_search() {
   local root="${1:-$ROOT}" m f hits="" mod_hits path_hits
   local key='"(sig|kid|seq|sent_at_ms|body_sha256)"|HEADERS[])]*(\.(get|get_mut|contains_key|remove)\(|\[)[[:space:]]*"|HEADERS[])]*\.and_then\([^;]*\.(get|contains_key)\([[:space:]]*"|(^|[^.[:alnum:]_])headers\b[^;]*\.(get|get_mut|contains_key|remove)\([[:space:]]*"'
-  local transport='\.get\([[:space:]]*"(mcp-session-id|last-event-id|authorization|content-length|content-type|accept|host|upgrade|connection|origin|sec-websocket-[a-z-]+)"'
+  local transport='\.get\([[:space:]]*"(mcp-session-id|last-event-id|mcp-protocol-version|mcp-method|mcp-name|x-roger-[a-z-]+|authorization|content-length|content-type|accept|host|upgrade|connection|origin|sec-websocket-[a-z-]+)"'
   local delivery='\b(TcpStream|TcpListener|UnixStream|UnixListener|UdpSocket|Command::new|File::create|OpenOptions|fs::write|fs::rename|fs::remove_file|fs::create_dir|tokio|hyper|axum|tungstenite|reqwest|mio)\b'
   src_of() { # non-test source lines as path:line:text, the literal "headers" folded to HEADERS
     local f

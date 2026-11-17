@@ -1,8 +1,10 @@
-//! Streamable HTTP + Server-Sent Events (SSE) push gateway service over HTTP/1.1 and HTTP/2 (`h2c`).
+//! MCP `2026-07-28` sessionless Streamable HTTP + SEP-3415 SSE push gateway
+//! over HTTP/1.1 and HTTP/2 (`h2c`).
 
 use crate::cli::{constant_time_eq, write_port_file, Config};
-use crate::mcp::{self, Parsed};
-use crate::session::{GatewaySession, InitParams, SessionManager};
+use crate::durlog::{blocking_io, read_store_entries};
+use crate::mcp::{self, Parsed, RpcErr, ValidatedEventReq};
+use crate::session::SessionManager;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -11,28 +13,35 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
-use tokio::sync::futures::OwnedNotified;
+use tokio::sync::{mpsc, watch};
+// no-poll: Instant bounds SEP-3415 stream heartbeat and subscriptions/listen keepalive.
+use tokio::time::{Duration, Instant};
 
 /// 16 MiB limit on `POST <endpoint>` bodies.
 pub const MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const LISTEN_KEEPALIVE_SECS: u64 = 30;
 
 pub struct GatewayState {
     pub endpoint: String,
+    pub bind_loopback: bool,
     pub bearer_token: Option<String>,
     pub sessions: Arc<SessionManager>,
+    pub shutdown_rx: watch::Receiver<bool>,
 }
 
 pub enum GatewayBody {
     Full(Full<Bytes>),
-    Sse(SseBody),
+    Stream(SseStreamBody),
 }
 
 impl Body for GatewayBody {
@@ -45,90 +54,52 @@ impl Body for GatewayBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
             GatewayBody::Full(full) => Pin::new(full).poll_frame(cx),
-            GatewayBody::Sse(sse) => Pin::new(sse).poll_frame(cx),
+            GatewayBody::Stream(stream) => Pin::new(stream).poll_frame(cx),
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
             GatewayBody::Full(full) => full.is_end_stream(),
-            GatewayBody::Sse(_) => false,
+            GatewayBody::Stream(_) => false,
         }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         match self {
             GatewayBody::Full(full) => full.size_hint(),
-            GatewayBody::Sse(_) => hyper::body::SizeHint::default(),
+            GatewayBody::Stream(_) => hyper::body::SizeHint::default(),
         }
     }
 }
 
-/// Pure event-driven SSE body: yields `id: <seq>\nevent: message\ndata: <json>\n\n` frames
-/// directly from the session's ordered event log using `Notify`, with zero polling.
-pub struct SseBody {
-    session: Arc<GatewaySession>,
-    cursor: u64,
-    waiter: Option<Pin<Box<OwnedNotified>>>,
+pub struct SseStreamBody {
+    rx: mpsc::Receiver<Bytes>,
 }
 
-impl SseBody {
-    pub fn new(session: Arc<GatewaySession>, cursor: u64) -> Self {
-        Self {
-            session,
-            cursor,
-            waiter: None,
-        }
-    }
-}
-
-impl Body for SseBody {
+impl Body for SseStreamBody {
     type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        loop {
-            if this.waiter.is_none() {
-                let mut fut = Box::pin(Arc::clone(&this.session.event_notify).notified_owned());
-                let _ = fut.as_mut().poll(cx);
-                this.waiter = Some(fut);
-            }
-
-            let next_item = {
-                let mut log = this.session.event_log.lock().unwrap();
-                let idx = log.events.partition_point(|(seq, _)| *seq <= this.cursor);
-                if let Some((seq, payload)) = log.events.get(idx).cloned() {
-                    this.cursor = seq;
-                    if log.delivered_up_to < seq {
-                        log.delivered_up_to = seq;
-                    }
-                    Some((seq, payload))
-                } else if log.closed {
-                    return Poll::Ready(None);
-                } else {
-                    None
-                }
-            };
-
-            if let Some((seq, payload)) = next_item {
-                this.waiter = None;
-                let frame = format!("id: {seq}\nevent: message\ndata: {payload}\n\n");
-                return Poll::Ready(Some(Ok(Frame::data(Bytes::from(frame)))));
-            }
-
-            let waiter = this.waiter.as_mut().expect("waiter initialized above");
-            match waiter.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    this.waiter = None;
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let host = if let Some(rest) = bind.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        bind.rsplit_once(':').map_or(bind, |(h, _)| h)
+    };
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
 /// Bind and serve the gateway until `shutdown` resolves.
@@ -145,19 +116,24 @@ pub async fn run_server(cfg: Config, shutdown: impl Future<Output = ()>) -> io::
     let sessions = SessionManager::new(
         cfg.socket,
         cfg.store_dir,
+        cfg.groups,
         #[cfg(feature = "test-hooks")]
         cfg.hold_before_ack,
     );
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = Arc::new(GatewayState {
         endpoint: cfg.endpoint,
+        bind_loopback: is_loopback_bind(&cfg.bind),
         bearer_token: cfg.bearer_token,
         sessions,
+        shutdown_rx,
     });
 
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => {
+                let _ = shutdown_tx.send(true);
                 break;
             }
             accepted = listener.accept() => {
@@ -207,6 +183,10 @@ pub async fn handle_request(
         );
     }
 
+    if let Err(reason) = validate_origin(req.headers(), state.bind_loopback) {
+        return error_response(StatusCode::FORBIDDEN, &reason);
+    }
+
     if let Some(expected) = &state.bearer_token {
         if !authorized(req.headers(), expected.as_bytes()) {
             let mut resp = error_response(
@@ -223,24 +203,75 @@ pub async fn handle_request(
 
     match *req.method() {
         Method::POST => handle_post(&state, req).await,
-        Method::GET => handle_get(&state, req),
-        Method::DELETE => handle_delete(&state, req).await,
+        Method::GET | Method::DELETE => {
+            let mut resp = error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                &format!("expected POST on {}, saw {}", state.endpoint, req.method()),
+            );
+            resp.headers_mut()
+                .insert(http::header::ALLOW, HeaderValue::from_static("POST"));
+            resp
+        }
         ref other => {
             let mut resp = error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
-                &format!("expected POST, GET, or DELETE, saw {other}"),
+                &format!("expected POST, saw {other}"),
             );
-            resp.headers_mut().insert(
-                http::header::ALLOW,
-                HeaderValue::from_static("GET, POST, DELETE"),
-            );
+            resp.headers_mut()
+                .insert(http::header::ALLOW, HeaderValue::from_static("POST"));
             resp
         }
     }
 }
 
-fn authorized(headers: &HeaderMap, expected_token: &[u8]) -> bool {
-    let Some(raw) = headers.get(http::header::AUTHORIZATION) else {
+fn validate_origin(hdrs: &HeaderMap, bind_loopback: bool) -> Result<(), String> {
+    let Some(raw) = hdrs.get(http::header::ORIGIN) else {
+        return Ok(());
+    };
+    let origin = std::str::from_utf8(raw.as_bytes())
+        .map_err(|_| "expected UTF-8 Origin header, saw invalid bytes".to_string())?
+        .trim();
+    if origin.is_empty() || origin == "null" {
+        return Err("expected valid Origin URL, saw empty or null".into());
+    }
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .ok_or_else(|| format!("expected http:// or https:// Origin, saw {origin}"))?;
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', ' ']) {
+        return Err(format!("expected valid Origin authority, saw {origin}"));
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((h, port_part)) = bracketed.split_once(']') else {
+            return Err(format!("expected valid IPv6 Origin host, saw {origin}"));
+        };
+        if !port_part.is_empty()
+            && !port_part
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(format!("expected valid Origin port, saw {origin}"));
+        }
+        h
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.is_empty() || p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("expected valid Origin host:port, saw {origin}"));
+        }
+        h
+    } else {
+        authority
+    };
+    if bind_loopback && !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(format!(
+            "expected loopback Origin for local gateway, saw {origin}"
+        ));
+    }
+    Ok(())
+}
+
+fn authorized(hdrs: &HeaderMap, expected_token: &[u8]) -> bool {
+    let Some(raw) = hdrs.get(http::header::AUTHORIZATION) else {
         return false;
     };
     let bytes = raw.as_bytes();
@@ -248,6 +279,154 @@ fn authorized(headers: &HeaderMap, expected_token: &[u8]) -> bool {
         return false;
     }
     constant_time_eq(&bytes[7..], expected_token)
+}
+
+fn header_utf8(hdrs: &HeaderMap, name: &str) -> Result<Option<String>, String> {
+    let Some(raw) = hdrs.get(name) else {
+        return Ok(None);
+    };
+    let s = std::str::from_utf8(raw.as_bytes())
+        .map_err(|_| format!("expected UTF-8 in {name}, saw invalid bytes"))?;
+    Ok((!s.is_empty()).then(|| s.to_string()))
+}
+
+pub fn decode_mcp_name_header(raw: &str) -> Result<String, String> {
+    if let Some(inner) = raw
+        .strip_prefix("=?base64?")
+        .and_then(|s| s.strip_suffix("?="))
+    {
+        let bytes = decode_base64(inner)?;
+        return String::from_utf8(bytes)
+            .map_err(|_| "expected UTF-8 inside base64 Mcp-Name header".to_string());
+    }
+    Ok(raw.to_string())
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("expected padded base64 in Mcp-Name sentinel".into());
+    }
+    let val = |b: u8| -> Result<u8, String> {
+        match b {
+            b'A'..=b'Z' => Ok(b - b'A'),
+            b'a'..=b'z' => Ok(b - b'a' + 26),
+            b'0'..=b'9' => Ok(b - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte {b:#x}")),
+        }
+    };
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 || (pad > 0 && chunk[2] == b'=' && chunk[3] != b'=') {
+            return Err("invalid base64 padding".into());
+        }
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        let c = if chunk[2] == b'=' { 0 } else { val(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { val(chunk[3])? };
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((c << 6) | d);
+        }
+    }
+    Ok(out)
+}
+
+fn accept_allows_media(hdrs: &HeaderMap, target: &str) -> bool {
+    let mut saw_accept = false;
+    let target_prefix = target.split('/').next().unwrap_or("");
+    for val in hdrs.get_all(http::header::ACCEPT) {
+        saw_accept = true;
+        let Ok(text) = val.to_str() else {
+            continue;
+        };
+        for item in text.split(',') {
+            let mut parts = item.split(';');
+            let media = parts.next().unwrap_or("").trim();
+            let mut q_zero = false;
+            for param in parts {
+                if let Some((k, v)) = param.trim().split_once('=') {
+                    if k.trim().eq_ignore_ascii_case("q") {
+                        if let Ok(q) = v.trim().parse::<f32>() {
+                            if q <= 0.0 {
+                                q_zero = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if q_zero {
+                continue;
+            }
+            if media.eq_ignore_ascii_case(target)
+                || media == "*/*"
+                || media
+                    .strip_suffix("/*")
+                    .is_some_and(|p| p.eq_ignore_ascii_case(target_prefix))
+            {
+                return true;
+            }
+        }
+    }
+    !saw_accept
+}
+
+fn validate_request_headers(
+    hdrs: &HeaderMap,
+    method: &str,
+    params: &Value,
+) -> Result<String, RpcErr> {
+    let hdr_pv = match header_utf8(hdrs, "mcp-protocol-version") {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Err(RpcErr::header_mismatch(
+                "expected MCP-Protocol-Version header, saw none",
+            ))
+        }
+        Err(e) => return Err(RpcErr::header_mismatch(e)),
+    };
+    let hdr_method = match header_utf8(hdrs, "mcp-method") {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Err(RpcErr::header_mismatch(
+                "expected Mcp-Method header, saw none",
+            ))
+        }
+        Err(e) => return Err(RpcErr::header_mismatch(e)),
+    };
+    if hdr_method != method {
+        return Err(RpcErr::header_mismatch(format!(
+            "Header mismatch: Mcp-Method header value '{hdr_method}' does not match body method '{method}'"
+        )));
+    }
+    if matches!(
+        method,
+        "tools/call" | "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe"
+    ) {
+        let raw_name = match header_utf8(hdrs, "mcp-name") {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err(RpcErr::header_mismatch(
+                    "expected Mcp-Name header, saw none",
+                ))
+            }
+            Err(e) => return Err(RpcErr::header_mismatch(e)),
+        };
+        let decoded = decode_mcp_name_header(&raw_name).map_err(RpcErr::header_mismatch)?;
+        let body_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        if body_name.is_empty() || decoded != body_name {
+            return Err(RpcErr::header_mismatch(format!(
+                "Header mismatch: Mcp-Name header value '{decoded}' does not match body params.name '{body_name}'"
+            )));
+        }
+    }
+    Ok(hdr_pv)
 }
 
 async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<GatewayBody> {
@@ -293,9 +472,7 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
         Ok(t) => t.trim(),
         Err(_) => {
             return json_value_response(
-                StatusCode::OK,
-                None,
-                None,
+                StatusCode::BAD_REQUEST,
                 &mcp::reply_err(
                     &Value::Null,
                     -32700,
@@ -305,419 +482,565 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
         }
     };
 
-    match mcp::parse_message(text) {
-        Parsed::Request { id, method, params } if method == "initialize" => {
-            let init_params = match extract_init_params(&parts.headers, parts.uri.query(), &params)
-            {
-                Ok(p) => p,
-                Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
-            };
-            match state.sessions.initialize(init_params).await {
-                Ok(session) => {
-                    let payload = mcp::reply_ok(&id, mcp::initialize_result(&params));
-                    json_value_response(
-                        StatusCode::OK,
-                        Some(&session.session_id),
-                        Some(&session.address),
-                        &payload,
-                    )
-                }
-                Err(e) => {
-                    let code = if e.kind() == io::ErrorKind::WouldBlock {
-                        StatusCode::CONFLICT
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    };
-                    error_response(code, &e.to_string())
-                }
-            }
-        }
-        Parsed::Bad { id, code, message } => {
-            if let Some(raw_sid) = parts.headers.get("mcp-session-id") {
-                let Ok(sid) = std::str::from_utf8(raw_sid.as_bytes()) else {
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "expected UTF-8 Mcp-Session-Id header, saw invalid bytes",
-                    );
-                };
-                if sid.is_empty() {
-                    return error_response(
-                        StatusCode::BAD_REQUEST,
-                        "expected non-empty Mcp-Session-Id header, saw empty value",
-                    );
-                }
-                if state.sessions.get(sid).is_none() {
-                    return error_response(
-                        StatusCode::NOT_FOUND,
-                        "expected an active Mcp-Session-Id, saw unknown or terminated session",
-                    );
-                }
-            }
-            json_value_response(
-                StatusCode::OK,
-                None,
-                None,
-                &mcp::reply_err(&id, code, &message),
+    let (id, method, params) = match mcp::parse_message(text) {
+        Parsed::Notification => return empty_response(StatusCode::ACCEPTED),
+        Parsed::Ignore => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "expected a JSON-RPC request or notification, saw a response",
             )
         }
-        other => {
-            let session = match require_session(state, &parts.headers) {
-                Ok(s) => s,
-                Err((status, msg)) => return error_response(status, msg),
-            };
-            match other {
-                Parsed::Notification | Parsed::Ignore => {
-                    empty_response(StatusCode::ACCEPTED, Some(&session.session_id))
-                }
-                Parsed::Request { id, method, params } => match method.as_str() {
-                    "ping" => json_value_response(
-                        StatusCode::OK,
-                        Some(&session.session_id),
-                        None,
-                        &mcp::reply_ok(&id, Value::Object(Map::new())),
-                    ),
-                    "tools/list" => json_value_response(
-                        StatusCode::OK,
-                        Some(&session.session_id),
-                        None,
-                        &mcp::reply_ok(&id, mcp::tools_list_groups(session.groups)),
-                    ),
-                    "tools/call" => {
-                        let result = match mcp::call_tool(&session, &params).await {
-                            Ok(v) => {
-                                let rendered = serde_json::to_string(&v)
-                                    .expect("tool output serializes as JSON");
-                                mcp::tool_result(&rendered, false)
-                            }
-                            Err(reason) => mcp::tool_result(&reason, true),
-                        };
-                        json_value_response(
-                            StatusCode::OK,
-                            Some(&session.session_id),
-                            None,
-                            &mcp::reply_ok(&id, result),
-                        )
-                    }
-                    unknown => {
-                        let msg = format!(
-                            "expected initialize, ping, tools/list, or tools/call, saw {unknown}"
-                        );
-                        json_value_response(
-                            StatusCode::OK,
-                            Some(&session.session_id),
-                            None,
-                            &mcp::reply_err(&id, -32601, &msg),
-                        )
-                    }
-                },
-                Parsed::Bad { .. } => unreachable!(),
-            }
+        Parsed::Bad { id, code, message } => {
+            return json_value_response(
+                StatusCode::BAD_REQUEST,
+                &mcp::reply_err(&id, code, &message),
+            );
         }
-    }
-}
-
-fn handle_get(state: &GatewayState, req: Request<Incoming>) -> Response<GatewayBody> {
-    let session = match require_session(state, req.headers()) {
-        Ok(s) => s,
-        Err((status, msg)) => return error_response(status, msg),
+        Parsed::Request { id, method, params } => (id, method, params),
     };
 
-    if !accept_allows_sse(req.headers()) {
+    let hdr_pv = match validate_request_headers(&parts.headers, &method, &params) {
+        Ok(v) => v,
+        Err(err) => return rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+    };
+
+    // Validate _meta and confirm MCP-Protocol-Version matches _meta["io.modelcontextprotocol/protocolVersion"].
+    let body_pv = params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str);
+    if let Some(pv) = body_pv {
+        if hdr_pv != pv {
+            return rpc_err_response(
+                StatusCode::BAD_REQUEST,
+                &id,
+                RpcErr::header_mismatch(format!(
+                    "Header mismatch: MCP-Protocol-Version '{hdr_pv}' does not match _meta protocolVersion '{pv}'"
+                )),
+            );
+        }
+    }
+    if let Err(err) = mcp::validate_meta(&params) {
+        return rpc_err_response(StatusCode::BAD_REQUEST, &id, err);
+    }
+
+    let is_stream = matches!(method.as_str(), "events/stream" | "subscriptions/listen");
+    if is_stream {
+        if !accept_allows_media(&parts.headers, "text/event-stream") {
+            return error_response(
+                StatusCode::NOT_ACCEPTABLE,
+                "expected Accept header to include text/event-stream or */*, saw neither",
+            );
+        }
+    } else if !accept_allows_media(&parts.headers, "application/json") {
         return error_response(
             StatusCode::NOT_ACCEPTABLE,
-            "expected Accept header to include text/event-stream or */*, saw neither",
+            "expected Accept header to include application/json or */*, saw neither",
         );
     }
 
-    let last_event_id = match parse_last_event_id(req.headers()) {
-        Ok(v) => v,
-        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
-    };
-
-    let cursor = session.initial_sse_cursor(last_event_id);
-    let sid = session.session_id.clone();
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "text/event-stream")
-        .header(http::header::CACHE_CONTROL, "no-cache");
-    if let Ok(hv) = HeaderValue::from_bytes(sid.as_bytes()) {
-        builder = builder.header("mcp-session-id", hv);
-    }
-    builder
-        .body(GatewayBody::Sse(SseBody::new(session, cursor)))
-        .expect("valid SSE response")
-}
-
-async fn handle_delete(state: &GatewayState, req: Request<Incoming>) -> Response<GatewayBody> {
-    let sid = match extract_session_id(req.headers()) {
-        Ok(id) => id,
-        Err((status, msg)) => return error_response(status, msg),
-    };
-    if state.sessions.delete(&sid).await {
-        raw_json_response(StatusCode::OK, r#"{"ok":true}"#)
-    } else {
-        error_response(
+    match method.as_str() {
+        "server/discover" => json_value_response(
+            StatusCode::OK,
+            &mcp::reply_ok(&id, mcp::discover_result()),
+        ),
+        "tools/list" => json_value_response(
+            StatusCode::OK,
+            &mcp::reply_ok(&id, mcp::tools_list(state.sessions.groups())),
+        ),
+        "tools/call" => {
+            let result = match mcp::call_tool(&state.sessions, &params).await {
+                Ok(v) => {
+                    let rendered =
+                        serde_json::to_string(&v).expect("tool output serializes as JSON");
+                    mcp::tool_result(&rendered, false)
+                }
+                Err(reason) => mcp::tool_result(&reason, true),
+            };
+            json_value_response(StatusCode::OK, &mcp::reply_ok(&id, result))
+        }
+        "events/list" => json_value_response(
+            StatusCode::OK,
+            &mcp::reply_ok(&id, mcp::events_list_result()),
+        ),
+        "events/poll" => match mcp::events_poll(&state.sessions, &params).await {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => {
+                let status = if err.code == -32602 {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                };
+                rpc_err_response(status, &id, err)
+            }
+        },
+        "events/stream" => {
+            let req = match mcp::validate_event_req(&state.sessions, &params, false) {
+                Ok(r) => r,
+                Err(err) => {
+                    let status = if err.code == -32602 {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    };
+                    return rpc_err_response(status, &id, err);
+                }
+            };
+            if req.name == "roger.board" {
+                if let Err(e) = req.session.ensure_watch().await {
+                    return rpc_err_response(
+                        StatusCode::BAD_GATEWAY,
+                        &id,
+                        RpcErr {
+                            code: -32603,
+                            message: e.to_string(),
+                            data: None,
+                        },
+                    );
+                }
+            }
+            sse_response(spawn_events_stream(req, id, state.shutdown_rx.clone()))
+        }
+        "subscriptions/listen" => {
+            if let Some(n) = params.get("notifications") {
+                if !n.is_object() {
+                    return rpc_err_response(
+                        StatusCode::BAD_REQUEST,
+                        &id,
+                        RpcErr::invalid_params("expected notifications to be an object"),
+                    );
+                }
+            }
+            sse_response(spawn_subscriptions_listen(id, state.shutdown_rx.clone()))
+        }
+        unknown => rpc_err_response(
             StatusCode::NOT_FOUND,
-            "expected an active Mcp-Session-Id, saw unknown or terminated session",
-        )
+            &id,
+            RpcErr {
+                code: -32601,
+                message: format!(
+                    "expected server/discover, tools/list, tools/call, subscriptions/listen, or events/*, saw {unknown}"
+                ),
+                data: None,
+            },
+        ),
     }
 }
 
-fn extract_session_id(headers: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
-    let Some(raw) = headers.get("mcp-session-id") else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "expected Mcp-Session-Id header, saw none",
-        ));
-    };
-    let text = std::str::from_utf8(raw.as_bytes()).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "expected UTF-8 Mcp-Session-Id header, saw invalid bytes",
-        )
-    })?;
-    if text.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "expected non-empty Mcp-Session-Id header, saw empty value",
-        ));
-    }
-    Ok(text.to_string())
+fn sse_frame_data(json_line: &str) -> Bytes {
+    Bytes::from(format!("data: {json_line}\n\n"))
 }
 
-fn require_session(
-    state: &GatewayState,
-    headers: &HeaderMap,
-) -> Result<Arc<GatewaySession>, (StatusCode, &'static str)> {
-    let sid = extract_session_id(headers)?;
-    state.sessions.get(&sid).ok_or((
-        StatusCode::NOT_FOUND,
-        "expected an active Mcp-Session-Id, saw unknown or terminated session",
+fn stream_complete_frame(id: &Value) -> Bytes {
+    let payload = mcp::reply_ok(
+        id,
+        serde_json::json!({
+            "resultType": "complete",
+            "_meta": {
+                "io.modelcontextprotocol/subscriptionId": id,
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "roger-mcp-gateway",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        }),
+    );
+    sse_frame_data(&serde_json::to_string(&payload).expect("JSON serializes"))
+}
+
+fn stream_terminated_frame(id: &Value, reason: &str) -> Bytes {
+    let mut params = Map::new();
+    params.insert(
+        "error".into(),
+        serde_json::json!({
+            "code": -32023,
+            "message": "NotFound",
+            "data": { "kind": "session", "reason": reason },
+        }),
+    );
+    sse_frame_data(&mcp::format_notification(
+        "notifications/events/terminated",
+        params,
+        id,
     ))
 }
 
-fn accept_allows_sse(headers: &HeaderMap) -> bool {
-    let mut saw_accept = false;
-    for val in headers.get_all(http::header::ACCEPT) {
-        saw_accept = true;
-        let Ok(text) = val.to_str() else {
-            continue;
-        };
-        for item in text.split(',') {
-            let mut parts = item.split(';');
-            let media = parts.next().unwrap_or("").trim();
-            let mut q_zero = false;
-            for param in parts {
-                if let Some((k, v)) = param.trim().split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("q") {
-                        if let Ok(q) = v.trim().parse::<f32>() {
-                            if q <= 0.0 {
-                                q_zero = true;
-                            }
-                        }
+fn spawn_subscriptions_listen(id: Value, mut shutdown_rx: watch::Receiver<bool>) -> SseStreamBody {
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
+    tokio::spawn(async move {
+        let mut ack_params = Map::new();
+        ack_params.insert("notifications".into(), Value::Object(Map::new()));
+        let ack =
+            mcp::format_notification("notifications/subscriptions/acknowledged", ack_params, &id);
+        if tx.send(sse_frame_data(&ack)).await.is_err() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        let _ = tx.send(stream_complete_frame(&id)).await;
+                        break;
+                    }
+                }
+                // no-poll: periodic SSE comment keepalive on quiet subscriptions/listen stream.
+                _ = tokio::time::sleep(Duration::from_secs(LISTEN_KEEPALIVE_SECS)) => {
+                    if tx.send(Bytes::from_static(b":\n\n")).await.is_err() {
+                        break;
                     }
                 }
             }
-            if !q_zero && (media.eq_ignore_ascii_case("text/event-stream") || media == "*/*") {
-                return true;
+        }
+    });
+    SseStreamBody { rx }
+}
+
+fn spawn_events_stream(
+    req: ValidatedEventReq,
+    id: Value,
+    shutdown_rx: watch::Receiver<bool>,
+) -> SseStreamBody {
+    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    tokio::spawn(async move {
+        match req.name.as_str() {
+            "roger.mail" => run_mail_sse(req, id, tx, shutdown_rx).await,
+            "roger.board" => run_board_sse(req, id, tx, shutdown_rx).await,
+            _ => run_reg_sse(req, id, tx, shutdown_rx).await,
+        }
+    });
+    SseStreamBody { rx }
+}
+
+async fn run_mail_sse(
+    req: ValidatedEventReq,
+    id: Value,
+    tx: mpsc::Sender<Bytes>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let session = req.session;
+    let mut seen_seq = session.mail_seq.load(Ordering::SeqCst);
+    let store_path = session.store_path.clone();
+    let all = match blocking_io(move || read_store_entries(&store_path)) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = tx.send(stream_terminated_frame(&id, &e.to_string())).await;
+            return;
+        }
+    };
+    let now = crate::session::now_ms();
+    let (start, truncated, start_cursor) =
+        mcp::resolve_mail_window(&all, req.cursor.as_deref(), req.max_age_ms, now);
+    let mut latest_cursor = if start >= all.len() {
+        start_cursor.clone()
+    } else {
+        mcp::tail_cursor(&all)
+    };
+
+    let mut active_params = Map::new();
+    active_params.insert("cursor".into(), Value::String(start_cursor));
+    active_params.insert("truncated".into(), Value::Bool(truncated));
+    active_params.insert("heartbeatMs".into(), Value::Number(req.heartbeat_ms.into()));
+    let active = mcp::format_notification("notifications/events/active", active_params, &id);
+    if tx.send(sse_frame_data(&active)).await.is_err() {
+        return;
+    }
+
+    let mut emitted_records: BTreeSet<String> = all[..start]
+        .iter()
+        .map(|e| mcp::record_of(e).to_string())
+        .collect();
+    for entry in &all[start..] {
+        let rec = mcp::record_of(entry).to_string();
+        emitted_records.insert(rec.clone());
+        latest_cursor = rec;
+        if req.filter.matches(entry) {
+            let occ = match mcp::mail_occurrence(entry, true) {
+                Value::Object(m) => m,
+                _ => Map::new(),
+            };
+            let ev = mcp::format_notification("notifications/events/event", occ, &id);
+            if tx.send(sse_frame_data(&ev)).await.is_err() {
+                return;
             }
         }
     }
-    !saw_accept
-}
 
-fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, String> {
-    let Some(raw) = headers.get("last-event-id") else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(raw.as_bytes())
-        .map_err(|_| "expected UTF-8 Last-Event-ID header, saw invalid bytes".to_string())?
-        .trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    text.parse::<u64>()
-        .map(Some)
-        .map_err(|_| format!("expected Last-Event-ID to be an unsigned integer, saw {text:?}"))
-}
+    let hb_dur = Duration::from_millis(req.heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound when quiet.
+    let mut next_hb = Instant::now() + hb_dur;
 
-fn header_utf8(headers: &HeaderMap, name: &str) -> Result<Option<String>, String> {
-    let Some(raw) = headers.get(name) else {
-        return Ok(None);
-    };
-    let s = std::str::from_utf8(raw.as_bytes())
-        .map_err(|_| format!("expected UTF-8 in {name}, saw invalid bytes"))?;
-    Ok((!s.is_empty()).then(|| s.to_string()))
-}
+    loop {
+        let notified = session.mail_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-pub fn percent_decode(raw: &str) -> Result<String, String> {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return Err(format!(
-                    "expected two hex digits after '%', saw {:?}",
-                    &raw[i..]
-                ));
-            }
-            let hi = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
-                format!(
-                    "expected hex digit in percent escape, saw {:?}",
-                    &raw[i..i + 3]
-                )
-            })?;
-            let lo = (bytes[i + 2] as char).to_digit(16).ok_or_else(|| {
-                format!(
-                    "expected hex digit in percent escape, saw {:?}",
-                    &raw[i..i + 3]
-                )
-            })?;
-            out.push(((hi << 4) | lo) as u8);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+        if session.closed.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(stream_terminated_frame(&id, "session closed"))
+                .await;
+            return;
         }
-    }
-    String::from_utf8(out)
-        .map_err(|_| "expected percent-decoded UTF-8, saw invalid UTF-8 bytes".to_string())
-}
-
-pub fn query_param(query: Option<&str>, key: &str) -> Result<Option<String>, String> {
-    let Some(q) = query else {
-        return Ok(None);
-    };
-    for pair in q.split('&') {
-        if pair.is_empty() {
+        let cur_seq = session.mail_seq.load(Ordering::SeqCst);
+        if cur_seq != seen_seq {
+            seen_seq = cur_seq;
+            let sp = session.store_path.clone();
+            if let Ok(now_all) = blocking_io(move || read_store_entries(&sp)) {
+                let mut sent_any = false;
+                for entry in now_all {
+                    let rec = mcp::record_of(&entry).to_string();
+                    if rec.is_empty() || !emitted_records.insert(rec.clone()) {
+                        continue;
+                    }
+                    latest_cursor = rec;
+                    if req.filter.matches(&entry) {
+                        let occ = match mcp::mail_occurrence(&entry, true) {
+                            Value::Object(m) => m,
+                            _ => Map::new(),
+                        };
+                        let ev = mcp::format_notification("notifications/events/event", occ, &id);
+                        if tx.send(sse_frame_data(&ev)).await.is_err() {
+                            return;
+                        }
+                        sent_any = true;
+                    }
+                }
+                if sent_any {
+                    // no-poll: reset heartbeat bound after sending an event.
+                    next_hb = Instant::now() + hb_dur;
+                }
+            }
             continue;
         }
-        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-        let k = percent_decode(raw_k)?;
-        if k == key {
-            let v = percent_decode(raw_v)?;
-            if !v.is_empty() {
-                return Ok(Some(v));
+
+        tokio::select! {
+            _ = tx.closed() => return,
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    let _ = tx.send(stream_complete_frame(&id)).await;
+                    return;
+                }
+            }
+            _ = &mut notified => {}
+            // no-poll: SEP-3415 stream heartbeat bound.
+            _ = tokio::time::sleep_until(next_hb) => {
+                let mut hb = Map::new();
+                hb.insert("cursor".into(), Value::String(latest_cursor.clone()));
+                let msg = mcp::format_notification("notifications/events/heartbeat", hb, &id);
+                if tx.send(sse_frame_data(&msg)).await.is_err() {
+                    return;
+                }
+                // no-poll: schedule next SEP-3415 heartbeat.
+                next_hb = Instant::now() + hb_dur;
             }
         }
     }
-    Ok(None)
 }
 
-fn meta_str(params: &Value, key: &str) -> Option<String> {
-    params
-        .get("_meta")
-        .and_then(Value::as_object)
-        .and_then(|m| m.get(key))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
+async fn run_board_sse(
+    req: ValidatedEventReq,
+    id: Value,
+    tx: mpsc::Sender<Bytes>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let session = req.session;
+    let mut seq_cursor = session.board_feed.lock().unwrap().next_seq;
+    let mut evt_counter = 0u64;
 
-fn extract_init_params(
-    headers: &HeaderMap,
-    query: Option<&str>,
-    params: &Value,
-) -> Result<InitParams, String> {
-    let address = match header_utf8(headers, "x-roger-address")? {
-        Some(a) => Some(a),
-        None => match query_param(query, "id")? {
-            Some(a) => Some(a),
-            None => match query_param(query, "address")? {
-                Some(a) => Some(a),
-                None => meta_str(params, "roger_address"),
-            },
-        },
-    };
+    let mut active_params = Map::new();
+    active_params.insert("cursor".into(), Value::Null);
+    active_params.insert("truncated".into(), Value::Bool(false));
+    active_params.insert("heartbeatMs".into(), Value::Number(req.heartbeat_ms.into()));
+    let active = mcp::format_notification("notifications/events/active", active_params, &id);
+    if tx.send(sse_frame_data(&active)).await.is_err() {
+        return;
+    }
 
-    let label = match header_utf8(headers, "x-roger-label")? {
-        Some(l) => Some(l),
-        None => match query_param(query, "label")? {
-            Some(l) => Some(l),
-            None => meta_str(params, "roger_label"),
-        },
-    };
+    let hb_dur = Duration::from_millis(req.heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound.
+    let mut next_hb = Instant::now() + hb_dur;
 
-    let declared = match header_utf8(headers, "x-roger-declare")? {
-        Some(d) => Some(d),
-        None => match query_param(query, "declare")? {
-            Some(d) => Some(d),
-            None => meta_str(params, "roger_declare"),
-        },
-    };
+    loop {
+        let notified = session.board_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-    let watch = match header_utf8(headers, "x-roger-watch")? {
-        Some(w) => watch_flag(&w, "X-Roger-Watch")?,
-        None => match query_param(query, "watch")? {
-            Some(w) => watch_flag(&w, "query watch")?,
-            None => match params.get("_meta").and_then(|m| m.get("roger_watch")) {
-                None | Some(Value::Null) => false,
-                Some(Value::Bool(b)) => *b,
-                Some(Value::String(w)) => watch_flag(w, "_meta.roger_watch")?,
-                Some(Value::Number(n)) => watch_flag(&n.to_string(), "_meta.roger_watch")?,
-                Some(other) => {
-                    return Err(format!(
-                        "expected _meta.roger_watch to be true, false, 1 or 0, saw {other}"
-                    ))
+        if session.closed.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(stream_terminated_frame(&id, "session closed"))
+                .await;
+            return;
+        }
+
+        let batch: Vec<(u64, i64, Value)> = {
+            let feed = session.board_feed.lock().unwrap();
+            feed.items
+                .iter()
+                .filter(|(s, _)| *s > seq_cursor)
+                .map(|(s, n)| (*s, n.at_ms, n.data.clone()))
+                .collect()
+        };
+        if !batch.is_empty() {
+            for (seq, at_ms, data) in batch {
+                seq_cursor = seq;
+                evt_counter += 1;
+                let mut params = Map::new();
+                params.insert(
+                    "eventId".into(),
+                    Value::String(format!("board-{seq}-{evt_counter}")),
+                );
+                params.insert("name".into(), Value::String("roger.board".into()));
+                params.insert(
+                    "timestamp".into(),
+                    Value::String(mcp::format_iso8601_utc(at_ms)),
+                );
+                params.insert("data".into(), data);
+                params.insert("cursor".into(), Value::Null);
+                let msg = mcp::format_notification("notifications/events/event", params, &id);
+                if tx.send(sse_frame_data(&msg)).await.is_err() {
+                    return;
                 }
-            },
-        },
-    };
-    let groups = match header_utf8(headers, "x-roger-groups")? {
-        Some(v) => watch_flag(&v, "X-Roger-Groups")?,
-        None => match query_param(query, "groups")? {
-            Some(v) => watch_flag(&v, "query groups")?,
-            None => match params.get("_meta").and_then(|m| m.get("roger_groups")) {
-                None | Some(Value::Null) => false,
-                Some(Value::Bool(v)) => *v,
-                Some(Value::String(v)) => watch_flag(v, "_meta.roger_groups")?,
-                Some(v) => watch_flag(&v.to_string(), "_meta.roger_groups")?,
-            },
-        },
-    };
+            }
+            // no-poll: reset heartbeat bound after sending an event.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
 
-    Ok(InitParams {
-        address,
-        label,
-        declared,
-        watch,
-        groups,
-    })
-}
-
-/// The `board_event` opt-in: `1` or `true` asks, `0` or `false` does not.
-fn watch_flag(raw: &str, from: &str) -> Result<bool, String> {
-    match raw.trim() {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(format!(
-            "expected {from} to be 1, 0, true or false, saw {other:?}"
-        )),
+        tokio::select! {
+            _ = tx.closed() => return,
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    let _ = tx.send(stream_complete_frame(&id)).await;
+                    return;
+                }
+            }
+            _ = &mut notified => {}
+            // no-poll: SEP-3415 stream heartbeat bound.
+            _ = tokio::time::sleep_until(next_hb) => {
+                let mut hb = Map::new();
+                hb.insert("cursor".into(), Value::Null);
+                let msg = mcp::format_notification("notifications/events/heartbeat", hb, &id);
+                if tx.send(sse_frame_data(&msg)).await.is_err() {
+                    return;
+                }
+                // no-poll: schedule next SEP-3415 heartbeat.
+                next_hb = Instant::now() + hb_dur;
+            }
+        }
     }
 }
 
-fn json_value_response(
-    status: StatusCode,
-    session_id: Option<&str>,
-    address: Option<&str>,
-    value: &Value,
-) -> Response<GatewayBody> {
+async fn run_reg_sse(
+    req: ValidatedEventReq,
+    id: Value,
+    tx: mpsc::Sender<Bytes>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let session = req.session;
+    let mut seq_cursor = 0u64;
+
+    let mut active_params = Map::new();
+    active_params.insert("cursor".into(), Value::Null);
+    active_params.insert("truncated".into(), Value::Bool(false));
+    active_params.insert("heartbeatMs".into(), Value::Number(req.heartbeat_ms.into()));
+    let active = mcp::format_notification("notifications/events/active", active_params, &id);
+    if tx.send(sse_frame_data(&active)).await.is_err() {
+        return;
+    }
+
+    let hb_dur = Duration::from_millis(req.heartbeat_ms as u64);
+    // no-poll: SEP-3415 stream heartbeat bound.
+    let mut next_hb = Instant::now() + hb_dur;
+
+    loop {
+        let notified = session.reg_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if session.closed.load(Ordering::SeqCst) {
+            let _ = tx
+                .send(stream_terminated_frame(&id, "session closed"))
+                .await;
+            return;
+        }
+
+        let batch: Vec<(u64, i64, Value)> = {
+            let feed = session.reg_feed.lock().unwrap();
+            feed.items
+                .iter()
+                .filter(|(s, _)| *s > seq_cursor)
+                .map(|(s, n)| (*s, n.at_ms, n.data.clone()))
+                .collect()
+        };
+        if !batch.is_empty() {
+            for (seq, at_ms, data) in batch {
+                seq_cursor = seq;
+                let mut params = Map::new();
+                params.insert("eventId".into(), Value::String(format!("reg-{seq}")));
+                params.insert("name".into(), Value::String("roger.registration".into()));
+                params.insert(
+                    "timestamp".into(),
+                    Value::String(mcp::format_iso8601_utc(at_ms)),
+                );
+                params.insert("data".into(), data);
+                params.insert("cursor".into(), Value::Null);
+                let msg = mcp::format_notification("notifications/events/event", params, &id);
+                if tx.send(sse_frame_data(&msg)).await.is_err() {
+                    return;
+                }
+            }
+            // no-poll: reset heartbeat bound after sending an event.
+            next_hb = Instant::now() + hb_dur;
+            continue;
+        }
+
+        tokio::select! {
+            _ = tx.closed() => return,
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    let _ = tx.send(stream_complete_frame(&id)).await;
+                    return;
+                }
+            }
+            _ = &mut notified => {}
+            // no-poll: SEP-3415 stream heartbeat bound.
+            _ = tokio::time::sleep_until(next_hb) => {
+                let mut hb = Map::new();
+                hb.insert("cursor".into(), Value::Null);
+                let msg = mcp::format_notification("notifications/events/heartbeat", hb, &id);
+                if tx.send(sse_frame_data(&msg)).await.is_err() {
+                    return;
+                }
+                // no-poll: schedule next SEP-3415 heartbeat.
+                next_hb = Instant::now() + hb_dur;
+            }
+        }
+    }
+}
+
+fn sse_response(body: SseStreamBody) -> Response<GatewayBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/event-stream")
+        .header(http::header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(GatewayBody::Stream(body))
+        .expect("valid SSE response")
+}
+
+fn rpc_err_response(status: StatusCode, id: &Value, err: RpcErr) -> Response<GatewayBody> {
+    json_value_response(
+        status,
+        &mcp::reply_err_data(id, err.code, &err.message, err.data),
+    )
+}
+
+fn json_value_response(status: StatusCode, value: &Value) -> Response<GatewayBody> {
     let body = serde_json::to_vec(value).expect("JSON response serializes");
-    let mut builder = Response::builder()
+    Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json");
-    if let Some(sid) = session_id {
-        if let Ok(hv) = HeaderValue::from_bytes(sid.as_bytes()) {
-            builder = builder.header("mcp-session-id", hv);
-        }
-    }
-    if let Some(addr) = address {
-        if let Ok(hv) = HeaderValue::from_bytes(addr.as_bytes()) {
-            builder = builder.header("x-roger-address", hv);
-        }
-    }
-    builder
+        .header(http::header::CONTENT_TYPE, "application/json")
         .body(GatewayBody::Full(Full::new(Bytes::from(body))))
         .expect("valid JSON response")
 }
@@ -732,14 +1055,9 @@ fn raw_json_response(status: StatusCode, raw_json: &'static str) -> Response<Gat
         .expect("valid static JSON response")
 }
 
-fn empty_response(status: StatusCode, session_id: Option<&str>) -> Response<GatewayBody> {
-    let mut builder = Response::builder().status(status);
-    if let Some(sid) = session_id {
-        if let Ok(hv) = HeaderValue::from_bytes(sid.as_bytes()) {
-            builder = builder.header("mcp-session-id", hv);
-        }
-    }
-    builder
+fn empty_response(status: StatusCode) -> Response<GatewayBody> {
+    Response::builder()
+        .status(status)
         .body(GatewayBody::Full(Full::new(Bytes::new())))
         .expect("valid empty response")
 }
@@ -747,7 +1065,7 @@ fn empty_response(status: StatusCode, session_id: Option<&str>) -> Response<Gate
 fn error_response(status: StatusCode, message: &str) -> Response<GatewayBody> {
     let mut m = Map::new();
     m.insert("error".into(), Value::String(message.to_string()));
-    json_value_response(status, None, None, &Value::Object(m))
+    json_value_response(status, &Value::Object(m))
 }
 
 #[cfg(test)]
@@ -755,125 +1073,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn percent_decoding_handles_composite_addresses_and_utf8() {
-        let encoded = "%5B%5B153%3AMeteor%20Shower%3A7%5D%5Dcaf%C3%A9";
+    fn base64_mcp_name_decoding_matches_spec_examples() {
+        assert_eq!(decode_mcp_name_header("roger_send").unwrap(), "roger_send");
         assert_eq!(
-            percent_decode(encoded).unwrap(),
-            "[[153:Meteor Shower:7]]café"
+            decode_mcp_name_header("=?base64?SGVsbG8sIOS4lueVjA==?=").unwrap(),
+            "Hello, 世界"
         );
-        assert!(percent_decode("%ZZ").is_err());
-        assert!(percent_decode("%2").is_err());
+        assert_eq!(
+            decode_mcp_name_header("=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=").unwrap(),
+            "=?base64?literal?="
+        );
+        assert!(decode_mcp_name_header("=?base64?not_valid!?=").is_err());
     }
 
     #[test]
-    fn init_parameter_precedence_is_header_then_query_then_meta() {
-        let mut headers = HeaderMap::new();
-        let meta = serde_json::from_str::<Value>(
-            r#"{"_meta":{"roger_address":"from-meta","roger_label":"meta-l","roger_declare":"meta-d"}}"#,
-        )
-        .unwrap();
-
-        let p = extract_init_params(&headers, None, &meta).unwrap();
-        assert_eq!(p.address.as_deref(), Some("from-meta"));
-        assert_eq!(p.label.as_deref(), Some("meta-l"));
-        assert_eq!(p.declared.as_deref(), Some("meta-d"));
-
-        let p = extract_init_params(
-            &headers,
-            Some("id=from-id&address=from-addr&label=query%20l&declare=query%20d"),
-            &meta,
-        )
-        .unwrap();
-        assert_eq!(p.address.as_deref(), Some("from-id"));
-        assert_eq!(p.label.as_deref(), Some("query l"));
-        assert_eq!(p.declared.as_deref(), Some("query d"));
-
-        headers.insert("x-roger-address", HeaderValue::from_static("from-hdr"));
-        headers.insert("x-roger-label", HeaderValue::from_static("hdr-l"));
-        headers.insert("x-roger-declare", HeaderValue::from_static("hdr-d"));
-        let p = extract_init_params(&headers, Some("id=from-id"), &meta).unwrap();
-        assert_eq!(p.address.as_deref(), Some("from-hdr"));
-        assert_eq!(p.label.as_deref(), Some("hdr-l"));
-        assert_eq!(p.declared.as_deref(), Some("hdr-d"));
-        assert!(!p.watch);
-    }
-
-    #[test]
-    fn watch_opt_in_is_header_then_query_then_meta() {
-        let mut headers = HeaderMap::new();
-        let none = Value::Object(serde_json::Map::new());
-        assert!(!extract_init_params(&headers, None, &none).unwrap().watch);
-        let meta = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":true}}"#).unwrap();
-        assert!(extract_init_params(&headers, None, &meta).unwrap().watch);
-        let meta1 = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":1}}"#).unwrap();
-        assert!(extract_init_params(&headers, None, &meta1).unwrap().watch);
-        assert!(
-            !extract_init_params(&headers, Some("watch=0"), &meta)
-                .unwrap()
-                .watch
-        );
-        headers.insert("x-roger-watch", HeaderValue::from_static("1"));
-        assert!(
-            extract_init_params(&headers, Some("watch=0"), &none)
-                .unwrap()
-                .watch
-        );
-        headers.insert("x-roger-watch", HeaderValue::from_static("yes"));
-        let err = extract_init_params(&headers, None, &none).err().unwrap();
-        assert!(err.contains("saw \"yes\""), "{err}");
-        let bad = serde_json::from_str::<Value>(r#"{"_meta":{"roger_watch":[1]}}"#).unwrap();
-        assert!(extract_init_params(&HeaderMap::new(), None, &bad).is_err());
-    }
-
-    #[test]
-    fn accept_header_negotiation_follows_sse_rules() {
+    fn origin_validation_accepts_loopback_and_rejects_malformed_or_remote() {
         let mut h = HeaderMap::new();
-        assert!(accept_allows_sse(&h));
+        assert!(validate_origin(&h, true).is_ok());
+
+        h.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        assert!(validate_origin(&h, true).is_ok());
+
+        h.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("http://localhost:3000"),
+        );
+        assert!(validate_origin(&h, true).is_ok());
+
+        h.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("https://[::1]:8443"),
+        );
+        assert!(validate_origin(&h, true).is_ok());
+
+        h.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(validate_origin(&h, true).is_err());
+        assert!(validate_origin(&h, false).is_ok());
+
+        h.insert(http::header::ORIGIN, HeaderValue::from_static("null"));
+        assert!(validate_origin(&h, true).is_err());
+    }
+
+    #[test]
+    fn accept_header_negotiation_handles_json_and_sse() {
+        let mut h = HeaderMap::new();
+        assert!(accept_allows_media(&h, "text/event-stream"));
+        assert!(accept_allows_media(&h, "application/json"));
 
         h.insert(
             http::header::ACCEPT,
             HeaderValue::from_static("application/json"),
         );
-        assert!(!accept_allows_sse(&h));
+        assert!(accept_allows_media(&h, "application/json"));
+        assert!(!accept_allows_media(&h, "text/event-stream"));
 
         h.insert(
             http::header::ACCEPT,
             HeaderValue::from_static("application/json, text/event-stream;q=0.9"),
         );
-        assert!(accept_allows_sse(&h));
+        assert!(accept_allows_media(&h, "application/json"));
+        assert!(accept_allows_media(&h, "text/event-stream"));
 
-        h.insert(http::header::ACCEPT, HeaderValue::from_static("*/*"));
-        assert!(accept_allows_sse(&h));
-
-        h.insert(
-            http::header::ACCEPT,
-            HeaderValue::from_static("text/event-stream;q=0"),
-        );
-        assert!(!accept_allows_sse(&h));
-    }
-}
-
-#[cfg(test)]
-mod group_tests {
-    use super::*;
-    #[test]
-    fn group_negotiation() {
-        let mut h = HeaderMap::new();
-        assert!(!extract_init_params(&h, None, &Value::Null).unwrap().groups);
-        let meta = serde_json::json!({"_meta":{"roger_groups":true}});
-        assert!(extract_init_params(&h, None, &meta).unwrap().groups);
-        assert!(
-            !extract_init_params(&h, Some("groups=0"), &meta)
-                .unwrap()
-                .groups
-        );
-        h.insert("x-roger-groups", HeaderValue::from_static("1"));
-        assert!(
-            extract_init_params(&h, Some("groups=0"), &meta)
-                .unwrap()
-                .groups
-        );
-        h.insert("x-roger-groups", HeaderValue::from_static("bad"));
-        assert!(extract_init_params(&h, None, &meta).is_err());
+        h.insert(http::header::ACCEPT, HeaderValue::from_static("text/plain"));
+        assert!(!accept_allows_media(&h, "application/json"));
+        assert!(!accept_allows_media(&h, "text/event-stream"));
     }
 }

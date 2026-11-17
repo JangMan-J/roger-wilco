@@ -1,6 +1,6 @@
 # `roger-mcp-gateway`
 
-`roger-mcp-gateway` is an optional multi-session Model Context Protocol (MCP) Streamable HTTP and Server-Sent Events (SSE) push gateway for Roger-Wilco. It serves HTTP/1.1 and prior-knowledge HTTP/2 (`h2c`) from a single TCP listener so containerized MCP clients across local or remote network namespaces can register sessions, receive real-time push notifications as Mail commits to their durable Store, resume seamlessly with `Last-Event-ID` or `roger_inbox` Cursor files, and invoke all 9 Roger MCP tools with exact wire and semantic parity to `roger mcp`.
+`roger-mcp-gateway` is an optional multi-session Model Context Protocol (MCP `2026-07-28`) Streamable HTTP and SEP-3415 (`io.modelcontextprotocol/events`) push/poll gateway for Roger-Wilco. It serves HTTP/1.1 and prior-knowledge HTTP/2 (`h2c`) from a single TCP listener so containerized MCP clients across local or remote network namespaces can manage explicit durable Roger session handles (`roger_register` / `roger_unregister`), consume real-time push or cursor-resumable poll event streams backed directly by `DurLog` + `Notify`, and invoke all Roger MCP tools with exact wire and semantic parity to `roger mcp`.
 
 ## Build
 
@@ -12,7 +12,7 @@ cargo build --release --manifest-path modules/mcp-gateway/Cargo.toml
 
 ```text
 Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port> --store-dir <dir>
-                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>]
+                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>] [--groups]
 ```
 
 - `--bind <address:port>`: TCP listener serving both HTTP/1.1 and HTTP/2 (`h2c`).
@@ -21,64 +21,27 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 - `--port-file <path>`: optional path atomically populated (`<path>.tmp` -> `fsync` -> `rename`) with the bound TCP port immediately after `bind`.
 - `--endpoint <path>`: MCP HTTP endpoint path (default `"/mcp"`). `GET /healthz` is always served (`200 OK` `{"ok":true}`).
 - `--token-env <NAME>`: optional environment variable holding the required Bearer secret. When set, every request to `<endpoint>` must carry `Authorization: Bearer <token>` (checked in constant time) or receives `401 Unauthorized` with `WWW-Authenticate: Bearer`.
+- `--groups`: enable Named Group tools (`roger_subscribe`, `roger_unsubscribe`, `roger_groups`) and `group` sends on `roger_send` statically across this gateway deployment.
 
-## Multi-Container & Cross-Host Topology
+## MCP `2026-07-28` Streamable HTTP
 
-Run one `roger daemon` per host connected to the central `roger coordinator`, and run `roger-mcp-gateway` alongside that host daemon with a persistent `--store-dir` volume:
+- **Sessionless HTTP**: `POST <endpoint>` handles all JSON-RPC requests and notifications. `GET <endpoint>` and `DELETE <endpoint>` return `405 Method Not Allowed` (`Allow: POST`). Any legacy `Mcp-Session-Id` or `Last-Event-ID` headers are ignored.
+- **Required Headers**: Every JSON-RPC request POST must carry `MCP-Protocol-Version` (matching `_meta["io.modelcontextprotocol/protocolVersion"]`), `Mcp-Method` (matching `method`), and `Mcp-Name` (for `tools/call`, `events/poll`, `events/stream`, `events/subscribe`, `events/unsubscribe`, supporting `=?base64?<b64>?=` sentinel decoding) — mismatches return `400 Bad Request` + JSON-RPC `-32020` (`HeaderMismatch`).
+- **Per-Request `_meta`**: Every request carries `_meta["io.modelcontextprotocol/protocolVersion"]` (`"2026-07-28"`, else `400` + `-32022`) and `_meta["io.modelcontextprotocol/clientCapabilities"]` (object, else `400` + `-32602`).
+- **`Origin` & `Accept`**: Non-loopback or invalid `Origin` headers on local bindings return `403 Forbidden`; incompatible `Accept` headers return `406 Not Acceptable`.
+- **Discovery & Listen**: `server/discover` returns `supportedVersions: ["2026-07-28"]`, `tools`, `io.modelcontextprotocol/events`, `ttlMs`, and `cacheScope: "public"`. `subscriptions/listen` returns an SSE stream with `notifications/subscriptions/acknowledged`, keepalive comments, and graceful closure on server shutdown.
 
-1. Each container initializes its own MCP session over HTTP/1.1 or HTTP/2 (`h2c`) against `<endpoint>`.
-2. Every session's Address (including composite Reference Addresses such as `[[153:Meteor Shower:7]]<uuid>`) is kept verbatim and mapped to `<sha256_hex(address)>.store` inside `--store-dir`.
-3. Every incoming Mail delivery is appended and `fsync`ed to that session's Store and enqueued onto its SSE event log **before** sending `ack` to `roger daemon`.
-4. If a container restarts and sends a fresh `initialize` for an Address still held by an earlier `Mcp-Session-Id` in the same gateway process, the gateway cleanly closes the stale `Mcp-Session-Id` (releasing its OS file lock without sending `unregister`) before opening the Store for the new session. A second gateway process pointed at the same `--store-dir` is refused immediately by `File::try_lock()`.
+## Explicit Session Handles (`roger_register` / `roger_unregister`)
 
-## Streamable HTTP & SSE Protocol
+1. Call `roger_register` (`{ id?, label?, declare?, watch? }`) to register or reattach an Address and receive `{ session, address }`. The handle survives across HTTP requests; re-registering the same `id` cleanly replaces the previous handle in this gateway without sending `unregister`.
+2. Pass `session` to `roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_renew`, `roger_release`, `roger_receipt`, `roger_registered` (plus `roger_subscribe`, `roger_unsubscribe`, `roger_groups` with `--groups`), and `events/poll` / `events/stream` `arguments`.
+3. Call `roger_unregister` (`{ session }`) to send `unregister` to `roger daemon`, close active streams, release the Store lock, and remove empty Store/Cursor files.
 
-Negotiated MCP protocol versions: `2025-06-18` (default), `2025-03-26`, `2024-11-05`.
+## SEP-3415 (`io.modelcontextprotocol/events`)
 
-### 1. `POST <endpoint>` — `initialize`
-
-Allowed without `Mcp-Session-Id` (request body limit: 16 MiB). Session parameters are extracted verbatim in precedence order:
-
-- **Address**: `X-Roger-Address` header -> URL query `id` or `address` (percent-decoded UTF-8) -> `params._meta.roger_address` -> generated UUIDv4.
-- **Label**: `X-Roger-Label` header -> URL query `label` -> `params._meta.roger_label`.
-- **Declaration**: `X-Roger-Declare` header -> URL query `declare` -> `params._meta.roger_declare`.
-
-Response (`200 OK`) returns `Mcp-Session-Id: <uuid>` and `X-Roger-Address: <address>` headers with the JSON-RPC `initialize` result. Any Store entries after `.cursor` are seeded into the session's SSE log at startup.
-
-### 2. `POST <endpoint>` — Requests & Notifications
-
-Requires `Mcp-Session-Id` (`400` if absent, `404` if unknown or closed):
-
-- JSON-RPC notifications (e.g. `notifications/initialized`) return `202 Accepted` with an empty body.
-- `ping` returns `{}`.
-- `tools/list` and `tools/call` expose all 9 Roger tools concurrently (`roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_renew`, `roger_release`, `roger_receipt`, `roger_registered`). Short-lived daemon connections handle outbound requests so a waiting `roger_inbox` call never blocks `roger_send`, `roger_board`, or SSE delivery.
-
-### 3. `GET <endpoint>` — Real-Time SSE Push & `Last-Event-ID`
-
-Requires `Mcp-Session-Id` (`400` / `404`; `406` if `Accept` excludes `text/event-stream` and `*/*`). Streams frames formatted as:
-
-```text
-id: <seq>
-event: message
-data: <compact-json>
-
-```
-
-Push notification payloads:
-
-- `{"jsonrpc":"2.0","method":"notifications/roger/mail","params":{"record":"r-1","mail":"...","from":"...","body":"...","kind":"directed","headers":{...}}}`
-- `{"jsonrpc":"2.0","method":"notifications/roger/registered","params":{"session":"..."}}`
-- `{"jsonrpc":"2.0","method":"notifications/roger/superseded","params":{"session":"...","host":"...","at_ms":...}}`
-
-Resumption rules:
-
-- **With `Last-Event-ID: <n>`**: replays all events in the session log with `seq > n`, followed by live events as they commit.
-- **Without `Last-Event-ID`**: starts from `delivered_up_to`, delivering any events committed in the startup window between `POST initialize` and `GET <endpoint>` without duplicating frames already streamed on an earlier SSE connection.
-- **Across gateway restarts**: clients using `roger_inbox` resume from `<store>.cursor`; push-driven clients receive all unconsumed Store records after `<store>.cursor` seeded immediately upon `initialize`.
-
-### 4. `DELETE <endpoint>` — Unregister & Clean Shutdown
-
-Requires `Mcp-Session-Id`. Sends `{"type":"unregister"}` to `roger daemon`, closes active SSE streams, releases the Store file lock (removing empty `.store` and `.cursor` files when zero records were written), and returns `200 OK` `{"ok":true}`.
+- `events/list` advertises `roger.mail` (`["push", "poll"]`), `roger.board` (`["push"]`), and `roger.registration` (`["push"]`).
+- `events/poll` (`roger.mail`) reads directly from the durable `.store` using `cursor` (`null` = start from now, `"r-0"` = from first record, `"r-N"` = after `r-N`), `maxAgeMs`, `maxEvents`, and `group`/`kind` filters without touching `.store.cursor`.
+- `events/stream` opens a dedicated SSE stream (`notifications/events/active`, replay + live `notifications/events/event`, `notifications/events/heartbeat` `data:` frames on `heartbeatMs`, and `notifications/events/terminated` on session teardown; closing the HTTP stream cancels immediately).
 
 ## Auditing Gateway Stores with `roger audit`
 
@@ -91,15 +54,3 @@ roger audit \
   --store /var/lib/roger/gateway-stores/<sha256_address>.store \
   --bodies
 ```
-
-## Named Groups and positions
-
-Opt in during initialize with `X-Roger-Groups: 1`, `?groups=1`, or
-`_meta.roger_groups: true`, in that precedence order. Each accepts `1`, `0`,
-`true`, or `false`; the default is false and retains the existing nine tools.
-Opted-in sessions additionally expose `roger_subscribe` (non-empty `group`,
-optional nonnegative `after` and boolean `latest`), `roger_unsubscribe`
-(non-empty `group`), and `roger_groups`. Positions are durable in the service.
-`roger_send` accepts exactly one of `to` and `group`; Group replies include
-`mail`, `group`, and `article`. Group deliveries retain `group` and `article`
-in the Store, inbox, and SSE mail notification, including event recovery.

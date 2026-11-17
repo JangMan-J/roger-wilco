@@ -1,4 +1,4 @@
-//! Multi-session lifecycle, durable Store commit-before-Ack loop, ordered SSE event log,
+//! Multi-session lifecycle, durable Store commit-before-Ack loop, SEP-3415 event feeds,
 //! and concurrent async Inbox reader.
 
 use crate::cli::DaemonSocket;
@@ -11,18 +11,26 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 // no-poll: Instant bounds client-requested wait_seconds on roger_inbox and roger_registered.
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+const MAX_RING_EVENTS: usize = 256;
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// Reader side of one session's Store, tracking `.cursor` across `roger_inbox` calls.
 pub struct AsyncInbox {
     store: PathBuf,
     pos_file: PathBuf,
-    initial: Option<String>,
     consumed: tokio::sync::Mutex<Option<String>>,
     arrived: Notify,
     closed: AtomicBool,
@@ -35,15 +43,10 @@ impl AsyncInbox {
         Ok(Self {
             store: store.to_path_buf(),
             pos_file,
-            initial: consumed.clone(),
             consumed: tokio::sync::Mutex::new(consumed),
             arrived: Notify::new(),
             closed: AtomicBool::new(false),
         })
-    }
-
-    pub fn initial_cursor(&self) -> Option<&str> {
-        self.initial.as_deref()
     }
 
     pub fn notify(&self) {
@@ -96,6 +99,7 @@ impl AsyncInbox {
             if left.is_zero() {
                 return Ok((Vec::new(), None));
             }
+            // no-poll: bounded wait on Store notification for wait_seconds.
             let _ = tokio::time::timeout(left, notified).await;
         }
     }
@@ -107,29 +111,37 @@ struct RegistrationState {
     superseded: Option<Value>,
 }
 
-pub struct EventLog {
-    pub events: Vec<(u64, String)>,
+pub struct EventFeed<T> {
+    pub items: Vec<(u64, T)>,
     pub next_seq: u64,
-    pub delivered_up_to: u64,
-    pub closed: bool,
 }
 
-impl EventLog {
-    fn new() -> Self {
+impl<T> Default for EventFeed<T> {
+    fn default() -> Self {
         Self {
-            events: Vec::new(),
-            next_seq: 1,
-            delivered_up_to: 0,
-            closed: false,
+            items: Vec::new(),
+            next_seq: 0,
         }
     }
+}
 
-    fn push(&mut self, json_line: String) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        self.events.push((seq, json_line));
+impl<T> EventFeed<T> {
+    pub fn push(&mut self, item: T) -> u64 {
+        let seq = self.next_seq + 1;
+        self.next_seq = seq;
+        self.items.push((seq, item));
+        if self.items.len() > MAX_RING_EVENTS {
+            let drain = self.items.len() - MAX_RING_EVENTS;
+            self.items.drain(..drain);
+        }
         seq
     }
+}
+
+#[derive(Clone)]
+pub struct NoticeItem {
+    pub at_ms: i64,
+    pub data: Value,
 }
 
 struct StoreGate {
@@ -145,20 +157,18 @@ pub struct GatewaySession {
     pub store_path: PathBuf,
     pub inbox: Arc<AsyncInbox>,
     reg_state: Mutex<RegistrationState>,
-    reg_notify: Notify,
-    pub event_log: Mutex<EventLog>,
-    pub event_notify: Arc<Notify>,
+    reg_wait_notify: Notify,
+    pub mail_seq: AtomicU64,
+    pub mail_notify: Arc<Notify>,
+    pub board_feed: Mutex<EventFeed<NoticeItem>>,
+    pub board_notify: Arc<Notify>,
+    pub reg_feed: Mutex<EventFeed<NoticeItem>>,
+    pub reg_notify: Arc<Notify>,
+    pub closed: AtomicBool,
+    watching: AtomicBool,
     store_gate: Mutex<StoreGate>,
     daemon_writer: DaemonWriter,
     reader_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-pub fn format_notification(method: &str, params: Value) -> String {
-    let mut obj = Map::new();
-    obj.insert("jsonrpc".into(), Value::String("2.0".into()));
-    obj.insert("method".into(), Value::String(method.into()));
-    obj.insert("params".into(), params);
-    serde_json::to_string(&Value::Object(obj)).expect("JSON-RPC notification serializes")
 }
 
 impl GatewaySession {
@@ -167,7 +177,7 @@ impl GatewaySession {
         // no-poll: bounds client-requested wait_seconds on roger_registered; notice arrival ends wait.
         let deadline = Instant::now() + wait;
         loop {
-            let notified = self.reg_notify.notified();
+            let notified = self.reg_wait_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
@@ -180,7 +190,7 @@ impl GatewaySession {
                     );
                 }
             }
-            if self.event_log.lock().unwrap().closed {
+            if self.closed.load(Ordering::SeqCst) {
                 let st = self.reg_state.lock().unwrap();
                 return (
                     st.confirmed && st.superseded.is_none(),
@@ -196,19 +206,27 @@ impl GatewaySession {
                     st.superseded.clone(),
                 );
             }
+            // no-poll: bounded wait on registration notification for wait_seconds.
             let _ = tokio::time::timeout(left, notified).await;
         }
     }
 
-    pub fn initial_sse_cursor(&self, last_event_id: Option<u64>) -> u64 {
-        match last_event_id {
-            Some(n) => n,
-            None => self.event_log.lock().unwrap().delivered_up_to,
+    pub async fn ensure_watch(&self) -> io::Result<()> {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return Ok(());
         }
+        let mut msg = Map::new();
+        msg.insert("type".into(), Value::String("watch".into()));
+        msg.insert("req".into(), Value::Number(1.into()));
+        if let Err(e) = self.daemon_writer.send(&Value::Object(msg)).await {
+            self.watching.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// Tear down an older session for the same Address during container restart re-initialization:
-    /// closes SSE streams, releases the Store file lock immediately, and disconnects from the
+    /// Tear down an older session for the same Address during re-registration:
+    /// closes streams, releases the Store file lock immediately, and disconnects from the
     /// daemon WITHOUT sending `unregister` (since the Address is immediately re-registering).
     pub async fn shutdown_for_reinit(&self) {
         {
@@ -219,12 +237,13 @@ impl GatewaySession {
         self.signal_closed();
         let _ = self.daemon_writer.shutdown().await;
         if let Some(handle) = self.reader_task.lock().await.take() {
+            // no-poll: bounded wait for reader task shutdown.
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
     }
 
-    /// Tear down on `DELETE`: send `unregister`, close SSE streams, release Store lock, and
-    /// remove empty Store/Cursor files if 0 entries were ever written.
+    /// Tear down on `roger_unregister`: send `unregister`, close streams, release Store lock,
+    /// and remove empty Store/Cursor files if 0 entries were ever written.
     pub async fn close_and_unregister(&self) {
         {
             let mut gate = self.store_gate.lock().unwrap();
@@ -237,6 +256,7 @@ impl GatewaySession {
         let _ = self.daemon_writer.shutdown().await;
         self.signal_closed();
         if let Some(handle) = self.reader_task.lock().await.take() {
+            // no-poll: bounded wait for reader task shutdown.
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
         let store_path = self.store_path.clone();
@@ -249,10 +269,12 @@ impl GatewaySession {
     }
 
     fn signal_closed(&self) {
-        self.event_log.lock().unwrap().closed = true;
-        self.event_notify.notify_waiters();
-        self.inbox.close();
+        self.closed.store(true, Ordering::SeqCst);
+        self.mail_notify.notify_waiters();
+        self.board_notify.notify_waiters();
         self.reg_notify.notify_waiters();
+        self.inbox.close();
+        self.reg_wait_notify.notify_waiters();
     }
 }
 
@@ -264,31 +286,33 @@ struct RegistryMaps {
 pub struct SessionManager {
     socket: DaemonSocket,
     store_dir: PathBuf,
+    groups: bool,
     #[cfg(feature = "test-hooks")]
     hold_before_ack: Option<PathBuf>,
     init_lock: tokio::sync::Mutex<()>,
     maps: Mutex<RegistryMaps>,
 }
 
-pub struct InitParams {
+pub struct RegisterParams {
     pub address: Option<String>,
     pub label: Option<String>,
     pub declared: Option<String>,
-    /// Ask the host daemon for committed Board changes, forwarded over SSE
-    /// as `notifications/roger/board`.
+    /// Ask the host daemon for committed Board changes, forwarded over
+    /// `roger.board` event streams.
     pub watch: bool,
-    pub groups: bool,
 }
 
 impl SessionManager {
     pub fn new(
         socket: DaemonSocket,
         store_dir: PathBuf,
+        groups: bool,
         #[cfg(feature = "test-hooks")] hold_before_ack: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             socket,
             store_dir,
+            groups,
             #[cfg(feature = "test-hooks")]
             hold_before_ack,
             init_lock: tokio::sync::Mutex::new(()),
@@ -299,34 +323,37 @@ impl SessionManager {
         })
     }
 
-    pub fn get(&self, session_id: &str) -> Option<Arc<GatewaySession>> {
-        self.maps.lock().unwrap().by_id.get(session_id).cloned()
+    pub fn groups(&self) -> bool {
+        self.groups
     }
 
-    pub async fn delete(&self, session_id: &str) -> bool {
+    pub fn get(&self, session_handle: &str) -> Option<Arc<GatewaySession>> {
+        self.maps.lock().unwrap().by_id.get(session_handle).cloned()
+    }
+
+    pub async fn unregister(&self, session_handle: &str) -> Option<String> {
         let removed = {
             let mut maps = self.maps.lock().unwrap();
-            let Some(session) = maps.by_id.remove(session_id) else {
-                return false;
-            };
+            let session = maps.by_id.remove(session_handle)?;
             if maps
                 .id_by_address
                 .get(&session.address)
-                .is_some_and(|id| id == session_id)
+                .is_some_and(|id| id == session_handle)
             {
                 maps.id_by_address.remove(&session.address);
             }
             session
         };
+        let address = removed.address.clone();
         removed.close_and_unregister().await;
-        true
+        Some(address)
     }
 
-    /// Initialize a new MCP session, cleanly dropping any older session in this gateway
-    /// process that holds the same `Address` before opening the durable Store.
-    pub async fn initialize(
+    /// Register or reattach a session handle, cleanly dropping any older session in this
+    /// gateway process that holds the same `Address` before opening the durable Store.
+    pub async fn register(
         self: &Arc<Self>,
-        params: InitParams,
+        params: RegisterParams,
     ) -> io::Result<Arc<GatewaySession>> {
         let _guard = self.init_lock.lock().await;
 
@@ -347,14 +374,13 @@ impl SessionManager {
             old_session.shutdown_for_reinit().await;
         }
 
-        let session_id = blocking_io(gen_uuid)?;
+        let session_id = format!("rw_{}", blocking_io(gen_uuid)?);
         let s_path = store_path(&self.store_dir, &address);
 
         let s_path_open = s_path.clone();
-        let (store, records, replayed_entries) = blocking_io(move || -> io::Result<_> {
+        let (store, records) = blocking_io(move || -> io::Result<_> {
             let (store, replay) = DurLog::open(&s_path_open)?;
             let mut records = HashMap::new();
-            let mut entries = Vec::new();
             for line in replay {
                 let line = line?;
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
@@ -363,19 +389,13 @@ impl SessionManager {
                         v.get("record").and_then(Value::as_str),
                     ) {
                         records.insert(mail.to_string(), record.to_string());
-                        entries.push(v);
                     }
                 }
             }
-            Ok((store, records, entries))
+            Ok((store, records))
         })?;
 
         let inbox = Arc::new(AsyncInbox::open(&s_path)?);
-        let mut event_log = EventLog::new();
-        for unconsumed in entries_after(&replayed_entries, inbox.initial_cursor(), usize::MAX) {
-            event_log.push(format_notification("notifications/roger/mail", unconsumed));
-        }
-
         let (daemon_reader, daemon_writer) = daemon::connect(&self.socket).await?;
         let mut reg_msg = Map::new();
         reg_msg.insert("type".into(), Value::String("register".into()));
@@ -397,13 +417,19 @@ impl SessionManager {
             session_id: session_id.clone(),
             address: address.clone(),
             socket: self.socket.clone(),
-            groups: params.groups,
+            groups: self.groups,
             store_path: s_path,
             inbox,
             reg_state: Mutex::new(RegistrationState::default()),
-            reg_notify: Notify::new(),
-            event_log: Mutex::new(event_log),
-            event_notify: Arc::new(Notify::new()),
+            reg_wait_notify: Notify::new(),
+            mail_seq: AtomicU64::new(0),
+            mail_notify: Arc::new(Notify::new()),
+            board_feed: Mutex::new(EventFeed::default()),
+            board_notify: Arc::new(Notify::new()),
+            reg_feed: Mutex::new(EventFeed::default()),
+            reg_notify: Arc::new(Notify::new()),
+            closed: AtomicBool::new(false),
+            watching: AtomicBool::new(params.watch),
             store_gate: Mutex::new(StoreGate {
                 closing: false,
                 store: Some(store),
@@ -497,11 +523,11 @@ async fn reader_loop(
                                 entry.insert(key.into(), value.clone());
                             }
                         }
+                        entry.insert("stored_at_ms".into(), Value::Number(now_ms().into()));
                         let entry_val = Value::Object(entry);
                         let Ok(line) = serde_json::to_string(&entry_val) else {
                             break;
                         };
-                        let notif = format_notification("notifications/roger/mail", entry_val);
 
                         let committed = blocking_io(|| {
                             let mut gate = session.store_gate.lock().unwrap();
@@ -512,15 +538,15 @@ async fn reader_loop(
                                 return Ok(false);
                             };
                             store.append(&line)?;
-                            session.event_log.lock().unwrap().push(notif);
                             Ok::<bool, io::Error>(true)
                         });
                         match committed {
                             Ok(true) => {
                                 next_record += 1;
                                 records.insert(mail.clone(), candidate.clone());
+                                session.mail_seq.fetch_add(1, Ordering::SeqCst);
                                 session.inbox.notify();
-                                session.event_notify.notify_waiters();
+                                session.mail_notify.notify_waiters();
                                 candidate
                             }
                             Ok(false) => continue,
@@ -568,14 +594,18 @@ async fn reader_loop(
             }
             "registered" => {
                 session.reg_state.lock().unwrap().confirmed = true;
-                session.reg_notify.notify_waiters();
+                session.reg_wait_notify.notify_waiters();
 
-                let mut params = Map::new();
-                params.insert("session".into(), Value::String(session.address.clone()));
-                let notif =
-                    format_notification("notifications/roger/registered", Value::Object(params));
-                session.event_log.lock().unwrap().push(notif);
-                session.event_notify.notify_waiters();
+                let at = now_ms();
+                let mut data = Map::new();
+                data.insert("event".into(), Value::String("registered".into()));
+                data.insert("session".into(), Value::String(session.address.clone()));
+                data.insert("at_ms".into(), Value::Number(at.into()));
+                session.reg_feed.lock().unwrap().push(NoticeItem {
+                    at_ms: at,
+                    data: Value::Object(data),
+                });
+                session.reg_notify.notify_waiters();
             }
             "superseded" => {
                 let (Ok(sess_name), Ok(host)) =
@@ -599,18 +629,21 @@ async fn reader_loop(
                 );
 
                 session.reg_state.lock().unwrap().superseded = Some(tool_notice_val);
-                session.reg_notify.notify_waiters();
+                session.reg_wait_notify.notify_waiters();
 
-                let mut sse_params = Map::new();
-                sse_params.insert("session".into(), Value::String(sess_name.to_string()));
-                sse_params.insert("host".into(), Value::String(host.to_string()));
-                sse_params.insert("at_ms".into(), at_ms);
-                let notif = format_notification(
-                    "notifications/roger/superseded",
-                    Value::Object(sse_params),
-                );
-                session.event_log.lock().unwrap().push(notif);
-                session.event_notify.notify_waiters();
+                let at = at_ms.as_i64().unwrap_or_else(now_ms);
+                let mut data = Map::new();
+                data.insert("event".into(), Value::String("superseded".into()));
+                data.insert("session".into(), Value::String(sess_name.to_string()));
+                data.insert("host".into(), Value::String(host.to_string()));
+                if !at_ms.is_null() {
+                    data.insert("at_ms".into(), at_ms);
+                }
+                session.reg_feed.lock().unwrap().push(NoticeItem {
+                    at_ms: at,
+                    data: Value::Object(data),
+                });
+                session.reg_notify.notify_waiters();
             }
             // A committed Board change; the host daemon sends it only because
             // this session asked. An observation, not Mail: no Store, no Ack.
@@ -620,15 +653,21 @@ async fn reader_loop(
                     _ => continue,
                 };
                 params.shift_remove("type");
-                let notif = format_notification("notifications/roger/board", Value::Object(params));
-                session.event_log.lock().unwrap().push(notif);
-                session.event_notify.notify_waiters();
+                let at = params
+                    .get("at_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(now_ms);
+                session.board_feed.lock().unwrap().push(NoticeItem {
+                    at_ms: at,
+                    data: Value::Object(params),
+                });
+                session.board_notify.notify_waiters();
             }
             _ => {}
         }
     }
 
-    // Daemon connection closed or session shut down: drop Store lock and finish SSE streams.
+    // Daemon connection closed or session shut down: drop Store lock and finish streams.
     {
         let mut gate = session.store_gate.lock().unwrap();
         gate.closing = true;

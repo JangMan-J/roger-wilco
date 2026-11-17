@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "\
 Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port> --store-dir <dir>
-                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>]";
+                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>] [--groups]";
 
 /// Target address of the host `roger daemon`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,7 @@ pub struct Config {
     pub port_file: Option<PathBuf>,
     pub endpoint: String,
     pub bearer_token: Option<String>,
+    pub groups: bool,
     #[cfg(feature = "test-hooks")]
     pub hold_before_ack: Option<PathBuf>,
 }
@@ -83,6 +84,7 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
     let mut port_file: Option<PathBuf> = None;
     let mut endpoint = "/mcp".to_string();
     let mut token_env: Option<String> = None;
+    let mut groups = false;
     #[cfg(feature = "test-hooks")]
     let mut hold_before_ack: Option<PathBuf> = None;
 
@@ -142,6 +144,9 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
                 }
                 token_env = Some(v);
             }
+            "--groups" => {
+                groups = true;
+            }
             #[cfg(feature = "test-hooks")]
             "--hold-before-ack" => {
                 let v = next_val()?;
@@ -154,7 +159,7 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
             }
             other => {
                 return Err(bad(format!(
-                    "expected a flag (--bind, --socket, --store-dir, --port-file, --endpoint, --token-env, --help), saw {other}"
+                    "expected a flag (--bind, --socket, --store-dir, --port-file, --endpoint, --token-env, --groups, --help), saw {other}"
                 )))
             }
         }
@@ -183,6 +188,7 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
         port_file,
         endpoint,
         bearer_token,
+        groups,
         #[cfg(feature = "test-hooks")]
         hold_before_ack,
     }))
@@ -246,6 +252,7 @@ mod tests {
                 "/v1/mcp",
                 "--token-env",
                 "GW_TOKEN",
+                "--groups",
             ]),
             &env,
         )
@@ -259,6 +266,7 @@ mod tests {
         assert_eq!(cfg.port_file, Some(PathBuf::from("/tmp/gw.port")));
         assert_eq!(cfg.endpoint, "/v1/mcp");
         assert_eq!(cfg.bearer_token.as_deref(), Some("secret-123"));
+        assert!(cfg.groups);
     }
 
     #[test]

@@ -2,34 +2,41 @@ use roger_mcp_gateway::{
     cli::DaemonSocket,
     durlog::read_store_entries,
     mcp,
-    session::{InitParams, SessionManager},
+    session::{RegisterParams, SessionManager},
 };
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
 };
+
 #[test]
 fn group_tool_isolation() {
-    let base = mcp::tools_list();
-    assert_eq!(base["tools"].as_array().unwrap().len(), 9);
-    let opt = mcp::tools_list_groups(true);
-    assert_eq!(opt["tools"].as_array().unwrap().len(), 12);
-    assert_eq!(opt["tools"][9]["name"], "roger_subscribe");
+    let base = mcp::tools_list(false);
+    let base_tools = base["tools"].as_array().unwrap();
+    assert_eq!(base_tools.len(), 11);
+    let opt = mcp::tools_list(true);
+    let opt_tools = opt["tools"].as_array().unwrap();
+    assert_eq!(opt_tools.len(), 14);
+    assert_eq!(opt_tools[11]["name"], "roger_subscribe");
+    // tools[2] is roger_send
     assert_eq!(
-        base["tools"][0]["inputSchema"]["required"],
-        json!(["to", "body"])
+        base_tools[2]["inputSchema"]["required"],
+        json!(["session", "to", "body"])
     );
-    assert!(opt["tools"][0]["inputSchema"]["properties"]["group"].is_object());
+    assert!(opt_tools[2]["inputSchema"]["properties"]["group"].is_object());
 }
+
 #[tokio::test]
-async fn group_delivery_store_ack_and_recovery() {
+async fn group_delivery_store_ack_and_events_poll_recovery() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = std::env::temp_dir().join(format!("gateway-groups-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let manager = SessionManager::new(
         DaemonSocket::Tcp(listener.local_addr().unwrap().to_string()),
         dir.clone(),
+        true,
         None,
     );
     let store = roger_mcp_gateway::durlog::store_path(&dir, "reader");
@@ -41,16 +48,17 @@ async fn group_delivery_store_ack_and_recovery() {
         w.write_all(b"{\"type\":\"deliver\",\"mail\":\"m-group\",\"from\":\"sender\",\"to\":\"reader\",\"group\":\"news\",\"article\":7,\"body\":\"hello\",\"kind\":\"group\"}\n").await.unwrap();
         let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(ack["type"], "ack");
-        assert_eq!(read_store_entries(&store).unwrap()[0]["article"], 7);
+        let entries = read_store_entries(&store).unwrap();
+        assert_eq!(entries[0]["article"], 7);
+        assert!(entries[0]["stored_at_ms"].is_i64());
         ack
     });
     let session = manager
-        .initialize(InitParams {
+        .register(RegisterParams {
             address: Some("reader".into()),
             label: None,
             declared: None,
             watch: false,
-            groups: true,
         })
         .await
         .unwrap();
@@ -59,51 +67,44 @@ async fn group_delivery_store_ack_and_recovery() {
     assert_eq!(entries[0]["record"], ack["record"]);
     assert_eq!(entries[0]["group"], "news");
     assert_eq!(entries[0]["article"], 7);
+
+    // Poll SEP-3415 roger.mail without touching roger_inbox cursor.
+    let polled = mcp::events_poll(
+        &manager,
+        &json!({
+            "name": "roger.mail",
+            "arguments": { "session": session.session_id, "group": "news" },
+            "cursor": "r-0"
+        }),
+    )
+    .await
+    .unwrap();
+    let evs = polled["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["eventId"], "m-group");
+    assert_eq!(evs[0]["data"]["group"], "news");
+    assert_eq!(evs[0]["data"]["article"], 7);
+    assert_eq!(polled["cursor"], "r-1");
+
+    // roger_inbox still sees the entry independently.
     let (items, _) = session
         .inbox
         .read(10, std::time::Duration::ZERO, true)
         .await
         .unwrap();
     assert_eq!(items[0]["article"], 7);
-    let seq = {
-        let log = session.event_log.lock().unwrap();
-        let payload: Value = serde_json::from_str(&log.events[0].1).unwrap();
-        assert_eq!(payload["method"], "notifications/roger/mail");
-        assert_eq!(payload["params"]["group"], "news");
-        log.events[0].0
-    };
-    assert_eq!(session.initial_sse_cursor(Some(seq)), seq);
-    use http_body_util::BodyExt;
-    let mut live = roger_mcp_gateway::http::SseBody::new(session.clone(), 0);
-    let bytes = live.frame().await.unwrap().unwrap().into_data().unwrap();
-    let text = std::str::from_utf8(&bytes).unwrap();
-    assert!(text.contains("notifications/roger/mail") && text.contains(r#""article":7"#));
-    let mut recovered =
-        roger_mcp_gateway::http::SseBody::new(session.clone(), session.initial_sse_cursor(Some(0)));
-    assert_eq!(
-        recovered
-            .frame()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_data()
-            .unwrap(),
-        bytes
-    );
-    let mut caught_up = roger_mcp_gateway::http::SseBody::new(
-        session.clone(),
-        session.initial_sse_cursor(Some(seq)),
-    );
-    assert!(caught_up.frame().await.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn group_request_frames() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = std::env::temp_dir().join(format!("gateway-frames-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     let manager = SessionManager::new(
         DaemonSocket::Tcp(listener.local_addr().unwrap().to_string()),
-        dir,
+        dir.clone(),
+        true,
         None,
     );
     let server = tokio::spawn(async move {
@@ -143,36 +144,40 @@ async fn group_request_frames() {
         }
     });
     let session = manager
-        .initialize(InitParams {
+        .register(RegisterParams {
             address: Some("reader".into()),
             label: None,
             declared: None,
             watch: false,
-            groups: true,
         })
         .await
         .unwrap();
-    for args in [json!({}), json!({"to":"a","group":"news"})] {
-        let error = mcp::call_tool(&session, &json!({"name":"roger_send","arguments":args}))
+    let sid = session.session_id.clone();
+
+    for args in [
+        json!({"session": sid}),
+        json!({"session": sid, "to":"a","group":"news"}),
+    ] {
+        let error = mcp::call_tool(&manager, &json!({"name":"roger_send","arguments":args}))
             .await
             .unwrap_err();
         assert!(error.contains("expected") && error.contains("saw"));
     }
     for args in [
-        json!({"group":""}),
-        json!({"group":"news","after":-1}),
-        json!({"group":"news","latest":1}),
+        json!({"session": sid, "group":""}),
+        json!({"session": sid, "group":"news","after":-1}),
+        json!({"session": sid, "group":"news","latest":1}),
     ] {
         assert!(mcp::call_tool(
-            &session,
+            &manager,
             &json!({"name":"roger_subscribe","arguments":args})
         )
         .await
         .is_err());
     }
     let sub = mcp::call_tool(
-        &session,
-        &json!({"name":"roger_subscribe","arguments":{"group":"news","after":0,"latest":false}}),
+        &manager,
+        &json!({"name":"roger_subscribe","arguments":{"session": sid, "group":"news","after":0,"latest":false}}),
     )
     .await
     .unwrap();
@@ -181,18 +186,30 @@ async fn group_request_frames() {
         json!({"session":"reader","group":"news","position":0,"high_water":7})
     );
     let unsub = mcp::call_tool(
-        &session,
-        &json!({"name":"roger_unsubscribe","arguments":{"group":"news"}}),
+        &manager,
+        &json!({"name":"roger_unsubscribe","arguments":{"session": sid, "group":"news"}}),
     )
     .await
     .unwrap();
     assert_eq!(unsub["position"], 0);
     assert_eq!(
-        mcp::call_tool(&session, &json!({"name":"roger_groups"}))
-            .await
-            .unwrap(),
+        mcp::call_tool(
+            &manager,
+            &json!({"name":"roger_groups","arguments":{"session": sid}})
+        )
+        .await
+        .unwrap(),
         json!({"groups":[]})
     );
-    assert_eq!(mcp::call_tool(&session,&json!({"name":"roger_send","arguments":{"group":"news","mail":"posted","body":"text","headers":{"x":"y"}}})).await.unwrap(),json!({"mail":"posted","group":"news","article":8}));
+    assert_eq!(
+        mcp::call_tool(
+            &manager,
+            &json!({"name":"roger_send","arguments":{"session": sid, "group":"news","mail":"posted","body":"text","headers":{"x":"y"}}})
+        )
+        .await
+        .unwrap(),
+        json!({"mail":"posted","group":"news","article":8})
+    );
     server.await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
