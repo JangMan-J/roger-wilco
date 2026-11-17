@@ -167,8 +167,28 @@ pub struct Group {
     pub position: Option<i64>,
     pub subscribed: bool,
     pub record_id: Option<String>,
+    pub retired: bool,
+    pub keep_last: Option<i64>,
+    pub ttl_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct Article {
+    pub article_num: i64,
+    pub mail_id: String,
+    pub from: String,
+    pub body: String,
+    pub headers: Value,
+    pub accepted_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArticlesPage {
+    pub group: String,
+    pub high_water: i64,
+    pub retired: bool,
+    pub articles: Vec<Article>,
+}
 /// Shared schema DDL for each coordinator slice `hot.sqlite` so `coord`,
 /// `import`, and `audit_ro` agree on exact table and column names.
 pub const COORD_SLICE_SCHEMA: &str = "
@@ -206,7 +226,10 @@ CREATE TABLE IF NOT EXISTS timeline (
 CREATE TABLE IF NOT EXISTS streams (
     stream TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
-    next_article INTEGER NOT NULL
+    next_article INTEGER NOT NULL,
+    keep_last INTEGER,
+    ttl_ms INTEGER,
+    retired_at_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS seen_ids (
     mail_id TEXT PRIMARY KEY,

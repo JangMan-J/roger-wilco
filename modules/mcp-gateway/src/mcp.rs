@@ -368,6 +368,8 @@ pub fn tools_list(groups: bool) -> Value {
         // tools[2] is roger_send
         tools[2]["inputSchema"]["properties"]["group"] =
             serde_json::json!({"type":"string","minLength":1});
+        tools[2]["inputSchema"]["properties"]["expected_article"] =
+            serde_json::json!({"type":"integer","minimum":0});
         tools[2]["inputSchema"]["required"] = serde_json::json!(["session", "body"]);
         tools[2]["inputSchema"]["oneOf"] = serde_json::json!([
             {"required":["to"],"not":{"required":["group"]}},
@@ -387,7 +389,7 @@ pub fn tools_list(groups: bool) -> Value {
             (
                 "roger_groups",
                 "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
-                serde_json::json!({"type":"object","properties":{"session":{"type":"string"}},"required":["session"],"additionalProperties":false}),
+                serde_json::json!({"type":"object","properties":{"session":{"type":"string"},"prefix":{"type":"string"},"include_retired":{"type":"boolean"}},"required":["session"],"additionalProperties":false}),
             ),
         ] {
             tools.push(serde_json::json!({
@@ -628,6 +630,18 @@ pub async fn call_session_tool(
             if session.groups && (args.get("to").is_some() == args.get("group").is_some()) {
                 return Err("roger_send: expected either to or group, saw both or neither".into());
             }
+            let expected_article = if session.groups && args.get("expected_article").is_some() {
+                Some(opt_int(
+                    name,
+                    args,
+                    "expected_article",
+                    0,
+                    (0, i64::MAX),
+                    false,
+                )?)
+            } else {
+                None
+            };
             if let Some(group) = group {
                 if group.is_empty() {
                     return Err("expected non-empty group, saw empty string".into());
@@ -641,10 +655,16 @@ pub async fn call_session_tool(
                 if let Some(h) = args.get("headers") {
                     req["headers"] = h.clone();
                 }
+                if let Some(exp) = expected_article {
+                    req["expected_article"] = serde_json::json!(exp);
+                }
                 return daemon::request(&session.socket, &req)
                     .await
                     .map(without_envelope)
                     .map_err(io_err);
+            }
+            if expected_article.is_some() {
+                return Err("roger_send: expected_article requires group".into());
             }
             let to = need_str(name, args, "to")?;
             let body = need_str(name, args, "body")?;
@@ -678,8 +698,18 @@ pub async fn call_session_tool(
                     return Err("expected non-empty group, saw empty string".into());
                 }
                 req["group"] = Value::String(group.into());
-            } else if let Some(m) = args.as_object() {
-                check_no_extra_keys(name, m, &["session"])?;
+            } else {
+                if let Some(m) = args.as_object() {
+                    check_no_extra_keys(name, m, &["session", "prefix", "include_retired"])?;
+                }
+                if let Some(p) = opt_str(name, args, "prefix")? {
+                    if !p.is_empty() {
+                        req["prefix"] = Value::String(p.into());
+                    }
+                }
+                if opt_bool(name, args, "include_retired")? {
+                    req["include_retired"] = Value::Bool(true);
+                }
             }
             if op == "subscribe" {
                 if args.get("after").is_some() {
@@ -882,6 +912,7 @@ pub fn events_list_result() -> Value {
                     "properties": {
                         "session": {"type": "string"},
                         "group": {"type": "string"},
+                        "groupPrefix": {"type": "string", "minLength": 1},
                         "kind": {"type": "string", "enum": ["directed", "broadcast", "group"]}
                     },
                     "required": ["session"],
@@ -963,6 +994,7 @@ pub fn events_list_result() -> Value {
 #[derive(Clone, Default)]
 pub struct MailFilter {
     pub group: Option<String>,
+    pub group_prefix: Option<String>,
     pub kind: Option<String>,
 }
 
@@ -970,6 +1002,15 @@ impl MailFilter {
     pub fn matches(&self, entry: &Value) -> bool {
         if let Some(g) = &self.group {
             if entry.get("group").and_then(Value::as_str) != Some(g.as_str()) {
+                return false;
+            }
+        }
+        if let Some(p) = &self.group_prefix {
+            if !entry
+                .get("group")
+                .and_then(Value::as_str)
+                .is_some_and(|g| g.starts_with(p.as_str()))
+            {
                 return false;
             }
         }
@@ -1027,6 +1068,20 @@ fn parse_event_args(
                     )));
                 };
                 filter.group = Some(g.to_string());
+            }
+            ("roger.mail", "groupPrefix") => {
+                let Some(p) = v.as_str() else {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.groupPrefix to be a string, saw {}",
+                        type_name(Some(v))
+                    )));
+                };
+                if p.is_empty() {
+                    return Err(RpcErr::invalid_params(
+                        "expected arguments.groupPrefix to be non-empty, saw empty string",
+                    ));
+                }
+                filter.group_prefix = Some(p.to_string());
             }
             ("roger.mail", "kind") => {
                 let Some(kind) = v.as_str() else {

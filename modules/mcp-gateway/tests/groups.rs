@@ -128,6 +128,18 @@ async fn group_request_frames() {
                 json!({"type":"send","req":1,"from":"reader","group":"news","mail":"posted","body":"text","headers":{"x":"y"}}),
                 json!({"type":"accepted","mail":"posted","group":"news","article":8}),
             ),
+            (
+                json!({"type":"send","req":1,"from":"reader","group":"news","mail":"stale-news","body":"no","expected_article":0}),
+                json!({"type":"error","reason":"expected group news at article 0, saw 8"}),
+            ),
+            (
+                json!({"type":"send","req":1,"from":"reader","group":"news","mail":"cas-news","body":"yes","expected_article":8}),
+                json!({"type":"accepted","mail":"cas-news","group":"news","article":9}),
+            ),
+            (
+                json!({"type":"groups","req":1,"session":"reader","prefix":"ne","include_retired":true}),
+                json!({"type":"groups","groups":[]}),
+            ),
         ] {
             let (stream, _) = listener.accept().await.unwrap();
             let (r, mut w) = stream.into_split();
@@ -210,6 +222,41 @@ async fn group_request_frames() {
         .unwrap(),
         json!({"mail":"posted","group":"news","article":8})
     );
+    // expected_article CAS + prefix/include_retired + groupPrefix filter
+    assert!(mcp::call_tool(
+        &manager,
+        &json!({"name":"roger_send","arguments":{"session": sid, "group":"news","mail":"stale-news","body":"no","expected_article": 0}})
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        mcp::call_tool(
+            &manager,
+            &json!({"name":"roger_send","arguments":{"session": sid, "group":"news","mail":"cas-news","body":"yes","expected_article": 8}})
+        )
+        .await
+        .unwrap(),
+        json!({"mail":"cas-news","group":"news","article":9})
+    );
+    let filtered_groups = mcp::call_tool(
+        &manager,
+        &json!({"name":"roger_groups","arguments":{"session": sid, "prefix":"ne", "include_retired": true}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered_groups, json!({"groups":[]}));
+    let prefix_req = mcp::validate_event_req(
+        &manager,
+        &json!({"name":"roger.mail","cursor":"r-0","arguments":{"session": sid, "groupPrefix":"ne"}}),
+        true,
+    )
+    .unwrap();
+    assert!(prefix_req
+        .filter
+        .matches(&json!({"group":"news","kind":"group"})));
+    assert!(!prefix_req
+        .filter
+        .matches(&json!({"group":"ops","kind":"group"})));
     server.await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

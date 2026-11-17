@@ -190,6 +190,23 @@ fn run_batch(conn: &mut Connection, batch: Vec<Job>) {
     }
 }
 
+fn migrate_streams(c: &Connection) -> rusqlite::Result<()> {
+    let mut st = c.prepare("PRAGMA table_info(streams)")?;
+    let cols: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, ty) in [
+        ("keep_last", "INTEGER"),
+        ("ttl_ms", "INTEGER"),
+        ("retired_at_ms", "INTEGER"),
+    ] {
+        if !cols.iter().any(|c| c == name) {
+            c.execute(&format!("ALTER TABLE streams ADD COLUMN {name} {ty}"), [])?;
+        }
+    }
+    Ok(())
+}
+
 fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
     let c = Connection::open(path).map_err(sq)?;
     c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
@@ -198,6 +215,7 @@ fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
         .map_err(sq)?;
     if schema {
         c.execute_batch(COORD_SLICE_SCHEMA).map_err(sq)?;
+        migrate_streams(&c).map_err(sq)?;
     }
     Ok(c)
 }
@@ -262,6 +280,7 @@ pub struct GroupMail {
     pub group: String,
     pub body: String,
     pub headers: Option<Value>,
+    pub expected_article: Option<i64>,
     pub accepted_at_ms: Option<i64>,
 }
 
@@ -360,6 +379,7 @@ struct NewEnvelope {
     accepted_at_ms: Option<i64>,
     day_bucket: i64,
     reader: Option<String>,
+    expected_article: Option<i64>,
 }
 
 struct NewSeen {
@@ -371,10 +391,31 @@ struct NewSeen {
     body_sha256: String,
 }
 
+enum InsertOutcome {
+    Committed(i64),
+    ResendConflict(String),
+    HeadConflict { expected: i64, saw: i64 },
+}
+
+fn prune_hot_group(c: &Connection, stream: &str, max_drop_art: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM hot_bodies WHERE mail_id IN (
+             SELECT mail_id FROM envelopes WHERE stream = ?1 AND article_num <= ?2 AND in_cold = 0
+         )",
+        params![stream, max_drop_art],
+    )?;
+    c.execute(
+        "DELETE FROM envelopes WHERE stream = ?1 AND article_num <= ?2 AND in_cold = 0",
+        params![stream, max_drop_art],
+    )?;
+    Ok(())
+}
+
 /// Insert one envelope and its body, assigning the stream's next article.
 /// A repeat of the same Mail returns its article; a different Mail under an
-/// existing id returns what differs.
-fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<Result<i64, String>> {
+/// existing id returns what differs; an expected-article mismatch returns the
+/// expected vs current head.
+fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<InsertOutcome> {
     let existing = c
         .query_row(
             "SELECT article_num, sender, recipient, body_len, body_sha256 FROM envelopes WHERE mail_id = ?1",
@@ -402,20 +443,26 @@ fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<Result<i
             what.push("body");
         }
         return Ok(if what.is_empty() {
-            Ok(art)
+            InsertOutcome::Committed(art)
         } else {
-            Err(what.join(", "))
+            InsertOutcome::ResendConflict(what.join(", "))
         });
     }
     c.execute(
         "INSERT OR IGNORE INTO streams (stream, kind, next_article) VALUES (?1, ?2, 1)",
         params![e.stream, e.stream_kind],
     )?;
-    let art: i64 = c.query_row(
-        "SELECT next_article FROM streams WHERE stream = ?1",
+    let (art, keep_last): (i64, Option<i64>) = c.query_row(
+        "SELECT next_article, keep_last FROM streams WHERE stream = ?1",
         [&e.stream],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    if let Some(expected) = e.expected_article {
+        let saw = art - 1;
+        if saw != expected {
+            return Ok(InsertOutcome::HeadConflict { expected, saw });
+        }
+    }
     c.execute(
         "UPDATE streams SET next_article = ?2 WHERE stream = ?1",
         params![e.stream, art + 1],
@@ -442,13 +489,18 @@ fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<Result<i
         "INSERT INTO hot_bodies (mail_id, body) VALUES (?1, ?2)",
         params![e.mail_id, e.body],
     )?;
+    if e.stream_kind == "group" {
+        if let Some(keep) = keep_last.filter(|&k| k >= 0) {
+            prune_hot_group(c, &e.stream, art - keep)?;
+        }
+    }
     if let Some(reader) = &e.reader {
         c.execute(
             "INSERT OR IGNORE INTO positions (stream, reader, subscribed, position, updated_at_ms) VALUES (?1, ?2, 1, 0, ?3)",
             params![e.stream, reader, e.accepted_at_ms],
         )?;
     }
-    Ok(Ok(art))
+    Ok(InsertOutcome::Committed(art))
 }
 
 fn insert_seen(c: &Connection, s: &NewSeen, article_num: i64) -> rusqlite::Result<()> {
@@ -608,28 +660,36 @@ impl Inner {
         })
     }
 
-    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<Delivery> {
-        let body = match raw.body {
-            Some(b) => b,
-            None if raw.in_cold => self.slices[idx]
+    fn resolve_body(
+        &self,
+        idx: usize,
+        mail_id: &str,
+        day_bucket: i64,
+        in_cold: bool,
+        body: Option<String>,
+    ) -> io::Result<String> {
+        match body {
+            Some(b) => Ok(b),
+            None if in_cold => self.slices[idx]
                 .cold
-                .read_body(raw.day_bucket, &raw.mail_id)?
+                .read_body(day_bucket, mail_id)?
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "expected mail {} in cold day {}, saw no such record",
-                            raw.mail_id, raw.day_bucket
+                            "expected mail {mail_id} in cold day {day_bucket}, saw no such record",
                         ),
                     )
-                })?,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expected a hot body for mail {}, saw none", raw.mail_id),
-                ))
-            }
-        };
+                }),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected a hot body for mail {mail_id}, saw none"),
+            )),
+        }
+    }
+
+    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<Delivery> {
+        let body = self.resolve_body(idx, &raw.mail_id, raw.day_bucket, raw.in_cold, raw.body)?;
         let group = raw.kind == "group";
         Ok(Delivery {
             seq: raw.seq,
@@ -738,17 +798,21 @@ impl Inner {
     /// slice's cold day file, then mark it cold and drop the hot copy.
     fn sweep(&self, now: i64) -> io::Result<()> {
         let _g = self.sweep_lock.lock().unwrap();
-        let cutoff = now.saturating_sub(self.cfg.retain_ms);
+        let default_retain = self.cfg.retain_ms;
         for (idx, slice) in self.slices.iter().enumerate() {
             let rows = self.read(idx, |c| {
                 let mut st = c.prepare(
                     "SELECT e.day_bucket, e.mail_id, e.stream, e.article_num, e.kind, e.sender, e.recipient,
                             e.headers_json, h.body, e.body_sha256, e.accepted_at_ms
-                     FROM envelopes e JOIN hot_bodies h ON h.mail_id = e.mail_id
-                     WHERE e.in_cold = 0 AND e.accepted_at_ms IS NOT NULL AND e.accepted_at_ms <= ?1
+                     FROM envelopes e
+                     JOIN hot_bodies h ON h.mail_id = e.mail_id
+                     LEFT JOIN streams s ON s.stream = e.stream
+                     WHERE e.in_cold = 0
+                       AND e.accepted_at_ms IS NOT NULL
+                       AND e.accepted_at_ms <= max(0, ?1 - COALESCE(s.ttl_ms, ?2))
                      ORDER BY e.seq",
                 )?;
-                let rows = st.query_map([cutoff], |r| {
+                let rows = st.query_map(params![now, default_retain], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         Record {
@@ -1148,10 +1212,17 @@ impl Store {
         let st_idx = inner.shard(&env.stream);
         let seen_idx = inner.shard(&seen.mail_id);
         let same = st_idx == seen_idx;
+        let target = env.recipient.clone();
+        let mail_id = env.mail_id.clone();
         let res = inner.slices[st_idx].writer.exec(move |c| {
             let art = match insert_envelope(c, &env)? {
-                Ok(a) => a,
-                Err(w) => return Ok(Err(w)),
+                InsertOutcome::Committed(a) => a,
+                InsertOutcome::ResendConflict(w) => return Ok(Err(resend_refusal(&mail_id, &w))),
+                InsertOutcome::HeadConflict { expected, saw } => {
+                    return Ok(Err(format!(
+                        "expected group {target} at article {expected}, saw {saw}"
+                    )));
+                }
             };
             if same {
                 insert_seen(c, &seen, art)?;
@@ -1164,7 +1235,7 @@ impl Store {
             Ok(Ok((art, subs, (!same).then_some(seen))))
         })?;
         match res {
-            Err(w) => Ok(Err(w)),
+            Err(reason) => Ok(Err(reason)),
             Ok((art, subs, rest)) => {
                 if let Some(seen) = rest {
                     inner.slices[seen_idx]
@@ -1185,6 +1256,7 @@ impl Store {
             req.headers,
             req.accepted_at_ms,
             false,
+            None,
         )
     }
 
@@ -1197,6 +1269,7 @@ impl Store {
             req.headers,
             req.accepted_at_ms,
             true,
+            req.expected_article,
         )
     }
 
@@ -1210,6 +1283,7 @@ impl Store {
         headers: Option<Value>,
         accepted_at_ms: Option<i64>,
         group: bool,
+        expected_article: Option<i64>,
     ) -> io::Result<Status> {
         let inner = &self.inner;
         let _flight = inner.hold(&mail_id);
@@ -1242,6 +1316,7 @@ impl Store {
             accepted_at_ms,
             day_bucket: day_bucket(accepted_at_ms, inner.cfg.day_ms),
             reader: (!group).then(|| target.clone()),
+            expected_article,
         };
         let seen = NewSeen {
             mail_id: mail_id.clone(),
@@ -1252,7 +1327,7 @@ impl Store {
             body_sha256: sha,
         };
         let status = match self.write_single(env, seen)? {
-            Err(w) => return Ok(Status::Conflict(resend_refusal(&mail_id, &w))),
+            Err(reason) => return Ok(Status::Conflict(reason)),
             Ok((article_num, subscribers)) => Status::Committed {
                 article_num,
                 subscribers,
@@ -1261,6 +1336,185 @@ impl Store {
         drop(_flight);
         self.after_send(accepted_at_ms);
         Ok(status)
+    }
+    pub fn groups(
+        &self,
+        session: Option<&str>,
+        prefix: Option<&str>,
+        include_retired: bool,
+    ) -> io::Result<Vec<Group>> {
+        let mut out = Vec::new();
+        for idx in 0..self.inner.slices.len() {
+            out.extend(self.inner.read(idx, |c| {
+                let mut st = c.prepare(
+                    "SELECT s.stream, s.next_article - 1,
+                            (SELECT COUNT(*) FROM positions p WHERE p.stream = s.stream AND p.subscribed = 1),
+                            q.position, q.subscribed, q.record_id,
+                            s.retired_at_ms IS NOT NULL, s.keep_last, s.ttl_ms
+                     FROM streams s
+                     LEFT JOIN positions q ON q.stream = s.stream AND q.reader = ?1
+                     WHERE s.kind = 'group'
+                       AND (?2 = 1 OR s.retired_at_ms IS NULL)",
+                )?;
+                let rows = st.query_map(params![session, i64::from(include_retired)], |r| {
+                    let stream: String = r.get(0)?;
+                    let name = stream.strip_prefix("g:").unwrap_or(&stream).to_string();
+                    Ok(Group {
+                        group: name,
+                        high_water: r.get(1)?,
+                        subscribers: r.get::<_, i64>(2)? as usize,
+                        position: r.get(3)?,
+                        subscribed: r.get::<_, Option<i64>>(4)? == Some(1),
+                        record_id: r.get(5)?,
+                        retired: r.get::<_, i64>(6)? != 0,
+                        keep_last: r.get(7)?,
+                        ttl_ms: r.get(8)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })?);
+        }
+        if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+            out.retain(|g| g.group.starts_with(p));
+        }
+        out.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(out)
+    }
+
+    /// Stateless read of Group articles strictly after `after`, up to `limit`,
+    /// without creating a stream row, position, or receipt.
+    pub fn articles(&self, group: &str, after: i64, limit: usize) -> io::Result<ArticlesPage> {
+        let stream = format!("g:{group}");
+        let idx = self.inner.shard(&stream);
+        let meta: Option<(i64, bool)> = self.inner.read(idx, |c| {
+            c.query_row(
+                "SELECT next_article - 1, retired_at_ms IS NOT NULL FROM streams WHERE stream = ?1 AND kind = 'group'",
+                [&stream],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+        })?;
+        let Some((high_water, retired)) = meta else {
+            return Ok(ArticlesPage {
+                group: group.to_string(),
+                high_water: 0,
+                retired: false,
+                articles: Vec::new(),
+            });
+        };
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let raws = self.inner.read(idx, |c| {
+            let mut st = c.prepare(
+                "SELECT e.article_num, e.mail_id, e.sender, e.headers_json, e.day_bucket, e.in_cold, h.body, e.accepted_at_ms
+                 FROM envelopes e
+                 LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
+                 WHERE e.stream = ?1 AND e.kind = 'group' AND e.article_num > ?2
+                 ORDER BY e.article_num
+                 LIMIT ?3",
+            )?;
+            let rows = st.query_map(params![&stream, after, cap], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)? != 0,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        let mut articles = Vec::with_capacity(raws.len());
+        for (article_num, mail_id, from, headers_json, day_bucket, in_cold, body, accepted_at_ms) in
+            raws
+        {
+            let body = self
+                .inner
+                .resolve_body(idx, &mail_id, day_bucket, in_cold, body)?;
+            articles.push(Article {
+                article_num,
+                mail_id,
+                from,
+                body,
+                headers: headers_value(headers_json.as_deref()),
+                accepted_at_ms,
+            });
+        }
+        Ok(ArticlesPage {
+            group: group.to_string(),
+            high_water,
+            retired,
+            articles,
+        })
+    }
+
+    pub fn group_policy(
+        &self,
+        group: &str,
+        keep_last: Option<Option<i64>>,
+        ttl_ms: Option<Option<i64>>,
+        retired: Option<bool>,
+        now_ms: i64,
+    ) -> io::Result<Group> {
+        let stream = format!("g:{group}");
+        let idx = self.inner.shard(&stream);
+        let group_name = group.to_string();
+        self.inner.slices[idx].writer.exec(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO streams (stream, kind, next_article) VALUES (?1, 'group', 1)",
+                [&stream],
+            )?;
+            if let Some(kl) = keep_last {
+                c.execute(
+                    "UPDATE streams SET keep_last = ?2 WHERE stream = ?1",
+                    params![&stream, kl],
+                )?;
+            }
+            if let Some(ttl) = ttl_ms {
+                c.execute(
+                    "UPDATE streams SET ttl_ms = ?2 WHERE stream = ?1",
+                    params![&stream, ttl],
+                )?;
+            }
+            if let Some(ret) = retired {
+                if ret {
+                    c.execute(
+                        "UPDATE streams SET retired_at_ms = COALESCE(retired_at_ms, ?2) WHERE stream = ?1",
+                        params![&stream, now_ms],
+                    )?;
+                } else {
+                    c.execute(
+                        "UPDATE streams SET retired_at_ms = NULL WHERE stream = ?1",
+                        [&stream],
+                    )?;
+                }
+            }
+            let (hw, subs, is_ret, kl, ttl): (i64, i64, i64, Option<i64>, Option<i64>) = c
+                .query_row(
+                    "SELECT next_article - 1,
+                            (SELECT COUNT(*) FROM positions p WHERE p.stream = s.stream AND p.subscribed = 1),
+                            s.retired_at_ms IS NOT NULL, s.keep_last, s.ttl_ms
+                     FROM streams s WHERE s.stream = ?1",
+                    [&stream],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?;
+            if let Some(k) = kl.filter(|&k| k >= 0) {
+                prune_hot_group(c, &stream, hw - k)?;
+            }
+            Ok(Group {
+                group: group_name,
+                high_water: hw,
+                subscribers: subs as usize,
+                position: None,
+                subscribed: false,
+                record_id: None,
+                retired: is_ret != 0,
+                keep_last: kl,
+                ttl_ms: ttl,
+            })
+        })
     }
 
     pub fn send_broadcast(&self, req: Broadcast) -> io::Result<Status> {
@@ -1307,6 +1561,7 @@ impl Store {
                 accepted_at_ms: req.accepted_at_ms,
                 day_bucket: day_bucket(req.accepted_at_ms, inner.cfg.day_ms),
                 reader: Some(rcpt.clone()),
+                expected_article: None,
             });
             seens[inner.shard(&copy)].push(NewSeen {
                 mail_id: copy,
@@ -1333,10 +1588,15 @@ impl Store {
         for w in waits {
             for (id, r) in w.wait()? {
                 match r {
-                    Ok(a) => {
+                    InsertOutcome::Committed(a) => {
                         articles.insert(id, a);
                     }
-                    Err(what) => conflict = Some(resend_refusal(&id, &what)),
+                    InsertOutcome::ResendConflict(what) => {
+                        conflict = Some(resend_refusal(&id, &what));
+                    }
+                    InsertOutcome::HeadConflict { expected, saw } => {
+                        conflict = Some(format!("expected {id} at article {expected}, saw {saw}"));
+                    }
                 }
             }
         }
@@ -1566,36 +1826,6 @@ impl Store {
         })
     }
 
-    pub fn groups(&self, session: Option<&str>) -> io::Result<Vec<Group>> {
-        let mut out = Vec::new();
-        for idx in 0..self.inner.slices.len() {
-            out.extend(self.inner.read(idx, |c| {
-                let mut st = c.prepare(
-                    "SELECT s.stream, s.next_article - 1,
-                            (SELECT COUNT(*) FROM positions p WHERE p.stream = s.stream AND p.subscribed = 1),
-                            q.position, q.subscribed, q.record_id
-                     FROM streams s
-                     LEFT JOIN positions q ON q.stream = s.stream AND q.reader = ?1
-                     WHERE s.kind = 'group'",
-                )?;
-                let rows = st.query_map([session], |r| {
-                    let stream: String = r.get(0)?;
-                    Ok(Group {
-                        group: stream.strip_prefix("g:").unwrap_or(&stream).to_string(),
-                        high_water: r.get(1)?,
-                        subscribers: r.get::<_, i64>(2)? as usize,
-                        position: r.get(3)?,
-                        subscribed: r.get::<_, Option<i64>>(4)? == Some(1),
-                        record_id: r.get(5)?,
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })?);
-        }
-        out.sort_by(|a, b| a.group.cmp(&b.group));
-        Ok(out)
-    }
-
     /// Wait for every background sweep started so far, then sweep once more now.
     pub fn flush_cold(&self) -> io::Result<()> {
         let handles = std::mem::take(&mut *self.inner.sweeps.lock().unwrap());
@@ -1650,6 +1880,7 @@ mod tests {
             group: g.into(),
             body: body.into(),
             headers: None,
+            expected_article: None,
             accepted_at_ms: Some(now_ms()),
         }
     }
@@ -1916,7 +2147,7 @@ mod tests {
 
         let pos = |r: &str| {
             store
-                .groups(Some(r))
+                .groups(Some(r), None, false)
                 .unwrap()
                 .into_iter()
                 .find(|g| g.group == "G")
@@ -1964,7 +2195,7 @@ mod tests {
 
         assert_eq!(store.unsubscribe("r3", "G", 20).unwrap(), 1);
         assert!(arts("r3").is_empty());
-        let g = &store.groups(None).unwrap()[0];
+        let g = &store.groups(None, None, false).unwrap()[0];
         assert_eq!((g.high_water, g.subscribers), (3, 2));
         let (p, _, back) = store.subscribe("r3", "G", None, false, 21).unwrap();
         assert_eq!((p, back.len()), (1, 2), "re-subscribe keeps the position");
@@ -2102,5 +2333,175 @@ mod tests {
         assert_eq!(st.claims.live("k", 0).unwrap().owner, "a");
         assert!(st.claims.live("k2", 0).is_none());
         assert!(st.takeover_registrations.contains("reg-1"));
+    }
+
+    #[test]
+    fn articles_stateless_reads_without_creating_stream_or_positions_and_restores_cold() {
+        let dir = tempdir("articles");
+        let mut c = cfg(&dir, 2);
+        c.retain_ms = 1_000;
+        c.day_ms = 10_000;
+        c.sweep_enabled = false;
+        let (store, _) = Store::open(c).unwrap();
+        let idx = store.inner.shard("g:card.1");
+
+        let empty = store.articles("card.1", 0, 10).unwrap();
+        assert_eq!(
+            (empty.high_water, empty.retired, empty.articles.len()),
+            (0, false, 0)
+        );
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM streams"), 0);
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM positions"), 0);
+
+        let mut m1 = group("m1", "s", "card.1", "first");
+        m1.accepted_at_ms = Some(100);
+        let mut m2 = group("m2", "s", "card.1", "second");
+        m2.accepted_at_ms = Some(2_000);
+        let mut m3 = group("m3", "s", "card.1", "third");
+        m3.accepted_at_ms = Some(2_500);
+        assert_eq!(committed(store.send_group(m1).unwrap()), 1);
+        assert_eq!(committed(store.send_group(m2).unwrap()), 2);
+        assert_eq!(committed(store.send_group(m3).unwrap()), 3);
+
+        store.inner.sweep(2_600).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                idx,
+                "SELECT COUNT(*) FROM envelopes WHERE in_cold = 1"
+            ),
+            1
+        );
+
+        let page1 = store.articles("card.1", 0, 2).unwrap();
+        assert_eq!(page1.high_water, 3);
+        assert_eq!(page1.articles.len(), 2);
+        assert_eq!(page1.articles[0].article_num, 1);
+        assert_eq!(page1.articles[0].body, "first");
+        assert_eq!(page1.articles[1].article_num, 2);
+        assert_eq!(page1.articles[1].body, "second");
+
+        let page2 = store.articles("card.1", 2, 10).unwrap();
+        assert_eq!(page2.articles.len(), 1);
+        assert_eq!(page2.articles[0].article_num, 3);
+        assert_eq!(page2.articles[0].body, "third");
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM positions"), 0);
+        assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM receipts"), 0);
+    }
+
+    #[test]
+    fn expected_article_cas_fences_group_head_and_preserves_idempotent_resend() {
+        let dir = tempdir("cas");
+        let (store, _) = Store::open(cfg(&dir, 1)).unwrap();
+        let mut g1 = group("cas-1", "s", "tx.1", "a1");
+        g1.expected_article = Some(0);
+        assert_eq!(committed(store.send_group(g1).unwrap()), 1);
+
+        let mut stale = group("cas-stale", "s", "tx.1", "nope");
+        stale.expected_article = Some(0);
+        let err = conflict(store.send_group(stale).unwrap());
+        assert!(
+            err.contains("expected group tx.1 at article 0, saw 1"),
+            "{err}"
+        );
+
+        let mut g2 = group("cas-2", "s", "tx.1", "a2");
+        g2.expected_article = Some(1);
+        assert_eq!(committed(store.send_group(g2).unwrap()), 2);
+
+        let mut resend = group("cas-1", "s", "tx.1", "a1");
+        resend.expected_article = Some(0);
+        match store.send_group(resend).unwrap() {
+            Status::DuplicateAccepted { article_num } => assert_eq!(article_num, 1),
+            other => panic!("expected DuplicateAccepted, saw {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_policy_keep_last_ttl_retire_and_prefix_preserve_monotonic_numbers() {
+        let dir = tempdir("policy");
+        let mut c = cfg(&dir, 1);
+        c.retain_ms = 100_000;
+        c.sweep_enabled = false;
+        let (store, _) = Store::open(c).unwrap();
+
+        for i in 1..=5 {
+            let mut gm = group(&format!("p-{i}"), "s", "card.a", &format!("b-{i}"));
+            gm.accepted_at_ms = Some(i * 100);
+            assert_eq!(committed(store.send_group(gm).unwrap()), i);
+        }
+        let pol = store
+            .group_policy("card.a", Some(Some(2)), Some(Some(500)), Some(false), 1_000)
+            .unwrap();
+        assert_eq!(
+            (pol.high_water, pol.keep_last, pol.ttl_ms, pol.retired),
+            (5, Some(2), Some(500), false)
+        );
+        let page = store.articles("card.a", 0, 10).unwrap();
+        let nums: Vec<i64> = page.articles.iter().map(|a| a.article_num).collect();
+        assert_eq!(nums, [4, 5]);
+
+        assert_eq!(
+            committed(
+                store
+                    .send_group(group("p-6", "s", "card.a", "b-6"))
+                    .unwrap()
+            ),
+            6
+        );
+        let nums: Vec<i64> = store
+            .articles("card.a", 0, 10)
+            .unwrap()
+            .articles
+            .iter()
+            .map(|a| a.article_num)
+            .collect();
+        assert_eq!(nums, [5, 6]);
+        // seen_ids stays intact for pruned article p-1
+        match store
+            .send_group(group("p-1", "s", "card.a", "b-1"))
+            .unwrap()
+        {
+            Status::DuplicateAccepted { article_num } => assert_eq!(article_num, 1),
+            other => panic!("expected DuplicateAccepted, saw {other:?}"),
+        }
+
+        let mut tx1 = group("tx-1", "s", "tx.d1", "go");
+        tx1.accepted_at_ms = Some(1_900);
+        committed(store.send_group(tx1).unwrap());
+        store
+            .group_policy("card.a", None, None, Some(true), 2_000)
+            .unwrap();
+        let active: Vec<String> = store
+            .groups(None, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.group)
+            .collect();
+        assert_eq!(active, ["tx.d1"]);
+        let by_prefix: Vec<String> = store
+            .groups(None, Some("card."), true)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.group)
+            .collect();
+        assert_eq!(by_prefix, ["card.a"]);
+
+        // Per-group ttl_ms sweeps earlier than global retain_ms.
+        let mut tx2 = group("tx-2", "s", "tx.d1", "done");
+        tx2.accepted_at_ms = Some(2_000);
+        committed(store.send_group(tx2).unwrap());
+        store
+            .group_policy("tx.d1", None, Some(Some(100)), None, 2_000)
+            .unwrap();
+        store.inner.sweep(2_200).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM envelopes WHERE stream = 'g:tx.d1' AND in_cold = 1"
+            ),
+            2
+        );
     }
 }

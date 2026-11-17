@@ -79,11 +79,13 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 | `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] [--client-token-env <NAME>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically; `--client-token-env` requires TCP clients to present `ROGER_CLIENT_TOKEN`) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
 | `adapter` | same as `session`, plus `[--registered] [--superseded] [--watch]` (also send `{"type":"registered"}`, see Faces; `board_event` lines, see Watching the Board) | the same session, fronted by a stdin/stdout line stream for a client |
-| `send` | `--socket --from <address> (--to <address or '*'> \| --group <group>) --body <text> [--mail <id>] [--header <key=value>]...` |
+| `send` | `--socket --from <address> (--to <address or '*'> \| --group <group>) --body <text> [--mail <id>] [--header <key=value>]... [--expected-article <n>]` | prints `ACCEPTED mail=<id>` (plus `group=... article=...` for Group sends); `--expected-article` fences Group head; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `subscribe` | `--socket --session <address> --group <group> [--after <n> \| --latest]` | subscribe `session` to `group` at durable reader Position |
 | `unsubscribe` | `--socket --session <address> --group <group>` | stop Group deliveries while keeping durable Position |
-| `groups` | `--socket [--session <address>]` | list Groups, high-water marks, subscriber counts, and optional session Position | prints `ACCEPTED mail=<id>`; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
-| `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>]` | the same session as an MCP server on stdio (see Faces) |
+| `groups` | `--socket [--session <address>] [--prefix <prefix>] [--include-retired]` | list Groups, high-water marks, subscriber counts, retention policy, and optional session Position |
+| `articles` | `--socket --group <group> [--after <n>] [--limit <n>] [--follow] [--json]` | stateless Group read (`0` positions/receipts) and optional live `article` frame follow |
+| `group-policy` | `--socket --group <group> [--keep-last <n\|none>] [--ttl-ms <ms\|none>] [--retire \| --reopen]` | configure per-Group retention (`keep_last`, `ttl_ms`) and retirement without reusing numbers or ids |
+| `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>] [--groups]` | the same session as an MCP server on stdio (see Faces; `roger.mail` supports `group` and `groupPrefix`) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
 | `audit` | `[--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |

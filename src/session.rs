@@ -311,7 +311,29 @@ fn client_request(socket: &Path, me: &str, v: &Value, groups_enabled: bool) -> i
         "unsubscribe" if groups_enabled => unsubscribe_req(socket, me, net::field(v, "group")?),
         "groups" if groups_enabled => {
             let sess = v.get("session").and_then(Value::as_str).unwrap_or(me);
-            groups_req(socket, Some(sess))
+            let prefix = v.get("prefix").and_then(Value::as_str);
+            let include_retired = v.get("include_retired") == Some(&Value::Bool(true));
+            groups_req_filtered(socket, Some(sess), prefix, include_retired)
+        }
+        "articles" if groups_enabled => {
+            let group = net::field(v, "group")?;
+            let after = v.get("after").and_then(Value::as_i64).unwrap_or(0);
+            let limit = v.get("limit").and_then(Value::as_i64).unwrap_or(100) as usize;
+            articles_req(socket, group, after, limit)
+        }
+        "group_policy" if groups_enabled => {
+            let group = net::field(v, "group")?;
+            let mut ask = vec![
+                ("type", s("group_policy")),
+                ("req", Value::Int(1)),
+                ("group", s(group)),
+            ];
+            for key in ["keep_last", "ttl_ms", "retired"] {
+                if let Some(val) = v.get(key) {
+                    ask.push((key, val.clone()));
+                }
+            }
+            request(socket, &obj(ask))
         }
         other if groups_enabled => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -374,13 +396,23 @@ fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io
             let group = grp_val.as_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "group must be a string")
             })?;
-            let (mail, grp, article) = send_group_mail(
+            let expected_article = match v.get("expected_article") {
+                None | Some(Value::Null) => None,
+                Some(x) => Some(x.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "expected_article must be a non-negative integer",
+                    )
+                })?),
+            };
+            let (mail, grp, article) = send_group_mail_with(
                 socket,
                 from,
                 group,
                 &mail,
                 net::field(v, "body")?,
                 v.get("headers"),
+                expected_article,
             )?;
             Ok(obj(vec![
                 ("type", s("accepted")),
@@ -728,6 +760,7 @@ pub fn send_group(
     mail: String,
     body: String,
     headers: Option<Value>,
+    expected_article: Option<i64>,
 ) -> io::Result<()> {
     send_group_to(
         &mut io::stdout().lock(),
@@ -737,9 +770,11 @@ pub fn send_group(
         &mail,
         &body,
         headers.as_ref(),
+        expected_article,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_group_to(
     out: &mut dyn Write,
     socket: &Path,
@@ -748,8 +783,10 @@ fn send_group_to(
     mail: &str,
     body: &str,
     headers: Option<&Value>,
+    expected_article: Option<i64>,
 ) -> io::Result<()> {
-    let (mail, grp, article) = send_group_mail(socket, from, group, mail, body, headers)?;
+    let (mail, grp, article) =
+        send_group_mail_with(socket, from, group, mail, body, headers, expected_article)?;
     writeln!(out, "ACCEPTED mail={mail} group={grp} article={article}")?;
     out.flush()
 }
@@ -827,12 +864,29 @@ fn unsubscribe_to(
 
 /// The client: list known Groups and optional per-session position state on stdout.
 #[allow(dead_code)]
-pub fn groups(socket: PathBuf, session: Option<String>) -> io::Result<()> {
-    groups_to(&mut io::stdout().lock(), &socket, session.as_deref())
+pub fn groups(
+    socket: PathBuf,
+    session: Option<String>,
+    prefix: Option<String>,
+    include_retired: bool,
+) -> io::Result<()> {
+    groups_to(
+        &mut io::stdout().lock(),
+        &socket,
+        session.as_deref(),
+        prefix.as_deref(),
+        include_retired,
+    )
 }
 
-fn groups_to(out: &mut dyn Write, socket: &Path, session: Option<&str>) -> io::Result<()> {
-    let reply = groups_req(socket, session)?;
+fn groups_to(
+    out: &mut dyn Write,
+    socket: &Path,
+    session: Option<&str>,
+    prefix: Option<&str>,
+    include_retired: bool,
+) -> io::Result<()> {
+    let reply = groups_req_filtered(socket, session, prefix, include_retired)?;
     let items = match reply.get("groups") {
         Some(Value::Arr(items)) => items.clone(),
         _ => Vec::new(),
@@ -841,6 +895,16 @@ fn groups_to(out: &mut dyn Write, socket: &Path, session: Option<&str>) -> io::R
         let grp = net::field(g, "group")?;
         let hw = g.get("high_water").and_then(Value::as_i64).unwrap_or(0);
         let subs = g.get("subscribers").and_then(Value::as_i64).unwrap_or(0);
+        let mut extra = String::new();
+        if matches!(g.get("retired"), Some(Value::Bool(true))) {
+            extra.push_str(" retired=true");
+        }
+        if let Some(kl) = g.get("keep_last").and_then(Value::as_i64) {
+            extra.push_str(&format!(" keep_last={kl}"));
+        }
+        if let Some(ttl) = g.get("ttl_ms").and_then(Value::as_i64) {
+            extra.push_str(&format!(" ttl_ms={ttl}"));
+        }
         if session.is_some()
             || g.get("subscribed").is_some()
             || g.get("position").is_some()
@@ -851,14 +915,166 @@ fn groups_to(out: &mut dyn Write, socket: &Path, session: Option<&str>) -> io::R
             let rec = g.get("record").and_then(Value::as_str).unwrap_or("absent");
             writeln!(
                 out,
-                "GROUP group={grp} high_water={hw} subscribers={subs} subscribed={subscribed} position={pos} record={rec}"
+                "GROUP group={grp} high_water={hw} subscribers={subs} subscribed={subscribed} position={pos} record={rec}{extra}"
             )?;
         } else {
-            writeln!(out, "GROUP group={grp} high_water={hw} subscribers={subs}")?;
+            writeln!(
+                out,
+                "GROUP group={grp} high_water={hw} subscribers={subs}{extra}"
+            )?;
         }
     }
     writeln!(out, "GROUPS count={}", items.len())?;
     out.flush()
+}
+
+#[allow(dead_code)]
+pub fn articles(
+    socket: PathBuf,
+    group: String,
+    after: i64,
+    limit: usize,
+    follow: bool,
+    json_out: bool,
+) -> io::Result<()> {
+    if after < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected after >= 0, saw {after}"),
+        ));
+    }
+    if !(1..=500).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected limit in 1..=500, saw {limit}"),
+        ));
+    }
+    let (writer, mut lines) = connect(&socket)?;
+    net::send(
+        &writer,
+        &obj(vec![
+            ("type", s("articles")),
+            ("req", Value::Int(1)),
+            ("group", s(&group)),
+            ("after", Value::Int(after)),
+            ("limit", Value::Int(limit as i64)),
+            ("follow", Value::Bool(follow)),
+        ]),
+    )?;
+    let reply = lines.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected one reply line from {}, saw EOF", socket.display()),
+        )
+    })??;
+    if net::field(&reply, "type")? == "error" {
+        return Err(io::Error::other(
+            net::field(&reply, "reason").unwrap_or("request refused"),
+        ));
+    }
+    let mut out = io::stdout().lock();
+    if json_out {
+        writeln!(out, "{}", json::stringify(&reply))?;
+        out.flush()?;
+        if follow {
+            for line in lines {
+                let v = line?;
+                writeln!(out, "{}", json::stringify(&v))?;
+                out.flush()?;
+            }
+        }
+        return Ok(());
+    }
+    let hw = reply.get("high_water").and_then(Value::as_i64).unwrap_or(0);
+    let items = match reply.get("articles") {
+        Some(Value::Arr(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    let mut last_seen = after;
+    for a in &items {
+        let art = a.get("article").and_then(Value::as_i64).unwrap_or(0);
+        last_seen = last_seen.max(art);
+        let mail = a.get("mail").and_then(Value::as_str).unwrap_or("");
+        let from = a.get("from").and_then(Value::as_str).unwrap_or("");
+        let body = a.get("body").and_then(Value::as_str).unwrap_or("");
+        writeln!(
+            out,
+            "ARTICLE group={group} article={art} mail={mail} from={from} body={body}"
+        )?;
+        if let Some(h) = a.get("headers") {
+            write_headers(&mut out, mail, h)?;
+        }
+    }
+    writeln!(
+        out,
+        "ARTICLES group={group} high_water={hw} count={}",
+        items.len()
+    )?;
+    out.flush()?;
+    if follow {
+        for line in lines {
+            let v = line?;
+            if net::field(&v, "type")? != "article" {
+                continue;
+            }
+            let art = v.get("article").and_then(Value::as_i64).unwrap_or(0);
+            if art <= last_seen {
+                continue;
+            }
+            last_seen = art;
+            let mail = v.get("mail").and_then(Value::as_str).unwrap_or("");
+            let from = v.get("from").and_then(Value::as_str).unwrap_or("");
+            let body = v.get("body").and_then(Value::as_str).unwrap_or("");
+            writeln!(
+                out,
+                "ARTICLE group={group} article={art} mail={mail} from={from} body={body}"
+            )?;
+            if let Some(h) = v.get("headers") {
+                write_headers(&mut out, mail, h)?;
+            }
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn group_policy(
+    socket: PathBuf,
+    group: String,
+    keep_last: Option<Option<i64>>,
+    ttl_ms: Option<Option<i64>>,
+    retired: Option<bool>,
+) -> io::Result<()> {
+    let mut ask = vec![
+        ("type", s("group_policy")),
+        ("req", Value::Int(1)),
+        ("group", s(&group)),
+    ];
+    if let Some(kl) = keep_last {
+        ask.push(("keep_last", kl.map_or(Value::Null, Value::Int)));
+    }
+    if let Some(ttl) = ttl_ms {
+        ask.push(("ttl_ms", ttl.map_or(Value::Null, Value::Int)));
+    }
+    if let Some(r) = retired {
+        ask.push(("retired", Value::Bool(r)));
+    }
+    let reply = request(&socket, &obj(ask))?;
+    let hw = reply.get("high_water").and_then(Value::as_i64).unwrap_or(0);
+    let ret = matches!(reply.get("retired"), Some(Value::Bool(true)));
+    let kl = reply
+        .get("keep_last")
+        .and_then(Value::as_i64)
+        .map_or_else(|| "none".to_string(), |n| n.to_string());
+    let ttl = reply
+        .get("ttl_ms")
+        .and_then(Value::as_i64)
+        .map_or_else(|| "none".to_string(), |n| n.to_string());
+    println!(
+        "GROUP_POLICY group={group} high_water={hw} retired={ret} keep_last={kl} ttl_ms={ttl}"
+    );
+    Ok(())
 }
 
 /// The client: watch committed Board changes on a connection that is no
@@ -944,13 +1160,14 @@ pub fn send_mail(
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
 }
 
-pub fn send_group_mail(
+pub fn send_group_mail_with(
     socket: &Path,
     from: &str,
     group: &str,
     mail: &str,
     body: &str,
     headers: Option<&Value>,
+    expected_article: Option<i64>,
 ) -> io::Result<(String, String, i64)> {
     let (writer, mut lines) = connect(socket)?;
     let mut ask = vec![
@@ -963,6 +1180,9 @@ pub fn send_group_mail(
     ];
     if let Some(h) = headers {
         ask.push(("headers", h.clone()));
+    }
+    if let Some(exp) = expected_article {
+        ask.push(("expected_article", Value::Int(exp)));
     }
     net::send(&writer, &obj(ask))?;
     for line in &mut lines {
@@ -1044,12 +1264,36 @@ pub fn unsubscribe_req(socket: &Path, session: &str, group: &str) -> io::Result<
     )
 }
 
-pub fn groups_req(socket: &Path, session: Option<&str>) -> io::Result<Value> {
+pub fn groups_req_filtered(
+    socket: &Path,
+    session: Option<&str>,
+    prefix: Option<&str>,
+    include_retired: bool,
+) -> io::Result<Value> {
     let mut ask = vec![("type", s("groups")), ("req", Value::Int(1))];
     if let Some(sess) = session {
         ask.push(("session", s(sess)));
     }
+    if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+        ask.push(("prefix", s(p)));
+    }
+    if include_retired {
+        ask.push(("include_retired", Value::Bool(true)));
+    }
     request(socket, &obj(ask))
+}
+
+pub fn articles_req(socket: &Path, group: &str, after: i64, limit: usize) -> io::Result<Value> {
+    request(
+        socket,
+        &obj(vec![
+            ("type", s("articles")),
+            ("req", Value::Int(1)),
+            ("group", s(group)),
+            ("after", Value::Int(after)),
+            ("limit", Value::Int(limit as i64)),
+        ]),
+    )
 }
 
 /// The line that follows a Mail's own line when it has headers: the set as
@@ -1392,6 +1636,7 @@ mod tests {
             "m-g1",
             "post body",
             Some(&hdrs),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1441,7 +1686,7 @@ mod tests {
         assert_eq!(net::field(&req, "group").unwrap(), "ops");
 
         let mut out = Vec::new();
-        groups_to(&mut out, &target, None).unwrap();
+        groups_to(&mut out, &target, None, None, false).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "GROUP group=ops high_water=9 subscribers=2\nGROUPS count=1\n"
@@ -1449,7 +1694,7 @@ mod tests {
         assert!(seen.recv().unwrap().get("session").is_none());
 
         let mut out = Vec::new();
-        groups_to(&mut out, &target, Some("s1")).unwrap();
+        groups_to(&mut out, &target, Some("s1"), None, false).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "GROUP group=ops high_water=9 subscribers=2 subscribed=true position=4 record=r-4\nGROUP group=dev high_water=2 subscribers=1 subscribed=false position=0 record=absent\nGROUPS count=2\n"

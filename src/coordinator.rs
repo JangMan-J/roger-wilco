@@ -20,7 +20,7 @@ use crate::net::{self, Writer};
 use crate::sql::{
     self,
     coord::{self, Broadcast, Directed, GroupMail, Status, Store},
-    AckResult, Delivery, Event, Group, Receipt,
+    AckResult, ArticlesPage, Delivery, Event, Group, Receipt,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -194,6 +194,8 @@ struct State {
     /// Host links whose hello asked for `board_event` lines, by connection
     /// id: each committed session or claim change is offered to them once.
     watchers: HashMap<u64, Writer>,
+    /// Connections watching a Group's live `article` frames, by Group name.
+    article_watchers: HashMap<String, Vec<(u64, Writer)>>,
     claims: Claims,
 }
 
@@ -244,6 +246,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         next_conn: 1,
         notice_writers: HashMap::new(),
         watchers: HashMap::new(),
+        article_watchers: HashMap::new(),
         claims: startup.claims,
     };
     let state = Arc::new(Mutex::new(state));
@@ -933,8 +936,111 @@ fn serve_link(
             "groups" => {
                 let req = req_of(&v);
                 let session = v.get("session").and_then(|x| x.as_str());
-                let list = store.groups(session)?;
+                let prefix = v.get("prefix").and_then(|x| x.as_str());
+                let include_retired = v.get("include_retired") == Some(&Value::Bool(true));
+                let list = store.groups(session, prefix, include_retired)?;
                 net::send(&writer, &groups_reply(req, session.is_some(), &list))?;
+            }
+            "articles" => {
+                let req = req_of(&v);
+                let group = net::field(&v, "group")?.to_string();
+                let after = match v.get("after") {
+                    None | Some(Value::Null) => 0,
+                    Some(x) => match x.as_i64() {
+                        Some(n) if n >= 0 => n,
+                        _ => {
+                            net::send(
+                                &writer,
+                                &error_reply(
+                                    req,
+                                    None,
+                                    "expected after to be a non-negative integer",
+                                ),
+                            )?;
+                            continue;
+                        }
+                    },
+                };
+                let limit = match v.get("limit") {
+                    None | Some(Value::Null) => 100,
+                    Some(x) => match x.as_i64() {
+                        Some(n) if (1..=500).contains(&n) => n as usize,
+                        _ => {
+                            net::send(
+                                &writer,
+                                &error_reply(req, None, "expected limit to be in 1..=500"),
+                            )?;
+                            continue;
+                        }
+                    },
+                };
+                let follow = v.get("follow") == Some(&Value::Bool(true));
+                if group.is_empty() {
+                    net::send(
+                        &writer,
+                        &error_reply(req, None, "expected a non-empty group, saw none"),
+                    )?;
+                    continue;
+                }
+                if follow {
+                    let mut st = state.lock().unwrap();
+                    let entry = st.article_watchers.entry(group.clone()).or_default();
+                    if !entry.iter().any(|(id, _)| *id == conn_id) {
+                        entry.push((conn_id, Arc::clone(&writer)));
+                    }
+                }
+                let page = store.articles(&group, after, limit)?;
+                net::send(&writer, &articles_reply(req, &page, follow))?;
+            }
+            "group_policy" => {
+                let req = req_of(&v);
+                let group = net::field(&v, "group")?.to_string();
+                if group.is_empty() {
+                    net::send(
+                        &writer,
+                        &error_reply(req, None, "expected a non-empty group, saw none"),
+                    )?;
+                    continue;
+                }
+                let parse_opt_nonneg = |field: &str| -> Result<Option<Option<i64>>, String> {
+                    match v.get(field) {
+                        None => Ok(None),
+                        Some(Value::Null) => Ok(Some(None)),
+                        Some(x) => match x.as_i64() {
+                            Some(n) if n >= 0 => Ok(Some(Some(n))),
+                            _ => Err(format!(
+                                "expected {field} to be a non-negative integer or null"
+                            )),
+                        },
+                    }
+                };
+                let keep_last = match parse_opt_nonneg("keep_last") {
+                    Ok(v) => v,
+                    Err(r) => {
+                        net::send(&writer, &error_reply(req, None, &r))?;
+                        continue;
+                    }
+                };
+                let ttl_ms = match parse_opt_nonneg("ttl_ms") {
+                    Ok(v) => v,
+                    Err(r) => {
+                        net::send(&writer, &error_reply(req, None, &r))?;
+                        continue;
+                    }
+                };
+                let retired = match v.get("retired") {
+                    None => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => {
+                        net::send(
+                            &writer,
+                            &error_reply(req, None, "expected retired to be a boolean"),
+                        )?;
+                        continue;
+                    }
+                };
+                let g = written(store.group_policy(&group, keep_last, ttl_ms, retired, now_ms()))?;
+                net::send(&writer, &group_policy_reply(req, &g))?;
             }
             "claim" => {
                 let reply = {
@@ -1007,22 +1113,49 @@ fn send(v: &Value, writer: &Writer, state: &Mutex<State>, store: &Store) -> io::
         )
     };
 
+    let expected_article = match v.get("expected_article") {
+        None | Some(Value::Null) => None,
+        Some(x) => match x.as_i64() {
+            Some(n) if n >= 0 => {
+                if group.is_none() {
+                    return net::send(
+                        writer,
+                        &error_reply(req, Some(&mail), "expected_article requires group"),
+                    );
+                }
+                Some(n)
+            }
+            _ => {
+                return net::send(
+                    writer,
+                    &error_reply(
+                        req,
+                        Some(&mail),
+                        "expected expected_article to be a non-negative integer",
+                    ),
+                );
+            }
+        },
+    };
+
     if let Some(group) = group {
         stamp(&mut state.lock().unwrap(), &from);
+        let accepted_at = now_ms();
         let status = written(store.send_group(GroupMail {
             mail_id: mail.clone(),
             from: from.clone(),
             group: group.to_string(),
             body: body.clone(),
             headers: headers.clone(),
-            accepted_at_ms: Some(now_ms()),
+            expected_article,
+            accepted_at_ms: Some(accepted_at),
         }))?;
-        let (article, readers) = match status {
+        let (article, readers, push_watch) = match status {
             Status::Committed {
                 article_num,
                 subscribers,
-            } => (article_num, subscribers),
-            Status::DuplicateAccepted { article_num } => (article_num, Vec::new()),
+            } => (article_num, subscribers, true),
+            Status::DuplicateAccepted { article_num } => (article_num, Vec::new(), false),
             Status::Conflict(what) => return refuse(&what),
         };
         let pending: Vec<Delivery> = readers
@@ -1039,10 +1172,35 @@ fn send(v: &Value, writer: &Writer, state: &Mutex<State>, store: &Store) -> io::
                 headers: headers.clone().unwrap_or(Value::Obj(Vec::new())),
             })
             .collect();
+        let mut pushes = push_pending(state, &pending);
+        if push_watch {
+            let watchers: Vec<Writer> = {
+                let st = state.lock().unwrap();
+                st.article_watchers
+                    .get(group)
+                    .map(|list| list.iter().map(|(_, w)| Arc::clone(w)).collect())
+                    .unwrap_or_default()
+            };
+            if !watchers.is_empty() {
+                let frame = obj(vec![
+                    ("type", s("article")),
+                    ("group", s(group)),
+                    ("article", Value::Int(article)),
+                    ("mail", s(&mail)),
+                    ("from", s(&from)),
+                    ("accepted_at_ms", Value::Int(accepted_at)),
+                    ("headers", headers.clone().unwrap_or(Value::Obj(Vec::new()))),
+                    ("body", s(&body)),
+                ]);
+                for w in watchers {
+                    pushes.push((w, frame.clone()));
+                }
+            }
+        }
         return answer_then_push(
             writer,
             &accepted(vec![("group", s(group)), ("article", Value::Int(article))]),
-            push_pending(state, &pending),
+            pushes,
         );
     }
 
@@ -1191,6 +1349,10 @@ impl Drop for HostLink {
         };
         st.notice_writers.remove(&self.conn_id);
         st.watchers.remove(&self.conn_id);
+        for list in st.article_watchers.values_mut() {
+            list.retain(|(id, _)| *id != self.conn_id);
+        }
+        st.article_watchers.retain(|_, list| !list.is_empty());
         // Only this connection may take the slot: a host that reconnected
         // while this thread was finishing already owns it, and its
         // re-registration has already marked its live sessions connected.
@@ -1398,28 +1560,88 @@ fn receipt_reply(req: i64, mail: &str, info: Option<&Receipt>) -> Value {
 
 /// The answer to `groups`: every Group with its high-water article and
 /// subscriber count, and, when a session asked, its own subscription.
+fn group_obj(for_session: bool, g: &Group) -> Value {
+    let mut pairs = vec![
+        ("group", s(&g.group)),
+        ("high_water", Value::Int(g.high_water)),
+        ("subscribers", Value::Int(g.subscribers as i64)),
+    ];
+    if g.retired {
+        pairs.push(("retired", Value::Bool(true)));
+    }
+    if let Some(kl) = g.keep_last {
+        pairs.push(("keep_last", Value::Int(kl)));
+    }
+    if let Some(ttl) = g.ttl_ms {
+        pairs.push(("ttl_ms", Value::Int(ttl)));
+    }
+    if for_session {
+        pairs.push(("subscribed", Value::Bool(g.subscribed)));
+        pairs.push(("position", g.position.map_or(Value::Null, Value::Int)));
+        pairs.push(("record", g.record_id.as_deref().map_or(Value::Null, s)));
+    }
+    obj(pairs)
+}
+
+/// The answer to `groups`: every Group with its high-water article and
+/// subscriber count, and, when a session asked, its own subscription.
 fn groups_reply(req: i64, for_session: bool, list: &[Group]) -> Value {
-    let groups = list
-        .iter()
-        .map(|g| {
-            let mut pairs = vec![
-                ("group", s(&g.group)),
-                ("high_water", Value::Int(g.high_water)),
-                ("subscribers", Value::Int(g.subscribers as i64)),
-            ];
-            if for_session {
-                pairs.push(("subscribed", Value::Bool(g.subscribed)));
-                pairs.push(("position", g.position.map_or(Value::Null, Value::Int)));
-                pairs.push(("record", g.record_id.as_deref().map_or(Value::Null, s)));
-            }
-            obj(pairs)
-        })
-        .collect();
+    let groups = list.iter().map(|g| group_obj(for_session, g)).collect();
     obj(vec![
         ("type", s("groups")),
         ("req", Value::Int(req)),
         ("groups", Value::Arr(groups)),
     ])
+}
+
+fn articles_reply(req: i64, page: &ArticlesPage, following: bool) -> Value {
+    let articles = page
+        .articles
+        .iter()
+        .map(|a| {
+            let mut pairs = vec![
+                ("article", Value::Int(a.article_num)),
+                ("mail", s(&a.mail_id)),
+                ("from", s(&a.from)),
+            ];
+            if let Some(at) = a.accepted_at_ms {
+                pairs.push(("accepted_at_ms", Value::Int(at)));
+            }
+            pairs.push(("headers", a.headers.clone()));
+            pairs.push(("body", s(&a.body)));
+            obj(pairs)
+        })
+        .collect();
+    let mut pairs = vec![
+        ("type", s("articles")),
+        ("req", Value::Int(req)),
+        ("group", s(&page.group)),
+        ("high_water", Value::Int(page.high_water)),
+        ("retired", Value::Bool(page.retired)),
+    ];
+    if following {
+        pairs.push(("following", Value::Bool(true)));
+    }
+    pairs.push(("articles", Value::Arr(articles)));
+    obj(pairs)
+}
+
+fn group_policy_reply(req: i64, g: &Group) -> Value {
+    let mut pairs = vec![
+        ("type", s("group_policy")),
+        ("req", Value::Int(req)),
+        ("group", s(&g.group)),
+        ("high_water", Value::Int(g.high_water)),
+        ("subscribers", Value::Int(g.subscribers as i64)),
+        ("retired", Value::Bool(g.retired)),
+    ];
+    if let Some(kl) = g.keep_last {
+        pairs.push(("keep_last", Value::Int(kl)));
+    }
+    if let Some(ttl) = g.ttl_ms {
+        pairs.push(("ttl_ms", Value::Int(ttl)));
+    }
+    obj(pairs)
 }
 
 /// The Mail id of one Broadcast copy: the broadcast's id and the recipient's
@@ -1620,6 +1842,9 @@ mod tests {
                 position: Some(1),
                 subscribed: true,
                 record_id: Some("r-2".into()),
+                retired: false,
+                keep_last: None,
+                ttl_ms: None,
             },
             Group {
                 group: "dev".into(),
@@ -1628,6 +1853,9 @@ mod tests {
                 position: None,
                 subscribed: false,
                 record_id: None,
+                retired: false,
+                keep_last: None,
+                ttl_ms: None,
             },
         ];
         assert_eq!(

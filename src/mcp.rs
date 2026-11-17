@@ -457,7 +457,7 @@ const TOOLS: [(&str, &str, &str); 9] = [
 const SEND_WITH_GROUPS: (&str, &str, &str) = (
     "roger_send",
     "Send one Mail to an Address, to every session with \"*\", or to a Group with `group`. Give either `to` or `group`, never both. Headers are opaque strings the sender attaches.",
-    r#"{"type":"object","properties":{"session":{"type":"string"},"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["body"]}"#,
+    r#"{"type":"object","properties":{"session":{"type":"string"},"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}},"expected_article":{"type":"integer","minimum":0}},"required":["body"]}"#,
 );
 
 const GROUP_TOOLS: [(&str, &str, &str); 3] = [
@@ -474,7 +474,7 @@ const GROUP_TOOLS: [(&str, &str, &str); 3] = [
     (
         "roger_groups",
         "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
-        r#"{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}"#,
+        r#"{"type":"object","properties":{"session":{"type":"string"},"prefix":{"type":"string"},"include_retired":{"type":"boolean"}},"additionalProperties":false}"#,
     ),
 ];
 
@@ -801,20 +801,35 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 Some(m) => m.to_string(),
                 None => session::gen_uuid().map_err(io)?,
             };
+            let expected_article = match args.get("expected_article") {
+                None => None,
+                Some(_) => Some(opt_int(
+                    name,
+                    args,
+                    "expected_article",
+                    0,
+                    (0, i64::MAX),
+                    false,
+                )?),
+            };
             if let Some(to) = to {
+                if expected_article.is_some() {
+                    return Err("roger_send: expected_article requires `group`".into());
+                }
                 let mail =
                     session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
                         .map_err(io)?;
                 Ok(obj(vec![("mail", s(&mail))]))
             } else {
                 let group = group.expect("checked group.is_some()");
-                let (mail, grp, article) = session::send_group_mail(
+                let (mail, grp, article) = session::send_group_mail_with(
                     &ctx.socket,
                     &ctx.me,
                     group,
                     &mail,
                     body,
                     args.get("headers"),
+                    expected_article,
                 )
                 .map_err(io)?;
                 Ok(obj(vec![
@@ -844,7 +859,11 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             Ok(without_envelope(reply))
         }
         "roger_groups" => {
-            let reply = session::groups_req(&ctx.socket, Some(&ctx.me)).map_err(io)?;
+            let prefix = opt_str(name, args, "prefix")?;
+            let include_retired = opt_bool(name, args, "include_retired")?;
+            let reply =
+                session::groups_req_filtered(&ctx.socket, Some(&ctx.me), prefix, include_retired)
+                    .map_err(io)?;
             Ok(without_envelope(reply))
         }
         "roger_inbox" => {
@@ -1093,7 +1112,7 @@ fn events_list_result() -> Value {
         (
             "inputSchema",
             json::parse(
-                r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"kind":{"type":"string","enum":["directed","broadcast","group"]}},"additionalProperties":false}"#,
+                r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"groupPrefix":{"type":"string","minLength":1},"kind":{"type":"string","enum":["directed","broadcast","group"]}},"additionalProperties":false}"#,
             )
             .unwrap(),
         ),
@@ -1164,6 +1183,7 @@ fn events_list_result() -> Value {
 #[derive(Clone, Default)]
 struct MailFilter {
     group: Option<String>,
+    group_prefix: Option<String>,
     kind: Option<String>,
 }
 
@@ -1171,6 +1191,15 @@ impl MailFilter {
     fn matches(&self, entry: &Value) -> bool {
         if let Some(g) = &self.group {
             if entry.get("group").and_then(Value::as_str) != Some(g.as_str()) {
+                return false;
+            }
+        }
+        if let Some(p) = &self.group_prefix {
+            if !entry
+                .get("group")
+                .and_then(Value::as_str)
+                .is_some_and(|g| g.starts_with(p.as_str()))
+            {
                 return false;
             }
         }
@@ -1236,6 +1265,20 @@ fn parse_event_args(ctx: &Ctx, event_name: &str, params: &Value) -> Result<MailF
                     )));
                 };
                 filter.group = Some(g.clone());
+            }
+            ("roger.mail", "groupPrefix") => {
+                let Value::Str(p) = v else {
+                    return Err(RpcErr::invalid_params(format!(
+                        "expected arguments.groupPrefix to be a string, saw {}",
+                        type_name(Some(v))
+                    )));
+                };
+                if p.is_empty() {
+                    return Err(RpcErr::invalid_params(
+                        "expected arguments.groupPrefix to be non-empty, saw empty string",
+                    ));
+                }
+                filter.group_prefix = Some(p.clone());
             }
             ("roger.mail", "kind") => {
                 let Value::Str(kind) = v else {
@@ -3279,6 +3322,21 @@ mod tests {
         );
         // Inbox cursor file was never created/modified by events/poll.
         assert!(!position_path(&store).exists());
+
+        // groupPrefix filter
+        let p_pref = events_poll(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger.mail","cursor":"r-0","arguments":{"groupPrefix":"de"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        let Some(Value::Arr(ev_pref)) = p_pref.get("events") else {
+            panic!("events");
+        };
+        assert_eq!(ev_pref.len(), 1);
+        assert_eq!(ev_pref[0].get("eventId"), Some(&s("m-3")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

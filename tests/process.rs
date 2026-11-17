@@ -6183,3 +6183,152 @@ fn named_groups_deliver_one_article_to_subscribed_readers_with_durable_positions
         );
     }
 }
+
+#[test]
+fn stateless_articles_follow_expected_article_cas_group_policy_and_prefix_end_to_end() {
+    let mut rig = Rig::new("usenet-group-ops");
+    rig.start_stack();
+
+    // 1. CAS expected_article fence via CLI
+    let out1 = cli(
+        &rig,
+        "send",
+        &[
+            "--from",
+            SENDER,
+            "--group",
+            "tx.d1",
+            "--mail",
+            "t-1",
+            "--body",
+            "assigned",
+            "--expected-article",
+            "0",
+        ],
+    );
+    assert_eq!(out1, "ACCEPTED mail=t-1 group=tx.d1 article=1\n");
+
+    let stale = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--from",
+            SENDER,
+            "--group",
+            "tx.d1",
+            "--mail",
+            "t-stale",
+            "--body",
+            "conflict",
+            "--expected-article",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("expected group tx.d1 at article 0, saw 1"),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+
+    let out2 = cli(
+        &rig,
+        "send",
+        &[
+            "--from",
+            SENDER,
+            "--group",
+            "tx.d1",
+            "--mail",
+            "t-2",
+            "--body",
+            "planned",
+            "--expected-article",
+            "1",
+        ],
+    );
+    assert_eq!(out2, "ACCEPTED mail=t-2 group=tx.d1 article=2\n");
+
+    // 2. Stateless articles fetch (zero positions created)
+    let arts = cli(
+        &rig,
+        "articles",
+        &["--group", "tx.d1", "--after", "0", "--limit", "10"],
+    );
+    assert!(
+        arts.contains("ARTICLE group=tx.d1 article=1 mail=t-1 from=")
+            && arts.contains("body=assigned")
+            && arts.contains("ARTICLE group=tx.d1 article=2 mail=t-2 from=")
+            && arts.contains("ARTICLES group=tx.d1 high_water=2 count=2\n"),
+        "{arts}"
+    );
+
+    // 3. Stateless articles --follow over host daemon pushes new article live
+    let follower_out = rig.p("follow.out");
+    let f_out = std::fs::File::create(&follower_out).unwrap();
+    let mut follower = Command::new(BIN)
+        .args([
+            "articles",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--group",
+            "tx.d1",
+            "--after",
+            "2",
+            "--follow",
+            "--json",
+        ])
+        .stdout(std::process::Stdio::from(f_out))
+        .spawn()
+        .unwrap();
+    wait_for_text(&follower_out, "\"following\":true", Duration::from_secs(10));
+    assert_eq!(
+        group_send(&rig, "tx.d1", "t-3", "accepted"),
+        "ACCEPTED mail=t-3 group=tx.d1 article=3\n"
+    );
+    wait_for_text(
+        &follower_out,
+        "\"type\":\"article\",\"group\":\"tx.d1\",\"article\":3",
+        Duration::from_secs(10),
+    );
+    let _ = follower.kill();
+    let _ = follower.wait();
+
+    // 4. Prefix filter + group-policy keep_last / retire
+    assert_eq!(
+        group_send(&rig, "card.c1", "c-1", "delta"),
+        "ACCEPTED mail=c-1 group=card.c1 article=1\n"
+    );
+    let tx_only = cli(&rig, "groups", &["--prefix", "tx."]);
+    assert!(
+        tx_only.contains("GROUP group=tx.d1 high_water=3 subscribers=0\n")
+            && !tx_only.contains("card.c1"),
+        "{tx_only}"
+    );
+    let pol = cli(
+        &rig,
+        "group-policy",
+        &["--group", "tx.d1", "--keep-last", "1", "--retire"],
+    );
+    assert_eq!(
+        pol,
+        "GROUP_POLICY group=tx.d1 high_water=3 retired=true keep_last=1 ttl_ms=none\n"
+    );
+    let after_retire = cli(&rig, "groups", &["--prefix", "tx."]);
+    assert_eq!(after_retire, "GROUPS count=0\n");
+    let with_retired = cli(&rig, "groups", &["--prefix", "tx.", "--include-retired"]);
+    assert!(
+        with_retired
+            .contains("GROUP group=tx.d1 high_water=3 subscribers=0 retired=true keep_last=1\n"),
+        "{with_retired}"
+    );
+    let tailed = cli(&rig, "articles", &["--group", "tx.d1", "--after", "0"]);
+    assert!(
+        !tailed.contains("article=1")
+            && !tailed.contains("article=2")
+            && tailed.contains("article=3"),
+        "{tailed}"
+    );
+}

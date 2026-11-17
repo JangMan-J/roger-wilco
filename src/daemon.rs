@@ -58,6 +58,8 @@ struct State {
     /// Local connections that asked for `board_event` lines (`watch`, or
     /// `"watch":true` on a Register), until they close.
     watchers: Vec<Writer>,
+    /// Local connections following a Group's live `article` frames, by Group name.
+    article_watchers: HashMap<String, Vec<Writer>>,
 }
 
 impl State {
@@ -75,6 +77,7 @@ impl State {
             next_req: 1,
             waiters: HashMap::new(),
             watchers: Vec::new(),
+            article_watchers: HashMap::new(),
         }
     }
 }
@@ -411,6 +414,19 @@ fn upstream_link(
                 ),
             );
         }
+        for g in st.article_watchers.keys() {
+            let _ = net::send(
+                &writer,
+                &obj(vec![
+                    ("type", s("articles")),
+                    ("req", Value::Int(0)),
+                    ("group", s(g)),
+                    ("after", Value::Int(0)),
+                    ("limit", Value::Int(1)),
+                    ("follow", Value::Bool(true)),
+                ]),
+            );
+        }
         st.receipts.clone()
     };
     // A receipt committed while upstream was down still has to arrive. The
@@ -439,6 +455,16 @@ fn upstream_link(
                 let st = state.lock().unwrap();
                 for w in &st.watchers {
                     let _ = net::send(w, &v);
+                }
+            }
+            "article" => {
+                if let Ok(g) = net::field(&v, "group") {
+                    let st = state.lock().unwrap();
+                    if let Some(ws) = st.article_watchers.get(g) {
+                        for w in ws {
+                            let _ = net::send(w, &v);
+                        }
+                    }
                 }
             }
             // The coordinator holds a Register. Not a reply to any request.
@@ -701,11 +727,14 @@ fn serve_local(writer: Writer, lines: net::Lines, state: Arc<Mutex<State>>) -> i
     if let Some(id) = session_id {
         release(&state, &writer, &id, "disconnect");
     }
-    state
-        .lock()
-        .unwrap()
-        .watchers
-        .retain(|w| !Arc::ptr_eq(w, &writer));
+    {
+        let mut st = state.lock().unwrap();
+        st.watchers.retain(|w| !Arc::ptr_eq(w, &writer));
+        for list in st.article_watchers.values_mut() {
+            list.retain(|w| !Arc::ptr_eq(w, &writer));
+        }
+        st.article_watchers.retain(|_, list| !list.is_empty());
+    }
     // What is already queued is written before the connection ends: a
     // client may still be reading the answers to what it asked.
     net::close(&writer, true);
@@ -884,6 +913,9 @@ fn local_loop(
                 if let Some(h) = v.get("headers") {
                     up.push(("headers", h.clone()));
                 }
+                if let Some(exp) = v.get("expected_article") {
+                    up.push(("expected_article", exp.clone()));
+                }
                 let resp = upstream_request(state, obj(up))?;
                 let mut answer = if net::field(&resp, "type")? == "error" {
                     obj(vec![
@@ -970,7 +1002,46 @@ fn local_loop(
             }
             // Claims, the Board and Receipts live only at the coordinator, so
             // the host daemon relays them and answers under the session's own req.
-            "claim" | "board" | "receipt" | "subscribe" | "unsubscribe" | "groups" => {
+            "articles" => {
+                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let follow = v.get("follow") == Some(&Value::Bool(true));
+                let group = v.get("group").and_then(Value::as_str).map(str::to_string);
+                if follow {
+                    if let Some(ref g) = group {
+                        if !g.is_empty() {
+                            let mut st = state.lock().unwrap();
+                            let list = st.article_watchers.entry(g.clone()).or_default();
+                            if !list.iter().any(|w| Arc::ptr_eq(w, writer)) {
+                                list.push(Arc::clone(writer));
+                            }
+                        }
+                    }
+                }
+                let mut upstream = v.clone();
+                if let Value::Obj(pairs) = &mut upstream {
+                    pairs.retain(|(k, _)| k != "req");
+                }
+                let resp = upstream_request(state, upstream);
+                if follow
+                    && (resp.is_err()
+                        || resp
+                            .as_ref()
+                            .is_ok_and(|r| net::field(r, "type").unwrap_or("") == "error"))
+                {
+                    if let Some(ref g) = group {
+                        let mut st = state.lock().unwrap();
+                        if let Some(list) = st.article_watchers.get_mut(g) {
+                            list.retain(|w| !Arc::ptr_eq(w, writer));
+                            if list.is_empty() {
+                                st.article_watchers.remove(g);
+                            }
+                        }
+                    }
+                }
+                net::send(writer, &with_req(resp?, req))?;
+            }
+            "claim" | "board" | "receipt" | "subscribe" | "unsubscribe" | "groups"
+            | "group_policy" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let mut upstream = v.clone();
                 if let Value::Obj(pairs) = &mut upstream {

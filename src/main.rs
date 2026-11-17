@@ -77,10 +77,12 @@ Commands:
   mcp         [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
               [--label <text>] [--declare <text>] [--groups]   (MCP server on stdio; a session)
   send        --socket <path> --from <address> (--to <address|*> | --group <group>) --body <text>
-              [--mail <id>] [--header <key=value>]...
+              [--mail <id>] [--header <key=value>]... [--expected-article <n>]
   subscribe   --socket <path> --session <address> --group <group> [--after <n> | --latest]
   unsubscribe --socket <path> --session <address> --group <group>
-  groups      --socket <path> [--session <address>]
+  groups      --socket <path> [--session <address>] [--prefix <prefix>] [--include-retired]
+  articles    --socket <path> --group <group> [--after <n>] [--limit <n>] [--follow] [--json]
+  group-policy --socket <path> --group <group> [--keep-last <n|none>] [--ttl-ms <ms|none>] [--retire | --reopen]
   claim       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   renew       --socket <path> --owner <address> --key <text> --ttl-ms <ms>
   release     --socket <path> --owner <address> --key <text>
@@ -198,13 +200,32 @@ fn main() -> io::Result<()> {
             };
             let body = need(&args, "--body")?;
             let hdrs = headers(&args)?;
+            let expected_article = match arg(&args, "--expected-article") {
+                Some(n) => Some(n.parse::<i64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--expected-article expects a non-negative integer, saw {n}"),
+                    )
+                })?),
+                None => None,
+            };
             match (to, group) {
                 (Some(_), Some(_)) => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "expected either --to or --group, saw both",
                 )),
-                (Some(to), None) => session::send(socket, from, to, mail, body, hdrs),
-                (None, Some(grp)) => session::send_group(socket, from, grp, mail, body, hdrs),
+                (Some(to), None) => {
+                    if expected_article.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--expected-article requires --group",
+                        ));
+                    }
+                    session::send(socket, from, to, mail, body, hdrs)
+                }
+                (None, Some(grp)) => {
+                    session::send_group(socket, from, grp, mail, body, hdrs, expected_article)
+                }
                 (None, None) => Err(io::Error::new(io::ErrorKind::InvalidInput, "missing --to")),
             }
         }
@@ -241,7 +262,82 @@ fn main() -> io::Result<()> {
         "groups" => session::groups(
             PathBuf::from(need(&args, "--socket")?),
             arg(&args, "--session"),
+            arg(&args, "--prefix"),
+            args.iter().any(|a| a == "--include-retired"),
         ),
+        "articles" => {
+            let after = match arg(&args, "--after") {
+                Some(n) => n.parse::<i64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--after expects a non-negative integer, saw {n}"),
+                    )
+                })?,
+                None => 0,
+            };
+            let limit = match arg(&args, "--limit") {
+                Some(n) => n.parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--limit expects a positive integer, saw {n}"),
+                    )
+                })?,
+                None => 100,
+            };
+            session::articles(
+                PathBuf::from(need(&args, "--socket")?),
+                need(&args, "--group")?,
+                after,
+                limit,
+                args.iter().any(|a| a == "--follow"),
+                args.iter().any(|a| a == "--json"),
+            )
+        }
+        "group-policy" => {
+            let parse_clearable = |flag: &str| -> io::Result<Option<Option<i64>>> {
+                match arg(&args, flag) {
+                    None => Ok(None),
+                    Some(v) if v == "none" => Ok(Some(None)),
+                    Some(v) => {
+                        let n = v.parse::<i64>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("{flag} expects a non-negative integer or 'none', saw {v}"),
+                            )
+                        })?;
+                        if n < 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("{flag} expects a non-negative integer or 'none', saw {v}"),
+                            ));
+                        }
+                        Ok(Some(Some(n)))
+                    }
+                }
+            };
+            let retire = args.iter().any(|a| a == "--retire");
+            let reopen = args.iter().any(|a| a == "--reopen");
+            if retire && reopen {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected at most one of --retire or --reopen, saw both",
+                ));
+            }
+            let retired = if retire {
+                Some(true)
+            } else if reopen {
+                Some(false)
+            } else {
+                None
+            };
+            session::group_policy(
+                PathBuf::from(need(&args, "--socket")?),
+                need(&args, "--group")?,
+                parse_clearable("--keep-last")?,
+                parse_clearable("--ttl-ms")?,
+                retired,
+            )
+        }
         "claim" | "renew" | "release" => {
             let op = claims::Op::parse(if cmd == "claim" { "acquire" } else { cmd })
                 .expect("the match arm names only claim ops");
