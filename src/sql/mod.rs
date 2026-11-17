@@ -238,7 +238,8 @@ CREATE TABLE IF NOT EXISTS seen_ids (
     target TEXT,
     body_len INTEGER NOT NULL,
     body_sha256 TEXT NOT NULL,
-    article_num INTEGER NOT NULL DEFAULT 0
+    article_num INTEGER NOT NULL DEFAULT 0,
+    stream TEXT
 );
 CREATE TABLE IF NOT EXISTS broadcasts (
     mail_id TEXT PRIMARY KEY,
@@ -286,6 +287,7 @@ CREATE TABLE IF NOT EXISTS positions (
     updated_at_ms INTEGER,
     PRIMARY KEY(stream, reader)
 );
+CREATE INDEX IF NOT EXISTS idx_positions_reader ON positions(reader, subscribed);
 CREATE TABLE IF NOT EXISTS receipts (
     mail_id TEXT NOT NULL,
     reader TEXT NOT NULL,

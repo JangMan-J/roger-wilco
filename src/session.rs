@@ -1120,18 +1120,124 @@ pub fn relabel(socket: PathBuf, session: String, label: String) -> io::Result<()
     Ok(())
 }
 
-pub fn send_mail(
-    socket: &Path,
+/// Reusable client connection to a host daemon, reconnecting once on EOF or
+/// broken pipe before a complete reply.
+pub struct Client {
+    socket: PathBuf,
+    conn: Option<(net::Writer, net::Lines)>,
+    next_req: i64,
+    #[cfg(test)]
+    connects: usize,
+}
+
+fn is_reconnectable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
+impl Client {
+    pub fn new(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            conn: None,
+            next_req: 0,
+            #[cfg(test)]
+            connects: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn connects(&self) -> usize {
+        self.connects
+    }
+
+    fn ensure_conn(&mut self) -> io::Result<&mut (net::Writer, net::Lines)> {
+        if self.conn.is_none() {
+            let pair = connect(&self.socket)?;
+            #[cfg(test)]
+            {
+                self.connects += 1;
+            }
+            self.conn = Some(pair);
+        }
+        Ok(self.conn.as_mut().expect("connection initialized"))
+    }
+
+    fn raw_request_once(&mut self, msg: &Value, req_id: i64) -> io::Result<Value> {
+        let socket_display = self.socket.display().to_string();
+        let (writer, lines) = self.ensure_conn()?;
+        net::send(writer, msg)?;
+        for item in lines {
+            let v = item?;
+            if let Some(r) = v.get("req").and_then(Value::as_i64) {
+                if r != req_id {
+                    continue;
+                }
+            }
+            return Ok(v);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected one reply line from {socket_display}, saw EOF"),
+        ))
+    }
+
+    fn raw_request(&mut self, mut msg: Value) -> io::Result<Value> {
+        self.next_req += 1;
+        let req_id = self.next_req;
+        if let Value::Obj(pairs) = &mut msg {
+            pairs.retain(|(k, _)| k != "req");
+            pairs.push(("req".to_string(), Value::Int(req_id)));
+        }
+        let had_conn = self.conn.is_some();
+        match self.raw_request_once(&msg, req_id) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.conn = None;
+                if had_conn && is_reconnectable(&e) {
+                    self.raw_request_once(&msg, req_id)
+                        .inspect_err(|_| self.conn = None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub fn request(&mut self, msg: Value) -> io::Result<Value> {
+        let reply = self.raw_request(msg)?;
+        if net::field(&reply, "type")? == "error" {
+            return Err(io::Error::other(match net::field(&reply, "reason") {
+                Ok(reason) => reason.to_string(),
+                Err(_) => format!(
+                    "expected a reason in the error reply, saw {}",
+                    json::stringify(&reply)
+                ),
+            }));
+        }
+        Ok(reply)
+    }
+}
+
+pub fn request_on(client: &mut Client, v: Value) -> io::Result<Value> {
+    client.request(v)
+}
+
+pub fn send_mail_on(
+    client: &mut Client,
     from: &str,
     to: &str,
     mail: &str,
     body: &str,
     headers: Option<&Value>,
 ) -> io::Result<String> {
-    let (writer, mut lines) = connect(socket)?;
     let mut ask = vec![
         ("type", s("send")),
-        ("req", Value::Int(1)),
         ("mail", s(mail)),
         ("from", s(from)),
         ("to", s(to)),
@@ -1140,28 +1246,25 @@ pub fn send_mail(
     if let Some(h) = headers {
         ask.push(("headers", h.clone()));
     }
-    net::send(&writer, &obj(ask))?;
-    for line in &mut lines {
-        let v = line?;
-        match net::field(&v, "type")? {
-            "accepted" => return Ok(net::field(&v, "mail")?.to_string()),
-            "error" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "send of {mail} refused: {}",
-                        net::field(&v, "reason").unwrap_or("unexplained")
-                    ),
-                ))
-            }
-            _ => {}
-        }
+    let v = client.raw_request(obj(ask))?;
+    match net::field(&v, "type")? {
+        "accepted" => Ok(net::field(&v, "mail")?.to_string()),
+        "error" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "send of {mail} refused: {}",
+                net::field(&v, "reason").unwrap_or("unexplained")
+            ),
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected accepted or error, saw {other}"),
+        )),
     }
-    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
 }
 
-pub fn send_group_mail_with(
-    socket: &Path,
+pub fn send_group_mail_on(
+    client: &mut Client,
     from: &str,
     group: &str,
     mail: &str,
@@ -1169,10 +1272,8 @@ pub fn send_group_mail_with(
     headers: Option<&Value>,
     expected_article: Option<i64>,
 ) -> io::Result<(String, String, i64)> {
-    let (writer, mut lines) = connect(socket)?;
     let mut ask = vec![
         ("type", s("send")),
-        ("req", Value::Int(1)),
         ("mail", s(mail)),
         ("from", s(from)),
         ("group", s(group)),
@@ -1184,40 +1285,37 @@ pub fn send_group_mail_with(
     if let Some(exp) = expected_article {
         ask.push(("expected_article", Value::Int(exp)));
     }
-    net::send(&writer, &obj(ask))?;
-    for line in &mut lines {
-        let v = line?;
-        match net::field(&v, "type")? {
-            "accepted" => {
-                let mail_id = net::field(&v, "mail")?.to_string();
-                let grp = v
-                    .get("group")
-                    .and_then(Value::as_str)
-                    .unwrap_or(group)
-                    .to_string();
-                let article = v
-                    .get("article")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing article"))?;
-                return Ok((mail_id, grp, article));
-            }
-            "error" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "send of {mail} refused: {}",
-                        net::field(&v, "reason").unwrap_or("unexplained")
-                    ),
-                ))
-            }
-            _ => {}
+    let v = client.raw_request(obj(ask))?;
+    match net::field(&v, "type")? {
+        "accepted" => {
+            let mail_id = net::field(&v, "mail")?.to_string();
+            let grp = v
+                .get("group")
+                .and_then(Value::as_str)
+                .unwrap_or(group)
+                .to_string();
+            let article = v
+                .get("article")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing article"))?;
+            Ok((mail_id, grp, article))
         }
+        "error" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "send of {mail} refused: {}",
+                net::field(&v, "reason").unwrap_or("unexplained")
+            ),
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected accepted or error, saw {other}"),
+        )),
     }
-    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
 }
 
-pub fn subscribe_req(
-    socket: &Path,
+pub fn subscribe_req_on(
+    client: &mut Client,
     session: &str,
     group: &str,
     after: Option<i64>,
@@ -1239,7 +1337,6 @@ pub fn subscribe_req(
     }
     let mut ask = vec![
         ("type", s("subscribe")),
-        ("req", Value::Int(1)),
         ("session", s(session)),
         ("group", s(group)),
     ];
@@ -1249,28 +1346,24 @@ pub fn subscribe_req(
     if latest {
         ask.push(("latest", Value::Bool(true)));
     }
-    request(socket, &obj(ask))
+    client.request(obj(ask))
 }
 
-pub fn unsubscribe_req(socket: &Path, session: &str, group: &str) -> io::Result<Value> {
-    request(
-        socket,
-        &obj(vec![
-            ("type", s("unsubscribe")),
-            ("req", Value::Int(1)),
-            ("session", s(session)),
-            ("group", s(group)),
-        ]),
-    )
+pub fn unsubscribe_req_on(client: &mut Client, session: &str, group: &str) -> io::Result<Value> {
+    client.request(obj(vec![
+        ("type", s("unsubscribe")),
+        ("session", s(session)),
+        ("group", s(group)),
+    ]))
 }
 
-pub fn groups_req_filtered(
-    socket: &Path,
+pub fn groups_req_filtered_on(
+    client: &mut Client,
     session: Option<&str>,
     prefix: Option<&str>,
     include_retired: bool,
 ) -> io::Result<Value> {
-    let mut ask = vec![("type", s("groups")), ("req", Value::Int(1))];
+    let mut ask = vec![("type", s("groups"))];
     if let Some(sess) = session {
         ask.push(("session", s(sess)));
     }
@@ -1280,7 +1373,66 @@ pub fn groups_req_filtered(
     if include_retired {
         ask.push(("include_retired", Value::Bool(true)));
     }
-    request(socket, &obj(ask))
+    client.request(obj(ask))
+}
+
+pub fn send_mail(
+    socket: &Path,
+    from: &str,
+    to: &str,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> io::Result<String> {
+    let mut client = Client::new(socket.to_path_buf());
+    send_mail_on(&mut client, from, to, mail, body, headers)
+}
+
+pub fn send_group_mail_with(
+    socket: &Path,
+    from: &str,
+    group: &str,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+    expected_article: Option<i64>,
+) -> io::Result<(String, String, i64)> {
+    let mut client = Client::new(socket.to_path_buf());
+    send_group_mail_on(
+        &mut client,
+        from,
+        group,
+        mail,
+        body,
+        headers,
+        expected_article,
+    )
+}
+
+pub fn subscribe_req(
+    socket: &Path,
+    session: &str,
+    group: &str,
+    after: Option<i64>,
+    latest: bool,
+) -> io::Result<Value> {
+    let mut client = Client::new(socket.to_path_buf());
+    subscribe_req_on(&mut client, session, group, after, latest)
+}
+
+pub fn unsubscribe_req(socket: &Path, session: &str, group: &str) -> io::Result<Value> {
+    let mut client = Client::new(socket.to_path_buf());
+    unsubscribe_req_on(&mut client, session, group)
+}
+
+pub fn groups_req_filtered(
+    socket: &Path,
+    session: Option<&str>,
+    prefix: Option<&str>,
+    include_retired: bool,
+) -> io::Result<Value> {
+    let mut client = Client::new(socket.to_path_buf());
+    groups_req_filtered_on(&mut client, session, prefix, include_retired)
 }
 
 pub fn articles_req(socket: &Path, group: &str, after: i64, limit: usize) -> io::Result<Value> {
@@ -1311,24 +1463,8 @@ fn print_headers(mail: &str, headers: &Value) {
 
 /// One request to the host daemon, answered by exactly one line.
 pub fn request(socket: &Path, v: &Value) -> io::Result<Value> {
-    let (writer, mut lines) = connect(socket)?;
-    net::send(&writer, v)?;
-    let reply = lines.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("expected one reply line from {}, saw EOF", socket.display()),
-        )
-    })??;
-    if net::field(&reply, "type")? == "error" {
-        return Err(io::Error::other(match net::field(&reply, "reason") {
-            Ok(reason) => reason.to_string(),
-            Err(_) => format!(
-                "expected a reason in the error reply, saw {}",
-                json::stringify(&reply)
-            ),
-        }));
-    }
-    Ok(reply)
+    let mut client = Client::new(socket.to_path_buf());
+    client.request(v.clone())
 }
 
 fn holder_text(v: &Value) -> String {
@@ -1456,46 +1592,7 @@ pub fn board(socket: PathBuf, from: Option<String>) -> io::Result<()> {
     Ok(())
 }
 
-fn fill_random(b: &mut [u8; 16]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        std::fs::File::open("/dev/urandom")?.read_exact(b)
-    }
-    #[cfg(windows)]
-    {
-        #[link(name = "bcrypt", kind = "raw-dylib")]
-        unsafe extern "system" {
-            fn BCryptGenRandom(
-                algorithm: *mut std::ffi::c_void,
-                buffer: *mut u8,
-                bytes: u32,
-                flags: u32,
-            ) -> i32;
-        }
-        // BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002
-        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), 16, 2) };
-        if status < 0 {
-            Err(io::Error::other(format!(
-                "expected BCryptGenRandom to succeed, saw NTSTATUS {status:#x}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-pub fn gen_uuid() -> io::Result<String> {
-    let mut b = [0u8; 16];
-    fill_random(&mut b)?;
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15]
-    ))
-}
+pub use roger_wire::wire::gen_uuid;
 
 #[cfg(test)]
 mod tests {
@@ -2076,5 +2173,71 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_reuses_connection_keeps_open_on_error_and_reconnects_on_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            // Connection 1: serves 3 requests (including an error reply), then drops.
+            let (conn1, _) = listener.accept().unwrap();
+            let mut lines1 = net::lines(Box::new(conn1.try_clone().unwrap()));
+            let w1 = net::writer(Box::new(conn1));
+            for expected_req in 1..=3 {
+                let req = lines1.next().unwrap().unwrap();
+                assert_eq!(req.get("req").and_then(Value::as_i64), Some(expected_req));
+                let resp = if expected_req == 2 {
+                    obj(vec![
+                        ("type", s("error")),
+                        ("req", Value::Int(expected_req)),
+                        ("reason", s("refused")),
+                    ])
+                } else {
+                    obj(vec![
+                        ("type", s("board")),
+                        ("req", Value::Int(expected_req)),
+                        ("sessions", Value::Arr(vec![])),
+                        ("claims", Value::Arr(vec![])),
+                    ])
+                };
+                net::send(&w1, &resp).unwrap();
+            }
+            drop((lines1, w1));
+
+            // Connection 2: accepts reconnect after EOF and serves req 4.
+            let (conn2, _) = listener.accept().unwrap();
+            let mut lines2 = net::lines(Box::new(conn2.try_clone().unwrap()));
+            let w2 = net::writer(Box::new(conn2));
+            let req = lines2.next().unwrap().unwrap();
+            assert_eq!(req.get("req").and_then(Value::as_i64), Some(4));
+            net::send(
+                &w2,
+                &obj(vec![
+                    ("type", s("accepted")),
+                    ("req", Value::Int(4)),
+                    ("mail", s("m-4")),
+                ]),
+            )
+            .unwrap();
+        });
+
+        let mut client = Client::new(target);
+        assert!(client.request(obj(vec![("type", s("board"))])).is_ok());
+        assert_eq!(client.connects(), 1);
+        let err = client
+            .request(obj(vec![("type", s("board"))]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "refused");
+        assert_eq!(client.connects(), 1, "error reply keeps socket open");
+        assert!(client.request(obj(vec![("type", s("board"))])).is_ok());
+        assert_eq!(client.connects(), 1);
+
+        // Server closed conn1; next call reconnects once cleanly.
+        let mail = send_mail_on(&mut client, "a", "b", "m-4", "hi", None).unwrap();
+        assert_eq!(mail, "m-4");
+        assert_eq!(client.connects(), 2);
+        server.join().unwrap();
     }
 }

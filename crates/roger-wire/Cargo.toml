@@ -1,0 +1,12 @@
+[package]
+name = "roger-wire"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Zero-dependency shared wire, JSON, SHA-256, and durable log primitives for Roger-Wilco"
+
+[dependencies]
+
+[lints.clippy]
+all = "warn"

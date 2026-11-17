@@ -15,10 +15,12 @@ The sealed documents name no harness or model; provenance frontmatter (`agent:`,
 The Core (`Cargo.toml` and `src/`, building the `roger` binary) stays one standalone binary
 satisfying every proof on its own without any Optional module, with vendored offline crates under
 `vendor/` so `--offline` clean-HOME builds of `roger` always succeed; plain SQL is isolated in
-one module (`src/sql.rs`) so storage stays portable. Optional modules (`modules/<name>/`) are
-standalone packages in the repository — each carrying its own `[workspace]` table in
-`modules/<name>/Cargo.toml` so root `Cargo.toml` never depends on them — that may link external
-crates to expose or bridge faces over network transports, read records, or ship cold archives.
+one module (`src/sql.rs`) so storage stays portable. `crates/roger-wire/` is the zero-external-dependency
+shared internal library crate used by the Core and Optional modules for JSON, SHA-256, durable logs,
+and wire constants. Optional modules (`modules/<name>/`) are standalone packages in the repository —
+each carrying its own `[workspace]` table in `modules/<name>/Cargo.toml` so root `Cargo.toml` never
+depends on them — that may link external crates to expose or bridge faces over network transports,
+read records, or ship cold archives.
 
 The offline core gate is `scripts/check`: fmt, clippy with warnings denied (`-D warnings`), the core
 test suite, `scripts/check-harness-free`, `scripts/check-vocabulary`, and `scripts/check-no-poll`.

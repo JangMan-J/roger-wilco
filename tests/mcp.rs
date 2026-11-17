@@ -7,9 +7,7 @@
 #[cfg(not(feature = "test-hooks"))]
 compile_error!("tests/mcp.rs needs the test hooks: cargo test --features test-hooks");
 
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod json;
+use roger_wire::json;
 
 use json::Value;
 use std::fs;
@@ -1936,4 +1934,137 @@ fn mcp_sep3415_events_list_poll_and_stream_replay_live_heartbeat_cancel() {
     assert_eq!(a.wait_exit().code(), Some(0));
     assert_eq!(b.wait_exit().code(), Some(0));
     assert_eq!(b2.wait_exit().code(), Some(0));
+}
+
+#[test]
+fn mcp_process_reuses_pooled_rpc_connection_and_reconnects_after_eof() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("roger-mcp-pool-proc-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let sock_path = dir.join("mock-pool.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+    let rpc_accepts = Arc::new(AtomicUsize::new(0));
+    let rpc_accepts_srv = Arc::clone(&rpc_accepts);
+    let (closed_tx, closed_rx) = mpsc::channel::<()>();
+    let daemon_thread = std::thread::spawn(move || {
+        let mut closed_tx = Some(closed_tx);
+        while let Ok((conn, _)) = listener.accept() {
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                continue;
+            }
+            let v = json::parse(first.trim()).unwrap();
+            let ty = s(&v, "type");
+            if ty == "stop_mock" {
+                break;
+            }
+            if ty == "register" {
+                let sess = s(&v, "session");
+                let mut w = conn;
+                let _ = writeln!(w, r#"{{"type":"registered","session":"{sess}"}}"#);
+                let _ = w.flush();
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        line.clear();
+                    }
+                });
+                continue;
+            }
+            let conn_num = rpc_accepts_srv.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut w = conn;
+            let mut handle_req = |req_val: Value| {
+                let req = req_val.get("req").and_then(Value::as_i64).unwrap_or(1);
+                let reply = match s(&req_val, "type").as_str() {
+                    "send" => format!(
+                        r#"{{"type":"accepted","req":{req},"mail":"{}"}}"#,
+                        s(&req_val, "mail")
+                    ),
+                    "board" => format!(
+                        r#"{{"type":"board","req":{req},"sessions":[],"claims":[],"now_ms":100}}"#
+                    ),
+                    "groups" => format!(r#"{{"type":"groups","req":{req},"groups":[]}}"#),
+                    other => panic!("unexpected mock request: {other}"),
+                };
+                writeln!(w, "{reply}").unwrap();
+                w.flush().unwrap();
+            };
+            handle_req(v);
+            if conn_num == 1 {
+                for _ in 0..2 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    handle_req(json::parse(line.trim()).unwrap());
+                }
+                // Drop conn #1 to inject EOF before the 4th RPC.
+                drop((reader, w));
+                if let Some(tx) = closed_tx.take() {
+                    let _ = tx.send(());
+                }
+            } else {
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    handle_req(json::parse(line.trim()).unwrap());
+                    line.clear();
+                }
+            }
+        }
+    });
+
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "mcp",
+        "--groups",
+        "--socket",
+        sock_path.to_str().unwrap(),
+        "--id",
+        A1,
+        "--store",
+        dir.join("pool.store").to_str().unwrap(),
+    ]);
+    let mut mcp = Mcp::start(cmd, &dir.join("pool.err"));
+    mcp.initialize();
+
+    let (err1, r1) = mcp.call(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"p-1","body":"one"}}"#),
+    );
+    assert!(!err1, "{r1}");
+    assert_eq!(s(&json::parse(&r1).unwrap(), "mail"), "p-1");
+    let (err2, r2) = mcp.call("roger_board", "{}");
+    assert!(!err2, "{r2}");
+    let (err3, r3) = mcp.call("roger_groups", "{}");
+    assert!(!err3, "{r3}");
+    assert_eq!(
+        rpc_accepts.load(Ordering::SeqCst),
+        1,
+        "consecutive RPCs must reuse one accepted socket"
+    );
+
+    // Wait until conn #1 is closed on the server side, then send 4th RPC.
+    closed_rx.recv().unwrap();
+    let (err4, r4) = mcp.call(
+        "roger_send",
+        &format!(r#"{{"to":"{A2}","mail":"p-4","body":"four"}}"#),
+    );
+    assert!(!err4, "{r4}");
+    assert_eq!(s(&json::parse(&r4).unwrap(), "mail"), "p-4");
+    assert_eq!(
+        rpc_accepts.load(Ordering::SeqCst),
+        2,
+        "EOF between calls must reconnect once cleanly"
+    );
+
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit().code(), Some(0));
+    if let Ok(mut stop) = std::os::unix::net::UnixStream::connect(&sock_path) {
+        let _ = writeln!(stop, r#"{{"type":"stop_mock"}}"#);
+    }
+    daemon_thread.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
 }

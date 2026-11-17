@@ -213,9 +213,13 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "roger-wire",
  "serde_json",
- "sha2",
 ]
+
+[[package]]
+name = "roger-wire"
+version = "0.1.0"
 
 [[package]]
 name = "rustc_version"

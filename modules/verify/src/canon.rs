@@ -3,7 +3,6 @@
 //! choice is listed in the module README.
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// The scheme a declared text must name.
 pub const DECLARE_SCHEME: &str = "roger-declare/1";
@@ -185,12 +184,7 @@ pub fn sig_form(
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+pub use roger_wire::sha256::hex_digest as sha256_hex;
 
 #[cfg(test)]
 mod tests {

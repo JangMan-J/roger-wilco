@@ -213,16 +213,7 @@ pub fn write_port_file(path: &Path, port: u16) -> io::Result<()> {
 }
 
 /// Constant-time byte slice equality check for Bearer token comparison.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+pub use roger_wire::wire::same_secret_bytes as constant_time_eq;
 
 #[cfg(test)]
 mod tests {

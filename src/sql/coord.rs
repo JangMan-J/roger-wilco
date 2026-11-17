@@ -207,6 +207,17 @@ fn migrate_streams(c: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_seen_ids(c: &Connection) -> rusqlite::Result<()> {
+    let mut st = c.prepare("PRAGMA table_info(seen_ids)")?;
+    let cols: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !cols.iter().any(|c| c == "stream") {
+        c.execute("ALTER TABLE seen_ids ADD COLUMN stream TEXT", [])?;
+    }
+    Ok(())
+}
+
 fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
     let c = Connection::open(path).map_err(sq)?;
     c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
@@ -216,6 +227,7 @@ fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
     if schema {
         c.execute_batch(COORD_SLICE_SCHEMA).map_err(sq)?;
         migrate_streams(&c).map_err(sq)?;
+        migrate_seen_ids(&c).map_err(sq)?;
     }
     Ok(c)
 }
@@ -301,6 +313,8 @@ struct Shard {
     cold: Arc<Index>,
     read: Mutex<Connection>,
     writer: Writer,
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 struct Inner {
@@ -308,6 +322,7 @@ struct Inner {
     slices: Vec<Shard>,
     next_seq: AtomicI64,
     in_flight: (Mutex<HashSet<String>>, Condvar),
+    subscribed_groups: Mutex<HashMap<String, HashMap<usize, HashSet<String>>>>,
     last_swept_day: AtomicI64,
     sweep_lock: Mutex<()>,
     sweeps: Mutex<Vec<JoinHandle<()>>>,
@@ -389,12 +404,19 @@ struct NewSeen {
     target: Option<String>,
     body_len: i64,
     body_sha256: String,
+    stream: Option<String>,
 }
 
 enum InsertOutcome {
     Committed(i64),
     ResendConflict(String),
     HeadConflict { expected: i64, saw: i64 },
+}
+
+enum SingleWrite {
+    Committed(i64, Vec<String>),
+    Duplicate(i64),
+    Conflict(String),
 }
 
 fn prune_hot_group(c: &Connection, stream: &str, max_drop_art: i64) -> rusqlite::Result<()> {
@@ -418,25 +440,26 @@ fn prune_hot_group(c: &Connection, stream: &str, max_drop_art: i64) -> rusqlite:
 fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<InsertOutcome> {
     let existing = c
         .query_row(
-            "SELECT article_num, sender, recipient, body_len, body_sha256 FROM envelopes WHERE mail_id = ?1",
+            "SELECT article_num, kind, sender, recipient, body_len, body_sha256 FROM envelopes WHERE mail_id = ?1",
             [&e.mail_id],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((art, sender, recipient, len, sha)) = existing {
+    if let Some((art, kind, sender, recipient, len, sha)) = existing {
         let mut what = Vec::new();
         if sender != e.sender {
             what.push("sender");
         }
-        if recipient != e.recipient {
+        if kind != e.kind || recipient != e.recipient {
             what.push("recipient");
         }
         if len != e.body.len() as i64 || sha != e.body_sha256 {
@@ -505,11 +528,56 @@ fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<InsertOu
 
 fn insert_seen(c: &Connection, s: &NewSeen, article_num: i64) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT OR IGNORE INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![s.mail_id, s.kind, s.sender, s.target, s.body_len, s.body_sha256, article_num],
+        "INSERT OR IGNORE INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num, stream)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            s.mail_id,
+            s.kind,
+            s.sender,
+            s.target,
+            s.body_len,
+            s.body_sha256,
+            article_num,
+            s.stream
+        ],
     )?;
     Ok(())
+}
+
+fn query_seen(c: &Connection, mail_id: &str) -> rusqlite::Result<Option<SeenRow>> {
+    c.query_row(
+        "SELECT kind, sender, target, body_len, body_sha256, article_num FROM seen_ids WHERE mail_id = ?1",
+        [mail_id],
+        |r| {
+            Ok(SeenRow {
+                kind: r.get(0)?,
+                sender: r.get(1)?,
+                target: r.get(2)?,
+                body_len: r.get(3)?,
+                body_sha256: r.get(4)?,
+                article_num: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn query_broadcast(c: &Connection, mail_id: &str) -> rusqlite::Result<Option<SeenRow>> {
+    c.query_row(
+        "SELECT sender, body_len, body_sha256 FROM broadcasts WHERE mail_id = ?1",
+        [mail_id],
+        |r| {
+            Ok(SeenRow {
+                kind: "broadcast".into(),
+                sender: r.get(0)?,
+                target: None,
+                body_len: r.get(1)?,
+                body_sha256: r.get(2)?,
+                article_num: 0,
+            })
+        },
+    )
+    .optional()
 }
 
 fn subscribers_of(c: &Connection, stream: &str) -> rusqlite::Result<Vec<String>> {
@@ -619,44 +687,14 @@ impl Inner {
         idx: usize,
         f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
     ) -> io::Result<R> {
+        #[cfg(test)]
+        self.slices[idx].reads.fetch_add(1, Ordering::SeqCst);
         f(&self.slices[idx].read.lock().unwrap()).map_err(sq)
     }
 
     fn seen(&self, mail_id: &str) -> io::Result<(Option<SeenRow>, Option<SeenRow>)> {
         self.read(self.shard(mail_id), |c| {
-            let seen = c
-                .query_row(
-                    "SELECT kind, sender, target, body_len, body_sha256, article_num FROM seen_ids WHERE mail_id = ?1",
-                    [mail_id],
-                    |r| {
-                        Ok(SeenRow {
-                            kind: r.get(0)?,
-                            sender: r.get(1)?,
-                            target: r.get(2)?,
-                            body_len: r.get(3)?,
-                            body_sha256: r.get(4)?,
-                            article_num: r.get(5)?,
-                        })
-                    },
-                )
-                .optional()?;
-            let bcast = c
-                .query_row(
-                    "SELECT sender, body_len, body_sha256 FROM broadcasts WHERE mail_id = ?1",
-                    [mail_id],
-                    |r| {
-                        Ok(SeenRow {
-                            kind: "broadcast".into(),
-                            sender: r.get(0)?,
-                            target: None,
-                            body_len: r.get(1)?,
-                            body_sha256: r.get(2)?,
-                            article_num: 0,
-                        })
-                    },
-                )
-                .optional()?;
-            Ok((seen, bcast))
+            Ok((query_seen(c, mail_id)?, query_broadcast(c, mail_id)?))
         })
     }
 
@@ -752,11 +790,50 @@ impl Inner {
             .into_iter()
             .map(|r| self.resolve(idx, r, session))
             .collect::<io::Result<Vec<_>>>()?;
-        for i in 0..self.slices.len() {
+        let group_shards: Vec<usize> = {
+            let subs = self.subscribed_groups.lock().unwrap();
+            let mut idxs: Vec<usize> = subs
+                .get(session)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default();
+            idxs.sort_unstable();
+            idxs
+        };
+        for i in group_shards {
             out.extend(self.group_pending(i, session, None)?);
         }
         out.sort_by_key(|p| p.seq);
         Ok(out)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn find_in_slice(
+        &self,
+        idx: usize,
+        mail_id: &str,
+    ) -> io::Result<
+        Option<(
+            usize,
+            (
+                String,
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<i64>,
+            ),
+        )>,
+    > {
+        let row = self.read(idx, |c| {
+            c.query_row(
+                "SELECT stream, article_num, kind, sender, recipient, headers_json, accepted_at_ms FROM envelopes WHERE mail_id = ?1",
+                [mail_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()
+        })?;
+        Ok(row.map(|r| (idx, r)))
     }
 
     /// Find an envelope by Mail id: (slice, stream, article, kind, sender, recipient, headers, accepted_at).
@@ -778,20 +855,29 @@ impl Inner {
             ),
         )>,
     > {
-        for idx in 0..self.slices.len() {
-            let row = self.read(idx, |c| {
-                c.query_row(
-                    "SELECT stream, article_num, kind, sender, recipient, headers_json, accepted_at_ms FROM envelopes WHERE mail_id = ?1",
-                    [mail_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-                )
-                .optional()
-            })?;
-            if let Some(row) = row {
-                return Ok(Some((idx, row)));
-            }
+        if self.slices.len() == 1 {
+            return self.find_in_slice(0, mail_id);
         }
-        Ok(None)
+        let seen_stream: Option<Option<String>> = self.read(self.shard(mail_id), |c| {
+            c.query_row(
+                "SELECT stream FROM seen_ids WHERE mail_id = ?1",
+                [mail_id],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        match seen_stream {
+            Some(Some(stream)) => self.find_in_slice(self.shard(&stream), mail_id),
+            Some(None) => {
+                for idx in 0..self.slices.len() {
+                    if let Some(found) = self.find_in_slice(idx, mail_id)? {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Seal every hot body accepted at or before `now - retain_ms` into its
@@ -1131,8 +1217,26 @@ impl Store {
         }
         let startup = load_startup(&conns[0]).map_err(sq)?;
         let mut top = 0;
-        for c in &conns {
+        let mut sub_map: HashMap<String, HashMap<usize, HashSet<String>>> = HashMap::new();
+        for (idx, c) in conns.iter().enumerate() {
             top = top.max(max_seq(c).map_err(sq)?);
+            let mut st = c
+                .prepare(
+                    "SELECT reader, stream FROM positions WHERE subscribed = 1 AND substr(stream, 1, 2) = 'g:'",
+                )
+                .map_err(sq)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(sq)?;
+            for row in rows {
+                let (reader, stream) = row.map_err(sq)?;
+                sub_map
+                    .entry(reader)
+                    .or_default()
+                    .entry(idx)
+                    .or_default()
+                    .insert(stream);
+            }
         }
         let mut slices = Vec::with_capacity(cfg.num_slices);
         for (idx, (conn, dir)) in conns.into_iter().zip(dirs).enumerate() {
@@ -1142,6 +1246,8 @@ impl Store {
                 cold_dir,
                 read: Mutex::new(open_conn(&dir.join("hot.sqlite"), false)?),
                 writer: Writer::spawn(conn, idx)?,
+                #[cfg(test)]
+                reads: std::sync::atomic::AtomicUsize::new(0),
             });
         }
         let inner = Inner {
@@ -1149,6 +1255,7 @@ impl Store {
             slices,
             next_seq: AtomicI64::new(top + 1),
             in_flight: (Mutex::new(HashSet::new()), Condvar::new()),
+            subscribed_groups: Mutex::new(sub_map),
             last_swept_day: AtomicI64::new(i64::MIN),
             sweep_lock: Mutex::new(()),
             sweeps: Mutex::new(Vec::new()),
@@ -1203,17 +1310,52 @@ impl Store {
 
     /// Write one single-stream envelope plus its Mail-id record; atomic when
     /// both live in the same slice.
-    fn write_single(
-        &self,
-        env: NewEnvelope,
-        seen: NewSeen,
-    ) -> io::Result<Result<(i64, Vec<String>), String>> {
+    fn write_single(&self, env: NewEnvelope, seen: NewSeen) -> io::Result<SingleWrite> {
         let inner = &self.inner;
         let st_idx = inner.shard(&env.stream);
         let seen_idx = inner.shard(&seen.mail_id);
         let same = st_idx == seen_idx;
         let target = env.recipient.clone();
         let mail_id = env.mail_id.clone();
+        if same {
+            return inner.slices[st_idx].writer.exec(move |c| {
+                if let Some(s) = query_seen(c, &mail_id)? {
+                    return Ok(
+                        match s.differs(
+                            env.kind,
+                            &env.sender,
+                            Some(&env.recipient),
+                            seen.body_len,
+                            &seen.body_sha256,
+                        ) {
+                            None => SingleWrite::Duplicate(s.article_num),
+                            Some(w) => SingleWrite::Conflict(resend_refusal(&mail_id, &w)),
+                        },
+                    );
+                }
+                if query_broadcast(c, &mail_id)?.is_some() {
+                    return Ok(SingleWrite::Conflict(resend_refusal(&mail_id, "recipient")));
+                }
+                let art = match insert_envelope(c, &env)? {
+                    InsertOutcome::Committed(a) => a,
+                    InsertOutcome::ResendConflict(w) => {
+                        return Ok(SingleWrite::Conflict(resend_refusal(&mail_id, &w)));
+                    }
+                    InsertOutcome::HeadConflict { expected, saw } => {
+                        return Ok(SingleWrite::Conflict(format!(
+                            "expected group {target} at article {expected}, saw {saw}"
+                        )));
+                    }
+                };
+                insert_seen(c, &seen, art)?;
+                let subs = if env.kind == "group" {
+                    subscribers_of(c, &env.stream)?
+                } else {
+                    vec![env.recipient.clone()]
+                };
+                Ok(SingleWrite::Committed(art, subs))
+            });
+        }
         let res = inner.slices[st_idx].writer.exec(move |c| {
             let art = match insert_envelope(c, &env)? {
                 InsertOutcome::Committed(a) => a,
@@ -1224,25 +1366,20 @@ impl Store {
                     )));
                 }
             };
-            if same {
-                insert_seen(c, &seen, art)?;
-            }
             let subs = if env.kind == "group" {
                 subscribers_of(c, &env.stream)?
             } else {
                 vec![env.recipient.clone()]
             };
-            Ok(Ok((art, subs, (!same).then_some(seen))))
+            Ok(Ok((art, subs)))
         })?;
         match res {
-            Err(reason) => Ok(Err(reason)),
-            Ok((art, subs, rest)) => {
-                if let Some(seen) = rest {
-                    inner.slices[seen_idx]
-                        .writer
-                        .exec(move |c| insert_seen(c, &seen, art))?;
-                }
-                Ok(Ok((art, subs)))
+            Err(reason) => Ok(SingleWrite::Conflict(reason)),
+            Ok((art, subs)) => {
+                inner.slices[seen_idx]
+                    .writer
+                    .exec(move |c| insert_seen(c, &seen, art))?;
+                Ok(SingleWrite::Committed(art, subs))
             }
         }
     }
@@ -1290,22 +1427,25 @@ impl Store {
         let kind = if group { "group" } else { "directed" };
         let sha = hex_digest(body.as_bytes());
         let len = body.len() as i64;
-        let (seen, bcast) = inner.seen(&mail_id)?;
-        if let Some(s) = seen {
-            return Ok(match s.differs(kind, &from, Some(&target), len, &sha) {
-                None => Status::DuplicateAccepted {
-                    article_num: s.article_num,
-                },
-                Some(w) => Status::Conflict(resend_refusal(&mail_id, &w)),
-            });
-        }
-        if bcast.is_some() {
-            return Ok(Status::Conflict(resend_refusal(&mail_id, "recipient")));
+        let stream = format!("{}:{target}", if group { "g" } else { "m" });
+        if inner.shard(&stream) != inner.shard(&mail_id) {
+            let (seen, bcast) = inner.seen(&mail_id)?;
+            if let Some(s) = seen {
+                return Ok(match s.differs(kind, &from, Some(&target), len, &sha) {
+                    None => Status::DuplicateAccepted {
+                        article_num: s.article_num,
+                    },
+                    Some(w) => Status::Conflict(resend_refusal(&mail_id, &w)),
+                });
+            }
+            if bcast.is_some() {
+                return Ok(Status::Conflict(resend_refusal(&mail_id, "recipient")));
+            }
         }
         let env = NewEnvelope {
             seq: inner.seq(),
             mail_id: mail_id.clone(),
-            stream: format!("{}:{target}", if group { "g" } else { "m" }),
+            stream: stream.clone(),
             stream_kind: if group { "group" } else { "mail" },
             kind,
             sender: from.clone(),
@@ -1325,10 +1465,14 @@ impl Store {
             target: Some(target),
             body_len: len,
             body_sha256: sha,
+            stream: Some(stream),
         };
         let status = match self.write_single(env, seen)? {
-            Err(reason) => return Ok(Status::Conflict(reason)),
-            Ok((article_num, subscribers)) => Status::Committed {
+            SingleWrite::Conflict(reason) => return Ok(Status::Conflict(reason)),
+            SingleWrite::Duplicate(article_num) => {
+                return Ok(Status::DuplicateAccepted { article_num });
+            }
+            SingleWrite::Committed(article_num, subscribers) => Status::Committed {
                 article_num,
                 subscribers,
             },
@@ -1550,7 +1694,7 @@ impl Store {
             envs[inner.shard(&stream)].push(NewEnvelope {
                 seq: inner.seq(),
                 mail_id: copy.clone(),
-                stream,
+                stream: stream.clone(),
                 stream_kind: "mail",
                 kind: "broadcast",
                 sender: req.from.clone(),
@@ -1570,6 +1714,7 @@ impl Store {
                 target: Some(rcpt.clone()),
                 body_len: len,
                 body_sha256: sha.clone(),
+                stream: Some(stream),
             });
         }
         // Phase 1: every copy's envelope, all slices at once.
@@ -1803,6 +1948,14 @@ impl Store {
             )?;
             Ok((pos, hw))
         })?;
+        {
+            let mut subs = inner.subscribed_groups.lock().unwrap();
+            subs.entry(session.to_string())
+                .or_default()
+                .entry(idx)
+                .or_default()
+                .insert(stream.clone());
+        }
         let pending = inner.group_pending(idx, session, Some(&stream))?;
         Ok((position, high_water, pending))
     }
@@ -1811,7 +1964,7 @@ impl Store {
         let stream = format!("g:{group}");
         let idx = self.inner.shard(&stream);
         let reader = session.to_string();
-        self.inner.slices[idx].writer.exec(move |c| {
+        let pos = self.inner.slices[idx].writer.exec(move |c| {
             c.execute(
                 "UPDATE positions SET subscribed = 0, updated_at_ms = ?3 WHERE stream = ?1 AND reader = ?2",
                 params![stream, reader, now_ms],
@@ -1823,7 +1976,23 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0))
-        })
+        })?;
+        {
+            let mut subs = self.inner.subscribed_groups.lock().unwrap();
+            if let Some(by_shard) = subs.get_mut(session) {
+                let stream_key = format!("g:{group}");
+                if let Some(streams) = by_shard.get_mut(&idx) {
+                    streams.remove(&stream_key);
+                    if streams.is_empty() {
+                        by_shard.remove(&idx);
+                    }
+                }
+                if by_shard.is_empty() {
+                    subs.remove(session);
+                }
+            }
+        }
+        Ok(pos)
     }
 
     /// Wait for every background sweep started so far, then sweep once more now.
@@ -1833,6 +2002,45 @@ impl Store {
             let _ = h.join();
         }
         self.inner.sweep(now_ms())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_slice0(
+        &self,
+    ) -> (
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<io::Result<()>>,
+    ) {
+        let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (gate_tx, gate_rx) = sync_channel::<()>(1);
+        let pending = self.inner.slices[0]
+            .writer
+            .submit(move |_| {
+                let _ = entered_tx.send(());
+                let _ = gate_rx.recv();
+                Ok(())
+            })
+            .unwrap();
+        entered_rx.recv().unwrap();
+        (gate_tx, pending.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_slice0_queued(&self, n: usize) {
+        self.inner.slices[0].writer.wait_queued(n);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeline_rows(&self) -> Vec<(i64, String, Option<String>, Option<String>)> {
+        self.inner
+            .read(0, |c| {
+                let mut st =
+                    c.prepare("SELECT seq, kind, addr, claim_key FROM timeline ORDER BY seq")?;
+                let rows =
+                    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
     }
 }
 
@@ -2503,5 +2711,268 @@ mod tests {
             ),
             2
         );
+    }
+
+    fn reset_reads(store: &Store) {
+        for s in &store.inner.slices {
+            s.reads.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn slice_reads(store: &Store) -> Vec<usize> {
+        store
+            .inner
+            .slices
+            .iter()
+            .map(|s| s.reads.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    #[test]
+    fn multi_slice_ack_receipt_and_pending_avoid_linear_slice_scans() {
+        let dir = tempdir("o1-slices");
+        let mut c = cfg(&dir, 4);
+        c.sweep_enabled = false;
+        let (store, _) = Store::open(c).unwrap();
+        let rcpt = "rcpt-o1";
+        let m_idx = store.inner.shard(&format!("m:{rcpt}"));
+        let mail_id = (0..100)
+            .map(|i| format!("mail-o1-{i}"))
+            .find(|id| store.inner.shard(id) != m_idx)
+            .unwrap();
+        let id_idx = store.inner.shard(&mail_id);
+        let grp = (0..100)
+            .map(|i| format!("grp-o1-{i}"))
+            .find(|g| {
+                let gi = store.inner.shard(&format!("g:{g}"));
+                gi != m_idx && gi != id_idx
+            })
+            .unwrap();
+        let g_idx = store.inner.shard(&format!("g:{grp}"));
+        let unused_idx = (0..4)
+            .find(|&i| i != m_idx && i != id_idx && i != g_idx)
+            .unwrap();
+
+        committed(
+            store
+                .send_directed(directed(&mail_id, "sender", rcpt, "hello"))
+                .unwrap(),
+        );
+
+        // Unsubscribed session: pending_session executes zero group queries.
+        reset_reads(&store);
+        let pend = store.pending_session(rcpt).unwrap();
+        assert_eq!(pend.len(), 1);
+        let reads = slice_reads(&store);
+        assert_eq!(reads[m_idx], 1);
+        for (i, &r) in reads.iter().enumerate() {
+            if i != m_idx {
+                assert_eq!(
+                    r, 0,
+                    "slice {i} should not be queried for unsubscribed session"
+                );
+            }
+        }
+
+        // receipt and ack resolve via seen_ids.stream in O(1) without touching other slices.
+        reset_reads(&store);
+        let rec = store.receipt(&mail_id, None).unwrap().unwrap();
+        assert_eq!(rec.record_id, None);
+        let reads = slice_reads(&store);
+        assert_eq!(reads[id_idx], 1);
+        assert_eq!(reads[m_idx], 2);
+        assert_eq!(reads[g_idx], 0);
+        assert_eq!(reads[unused_idx], 0);
+
+        reset_reads(&store);
+        assert_eq!(
+            store.ack(&mail_id, rcpt, "r-1", 10).unwrap(),
+            AckResult::Recorded {
+                newly_receipted: true
+            }
+        );
+        let reads = slice_reads(&store);
+        assert_eq!(reads[id_idx], 1);
+        assert_eq!(reads[m_idx], 1);
+        assert_eq!(reads[g_idx], 0);
+        assert_eq!(reads[unused_idx], 0);
+
+        // Subscribe to a group on g_idx: pending_session queries only m_idx and g_idx.
+        store.subscribe(rcpt, &grp, None, false, 11).unwrap();
+        committed(
+            store
+                .send_group(group("gpost-1", "sender", &grp, "post"))
+                .unwrap(),
+        );
+        reset_reads(&store);
+        let pend = store.pending_session(rcpt).unwrap();
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].mail_id, "gpost-1");
+        let reads = slice_reads(&store);
+        assert_eq!(reads[m_idx], 1);
+        assert_eq!(reads[g_idx], 1);
+        assert_eq!(reads[id_idx], 0);
+        assert_eq!(reads[unused_idx], 0);
+
+        // Reload Store::open: subscribed_groups and seen_ids.stream survive restart.
+        drop(store);
+        let mut c = cfg(&dir, 4);
+        c.sweep_enabled = false;
+        let (store, _) = Store::open(c).unwrap();
+        reset_reads(&store);
+        assert_eq!(store.pending_session(rcpt).unwrap().len(), 1);
+        let reads = slice_reads(&store);
+        assert_eq!(reads[m_idx], 1);
+        assert_eq!(reads[g_idx], 1);
+        assert_eq!(reads[id_idx], 0);
+        assert_eq!(reads[unused_idx], 0);
+
+        reset_reads(&store);
+        let rec = store.receipt(&mail_id, None).unwrap().unwrap();
+        assert_eq!(rec.record_id.as_deref(), Some("r-1"));
+        let reads = slice_reads(&store);
+        assert_eq!(reads[id_idx], 1);
+        assert_eq!(reads[m_idx], 2);
+        assert_eq!(reads[g_idx], 0);
+        assert_eq!(reads[unused_idx], 0);
+
+        // Unsubscribe removes the shard from subscribed_groups.
+        store.unsubscribe(rcpt, &grp, 12).unwrap();
+        reset_reads(&store);
+        assert!(store.pending_session(rcpt).unwrap().is_empty());
+        let reads = slice_reads(&store);
+        assert_eq!(reads[m_idx], 1);
+        assert_eq!(reads[g_idx], 0);
+
+        // Legacy row with seen_ids.stream = NULL falls back to scanning slices.
+        let mid = mail_id.clone();
+        store.inner.slices[id_idx]
+            .writer
+            .exec(move |c| {
+                c.execute(
+                    "UPDATE seen_ids SET stream = NULL WHERE mail_id = ?1",
+                    [&mid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let rec = store.receipt(&mail_id, None).unwrap().unwrap();
+        assert_eq!(rec.record_id.as_deref(), Some("r-1"));
+        assert_eq!(
+            store.ack(&mail_id, rcpt, "r-1", 13).unwrap(),
+            AckResult::Recorded {
+                newly_receipted: false
+            }
+        );
+        // Unknown mail_id returns None without scanning all slices.
+        reset_reads(&store);
+        assert!(store.receipt("never-existed", None).unwrap().is_none());
+        assert_eq!(slice_reads(&store).iter().sum::<usize>(), 1);
+
+        // Pre-migration database without seen_ids.stream upgrades idempotently on Store::open.
+        drop(store);
+        let legacy_dir = tempdir("o1-legacy-schema");
+        let root = coord_root(&legacy_dir.0.join("coordinator.db"));
+        let s0 = shard_dir(&root, 0);
+        fs::create_dir_all(s0.join("cold")).unwrap();
+        {
+            let c = Connection::open(s0.join("hot.sqlite")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, val TEXT NOT NULL);
+                 CREATE TABLE live_sessions (address TEXT PRIMARY KEY, host TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', declared TEXT, at_ms INTEGER);
+                 CREATE TABLE live_claims (claim_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_ms INTEGER NOT NULL);
+                 CREATE TABLE timeline (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, addr TEXT, host TEXT, old_host TEXT, label TEXT, declared TEXT, registration TEXT, claim_key TEXT, expires_ms INTEGER, mail_id TEXT, at_ms INTEGER, raw_line INTEGER);
+                 CREATE TABLE streams (stream TEXT PRIMARY KEY, kind TEXT NOT NULL, next_article INTEGER NOT NULL);
+                 CREATE TABLE seen_ids (mail_id TEXT PRIMARY KEY, kind TEXT NOT NULL, sender TEXT NOT NULL, target TEXT, body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL, article_num INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE broadcasts (mail_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, sender TEXT NOT NULL, body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL, headers_json TEXT, recipients_json TEXT NOT NULL, accepted_at_ms INTEGER, raw_line INTEGER);
+                 CREATE TABLE envelopes (seq INTEGER PRIMARY KEY, mail_id TEXT NOT NULL UNIQUE, stream TEXT NOT NULL, article_num INTEGER NOT NULL, kind TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, headers_json TEXT, body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL, accepted_at_ms INTEGER, day_bucket INTEGER NOT NULL, in_cold INTEGER NOT NULL DEFAULT 0, raw_line INTEGER, UNIQUE(stream, article_num));
+                 CREATE TABLE hot_bodies (mail_id TEXT PRIMARY KEY, body TEXT NOT NULL);
+                 CREATE TABLE positions (stream TEXT NOT NULL, reader TEXT NOT NULL, subscribed INTEGER NOT NULL DEFAULT 1, position INTEGER NOT NULL DEFAULT 0, record_id TEXT, receipted_at_ms INTEGER, updated_at_ms INTEGER, PRIMARY KEY(stream, reader));
+                 CREATE TABLE receipts (mail_id TEXT NOT NULL, reader TEXT NOT NULL, stream TEXT NOT NULL, article_num INTEGER NOT NULL, record_id TEXT NOT NULL, receipted_at_ms INTEGER, receipt_seq INTEGER NOT NULL, raw_line INTEGER, PRIMARY KEY(mail_id, reader));
+                 INSERT INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num) VALUES ('leg-1', 'directed', 'a', 'b', 2, 'xx', 1);
+                 INSERT INTO envelopes (seq, mail_id, stream, article_num, kind, sender, recipient, body_len, body_sha256, day_bucket) VALUES (1, 'leg-1', 'm:b', 1, 'directed', 'a', 'b', 2, 'xx', 0);
+                 INSERT INTO hot_bodies (mail_id, body) VALUES ('leg-1', 'hi');",
+            )
+            .unwrap();
+        }
+        let (leg_store, _) = Store::open(cfg(&legacy_dir, 1)).unwrap();
+        assert!(leg_store.receipt("leg-1", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn single_slice_fast_path_skips_preread_and_catches_pruned_and_cross_kind_conflicts() {
+        let dir = tempdir("fast-1slice");
+        let (store, _) = Store::open(cfg(&dir, 1)).unwrap();
+        store
+            .group_policy("G", Some(Some(1)), None, None, 1)
+            .unwrap();
+
+        reset_reads(&store);
+        assert_eq!(
+            committed(store.send_group(group("g1", "s", "G", "one")).unwrap()),
+            1
+        );
+        assert_eq!(
+            committed(store.send_group(group("g2", "s", "G", "two")).unwrap()),
+            2
+        );
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM envelopes WHERE mail_id = 'g1'"
+            ),
+            0,
+            "g1 was pruned from envelopes by keep_last=1"
+        );
+        // Reset after count() helper; verify send_single itself performs zero read-conn queries.
+        reset_reads(&store);
+        assert!(matches!(
+            store.send_group(group("g1", "s", "G", "one")).unwrap(),
+            Status::DuplicateAccepted { article_num: 1 }
+        ));
+        assert_eq!(
+            conflict(store.send_group(group("g1", "s", "G", "changed")).unwrap()),
+            "mail g1: expected a resend to repeat the Mail already accepted under this id, saw a different body"
+        );
+        assert!(
+            conflict(store.send_group(group("g1", "other", "G", "one")).unwrap())
+                .ends_with("different sender")
+        );
+        assert!(conflict(
+            store
+                .send_directed(directed("g1", "s", "G", "one"))
+                .unwrap()
+        )
+        .ends_with("different recipient"));
+        assert_eq!(
+            slice_reads(&store)[0],
+            0,
+            "1-slice send_single must not perform separate inner.seen pre-reads"
+        );
+
+        // Cross-kind conflict against broadcast parent id and directed->group id on 1-slice.
+        committed(
+            store
+                .send_broadcast(bcast("b1", "s", &["a", "b"], "all"))
+                .unwrap(),
+        );
+        reset_reads(&store);
+        assert!(conflict(
+            store
+                .send_directed(directed("b1", "s", "a", "all"))
+                .unwrap()
+        )
+        .ends_with("different recipient"));
+        assert!(
+            conflict(store.send_group(group("b1", "s", "G", "all")).unwrap())
+                .ends_with("different recipient")
+        );
+        committed(store.send_directed(directed("d1", "s", "G", "hi")).unwrap());
+        assert!(
+            conflict(store.send_group(group("d1", "s", "G", "hi")).unwrap())
+                .ends_with("different recipient")
+        );
+        assert_eq!(slice_reads(&store)[0], 0);
     }
 }

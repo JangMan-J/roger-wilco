@@ -2,7 +2,7 @@
 //! SEP-2575 per-request `_meta`, and SEP-3415 events (`events/list`, `events/poll`, `events/stream`).
 
 use crate::daemon;
-use crate::durlog::{blocking_io, gen_uuid, read_store_entries, shape_mail_entry};
+use crate::durlog::{blocking_io, gen_uuid, shape_mail_entry};
 use crate::session::{now_ms, GatewaySession, RegisterParams, SessionManager};
 use serde_json::{Map, Value};
 use std::io;
@@ -878,26 +878,7 @@ pub async fn call_session_tool(
 
 // ---- SEP-3415 events ----
 
-pub fn format_iso8601_utc(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let day_secs = secs.rem_euclid(86_400);
-    let hour = day_secs / 3600;
-    let min = (day_secs % 3600) / 60;
-    let sec = day_secs % 60;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
-}
+pub use roger_wire::wire::format_iso8601_utc;
 
 pub fn events_list_result() -> Value {
     serde_json::json!({
@@ -1228,8 +1209,9 @@ pub fn tail_cursor(all: &[Value]) -> String {
         .unwrap_or_else(|| "r-0".to_string())
 }
 
-pub fn resolve_mail_window(
+pub fn resolve_mail_window_indexed(
     all: &[Value],
+    record_index: &std::collections::HashMap<String, usize>,
     cursor: Option<&str>,
     max_age_ms: Option<i64>,
     now: i64,
@@ -1240,7 +1222,7 @@ pub fn resolve_mail_window(
     };
     let base_start = if cur == "r-0" {
         0
-    } else if let Some(idx) = all.iter().position(|e| record_of(e) == cur) {
+    } else if let Some(&idx) = record_index.get(cur) {
         idx + 1
     } else {
         return (all.len(), true, tail);
@@ -1269,6 +1251,22 @@ pub fn resolve_mail_window(
     (start, truncated, start_cursor)
 }
 
+pub fn resolve_mail_window(
+    all: &[Value],
+    cursor: Option<&str>,
+    max_age_ms: Option<i64>,
+    now: i64,
+) -> (usize, bool, String) {
+    let mut index = std::collections::HashMap::new();
+    for (i, e) in all.iter().enumerate() {
+        let rec = record_of(e);
+        if !rec.is_empty() {
+            index.entry(rec.to_string()).or_insert(i);
+        }
+    }
+    resolve_mail_window_indexed(all, &index, cursor, max_age_ms, now)
+}
+
 pub fn mail_occurrence(e: &Value, include_cursor: bool) -> Value {
     let ts_ms = e.get("stored_at_ms").and_then(Value::as_i64).unwrap_or(0);
     let event_id = e
@@ -1288,40 +1286,52 @@ pub fn mail_occurrence(e: &Value, include_cursor: bool) -> Value {
 
 pub async fn events_poll(sessions: &Arc<SessionManager>, params: &Value) -> Result<Value, RpcErr> {
     let req = validate_event_req(sessions, params, true)?;
-    let store_path = req.session.store_path.clone();
-    let all = blocking_io(move || read_store_entries(&store_path)).map_err(|e| RpcErr {
+    let cache_arc = Arc::clone(&req.session.store_cache);
+    let filter = req.filter;
+    let cursor = req.cursor;
+    let max_age_ms = req.max_age_ms;
+    let max_events = req.max_events;
+    let (matched, next_cursor, truncated, has_more) = blocking_io(move || -> io::Result<_> {
+        let mut cache = cache_arc.lock().unwrap();
+        cache.refresh()?;
+        let now = now_ms();
+        let (start, truncated, start_cursor) = resolve_mail_window_indexed(
+            &cache.entries,
+            &cache.record_index,
+            cursor.as_deref(),
+            max_age_ms,
+            now,
+        );
+        let mut matched = Vec::new();
+        let mut last_idx = None;
+        let mut has_more = false;
+        for (offset, entry) in cache.entries[start..].iter().enumerate() {
+            if !filter.matches(entry) {
+                continue;
+            }
+            if matched.len() == max_events {
+                has_more = true;
+                break;
+            }
+            matched.push(mail_occurrence(entry, false));
+            last_idx = Some(start + offset);
+        }
+        let next_cursor = if has_more {
+            last_idx
+                .map(|i| record_of(&cache.entries[i]).to_string())
+                .unwrap_or(start_cursor)
+        } else if start < cache.entries.len() {
+            tail_cursor(&cache.entries)
+        } else {
+            start_cursor
+        };
+        Ok((matched, next_cursor, truncated, has_more))
+    })
+    .map_err(|e| RpcErr {
         code: -32603,
         message: e.to_string(),
         data: None,
     })?;
-    let now = now_ms();
-    let (start, truncated, start_cursor) =
-        resolve_mail_window(&all, req.cursor.as_deref(), req.max_age_ms, now);
-
-    let mut matched = Vec::new();
-    let mut last_idx = None;
-    let mut has_more = false;
-    for (offset, entry) in all[start..].iter().enumerate() {
-        if !req.filter.matches(entry) {
-            continue;
-        }
-        if matched.len() == req.max_events {
-            has_more = true;
-            break;
-        }
-        matched.push(mail_occurrence(entry, false));
-        last_idx = Some(start + offset);
-    }
-    let next_cursor = if has_more {
-        last_idx
-            .map(|i| record_of(&all[i]).to_string())
-            .unwrap_or(start_cursor)
-    } else if start < all.len() {
-        tail_cursor(&all)
-    } else {
-        start_cursor
-    };
-
     Ok(serde_json::json!({
         "resultType": "complete",
         "events": matched,

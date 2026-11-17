@@ -3,7 +3,6 @@
 use crate::json::{self, obj, s, Value};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Where one peer's lines go.
@@ -103,13 +102,7 @@ pub fn ack_msg(mail: &str, session: &str, record: &str) -> Value {
     ])
 }
 
-/// The Kind of a Mail sent to one Address.
-pub const DIRECTED: &str = "directed";
-/// The Kind of a copy of a Broadcast.
-pub const BROADCAST: &str = "broadcast";
-/// The Kind of an article delivered to a subscribed reader of a Group.
-#[allow(dead_code)]
-pub const GROUP: &str = "group";
+pub use roger_wire::wire::{BROADCAST, DIRECTED, GROUP};
 
 /// The one shape both the coordinator and a host daemon use to hand a Mail
 /// to the next hop: its Kind and the sender's headers, carried as given.
@@ -347,14 +340,7 @@ impl Iterator for Lines {
     }
 }
 
-/// The longest first line a TCP peer may send before it has shown its token.
-pub const HELLO_MAX: usize = 64 * 1024;
-
-/// Compare two secrets without stopping at the first differing byte.
-pub fn same_secret(seen: &str, expected: &str) -> bool {
-    let (a, b) = (seen.as_bytes(), expected.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+pub use roger_wire::wire::{publish_port, same_secret, HELLO_MAX};
 
 /// The first line a client sends a host daemon over TCP when
 /// `ROGER_CLIENT_TOKEN` is set; `None` when it is unset or empty.
@@ -374,32 +360,6 @@ pub fn field<'a>(v: &'a Value, key: &str) -> io::Result<&'a str> {
     v.get(key)
         .and_then(|x| x.as_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))
-}
-
-/// Publish the bound port at `path` whole: write it beside the file, flush it,
-/// then rename it into place, so a reader that sees `path` reads a port and
-/// never an empty file.
-pub fn publish_port(path: &Path, port: u16) -> io::Result<()> {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(".tmp");
-    let aside = PathBuf::from(aside);
-    let wrote = (|| {
-        let mut f = std::fs::File::create(&aside)?;
-        f.write_all(port.to_string().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&aside, path)
-    })();
-    wrote.map_err(|e| {
-        let _ = std::fs::remove_file(&aside);
-        io::Error::new(
-            e.kind(),
-            format!(
-                "expected to publish port {port} at {} through {}, saw {e}",
-                path.display(),
-                aside.display()
-            ),
-        )
-    })
 }
 
 #[cfg(test)]

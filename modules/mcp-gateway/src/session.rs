@@ -4,8 +4,7 @@
 use crate::cli::DaemonSocket;
 use crate::daemon::{self, DaemonReader, DaemonWriter};
 use crate::durlog::{
-    blocking_io, cursor_path, entries_after, gen_uuid, load_cursor, read_store_entries,
-    save_cursor, store_path, DurLog,
+    blocking_io, cursor_path, gen_uuid, load_cursor, save_cursor, store_path, DurLog, StoreCache,
 };
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -29,8 +28,8 @@ pub fn now_ms() -> i64 {
 
 /// Reader side of one session's Store, tracking `.cursor` across `roger_inbox` calls.
 pub struct AsyncInbox {
-    store: PathBuf,
     pos_file: PathBuf,
+    cache: Arc<Mutex<StoreCache>>,
     consumed: tokio::sync::Mutex<Option<String>>,
     arrived: Notify,
     closed: AtomicBool,
@@ -38,11 +37,16 @@ pub struct AsyncInbox {
 
 impl AsyncInbox {
     pub fn open(store: &Path) -> io::Result<Self> {
+        let cache = Arc::new(Mutex::new(blocking_io(|| StoreCache::open(store))?));
+        Self::with_cache(store, cache)
+    }
+
+    pub fn with_cache(store: &Path, cache: Arc<Mutex<StoreCache>>) -> io::Result<Self> {
         let pos_file = cursor_path(store);
         let consumed = blocking_io(|| load_cursor(&pos_file))?;
         Ok(Self {
-            store: store.to_path_buf(),
             pos_file,
+            cache,
             consumed: tokio::sync::Mutex::new(consumed),
             arrived: Notify::new(),
             closed: AtomicBool::new(false),
@@ -72,9 +76,13 @@ impl AsyncInbox {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let store_file = self.store.clone();
-            let all = blocking_io(move || read_store_entries(&store_file))?;
-            let page = entries_after(&all, consumed.as_deref(), limit);
+            let cache = Arc::clone(&self.cache);
+            let consumed_cur = consumed.clone();
+            let page = blocking_io(move || -> io::Result<Vec<Value>> {
+                let mut guard = cache.lock().unwrap();
+                guard.refresh()?;
+                Ok(guard.entries_after(consumed_cur.as_deref(), limit))
+            })?;
             if !page.is_empty() {
                 let last = page
                     .last()
@@ -156,6 +164,7 @@ pub struct GatewaySession {
     pub groups: bool,
     pub store_path: PathBuf,
     pub inbox: Arc<AsyncInbox>,
+    pub store_cache: Arc<Mutex<StoreCache>>,
     reg_state: Mutex<RegistrationState>,
     reg_wait_notify: Notify,
     pub mail_seq: AtomicU64,
@@ -260,8 +269,9 @@ impl GatewaySession {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
         let store_path = self.store_path.clone();
+        let cache = Arc::clone(&self.store_cache);
         blocking_io(move || {
-            if read_store_entries(&store_path).is_ok_and(|e| e.is_empty()) {
+            if cache.lock().unwrap().is_empty().unwrap_or(false) {
                 let _ = std::fs::remove_file(&store_path);
                 let _ = std::fs::remove_file(cursor_path(&store_path));
             }
@@ -378,10 +388,11 @@ impl SessionManager {
         let s_path = store_path(&self.store_dir, &address);
 
         let s_path_open = s_path.clone();
-        let (store, records) = blocking_io(move || -> io::Result<_> {
-            let (store, replay) = DurLog::open(&s_path_open)?;
+        let (store, records, store_cache) = blocking_io(move || -> io::Result<_> {
+            let (store, mut replay) = DurLog::open(&s_path_open)?;
             let mut records = HashMap::new();
-            for line in replay {
+            let mut initial_entries = Vec::new();
+            for line in &mut replay {
                 let line = line?;
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     if let (Some(mail), Some(record)) = (
@@ -389,13 +400,15 @@ impl SessionManager {
                         v.get("record").and_then(Value::as_str),
                     ) {
                         records.insert(mail.to_string(), record.to_string());
+                        initial_entries.push(v);
                     }
                 }
             }
-            Ok((store, records))
+            let cache = StoreCache::from_replayed(&s_path_open, replay.offset(), initial_entries)?;
+            Ok((store, records, Arc::new(Mutex::new(cache))))
         })?;
 
-        let inbox = Arc::new(AsyncInbox::open(&s_path)?);
+        let inbox = Arc::new(AsyncInbox::with_cache(&s_path, Arc::clone(&store_cache))?);
         let (daemon_reader, daemon_writer) = daemon::connect(&self.socket).await?;
         let mut reg_msg = Map::new();
         reg_msg.insert("type".into(), Value::String("register".into()));
@@ -420,6 +433,7 @@ impl SessionManager {
             groups: self.groups,
             store_path: s_path,
             inbox,
+            store_cache,
             reg_state: Mutex::new(RegistrationState::default()),
             reg_wait_notify: Notify::new(),
             mail_seq: AtomicU64::new(0),
@@ -537,7 +551,12 @@ async fn reader_loop(
                             let Some(store) = gate.store.as_mut() else {
                                 return Ok(false);
                             };
-                            store.append(&line)?;
+                            let span = store.append_at(&line)?;
+                            session
+                                .store_cache
+                                .lock()
+                                .unwrap()
+                                .push_appended(entry_val, span)?;
                             Ok::<bool, io::Error>(true)
                         });
                         match committed {

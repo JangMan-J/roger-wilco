@@ -50,15 +50,7 @@ fn conflict_reason(mail: &str, what: &str) -> String {
 /// The Address a send names to reach every registered session at once.
 pub const BROADCAST: &str = "*";
 
-/// Joins a Broadcast id to a recipient Address in that recipient's copy id.
-/// No accepted Mail id may contain it, so a client-chosen id can never equal
-/// a copy id, and two copy ids are equal only for the same broadcast and
-/// recipient.
-const COPY_SEP: char = '/';
-
-/// The longest hello line read from a connection that has not yet shown the
-/// fleet token.
-const HELLO_MAX: usize = 64 * 1024;
+use roger_wire::wire::{COPY_SEP, HELLO_MAX};
 
 /// How long a registered session may stay disconnected before it is
 /// unregistered: longer than a host daemon or coordinator restart takes.
@@ -169,7 +161,6 @@ struct Session {
 }
 
 struct State {
-    store: Arc<Store>,
     sessions: HashMap<String, Session>,
     /// When this coordinator started: a stored session that never
     /// re-registers counts as disconnected from then.
@@ -213,43 +204,51 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+impl State {
+    fn from_startup(startup: coord::Startup, unregister_after_ms: i64) -> Self {
+        Self {
+            sessions: startup
+                .sessions
+                .into_iter()
+                .map(|(a, row)| {
+                    (
+                        a,
+                        Session {
+                            host: row.host,
+                            label: row.label,
+                            declared: row.declared,
+                        },
+                    )
+                })
+                .collect(),
+            started: now_ms(),
+            unregister_after_ms,
+            seen: HashMap::new(),
+            connected: HashSet::new(),
+            registrations: HashMap::new(),
+            takeovers: startup
+                .takeover_registrations
+                .into_iter()
+                .map(|r| (r, None))
+                .collect(),
+            hosts: HashMap::new(),
+            next_conn: 1,
+            notice_writers: HashMap::new(),
+            watchers: HashMap::new(),
+            article_watchers: HashMap::new(),
+            claims: startup.claims,
+        }
+    }
+}
+
 pub fn run(cfg: Config) -> io::Result<()> {
     let (store, startup) = Store::open(cfg.open_config())?;
     let store = Arc::new(store);
-    let state = State {
-        store: Arc::clone(&store),
-        sessions: startup
-            .sessions
-            .into_iter()
-            .map(|(a, row)| {
-                (
-                    a,
-                    Session {
-                        host: row.host,
-                        label: row.label,
-                        declared: row.declared,
-                    },
-                )
-            })
-            .collect(),
-        started: now_ms(),
-        unregister_after_ms: cfg.unregister_after_ms,
-        seen: HashMap::new(),
-        connected: HashSet::new(),
-        registrations: HashMap::new(),
-        takeovers: startup
-            .takeover_registrations
-            .into_iter()
-            .map(|r| (r, None))
-            .collect(),
-        hosts: HashMap::new(),
-        next_conn: 1,
-        notice_writers: HashMap::new(),
-        watchers: HashMap::new(),
-        article_watchers: HashMap::new(),
-        claims: startup.claims,
-    };
-    let state = Arc::new(Mutex::new(state));
+    let state = Arc::new(Mutex::new(State::from_startup(
+        startup,
+        cfg.unregister_after_ms,
+    )));
+    let timeline_mu = Arc::new(Mutex::new(()));
 
     let listener = TcpListener::bind(&cfg.bind)?;
     if let Some(pf) = &cfg.port_file {
@@ -260,10 +259,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     for conn in listener.incoming() {
         let conn = conn?;
         let state = Arc::clone(&state);
+        let timeline_mu = Arc::clone(&timeline_mu);
         let store = Arc::clone(&store);
         let token = cfg.token.clone();
         std::thread::spawn(move || {
-            if let Err(_e) = serve(conn, state, store, &token) {
+            if let Err(_e) = serve(conn, state, timeline_mu, store, &token) {
                 // A failed write may have left the store ahead of memory.
                 // Stop here so a restart reads the store instead of serving
                 // a split view.
@@ -338,16 +338,33 @@ fn stamp(st: &mut State, session: &str) {
     }
 }
 
-/// Commit events durably as one transaction, then apply each to memory and
-/// show each Board change to watchers: the one path every session event
-/// takes, so the store and live state agree.
-fn commit(st: &mut State, events: Vec<Event>) -> io::Result<()> {
-    written(st.store.commit_timeline(events.clone(), now_ms()))?;
-    for ev in &events {
-        apply(st, ev);
-        if let Some(pairs) = board_event_of(ev) {
-            observe(st, pairs);
+/// Commit timeline events durably while `state` is unlocked, then apply each
+/// to memory and show each Board change to watchers. `timeline_mu` serializes
+/// timeline mutations so SQLite `timeline.seq` order and in-memory `State`
+/// `apply()` order stay identical without stalling `send`/`ack`/`link_of`
+/// behind `synchronous=FULL` fsyncs.
+fn commit_timeline_locked<T>(
+    state: &Mutex<State>,
+    store: &Store,
+    decide: impl FnOnce(&State) -> io::Result<(Vec<Event>, T)>,
+    after_apply: impl FnOnce(&mut State, T),
+) -> io::Result<()> {
+    let (events, ctx) = {
+        let st = state.lock().unwrap();
+        decide(&st)?
+    };
+    if !events.is_empty() {
+        written(store.commit_timeline(events.clone(), now_ms()))?;
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for ev in &events {
+            apply(&mut st, ev);
+            if let Some(pairs) = board_event_of(ev) {
+                observe(&st, pairs);
+            }
         }
+        after_apply(&mut st, ctx);
     }
     Ok(())
 }
@@ -443,43 +460,44 @@ fn observe(st: &State, pairs: Vec<(&str, Value)>) {
     }
 }
 
-/// End one session's registration: it leaves the Board and every later
-/// Broadcast. Mail already accepted for its Address stays pending and is
-/// delivered if that Address registers again.
-fn unregister(st: &mut State, session: &str) -> io::Result<()> {
-    let now = now_ms();
+/// Plan one session's unregister and claim releases without mutating `State`.
+fn plan_unregister(
+    st: &State,
+    session: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+    releases: &mut Vec<(String, Held, i64)>,
+) {
     let freed = st.claims.release_owner(session, now);
-    let held: Vec<_> = freed
-        .iter()
-        .map(|(key, _)| st.claims.live(key, now).cloned())
-        .collect();
-    let mut events = vec![Event::Unregister {
+    events.push(Event::Unregister {
         session: session.to_string(),
         at_ms: Some(now),
-    }];
-    events.extend(
-        freed
-            .iter()
-            .map(|(key, change)| claim_timeline(key, change)),
-    );
-    commit(st, events)?;
-    for ((key, _), before) in freed.iter().zip(held) {
-        if let Some(h) = before {
-            observe(
-                st,
-                vec![
-                    ("event", s("release")),
-                    ("key", s(key)),
-                    ("owner", s(&h.owner)),
-                    ("expires_ms", Value::Int(h.expires_ms)),
-                    ("at_ms", Value::Int(now)),
-                ],
-            );
+    });
+    for (key, change) in &freed {
+        if let Some(h) = st.claims.live(key, now) {
+            releases.push((key.clone(), h.clone(), now));
         }
+        events.push(claim_timeline(key, change));
     }
-    st.connected.remove(session);
-    st.seen.remove(session);
-    Ok(())
+}
+
+fn finish_unregisters(st: &mut State, sessions: &[String], releases: &[(String, Held, i64)]) {
+    for (key, h, now) in releases {
+        observe(
+            st,
+            vec![
+                ("event", s("release")),
+                ("key", s(key)),
+                ("owner", s(&h.owner)),
+                ("expires_ms", Value::Int(h.expires_ms)),
+                ("at_ms", Value::Int(*now)),
+            ],
+        );
+    }
+    for session in sessions {
+        st.connected.remove(session);
+        st.seen.remove(session);
+    }
 }
 
 /// The registered sessions disconnected for `unregister_after_ms` at `now`,
@@ -500,13 +518,26 @@ fn stale(st: &State, now: i64) -> Vec<String> {
 }
 
 /// Unregister every session disconnected for `unregister_after_ms`, read
-/// against now. Called by each request that reads the registered set
-/// (Broadcast, Board, claim, relabel), as claim expiry is: no timer runs it.
-fn expire(st: &mut State) -> io::Result<()> {
-    for a in stale(st, now_ms()) {
-        unregister(st, &a)?;
-    }
-    Ok(())
+/// against now. Caller holds `timeline_mu`; `state` is unlocked across the
+/// SQLite commit.
+fn expire_locked(state: &Mutex<State>, store: &Store) -> io::Result<()> {
+    commit_timeline_locked(
+        state,
+        store,
+        |st| {
+            let now = now_ms();
+            let gone = stale(st, now);
+            let mut events = Vec::new();
+            let mut releases = Vec::new();
+            for a in &gone {
+                plan_unregister(st, a, now, &mut events, &mut releases);
+            }
+            Ok((events, (gone, releases)))
+        },
+        |st, (gone, releases)| {
+            finish_unregisters(st, &gone, &releases);
+        },
+    )
 }
 
 fn host_of<'a>(state: &'a State, session: &str) -> Option<&'a str> {
@@ -558,6 +589,7 @@ fn push_pending(state: &Mutex<State>, pending: &[Delivery]) -> Vec<(Writer, Valu
 fn serve(
     conn: TcpStream,
     state: Arc<Mutex<State>>,
+    timeline_mu: Arc<Mutex<()>>,
     store: Arc<Store>,
     token: &str,
 ) -> io::Result<()> {
@@ -567,8 +599,14 @@ fn serve(
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
     });
-    let result = serve_link(&conn, Arc::clone(&writer), state, &store, token);
-    // What is already queued is owed to the peer: answers to requests this
+    let result = serve_link(
+        &conn,
+        Arc::clone(&writer),
+        state,
+        timeline_mu,
+        &store,
+        token,
+    );
     // coordinator has committed. It is written before the link ends, unless
     // the link ended because the peer went silent; then nothing can reach it,
     // and the link ends at once, under any write still waiting on it.
@@ -620,6 +658,7 @@ fn serve_link(
     conn: &TcpStream,
     writer: Writer,
     state: Arc<Mutex<State>>,
+    timeline_mu: Arc<Mutex<()>>,
     store: &Store,
     token: &str,
 ) -> io::Result<()> {
@@ -708,11 +747,31 @@ fn serve_link(
                 let registration = net::field(&v, "registration")?;
                 let old = net::field(&v, "replaces")?;
                 {
-                    let mut st = state.lock().unwrap();
-                    let notice = takeover(&mut st, session, &host, &host, old, None)?;
-                    if let Some(tx) = st.notice_writers.get(&conn_id) {
-                        let _ = tx.send(notice);
-                    }
+                    let _tl = timeline_mu.lock().unwrap();
+                    commit_timeline_locked(
+                        &state,
+                        store,
+                        |st| {
+                            let mut events = Vec::new();
+                            let mut pending_takeovers = HashMap::new();
+                            let notice = plan_takeover(
+                                st,
+                                session,
+                                &host,
+                                &host,
+                                old,
+                                None,
+                                &mut pending_takeovers,
+                                &mut events,
+                            );
+                            Ok((events, notice))
+                        },
+                        |st, notice| {
+                            if let Some(tx) = st.notice_writers.get(&conn_id) {
+                                let _ = tx.send(notice);
+                            }
+                        },
+                    )?;
                 }
                 net::send(
                     &writer,
@@ -725,70 +784,96 @@ fn serve_link(
             }
             "register" => {
                 let session = net::field(&v, "session")?.to_string();
+                let registration = net::field(&v, "registration").unwrap_or("").to_string();
+                let label = v.get("label").and_then(|x| x.as_str()).map(str::to_string);
+                let declared = net::declared_of(&v);
+                let replaces = net::field(&v, "replaces").ok().map(str::to_string);
                 {
-                    let mut st = state.lock().unwrap();
-                    let registration = net::field(&v, "registration").unwrap_or("");
-                    let at = now_ms();
-                    let previous = st.registrations.get(&session).cloned();
-                    if st.connected.contains(&session)
-                        && previous
-                            .as_ref()
-                            .is_none_or(|(_, r)| r != registration || registration.is_empty())
-                    {
-                        let old_host = st.sessions[&session].host.clone();
-                        let old_registration =
-                            previous.as_ref().map(|(_, r)| r.as_str()).unwrap_or("");
-                        let notice = takeover(
-                            &mut st,
-                            &session,
-                            &old_host,
-                            &host,
-                            old_registration,
-                            Some(at),
-                        )?;
-                        if let Some((old_conn, _)) = previous {
-                            if let Some(tx) = st.notice_writers.get(&old_conn) {
-                                let _ = tx.send(notice);
+                    let _tl = timeline_mu.lock().unwrap();
+                    commit_timeline_locked(
+                        &state,
+                        store,
+                        |st| {
+                            let at = now_ms();
+                            let mut events = Vec::new();
+                            let mut pending_takeovers = HashMap::new();
+                            let mut notices: Vec<(u64, Value)> = Vec::new();
+                            let previous = st.registrations.get(&session).cloned();
+                            if st.connected.contains(&session)
+                                && previous.as_ref().is_none_or(|(_, r)| {
+                                    r != &registration || registration.is_empty()
+                                })
+                            {
+                                let old_host = st.sessions[&session].host.clone();
+                                let old_registration =
+                                    previous.as_ref().map(|(_, r)| r.as_str()).unwrap_or("");
+                                let notice = plan_takeover(
+                                    st,
+                                    &session,
+                                    &old_host,
+                                    &host,
+                                    old_registration,
+                                    Some(at),
+                                    &mut pending_takeovers,
+                                    &mut events,
+                                );
+                                if let Some((old_conn, _)) = previous {
+                                    notices.push((old_conn, notice));
+                                }
                             }
-                        }
-                    }
-                    // A local replacement can happen while this host's link
-                    // is down. Its retained edge is evidence of that live
-                    // local connection, not a reconnect of the same one.
-                    if let Ok(old) = net::field(&v, "replaces") {
-                        let notice = takeover(&mut st, &session, &host, &host, old, None)?;
-                        if let Some(tx) = st.notice_writers.get(&conn_id) {
-                            let _ = tx.send(notice);
-                        }
-                    }
-                    st.registrations
-                        .insert(session.clone(), (conn_id, registration.to_string()));
-                    st.seen.insert(session.clone(), at);
-                    st.connected.insert(session.clone());
-                    // Every Register is one stamped event, so the timeline
-                    // says when an Address registered even when nothing changed.
-                    let mut events = vec![Event::Session {
-                        session: session.clone(),
-                        host: host.clone(),
-                        at_ms: Some(now_ms()),
-                    }];
-                    if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
-                        events.push(label_event(&session, label));
-                    }
-                    let declared = net::declared_of(&v);
-                    if st
-                        .sessions
-                        .get(&session)
-                        .and_then(|row| row.declared.as_ref())
-                        != declared.as_ref()
-                    {
-                        events.push(Event::Declared {
-                            session: session.clone(),
-                            declared,
-                            at_ms: Some(now_ms()),
-                        });
-                    }
-                    commit(&mut st, events)?;
+                            // A local replacement can happen while this host's link
+                            // is down. Its retained edge is evidence of that live
+                            // local connection, not a reconnect of the same one.
+                            if let Some(old) = &replaces {
+                                let notice = plan_takeover(
+                                    st,
+                                    &session,
+                                    &host,
+                                    &host,
+                                    old,
+                                    None,
+                                    &mut pending_takeovers,
+                                    &mut events,
+                                );
+                                notices.push((conn_id, notice));
+                            }
+                            // says when an Address registered even when nothing changed.
+                            events.push(Event::Session {
+                                session: session.clone(),
+                                host: host.clone(),
+                                at_ms: Some(now_ms()),
+                            });
+                            if let Some(lbl) = &label {
+                                events.push(label_event(&session, lbl));
+                            }
+                            if st
+                                .sessions
+                                .get(&session)
+                                .and_then(|row| row.declared.as_ref())
+                                != declared.as_ref()
+                            {
+                                events.push(Event::Declared {
+                                    session: session.clone(),
+                                    declared: declared.clone(),
+                                    at_ms: Some(now_ms()),
+                                });
+                            }
+                            Ok((events, (at, notices)))
+                        },
+                        |st, (at, notices)| {
+                            for (target_conn, notice) in notices {
+                                if let Some(tx) = st.notice_writers.get(&target_conn) {
+                                    let _ = tx.send(notice);
+                                }
+                            }
+                            st.seen.insert(session.clone(), at);
+                            if st.hosts.get(&host).map(|(id, _)| *id) == Some(conn_id) {
+                                st.registrations
+                                    .insert(session.clone(), (conn_id, registration.clone()));
+                                st.connected.insert(session.clone());
+                            }
+                        },
+                    )?;
                 }
                 for p in store.pending_session(&session)? {
                     let _ = net::send(&writer, &deliver_of(&p));
@@ -800,14 +885,11 @@ fn serve_link(
                     &obj(vec![
                         ("type", s("registered")),
                         ("session", s(&session)),
-                        (
-                            "registration",
-                            s(net::field(&v, "registration").unwrap_or("")),
-                        ),
+                        ("registration", s(&registration)),
                     ]),
                 );
             }
-            "send" => send(&v, &writer, &state, store)?,
+            "send" => send(&v, &writer, &state, &timeline_mu, store)?,
             // The session's connection to this host daemon closed.
             "disconnect" => {
                 let session = net::field(&v, "session")?.to_string();
@@ -824,36 +906,33 @@ fn serve_link(
             // it has since registered through another host.
             "unregister" => {
                 let session = net::field(&v, "session")?.to_string();
-                let mut st = state.lock().unwrap();
-                if owns_registration(&st, &session, &host, conn_id, &v) {
-                    unregister(&mut st, &session)?;
-                }
+                let _tl = timeline_mu.lock().unwrap();
+                commit_timeline_locked(
+                    &state,
+                    store,
+                    |st| {
+                        if owns_registration(st, &session, &host, conn_id, &v) {
+                            let now = now_ms();
+                            let mut events = Vec::new();
+                            let mut releases = Vec::new();
+                            plan_unregister(st, &session, now, &mut events, &mut releases);
+                            Ok((events, Some(releases)))
+                        } else {
+                            Ok((Vec::new(), None))
+                        }
+                    },
+                    |st, outcome| {
+                        if let Some(releases) = outcome {
+                            finish_unregisters(st, std::slice::from_ref(&session), &releases);
+                        }
+                    },
+                )?;
             }
             "relabel" => {
                 let req = req_of(&v);
                 let session = net::field(&v, "session")?.to_string();
                 let label = net::field(&v, "label")?.to_string();
-                let reply = {
-                    let mut st = state.lock().unwrap();
-                    expire(&mut st)?;
-                    // A label belongs to a session: an Address that never
-                    // registered gets none, so no label can be parked on it.
-                    if st.sessions.contains_key(&session) {
-                        commit(&mut st, vec![label_event(&session, &label)])?;
-                        obj(vec![
-                            ("type", s("relabeled")),
-                            ("req", Value::Int(req)),
-                            ("session", s(&session)),
-                            ("label", s(&label)),
-                        ])
-                    } else {
-                        error_reply(
-                            req,
-                            None,
-                            &format!("expected a registered session to relabel, saw {session}"),
-                        )
-                    }
-                };
+                let reply = handle_relabel(&timeline_mu, &state, store, req, &session, &label)?;
                 net::send(&writer, &reply)?;
             }
             "ack" => {
@@ -1043,24 +1122,11 @@ fn serve_link(
                 net::send(&writer, &group_policy_reply(req, &g))?;
             }
             "claim" => {
-                let reply = {
-                    let mut st = state.lock().unwrap();
-                    expire(&mut st)?;
-                    claim(&mut st, &v)?
-                };
+                let reply = handle_claim(&timeline_mu, &state, store, &v)?;
                 net::send(&writer, &reply)?;
             }
             "board" => {
-                let reply = {
-                    let mut st = state.lock().unwrap();
-                    expire(&mut st)?;
-                    // A Board read that names its reader is that session's own
-                    // activity.
-                    if let Ok(reader) = net::field(&v, "session") {
-                        stamp(&mut st, reader);
-                    }
-                    board(&st, &v)
-                };
+                let reply = handle_board(&timeline_mu, &state, store, &v)?;
                 net::send(&writer, &reply)?;
             }
             other => {
@@ -1078,7 +1144,13 @@ fn serve_link(
 /// instead of `to`). The store commits without the state lock; the lock is
 /// taken briefly before (presence, the registered set) and after (the host
 /// links to push to).
-fn send(v: &Value, writer: &Writer, state: &Mutex<State>, store: &Store) -> io::Result<()> {
+fn send(
+    v: &Value,
+    writer: &Writer,
+    state: &Mutex<State>,
+    timeline_mu: &Mutex<()>,
+    store: &Store,
+) -> io::Result<()> {
     let req = req_of(v);
     let mail = net::field(v, "mail")?.to_string();
     let group = v.get("group").and_then(|x| x.as_str());
@@ -1207,12 +1279,28 @@ fn send(v: &Value, writer: &Writer, state: &Mutex<State>, store: &Store) -> io::
     let to = net::field(v, "to")?.to_string();
     let (status, recipients) = if to == BROADCAST {
         let recipients = {
-            let mut st = state.lock().unwrap();
-            stamp(&mut st, &from);
-            expire(&mut st)?;
-            let mut all: Vec<String> = st.sessions.keys().cloned().collect();
-            all.sort();
-            all
+            let mut fast = None;
+            {
+                let mut st = state.lock().unwrap();
+                if stale(&st, now_ms()).is_empty() {
+                    stamp(&mut st, &from);
+                    let mut all: Vec<String> = st.sessions.keys().cloned().collect();
+                    all.sort();
+                    fast = Some(all);
+                }
+            }
+            match fast {
+                Some(all) => all,
+                None => {
+                    let _tl = timeline_mu.lock().unwrap();
+                    expire_locked(state, store)?;
+                    let mut st = state.lock().unwrap();
+                    stamp(&mut st, &from);
+                    let mut all: Vec<String> = st.sessions.keys().cloned().collect();
+                    all.sort();
+                    all
+                }
+            }
         };
         let status = written(store.send_broadcast(Broadcast {
             mail_id: mail.clone(),
@@ -1284,19 +1372,26 @@ fn ack_reply(req: i64, mail: &str, session: &str, record: &str, result: &AckResu
     }
 }
 
-fn takeover(
-    st: &mut State,
+#[allow(clippy::too_many_arguments)]
+fn plan_takeover(
+    st: &State,
     session: &str,
     old_host: &str,
     host: &str,
     registration: &str,
     at: Option<i64>,
-) -> io::Result<Value> {
-    let known = st
-        .takeovers
-        .get(registration)
-        .filter(|_| !registration.is_empty() && at.is_none())
-        .cloned();
+    pending_takeovers: &mut HashMap<String, (String, i64)>,
+    events: &mut Vec<Event>,
+) -> Value {
+    let known = if !registration.is_empty() && at.is_none() {
+        pending_takeovers
+            .get(registration)
+            .cloned()
+            .map(Some)
+            .or_else(|| st.takeovers.get(registration).cloned())
+    } else {
+        None
+    };
     let (new_host, at_ms) = match known {
         Some(Some(recorded)) => recorded,
         // Committed before this process started: the store holds the line,
@@ -1304,26 +1399,26 @@ fn takeover(
         Some(None) => (host.to_string(), now_ms()),
         None => {
             let at_ms = at.unwrap_or_else(now_ms);
-            commit(
-                st,
-                vec![Event::Takeover {
-                    session: session.to_string(),
-                    old_host: old_host.to_string(),
-                    host: host.to_string(),
-                    at_ms: Some(at_ms),
-                    registration: Some(registration.to_string()),
-                }],
-            )?;
+            if !registration.is_empty() {
+                pending_takeovers.insert(registration.to_string(), (host.to_string(), at_ms));
+            }
+            events.push(Event::Takeover {
+                session: session.to_string(),
+                old_host: old_host.to_string(),
+                host: host.to_string(),
+                at_ms: Some(at_ms),
+                registration: Some(registration.to_string()),
+            });
             (host.to_string(), at_ms)
         }
     };
-    Ok(obj(vec![
+    obj(vec![
         ("type", s("superseded")),
         ("session", s(session)),
         ("host", s(&new_host)),
         ("at_ms", Value::Int(at_ms)),
         ("registration", s(registration)),
-    ]))
+    ])
 }
 
 fn owns_registration(st: &State, session: &str, host: &str, conn: u64, v: &Value) -> bool {
@@ -1381,9 +1476,84 @@ fn holder_fields(pairs: &mut Vec<(&str, Value)>, holder: Option<&Held>, now: i64
     }
 }
 
-/// Decide one claim request, commit its change durably, then answer. The lock
-/// is held throughout, so two owners racing for one key see one order.
-fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
+fn handle_relabel(
+    timeline_mu: &Mutex<()>,
+    state: &Mutex<State>,
+    store: &Store,
+    req: i64,
+    session: &str,
+    label: &str,
+) -> io::Result<Value> {
+    let _tl = timeline_mu.lock().unwrap();
+    expire_locked(state, store)?;
+    let mut reply = None;
+    commit_timeline_locked(
+        state,
+        store,
+        |st| {
+            // A label belongs to a session: an Address that never
+            // registered gets none, so no label can be parked on it.
+            if st.sessions.contains_key(session) {
+                Ok((vec![label_event(session, label)], true))
+            } else {
+                Ok((Vec::new(), false))
+            }
+        },
+        |_, ok| {
+            reply = Some(if ok {
+                obj(vec![
+                    ("type", s("relabeled")),
+                    ("req", Value::Int(req)),
+                    ("session", s(session)),
+                    ("label", s(label)),
+                ])
+            } else {
+                error_reply(
+                    req,
+                    None,
+                    &format!("expected a registered session to relabel, saw {session}"),
+                )
+            });
+        },
+    )?;
+    Ok(reply.unwrap())
+}
+
+fn handle_board(
+    timeline_mu: &Mutex<()>,
+    state: &Mutex<State>,
+    store: &Store,
+    v: &Value,
+) -> io::Result<Value> {
+    {
+        let mut st = state.lock().unwrap();
+        if stale(&st, now_ms()).is_empty() {
+            // A Board read that names its reader is that session's own
+            // activity.
+            if let Ok(reader) = net::field(v, "session") {
+                stamp(&mut st, reader);
+            }
+            return Ok(board(&st, v));
+        }
+    }
+    let _tl = timeline_mu.lock().unwrap();
+    expire_locked(state, store)?;
+    let mut st = state.lock().unwrap();
+    if let Ok(reader) = net::field(v, "session") {
+        stamp(&mut st, reader);
+    }
+    Ok(board(&st, v))
+}
+
+/// Decide one claim request, commit its change durably without holding `state`,
+/// then apply and answer. `timeline_mu` serializes timeline mutations so two
+/// owners racing for one key see one order.
+fn handle_claim(
+    timeline_mu: &Mutex<()>,
+    state: &Mutex<State>,
+    store: &Store,
+    v: &Value,
+) -> io::Result<Value> {
     let req = req_of(v);
     let op_name = net::field(v, "op")?;
     // A bad op is answered, not fatal: an error here would drop the whole
@@ -1405,61 +1575,85 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
             &format!("ttl_ms must be positive, saw {ttl_ms}"),
         ));
     }
-    // A Claim is held by a session: an owner the coordinator has never seen
-    // Register is refused before any decision, so a stray string can neither
-    // hold a key nor renew one.
-    if !st.sessions.contains_key(&owner) {
-        return Ok(obj(vec![
-            ("type", s("claim_result")),
-            ("req", Value::Int(req)),
-            ("ok", Value::Bool(false)),
-            ("op", s(op.name())),
-            ("key", s(&key)),
-            (
-                "reason",
-                s(&format!("owner {owner} is not a registered session")),
-            ),
-        ]));
-    }
-    let now = now_ms();
-    let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
-    if let Some(change) = &d.change {
-        // The grant this change replaces, live or not: every committed
-        // deadline lies after i64::MIN, so this reads the stored entry.
-        let before = st.claims.live(&key, i64::MIN).cloned();
-        commit(st, vec![claim_timeline(&key, change)])?;
-        let claim_event = |name: &str, h: &Held| {
-            vec![
-                ("event", s(name)),
-                ("key", s(&key)),
-                ("owner", s(&h.owner)),
-                ("expires_ms", Value::Int(h.expires_ms)),
-                ("at_ms", Value::Int(now)),
-            ]
-        };
-        // An expired grant has no line of its own; it is shown once, when
-        // the change committed over it is.
-        if let Some(old) = before.as_ref().filter(|h| h.expires_ms <= now) {
-            observe(st, claim_event("expired", old));
-        }
-        match change {
-            Change::Grant(h) => observe(st, claim_event(op.name(), h)),
-            Change::Release => {
-                if let Some(old) = &before {
-                    observe(st, claim_event("release", old));
+    let _tl = timeline_mu.lock().unwrap();
+    expire_locked(state, store)?;
+    let mut reply = None;
+    commit_timeline_locked(
+        state,
+        store,
+        |st| {
+            // A Claim is held by a session: an owner the coordinator has never seen
+            // Register is refused before any decision, so a stray string can neither
+            // hold a key nor renew one.
+            if !st.sessions.contains_key(&owner) {
+                return Ok((Vec::new(), None));
+            }
+            let now = now_ms();
+            let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
+            // The grant this change replaces, live or not: every committed
+            // deadline lies after i64::MIN, so this reads the stored entry.
+            let before = d
+                .change
+                .as_ref()
+                .and_then(|_| st.claims.live(&key, i64::MIN).cloned());
+            let events = d
+                .change
+                .as_ref()
+                .map(|ch| vec![claim_timeline(&key, ch)])
+                .unwrap_or_default();
+            Ok((events, Some((now, d, before))))
+        },
+        |st, outcome| {
+            let Some((now, d, before)) = outcome else {
+                reply = Some(obj(vec![
+                    ("type", s("claim_result")),
+                    ("req", Value::Int(req)),
+                    ("ok", Value::Bool(false)),
+                    ("op", s(op.name())),
+                    ("key", s(&key)),
+                    (
+                        "reason",
+                        s(&format!("owner {owner} is not a registered session")),
+                    ),
+                ]));
+                return;
+            };
+            if let Some(change) = &d.change {
+                let claim_event = |name: &str, h: &Held| {
+                    vec![
+                        ("event", s(name)),
+                        ("key", s(&key)),
+                        ("owner", s(&h.owner)),
+                        ("expires_ms", Value::Int(h.expires_ms)),
+                        ("at_ms", Value::Int(now)),
+                    ]
+                };
+                // An expired grant has no line of its own; it is shown once, when
+                // the change committed over it is.
+                if let Some(old) = before.as_ref().filter(|h| h.expires_ms <= now) {
+                    observe(st, claim_event("expired", old));
+                }
+                match change {
+                    Change::Grant(h) => observe(st, claim_event(op.name(), h)),
+                    Change::Release => {
+                        if let Some(old) = &before {
+                            observe(st, claim_event("release", old));
+                        }
+                    }
                 }
             }
-        }
-    }
-    let mut pairs = vec![
-        ("type", s("claim_result")),
-        ("req", Value::Int(req)),
-        ("op", s(op.name())),
-        ("key", s(&key)),
-        ("ok", Value::Bool(d.ok)),
-    ];
-    holder_fields(&mut pairs, d.holder.as_ref(), now);
-    Ok(obj(pairs))
+            let mut pairs = vec![
+                ("type", s("claim_result")),
+                ("req", Value::Int(req)),
+                ("op", s(op.name())),
+                ("key", s(&key)),
+                ("ok", Value::Bool(d.ok)),
+            ];
+            holder_fields(&mut pairs, d.holder.as_ref(), now);
+            reply = Some(obj(pairs));
+        },
+    )?;
+    Ok(reply.unwrap())
 }
 
 /// The Board: registered sessions and every claim live at the moment of the
@@ -1990,5 +2184,211 @@ mod tests {
         assert!(answered.is_err(), "the closed link takes no answer");
         let pushed = net::lines(Box::new(far)).next().unwrap().unwrap();
         assert_eq!(pushed, deliver);
+    }
+
+    #[test]
+    fn state_lock_is_not_held_across_timeline_fsync_and_claims_keep_strict_order() {
+        use std::sync::atomic::AtomicUsize;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rw-coord-tl-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = coord::Config::new(dir.join("coord.db"));
+        cfg.num_slices = 2;
+        let (store, startup) = Store::open(cfg).unwrap();
+        let store = Arc::new(store);
+        let state = Arc::new(Mutex::new(State::from_startup(startup, 1_000)));
+        let timeline_mu = Arc::new(Mutex::new(()));
+
+        // Register s1 and s2 on host h1, plus a live host writer for link_of.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server_sock, _) = listener.accept().unwrap();
+        let host_writer = net::queued(Arc::new(client_sock), |c| {
+            let _ = c.shutdown(Shutdown::Both);
+        });
+        commit_timeline_locked(
+            &state,
+            &store,
+            |_| {
+                Ok((
+                    vec![
+                        Event::Session {
+                            session: "s1".into(),
+                            host: "h1".into(),
+                            at_ms: Some(now_ms()),
+                        },
+                        Event::Session {
+                            session: "s2".into(),
+                            host: "h1".into(),
+                            at_ms: Some(now_ms()),
+                        },
+                    ],
+                    (),
+                ))
+            },
+            |st, ()| {
+                st.hosts.insert("h1".into(), (1, Arc::clone(&host_writer)));
+                st.connected.insert("s1".into());
+                st.connected.insert("s2".into());
+                st.seen.insert("s1".into(), now_ms());
+                st.seen.insert("s2".into(), now_ms());
+            },
+        )
+        .unwrap();
+
+        // Gate slice 0 writer so the next commit_timeline blocks in flight.
+        let (gate_tx, gate_rx) = store.gate_slice0();
+        let (tl1, st1, store1) = (
+            Arc::clone(&timeline_mu),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        );
+        let claim1 = std::thread::spawn(move || {
+            handle_claim(
+                &tl1,
+                &st1,
+                &store1,
+                &obj(vec![
+                    ("type", s("claim")),
+                    ("req", Value::Int(1)),
+                    ("op", s("acquire")),
+                    ("key", s("k1")),
+                    ("owner", s("s1")),
+                    ("ttl_ms", Value::Int(60_000)),
+                ]),
+            )
+            .unwrap()
+        });
+        // Wait until claim1 has unlocked `state` and queued its commit_timeline on slice 0.
+        store.wait_slice0_queued(1);
+
+        // While claim1's timeline commit is blocked on disk, `state` is unlocked:
+        // link_of, stamp, article_watchers, and non-mutating board reads proceed immediately.
+        {
+            let mut st = state.lock().unwrap();
+            assert!(link_of(&st, "s1").is_some());
+            stamp(&mut st, "s1");
+            assert!(st.article_watchers.is_empty());
+            let b = board(
+                &st,
+                &obj(vec![("type", s("board")), ("req", Value::Int(2))]),
+            );
+            assert_eq!(net::field(&b, "type").unwrap(), "board");
+        }
+        // A send whose stream and mail_id both shard to slice 1 proceeds without blocking on slice 0 or state.
+        let s2_target = (0..100)
+            .map(|i| format!("s2-slice1-{i}"))
+            .find(|a| crate::sha256::hash_pair(format!("m:{a}").as_bytes()).0 as usize % 2 == 1)
+            .unwrap();
+        let s2_mail = (0..100)
+            .map(|i| format!("m-concurrent-{i}"))
+            .find(|id| crate::sha256::hash_pair(id.as_bytes()).0 as usize % 2 == 1)
+            .unwrap();
+        assert!(matches!(
+            store
+                .send_directed(Directed {
+                    mail_id: s2_mail,
+                    from: "s1".into(),
+                    to: s2_target,
+                    body: "fast".into(),
+                    headers: None,
+                    accepted_at_ms: Some(now_ms()),
+                })
+                .unwrap(),
+            Status::Committed { .. }
+        ));
+
+        // A competing claim on the same key waits on timeline_mu and sees claim1's grant.
+        let (tl2, st2, store2) = (
+            Arc::clone(&timeline_mu),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        );
+        let claim2 = std::thread::spawn(move || {
+            handle_claim(
+                &tl2,
+                &st2,
+                &store2,
+                &obj(vec![
+                    ("type", s("claim")),
+                    ("req", Value::Int(3)),
+                    ("op", s("acquire")),
+                    ("key", s("k1")),
+                    ("owner", s("s2")),
+                    ("ttl_ms", Value::Int(60_000)),
+                ]),
+            )
+            .unwrap()
+        });
+
+        gate_tx.send(()).unwrap();
+        gate_rx.recv().unwrap().unwrap();
+
+        let r1 = claim1.join().unwrap();
+        let r2 = claim2.join().unwrap();
+        assert_eq!(r1.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(r2.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(net::field(&r2, "holder").unwrap(), "s1");
+
+        // Also verify expire_locked drops `state` across its timeline commit.
+        {
+            let mut st = state.lock().unwrap();
+            st.connected.remove("s2");
+            st.seen.insert("s2".into(), 1);
+            st.started = 1;
+        }
+        let (gate_tx, gate_rx) = store.gate_slice0();
+        let (tl3, st3, store3) = (
+            Arc::clone(&timeline_mu),
+            Arc::clone(&state),
+            Arc::clone(&store),
+        );
+        let exp_thread = std::thread::spawn(move || {
+            handle_board(
+                &tl3,
+                &st3,
+                &store3,
+                &obj(vec![("type", s("board")), ("req", Value::Int(4))]),
+            )
+            .unwrap()
+        });
+        store.wait_slice0_queued(1);
+        {
+            let mut st = state.lock().unwrap();
+            assert!(link_of(&st, "s1").is_some());
+            stamp(&mut st, "s1");
+        }
+        gate_tx.send(()).unwrap();
+        gate_rx.recv().unwrap().unwrap();
+        let b = exp_thread.join().unwrap();
+        let Some(Value::Arr(sessions)) = b.get("sessions") else {
+            panic!("expected sessions array");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(net::field(&sessions[0], "session").unwrap(), "s1");
+
+        let rows = store.timeline_rows();
+        let kinds: Vec<(&str, Option<&str>, Option<&str>)> = rows
+            .iter()
+            .map(|(_, k, a, c)| (k.as_str(), a.as_deref(), c.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("session", Some("s1"), None),
+                ("session", Some("s2"), None),
+                ("claim", Some("s1"), Some("k1")),
+                ("unregister", Some("s2"), None),
+            ]
+        );
+
+        net::close(&host_writer, false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,9 +6,7 @@
 
 use crate::json::Value;
 
-pub const MAX_HEADERS: usize = 32;
-pub const MAX_KEY_BYTES: usize = 128;
-pub const MAX_VALUE_BYTES: usize = 4096;
+pub use roger_wire::wire::{MAX_HEADERS, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 
 fn kind_of(v: &Value) -> &'static str {
     match v {

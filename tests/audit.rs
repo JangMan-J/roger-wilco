@@ -6,9 +6,7 @@
 #[cfg(not(feature = "test-hooks"))]
 compile_error!("tests/audit.rs needs the test hooks: cargo test --features test-hooks");
 
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod json;
+use roger_wire::json;
 
 use json::Value;
 use std::fs;

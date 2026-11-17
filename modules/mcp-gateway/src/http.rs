@@ -2,7 +2,7 @@
 //! over HTTP/1.1 and HTTP/2 (`h2c`).
 
 use crate::cli::{constant_time_eq, write_port_file, Config};
-use crate::durlog::{blocking_io, read_store_entries};
+use crate::durlog::blocking_io;
 use crate::mcp::{self, Parsed, RpcErr, ValidatedEventReq};
 use crate::session::SessionManager;
 use bytes::Bytes;
@@ -13,7 +13,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -721,22 +720,43 @@ async fn run_mail_sse(
 ) {
     let session = req.session;
     let mut seen_seq = session.mail_seq.load(Ordering::SeqCst);
-    let store_path = session.store_path.clone();
-    let all = match blocking_io(move || read_store_entries(&store_path)) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = tx.send(stream_terminated_frame(&id, &e.to_string())).await;
-            return;
-        }
-    };
-    let now = crate::session::now_ms();
-    let (start, truncated, start_cursor) =
-        mcp::resolve_mail_window(&all, req.cursor.as_deref(), req.max_age_ms, now);
-    let mut latest_cursor = if start >= all.len() {
-        start_cursor.clone()
-    } else {
-        mcp::tail_cursor(&all)
-    };
+    let cache_arc = Arc::clone(&session.store_cache);
+    let cursor_opt = req.cursor.clone();
+    let max_age_ms = req.max_age_ms;
+    let init = blocking_io(move || -> io::Result<_> {
+        let mut cache = cache_arc.lock().unwrap();
+        cache.refresh()?;
+        let now = crate::session::now_ms();
+        let (start, truncated, start_cursor) = mcp::resolve_mail_window_indexed(
+            &cache.entries,
+            &cache.record_index,
+            cursor_opt.as_deref(),
+            max_age_ms,
+            now,
+        );
+        let latest_cursor = if start >= cache.entries.len() {
+            start_cursor.clone()
+        } else {
+            mcp::tail_cursor(&cache.entries)
+        };
+        let initial = cache.entries[start..].to_vec();
+        Ok((
+            start_cursor,
+            truncated,
+            latest_cursor,
+            initial,
+            cache.generation,
+            cache.entries.len(),
+        ))
+    });
+    let (start_cursor, truncated, mut latest_cursor, initial_entries, mut seen_gen, mut next_idx) =
+        match init {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(stream_terminated_frame(&id, &e.to_string())).await;
+                return;
+            }
+        };
 
     let mut active_params = Map::new();
     active_params.insert("cursor".into(), Value::String(start_cursor));
@@ -747,13 +767,11 @@ async fn run_mail_sse(
         return;
     }
 
-    let mut emitted_records: BTreeSet<String> = all[..start]
-        .iter()
-        .map(|e| mcp::record_of(e).to_string())
-        .collect();
-    for entry in &all[start..] {
+    for entry in &initial_entries {
         let rec = mcp::record_of(entry).to_string();
-        emitted_records.insert(rec.clone());
+        if rec.is_empty() {
+            continue;
+        }
         latest_cursor = rec;
         if req.filter.matches(entry) {
             let occ = match mcp::mail_occurrence(entry, true) {
@@ -785,12 +803,29 @@ async fn run_mail_sse(
         let cur_seq = session.mail_seq.load(Ordering::SeqCst);
         if cur_seq != seen_seq {
             seen_seq = cur_seq;
-            let sp = session.store_path.clone();
-            if let Ok(now_all) = blocking_io(move || read_store_entries(&sp)) {
+            let cache_arc = Arc::clone(&session.store_cache);
+            let delta = blocking_io(move || -> io::Result<_> {
+                let mut cache = cache_arc.lock().unwrap();
+                cache.refresh()?;
+                if cache.generation != seen_gen {
+                    Ok((cache.generation, cache.entries.len(), cache.entries.clone()))
+                } else if next_idx < cache.entries.len() {
+                    Ok((
+                        seen_gen,
+                        cache.entries.len(),
+                        cache.entries[next_idx..].to_vec(),
+                    ))
+                } else {
+                    Ok((seen_gen, next_idx, Vec::new()))
+                }
+            });
+            if let Ok((new_gen, new_next, now_all)) = delta {
+                seen_gen = new_gen;
+                next_idx = new_next;
                 let mut sent_any = false;
                 for entry in now_all {
                     let rec = mcp::record_of(&entry).to_string();
-                    if rec.is_empty() || !emitted_records.insert(rec.clone()) {
+                    if rec.is_empty() {
                         continue;
                     }
                     latest_cursor = rec;

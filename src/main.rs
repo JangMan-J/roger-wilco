@@ -4,18 +4,15 @@ mod claims;
 mod cold;
 mod coordinator;
 mod daemon;
-#[allow(dead_code)]
-mod durlog;
 mod headers;
-mod json;
 mod mcp;
 mod net;
 mod session;
 #[allow(dead_code)]
-mod sha256;
-#[allow(dead_code)]
 pub mod sql;
 
+#[allow(unused_imports)]
+pub use roger_wire::{durlog, json, sha256};
 use std::io;
 use std::path::PathBuf;
 

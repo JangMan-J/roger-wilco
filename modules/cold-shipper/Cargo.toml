@@ -14,9 +14,9 @@ name = "roger-cold-shipper"
 path = "src/main.rs"
 
 [dependencies]
+roger-wire = { path = "../../crates/roger-wire" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 
 [lints.clippy]
 all = "warn"

@@ -247,8 +247,8 @@ fn insert_envelope_row(
     txns[id_slice]
         .execute(
             "INSERT OR REPLACE INTO seen_ids (
-                mail_id, kind, sender, target, body_len, body_sha256, article_num
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                mail_id, kind, sender, target, body_len, body_sha256, article_num, stream
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 row.mail_id,
                 row.kind,
@@ -257,6 +257,7 @@ fn insert_envelope_row(
                 body_len,
                 &digest,
                 article_num,
+                &stream,
             ],
         )
         .map_err(sql_err)?;

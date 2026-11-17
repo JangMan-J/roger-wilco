@@ -10,6 +10,9 @@ cd "$ROOT"
 
 step() { echo "== $*"; "$@"; }
 
+step cargo fmt --manifest-path crates/roger-wire/Cargo.toml --check
+step cargo clippy --manifest-path crates/roger-wire/Cargo.toml --offline --all-targets -- -D warnings
+step cargo test --manifest-path crates/roger-wire/Cargo.toml --offline
 step cargo fmt --check
 step cargo clippy --offline --all-targets --features test-hooks -- -D warnings
 step cargo test --offline --features test-hooks

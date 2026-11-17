@@ -46,7 +46,7 @@ list_files() {
   fi
 }
 mapfile -t files < <(list_files "${@:-.}" |
-  grep -vE '^(VECTORS|\.slice|vendor)/|^(target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$|^(Cargo\.lock|modules/[^/]+/Cargo\.lock)$' | sort -u |
+  grep -vE '^(VECTORS|\.slice|vendor)/|^(target|crates/[^/]+/target|modules/[^/]+/target)/|^(KERNEL|INVARIANTS|GLOSSARY)\.md$|^docs/reviews/|^AGENTS\.md$|^scripts/check-vocabulary$|^(Cargo\.lock|modules/[^/]+/Cargo\.lock)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core or optional-module files under ${*:-.}" >&2; exit 1; }
 

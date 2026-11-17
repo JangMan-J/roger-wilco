@@ -8,7 +8,7 @@
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use crate::session::{self, Face, McpHooks};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -644,9 +644,9 @@ struct RegNotice {
 
 /// Everything a tool call or event subscription needs.
 struct Ctx {
-    socket: PathBuf,
     me: String,
     inbox: Inbox,
+    client: Mutex<session::Client>,
     groups: bool,
     legacy: AtomicBool,
     /// True once the coordinator's `registered` has arrived.
@@ -667,9 +667,9 @@ struct Ctx {
 impl Ctx {
     fn new(socket: PathBuf, me: String, inbox: Inbox, groups: bool) -> Self {
         Self {
-            socket,
             me,
             inbox,
+            client: Mutex::new(session::Client::new(socket)),
             groups,
             legacy: AtomicBool::new(false),
             confirmed: Mutex::new((false, None)),
@@ -783,9 +783,18 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                     Some(m) => m.to_string(),
                     None => session::gen_uuid().map_err(io)?,
                 };
-                let mail =
-                    session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
-                        .map_err(io)?;
+                let mail = {
+                    let mut client = ctx.client.lock().unwrap();
+                    session::send_mail_on(
+                        &mut client,
+                        &ctx.me,
+                        to,
+                        &mail,
+                        body,
+                        args.get("headers"),
+                    )
+                    .map_err(io)?
+                };
                 return Ok(obj(vec![("mail", s(&mail))]));
             }
             let to = opt_str(name, args, "to")?;
@@ -816,22 +825,34 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 if expected_article.is_some() {
                     return Err("roger_send: expected_article requires `group`".into());
                 }
-                let mail =
-                    session::send_mail(&ctx.socket, &ctx.me, to, &mail, body, args.get("headers"))
-                        .map_err(io)?;
+                let mail = {
+                    let mut client = ctx.client.lock().unwrap();
+                    session::send_mail_on(
+                        &mut client,
+                        &ctx.me,
+                        to,
+                        &mail,
+                        body,
+                        args.get("headers"),
+                    )
+                    .map_err(io)?
+                };
                 Ok(obj(vec![("mail", s(&mail))]))
             } else {
                 let group = group.expect("checked group.is_some()");
-                let (mail, grp, article) = session::send_group_mail_with(
-                    &ctx.socket,
-                    &ctx.me,
-                    group,
-                    &mail,
-                    body,
-                    args.get("headers"),
-                    expected_article,
-                )
-                .map_err(io)?;
+                let (mail, grp, article) = {
+                    let mut client = ctx.client.lock().unwrap();
+                    session::send_group_mail_on(
+                        &mut client,
+                        &ctx.me,
+                        group,
+                        &mail,
+                        body,
+                        args.get("headers"),
+                        expected_article,
+                    )
+                    .map_err(io)?
+                };
                 Ok(obj(vec![
                     ("mail", s(&mail)),
                     ("group", s(&grp)),
@@ -849,21 +870,28 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             if after.is_some() && latest {
                 return Err("roger_subscribe: expected `after` or `latest`, saw both".into());
             }
-            let reply =
-                session::subscribe_req(&ctx.socket, &ctx.me, group, after, latest).map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::subscribe_req_on(&mut client, &ctx.me, group, after, latest).map_err(io)?
+            };
             Ok(without_envelope(reply))
         }
         "roger_unsubscribe" => {
             let group = need_str(name, args, "group")?;
-            let reply = session::unsubscribe_req(&ctx.socket, &ctx.me, group).map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::unsubscribe_req_on(&mut client, &ctx.me, group).map_err(io)?
+            };
             Ok(without_envelope(reply))
         }
         "roger_groups" => {
             let prefix = opt_str(name, args, "prefix")?;
             let include_retired = opt_bool(name, args, "include_retired")?;
-            let reply =
-                session::groups_req_filtered(&ctx.socket, Some(&ctx.me), prefix, include_retired)
-                    .map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::groups_req_filtered_on(&mut client, Some(&ctx.me), prefix, include_retired)
+                    .map_err(io)?
+            };
             Ok(without_envelope(reply))
         }
         "roger_inbox" => {
@@ -930,15 +958,14 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 false,
             )?;
             let window_ms = seconds_to_ms(name, "window_seconds", window)?;
-            let reply = session::request(
-                &ctx.socket,
-                &obj(vec![
-                    ("type", s("board")),
-                    ("req", Value::Int(1)),
-                    ("session", s(&ctx.me)),
-                ]),
-            )
-            .map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(
+                    &mut client,
+                    obj(vec![("type", s("board")), ("session", s(&ctx.me))]),
+                )
+                .map_err(io)?
+            };
             let now = reply.get("now_ms").and_then(|v| v.as_i64()).unwrap_or(0);
             let sessions = match reply.get("sessions") {
                 Some(Value::Arr(rows)) => rows
@@ -961,16 +988,18 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
         }
         "roger_label" => {
             let label = need_str(name, args, "label")?;
-            let reply = session::request(
-                &ctx.socket,
-                &obj(vec![
-                    ("type", s("relabel")),
-                    ("req", Value::Int(1)),
-                    ("session", s(&ctx.me)),
-                    ("label", s(label)),
-                ]),
-            )
-            .map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(
+                    &mut client,
+                    obj(vec![
+                        ("type", s("relabel")),
+                        ("session", s(&ctx.me)),
+                        ("label", s(label)),
+                    ]),
+                )
+                .map_err(io)?
+            };
             Ok(obj(vec![
                 ("session", s(net::field(&reply, "session").map_err(io)?)),
                 ("label", s(net::field(&reply, "label").map_err(io)?)),
@@ -999,31 +1028,32 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                     ("acquire", seconds_to_ms(name, "ttl_seconds", t)?)
                 }
             };
-            let reply = session::request(
-                &ctx.socket,
-                &obj(vec![
-                    ("type", s("claim")),
-                    ("req", Value::Int(1)),
-                    ("op", s(op)),
-                    ("key", s(key)),
-                    ("owner", s(&ctx.me)),
-                    ("ttl_ms", Value::Int(ttl_ms)),
-                ]),
-            )
-            .map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(
+                    &mut client,
+                    obj(vec![
+                        ("type", s("claim")),
+                        ("op", s(op)),
+                        ("key", s(key)),
+                        ("owner", s(&ctx.me)),
+                        ("ttl_ms", Value::Int(ttl_ms)),
+                    ]),
+                )
+                .map_err(io)?
+            };
             Ok(without_envelope(reply))
         }
         _ => {
             let mail = need_str(name, args, "mail")?;
-            let reply = session::request(
-                &ctx.socket,
-                &obj(vec![
-                    ("type", s("receipt")),
-                    ("req", Value::Int(1)),
-                    ("mail", s(mail)),
-                ]),
-            )
-            .map_err(io)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(
+                    &mut client,
+                    obj(vec![("type", s("receipt")), ("mail", s(mail))]),
+                )
+                .map_err(io)?
+            };
             Ok(without_envelope(reply))
         }
     }
@@ -1077,26 +1107,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn format_iso8601_utc(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let day_secs = secs.rem_euclid(86_400);
-    let hour = day_secs / 3600;
-    let min = (day_secs % 3600) / 60;
-    let sec = day_secs % 60;
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
-}
+pub use roger_wire::wire::format_iso8601_utc;
 
 fn events_list_result() -> Value {
     let mail_event = obj(vec![
@@ -1371,6 +1382,7 @@ fn tail_cursor(all: &[Value]) -> String {
 /// Resolve `(start_index, truncated, reset_cursor)` for `roger.mail` replay.
 fn resolve_mail_window(
     all: &[Value],
+    record_index: &HashMap<String, usize>,
     cursor: Option<&str>,
     max_age_ms: Option<i64>,
     now: i64,
@@ -1381,7 +1393,7 @@ fn resolve_mail_window(
     };
     let base_start = if cur == "r-0" {
         0
-    } else if let Some(idx) = all.iter().position(|e| record_of(e) == cur) {
+    } else if let Some(&idx) = record_index.get(cur) {
         idx + 1
     } else {
         return (all.len(), true, tail);
@@ -1455,19 +1467,19 @@ fn events_poll(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
     let max_age_ms = parse_opt_max_age_ms(params)?;
     let max_events = parse_opt_max_events(params)?;
 
-    let all = entries(&ctx.inbox.store).map_err(|e| RpcErr {
+    let mut cache = ctx.inbox.cache.lock().unwrap();
+    cache.refresh().map_err(|e| RpcErr {
         code: -32603,
         message: e.to_string(),
         data: None,
     })?;
     let now = now_ms();
-    let (start, truncated, start_cursor) =
-        resolve_mail_window(&all, cursor.as_deref(), max_age_ms, now);
+    let (start, truncated, start_cursor) = cache.resolve_window(cursor.as_deref(), max_age_ms, now);
 
     let mut matched = Vec::new();
     let mut last_idx = None;
     let mut has_more = false;
-    for (offset, entry) in all[start..].iter().enumerate() {
+    for (offset, entry) in cache.entries[start..].iter().enumerate() {
         if !filter.matches(entry) {
             continue;
         }
@@ -1480,10 +1492,10 @@ fn events_poll(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
     }
     let next_cursor = if has_more {
         last_idx
-            .map(|i| record_of(&all[i]).to_string())
+            .map(|i| record_of(&cache.entries[i]).to_string())
             .unwrap_or(start_cursor)
-    } else if start < all.len() {
-        tail_cursor(&all)
+    } else if start < cache.entries.len() {
+        tail_cursor(&cache.entries)
     } else {
         start_cursor
     };
@@ -1695,18 +1707,27 @@ fn run_mail_stream(
     heartbeat_ms: i64,
 ) {
     let mut seen_seq = ctx.mail_seq.load(Ordering::SeqCst);
-    let all = match entries(&ctx.inbox.store) {
-        Ok(a) => a,
-        Err(e) => {
+    let (start_cursor, truncated, mut latest_cursor, initial_entries, mut seen_gen, mut next_idx) = {
+        let mut cache = ctx.inbox.cache.lock().unwrap();
+        if let Err(e) = cache.refresh() {
             finish_sub_terminated(out, id, &e.to_string());
             return;
         }
+        let (start, truncated, start_cursor) = cache.resolve_window(cursor, max_age_ms, now_ms());
+        let mut latest_cursor = tail_cursor(&cache.entries);
+        if start >= cache.entries.len() {
+            latest_cursor = start_cursor.clone();
+        }
+        let initial = cache.entries[start..].to_vec();
+        (
+            start_cursor,
+            truncated,
+            latest_cursor,
+            initial,
+            cache.generation,
+            cache.entries.len(),
+        )
     };
-    let (start, truncated, start_cursor) = resolve_mail_window(&all, cursor, max_age_ms, now_ms());
-    let mut latest_cursor = tail_cursor(&all);
-    if start >= all.len() {
-        latest_cursor = start_cursor.clone();
-    }
     if send_event_notif(
         out,
         "notifications/events/active",
@@ -1722,13 +1743,11 @@ fn run_mail_stream(
         return;
     }
 
-    let mut emitted_records: BTreeSet<String> = all[..start]
-        .iter()
-        .map(|e| record_of(e).to_string())
-        .collect();
-    for entry in &all[start..] {
+    for entry in &initial_entries {
         let rec = record_of(entry).to_string();
-        emitted_records.insert(rec.clone());
+        if rec.is_empty() {
+            continue;
+        }
         latest_cursor = rec;
         if filter.matches(entry) {
             let mut pairs = match mail_occurrence(entry, true) {
@@ -1773,11 +1792,29 @@ fn run_mail_stream(
         let cur_seq = ctx.mail_seq.load(Ordering::SeqCst);
         if cur_seq != seen_seq {
             seen_seq = cur_seq;
-            if let Ok(now_all) = entries(&ctx.inbox.store) {
+            let delta_entries = {
+                let mut cache = ctx.inbox.cache.lock().unwrap();
+                if cache.refresh().is_ok() {
+                    if cache.generation != seen_gen {
+                        seen_gen = cache.generation;
+                        next_idx = cache.entries.len();
+                        Some(cache.entries.clone())
+                    } else if next_idx < cache.entries.len() {
+                        let slice = cache.entries[next_idx..].to_vec();
+                        next_idx = cache.entries.len();
+                        Some(slice)
+                    } else {
+                        Some(Vec::new())
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(now_all) = delta_entries {
                 let mut sent_any = false;
                 for entry in now_all {
                     let rec = record_of(&entry).to_string();
-                    if rec.is_empty() || !emitted_records.insert(rec.clone()) {
+                    if rec.is_empty() {
                         continue;
                     }
                     latest_cursor = rec;
@@ -2093,9 +2130,72 @@ fn close_all_subs(ctx: &Ctx, terminated_reason: Option<&str>) {
 /// The reader's side of the Store: the entries after a read position kept in a file
 /// beside it. A delivery's Store write makes `notify` fire, which is what
 /// ends a wait for the next entry.
+struct StoreCache {
+    tail: crate::durlog::TailReader,
+    entries: Vec<Value>,
+    record_index: HashMap<String, usize>,
+    generation: u64,
+    #[cfg(test)]
+    parses: usize,
+}
+
+impl StoreCache {
+    fn open(store: &Path) -> io::Result<Self> {
+        let mut cache = Self {
+            tail: crate::durlog::TailReader::new(store.to_path_buf()),
+            entries: Vec::new(),
+            record_index: HashMap::new(),
+            generation: 0,
+            #[cfg(test)]
+            parses: 0,
+        };
+        cache.refresh()?;
+        Ok(cache)
+    }
+
+    fn refresh(&mut self) -> io::Result<crate::durlog::TailDelta> {
+        let entries = &mut self.entries;
+        let record_index = &mut self.record_index;
+        let generation = &mut self.generation;
+        #[cfg(test)]
+        let parses = &mut self.parses;
+        self.tail.refresh(|ev| match ev {
+            crate::durlog::TailEvent::Reset => {
+                entries.clear();
+                record_index.clear();
+                *generation += 1;
+            }
+            crate::durlog::TailEvent::Line(line) => {
+                #[cfg(test)]
+                {
+                    *parses += 1;
+                }
+                if let Ok(v) = json::parse(line) {
+                    if let Some(rec) = v.get("record").and_then(Value::as_str) {
+                        if !record_index.contains_key(rec) {
+                            let idx = entries.len();
+                            record_index.insert(rec.to_string(), idx);
+                            entries.push(v);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn resolve_window(
+        &self,
+        cursor: Option<&str>,
+        max_age_ms: Option<i64>,
+        now: i64,
+    ) -> (usize, bool, String) {
+        resolve_mail_window(&self.entries, &self.record_index, cursor, max_age_ms, now)
+    }
+}
+
 struct Inbox {
-    store: PathBuf,
     pos_file: PathBuf,
+    cache: Mutex<StoreCache>,
     /// The Record id the reader has consumed through. Held across a read and
     /// across the wait, so an entry is returned to one caller only.
     consumed: Mutex<Option<String>>,
@@ -2116,8 +2216,8 @@ impl Inbox {
             }
         };
         Ok(Inbox {
-            store: store.to_path_buf(),
             pos_file,
+            cache: Mutex::new(StoreCache::open(store)?),
             consumed: Mutex::new(consumed),
             arrived: Condvar::new(),
         })
@@ -2129,6 +2229,12 @@ impl Inbox {
     fn notify(&self) {
         let _held = self.consumed.lock().unwrap();
         self.arrived.notify_all();
+    }
+
+    fn is_empty(&self) -> io::Result<bool> {
+        let mut cache = self.cache.lock().unwrap();
+        cache.refresh()?;
+        Ok(cache.entries.is_empty())
     }
 
     /// Up to `limit` entries after the read position. With none and `wait` above
@@ -2144,7 +2250,16 @@ impl Inbox {
         let deadline = Instant::now() + wait;
         let mut consumed = self.consumed.lock().unwrap();
         loop {
-            let page = after(&entries(&self.store)?, consumed.as_deref(), limit);
+            let page = {
+                let mut cache = self.cache.lock().unwrap();
+                cache.refresh()?;
+                after_indexed(
+                    &cache.entries,
+                    &cache.record_index,
+                    consumed.as_deref(),
+                    limit,
+                )
+            };
             if !page.is_empty() {
                 let last = page
                     .last()
@@ -2199,83 +2314,34 @@ fn encode_ntfs_stem(address: &str) -> String {
     out
 }
 
-/// The file beside a Store that holds how far its reader has consumed.
-fn position_path(store: &Path) -> PathBuf {
-    let mut p = store.as_os_str().to_owned();
-    p.push(".cursor");
-    PathBuf::from(p)
-}
+use roger_wire::wire::{cursor_path as position_path, save_cursor as save_position};
 
-/// Every complete entry in the Store, oldest first. A trailing fragment with
-/// no newline (a write in progress) is not an entry yet.
-fn entries(store: &Path) -> io::Result<Vec<Value>> {
-    let bytes = match std::fs::read(store) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(io::Error::new(
-                e.kind(),
-                format!("expected to read {}, saw {e}", store.display()),
-            ))
-        }
-    };
-    let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    Ok(String::from_utf8_lossy(&bytes[..end])
-        .lines()
-        .filter_map(|l| json::parse(l).ok())
-        .filter(|e| e.get("record").is_some())
-        .collect())
-}
-
-/// The entries after the one named `consumed`, at most `limit`, shaped as the
-/// inbox returns them. A read position that names no entry (a Store that was
-/// replaced) starts from the first. A `kind` or `headers` the entry lacks is
-/// left out, never guessed. When the Store entry carries `group` and `article`,
-/// both are projected onto the returned `mail` entry.
-fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
+fn after_indexed(
+    all: &[Value],
+    record_index: &HashMap<String, usize>,
+    consumed: Option<&str>,
+    limit: usize,
+) -> Vec<Value> {
     let start = consumed
-        .and_then(|c| {
-            all.iter()
-                .position(|e| e.get("record").and_then(|r| r.as_str()) == Some(c))
-        })
+        .and_then(|c| record_index.get(c).copied())
         .map_or(0, |i| i + 1);
     all[start..]
         .iter()
         .take(limit)
-        .map(|e| {
-            let has_group = e.get("group").and_then(Value::as_str).is_some()
-                && e.get("article").and_then(Value::as_i64).is_some();
-            let keys: &[&str] = if has_group {
-                &[
-                    "record", "mail", "from", "group", "article", "body", "kind", "headers",
-                ]
-            } else {
-                &["record", "mail", "from", "body", "kind", "headers"]
-            };
-            Value::Obj(
-                keys.iter()
-                    .filter_map(|k| e.get(k).map(|v| (k.to_string(), v.clone())))
-                    .collect(),
-            )
-        })
+        .map(shape_mail_entry)
         .collect()
 }
 
-/// Write the read position so a crash leaves the old one or the new one: a temp
-/// file, fsynced, renamed over, then the directory fsynced.
-fn save_position(file: &Path, record: &str) -> io::Result<()> {
-    use std::io::Write;
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(format!("{record}\n").as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, file)?;
-    if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
-        crate::durlog::sync_dir(dir)?;
+#[cfg(test)]
+fn after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
+    let mut index = HashMap::new();
+    for (i, e) in all.iter().enumerate() {
+        let rec = record_of(e);
+        if !rec.is_empty() {
+            index.entry(rec.to_string()).or_insert(i);
+        }
     }
-    Ok(())
+    after_indexed(all, &index, consumed, limit)
 }
 
 // ---- the process ----
@@ -2351,10 +2417,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     let daemon = match rx.recv() {
         Ok(Event::Registered(w)) => w,
         Ok(Event::Ended(Err(e))) => {
-            if cfg.store_is_default
-                && !store_existed
-                && entries(&cfg.store).is_ok_and(|x| x.is_empty())
-            {
+            if cfg.store_is_default && !store_existed && ctx.inbox.is_empty().unwrap_or(false) {
                 let _ = std::fs::remove_file(&cfg.store);
             }
             return Err(e);
@@ -2377,7 +2440,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             };
             close_all_subs(&ctx, Some(&reason));
             eprintln!("roger mcp: expected the host daemon connection to stay up, saw {reason}");
-            finish(&cfg, &gate, None, 1)
+            finish(&cfg, &ctx.inbox, &gate, None, 1)
         }
     };
     std::thread::spawn(lost);
@@ -2396,7 +2459,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     close_all_subs(&ctx, None);
     // Stdin closed: the client is gone, so this session is too. It leaves the
     // Board and later Broadcasts; Mail accepted for its Address stays pending.
-    finish(&cfg, &gate, Some(&daemon), 0)
+    finish(&cfg, &ctx.inbox, &gate, Some(&daemon), 0)
 }
 
 fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
@@ -2498,13 +2561,19 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
 /// Leave. With a daemon writer, unregister first. A default Store with no
 /// entries is removed with its position file: the gate is held so a delivery
 /// cannot be written to a file about to go.
-fn finish(cfg: &Config, gate: &Mutex<bool>, daemon: Option<&net::Writer>, code: i32) -> ! {
+fn finish(
+    cfg: &Config,
+    inbox: &Inbox,
+    gate: &Mutex<bool>,
+    daemon: Option<&net::Writer>,
+    code: i32,
+) -> ! {
     let mut closing = gate.lock().unwrap();
     *closing = true;
     if let Some(w) = daemon {
         let _ = net::send(w, &obj(vec![("type", s("unregister"))]));
     }
-    if cfg.store_is_default && entries(&cfg.store).is_ok_and(|e| e.is_empty()) {
+    if cfg.store_is_default && inbox.is_empty().unwrap_or(false) {
         let _ = std::fs::remove_file(&cfg.store);
         let _ = std::fs::remove_file(position_path(&cfg.store));
     }
@@ -3338,6 +3407,197 @@ mod tests {
         assert_eq!(ev_pref.len(), 1);
         assert_eq!(ev_pref[0].get("eventId"), Some(&s("m-3")));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_cache_tails_incrementally_handles_torn_tail_cursor_lookup_and_truncation_reset() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("roger-mcp-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("cache.store");
+        let now = now_ms();
+        let line1 = format!(
+            "{{\"record\":\"r-1\",\"mail\":\"m-1\",\"from\":\"a\",\"body\":\"b1\",\"kind\":\"directed\",\"headers\":{{}},\"stored_at_ms\":{now}}}\n"
+        );
+        let line2 = format!(
+            "{{\"record\":\"r-2\",\"mail\":\"m-2\",\"from\":\"a\",\"body\":\"b2\",\"kind\":\"directed\",\"headers\":{{}},\"stored_at_ms\":{now}}}\n"
+        );
+        std::fs::write(&store, format!("{line1}{line2}{{\"record\":\"r-torn\"")).unwrap();
+
+        let ctx = Ctx::new(
+            PathBuf::from("tcp://127.0.0.1:1"),
+            "me".into(),
+            Inbox::open(&store).unwrap(),
+            true,
+        );
+        assert_eq!(ctx.inbox.cache.lock().unwrap().parses, 2);
+
+        // Repeated poll with no file growth parses 0 additional lines.
+        let p1 = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-0"}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(p1.get("cursor"), Some(&s("r-2")));
+        assert_eq!(ctx.inbox.cache.lock().unwrap().parses, 2);
+
+        // Truncate torn tail via DurLog::open and append r-3 -> parses only 1 new line.
+        {
+            let (mut log, replay) = crate::durlog::DurLog::open(&store).unwrap();
+            let prior: Vec<String> = replay.collect::<io::Result<Vec<_>>>().unwrap();
+            assert_eq!(prior.len(), 2);
+            log.append(&format!(
+                "{{\"record\":\"r-3\",\"mail\":\"m-3\",\"from\":\"a\",\"body\":\"b3\",\"kind\":\"directed\",\"headers\":{{}},\"stored_at_ms\":{now}}}"
+            ))
+            .unwrap();
+        }
+        let p2 = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-2"}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(ctx.inbox.cache.lock().unwrap().parses, 3);
+        let Some(Value::Arr(evs)) = p2.get("events") else {
+            panic!("events");
+        };
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].get("eventId"), Some(&s("m-3")));
+        assert_eq!(p2.get("cursor"), Some(&s("r-3")));
+
+        // Inbox read uses the same cache without re-parsing.
+        let (mail, cur) = ctx.inbox.read(10, Duration::ZERO, false).unwrap();
+        assert_eq!(mail.len(), 3);
+        assert_eq!(cur.as_deref(), Some("r-3"));
+        assert_eq!(ctx.inbox.cache.lock().unwrap().parses, 3);
+
+        // Truncate/replace file -> resets generation and re-reads cleanly from 0.
+        {
+            let mut f = std::fs::File::create(&store).unwrap();
+            writeln!(
+                f,
+                "{{\"record\":\"r-10\",\"mail\":\"m-10\",\"from\":\"a\",\"body\":\"fresh\",\"kind\":\"directed\",\"headers\":{{}},\"stored_at_ms\":{now}}}"
+            )
+            .unwrap();
+        }
+        let p3 = events_poll(
+            &ctx,
+            &json::parse(r#"{"name":"roger.mail","cursor":"r-3"}"#).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(p3.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(p3.get("cursor"), Some(&s("r-10")));
+        assert_eq!(ctx.inbox.cache.lock().unwrap().generation, 1);
+        assert_eq!(ctx.inbox.cache.lock().unwrap().parses, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_tools_reuse_single_pooled_connection_and_reconnect_on_eof() {
+        let dir = std::env::temp_dir().join(format!("roger-mcp-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("pool.store");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            // First accepted connection serves 4 consecutive tool calls, then closes.
+            let (conn1, _) = listener.accept().unwrap();
+            let mut lines1 = net::lines(Box::new(conn1.try_clone().unwrap()));
+            let w1 = net::writer(Box::new(conn1));
+            for expected_req in 1..=4 {
+                let req = lines1.next().unwrap().unwrap();
+                assert_eq!(req.get("req").and_then(Value::as_i64), Some(expected_req));
+                let resp = match net::field(&req, "type").unwrap() {
+                    "send" => obj(vec![
+                        ("type", s("accepted")),
+                        ("req", Value::Int(expected_req)),
+                        ("mail", s(net::field(&req, "mail").unwrap())),
+                    ]),
+                    "board" => obj(vec![
+                        ("type", s("board")),
+                        ("req", Value::Int(expected_req)),
+                        ("sessions", Value::Arr(vec![])),
+                        ("claims", Value::Arr(vec![])),
+                        ("now_ms", Value::Int(100)),
+                    ]),
+                    "groups" => obj(vec![
+                        ("type", s("groups")),
+                        ("req", Value::Int(expected_req)),
+                        ("groups", Value::Arr(vec![])),
+                    ]),
+                    "claim" => obj(vec![
+                        ("type", s("claim_result")),
+                        ("req", Value::Int(expected_req)),
+                        ("op", s("acquire")),
+                        ("key", s("k1")),
+                        ("ok", Value::Bool(true)),
+                    ]),
+                    other => panic!("unexpected {other}"),
+                };
+                net::send(&w1, &resp).unwrap();
+            }
+            drop((lines1, w1));
+
+            // Second accepted connection after EOF serves req 5.
+            let (conn2, _) = listener.accept().unwrap();
+            let mut lines2 = net::lines(Box::new(conn2.try_clone().unwrap()));
+            let w2 = net::writer(Box::new(conn2));
+            let req = lines2.next().unwrap().unwrap();
+            assert_eq!(req.get("req").and_then(Value::as_i64), Some(5));
+            net::send(
+                &w2,
+                &obj(vec![
+                    ("type", s("accepted")),
+                    ("req", Value::Int(5)),
+                    ("mail", s(net::field(&req, "mail").unwrap())),
+                ]),
+            )
+            .unwrap();
+        });
+
+        let ctx = Ctx::new(target, "me-pool".into(), Inbox::open(&store).unwrap(), true);
+        call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_send","arguments":{"to":"peer","mail":"m1","body":"hi"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_board","arguments":{}}"#).unwrap(),
+        )
+        .unwrap();
+        call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_groups","arguments":{}}"#).unwrap(),
+        )
+        .unwrap();
+        call_tool(
+            &ctx,
+            &json::parse(r#"{"name":"roger_claim","arguments":{"key":"k1"}}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ctx.client.lock().unwrap().connects(), 1);
+
+        // Server closed conn1; next call reconnects seamlessly.
+        let res = call_tool(
+            &ctx,
+            &json::parse(
+                r#"{"name":"roger_send","arguments":{"to":"peer","mail":"m2","body":"hi2"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(res.get("mail"), Some(&s("m2")));
+        assert_eq!(ctx.client.lock().unwrap().connects(), 2);
+
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

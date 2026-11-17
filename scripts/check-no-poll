@@ -28,7 +28,7 @@ MARKER='//[[:space:]]*no-poll:[[:space:]]*[^[:space:]]'
 
 if (( $# == 0 )); then
   shopt -s nullglob
-  dirs=(src modules/*/src)
+  dirs=(src crates/roger-wire/src modules/*/src)
   shopt -u nullglob
 else
   dirs=("$@")

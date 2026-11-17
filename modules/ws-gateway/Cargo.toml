@@ -19,8 +19,8 @@ test-hooks = []
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+roger-wire = { path = "../../crates/roger-wire" }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 

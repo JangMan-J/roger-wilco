@@ -2,3 +2,4 @@
 .proto/
 /target
 /modules/*/target
+/crates/*/target

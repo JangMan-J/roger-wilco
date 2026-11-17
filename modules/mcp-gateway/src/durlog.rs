@@ -1,37 +1,14 @@
-//! Durable append-only Store log, atomic Cursor file, and SHA-256 Store naming.
-//!
-//! Store files written here are byte-for-byte compatible with `roger` (`src/durlog.rs`,
-//! `src/mcp.rs`, and `roger audit --store`).
+//! Durable append-only Store log, atomic Cursor file, and `serde_json` Store helpers,
+//! backed by `roger-wire`.
 
+pub use roger_wire::durlog::{
+    sync_dir, AppendSpan, DurLog, Replay, TailDelta, TailEvent, TailReader,
+};
+pub use roger_wire::wire::{cursor_path, gen_uuid, load_cursor, save_cursor, store_path};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-/// Collision-free Store file path for `address` inside `store_dir`:
-/// `<hex_sha256_of_address>.store`.
-pub fn store_path(store_dir: &Path, address: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(address.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{b:02x}");
-    }
-    store_dir.join(format!("{hex}.store"))
-}
-
-/// Cursor file path alongside `store`: `<store>.cursor`.
-pub fn cursor_path(store: &Path) -> PathBuf {
-    let mut p = store.as_os_str().to_owned();
-    p.push(".cursor");
-    PathBuf::from(p)
-}
-
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 /// Run a short blocking filesystem operation safely whether called from a
 /// multi-thread Tokio worker or a single-threaded unit test.
 pub fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
@@ -42,202 +19,6 @@ pub fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
         _ => f(),
     }
 }
-
-pub struct DurLog {
-    file: File,
-    poison: Option<String>,
-    replayed: Arc<AtomicBool>,
-}
-
-pub struct Replay {
-    reader: BufReader<File>,
-    keep: u64,
-    done: bool,
-    replayed: Arc<AtomicBool>,
-}
-
-impl Iterator for Replay {
-    type Item = io::Result<String>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut line = Vec::new();
-        while !self.done {
-            line.clear();
-            let n = match self.reader.read_until(b'\n', &mut line) {
-                Ok(n) => n,
-                Err(e) => return Some(Err(e)),
-            };
-            if line.last() != Some(&b'\n') {
-                self.done = true;
-                if n > 0 {
-                    if let Err(e) = self
-                        .reader
-                        .get_ref()
-                        .set_len(self.keep)
-                        .and_then(|()| self.reader.get_ref().sync_all())
-                    {
-                        return Some(Err(e));
-                    }
-                }
-                self.replayed.store(true, Ordering::SeqCst);
-                break;
-            }
-            self.keep += n as u64;
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if !line.is_empty() {
-                return Some(Ok(String::from_utf8_lossy(&line).into_owned()));
-            }
-        }
-        None
-    }
-}
-
-/// Flush a directory entry on Unix; on non-Unix platforms opening a directory
-/// with `File::open` is unsupported and metadata follows the file flush.
-pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
-fn open_exclusive(path: &Path) -> io::Result<File> {
-    #[cfg(unix)]
-    {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
-        // no-poll: single non-blocking lock check on Store open; never retried.
-        let lock_res = file.try_lock();
-        lock_res.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "expected {} unlocked, saw it held by another process: {e}",
-                    path.display()
-                ),
-            )
-        })?;
-        Ok(file)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .share_mode(1)
-            .open(path)
-            .map_err(|e| {
-                if e.raw_os_error() == Some(32) {
-                    io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "expected {} unlocked, saw it held by another process: {e}",
-                            path.display()
-                        ),
-                    )
-                } else {
-                    e
-                }
-            })
-    }
-}
-
-impl DurLog {
-    pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let existed = path.exists();
-        let file = open_exclusive(path)?;
-        if !existed {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    sync_dir(parent)?;
-                }
-            }
-        }
-        let replayed = Arc::new(AtomicBool::new(false));
-        let replay = Replay {
-            reader: BufReader::new(file.try_clone()?),
-            keep: 0,
-            done: false,
-            replayed: Arc::clone(&replayed),
-        };
-        Ok((
-            DurLog {
-                file,
-                poison: None,
-                replayed,
-            },
-            replay,
-        ))
-    }
-
-    pub fn append(&mut self, line: &str) -> io::Result<()> {
-        debug_assert!(!line.contains('\n'));
-        if !self.replayed.load(Ordering::SeqCst) {
-            return Err(io::Error::other(
-                "expected the log replayed to its end before an append, saw the replay unfinished",
-            ));
-        }
-        if let Some(first) = &self.poison {
-            return Err(io::Error::other(format!(
-                "expected a durable log, saw one poisoned by an earlier append failure: {first}"
-            )));
-        }
-        self.write_line(line)
-            .inspect_err(|e| self.poison = Some(e.to_string()))
-    }
-
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.sync_all()
-    }
-}
-
-/// Read the saved Cursor from `<store>.cursor` if present.
-pub fn load_cursor(pos_file: &Path) -> io::Result<Option<String>> {
-    match std::fs::read_to_string(pos_file) {
-        Ok(text) => Ok(Some(text.trim().to_string()).filter(|c| !c.is_empty())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io::Error::new(
-            e.kind(),
-            format!("expected to read {}, saw {e}", pos_file.display()),
-        )),
-    }
-}
-
-/// Atomically persist the read position via `<cursor>.tmp` -> `sync_all` -> `rename` -> dir `sync_all`.
-pub fn save_cursor(pos_file: &Path, record: &str) -> io::Result<()> {
-    let mut tmp = pos_file.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let mut f = File::create(&tmp)?;
-    f.write_all(format!("{record}\n").as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, pos_file)?;
-    if let Some(dir) = pos_file.parent().filter(|d| !d.as_os_str().is_empty()) {
-        sync_dir(dir)?;
-    }
-    Ok(())
-}
-
 /// Every complete entry in `store`, oldest first. Any trailing fragment without `\n` is ignored.
 pub fn read_store_entries(store: &Path) -> io::Result<Vec<Value>> {
     let bytes = match std::fs::read(store) {
@@ -258,13 +39,111 @@ pub fn read_store_entries(store: &Path) -> io::Result<Vec<Value>> {
         .collect())
 }
 
-/// Entries after `consumed`, up to `limit`, shaped identically to `roger mcp`.
-pub fn entries_after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
-    let start = consumed
-        .and_then(|c| {
-            all.iter()
-                .position(|e| e.get("record").and_then(Value::as_str) == Some(c))
+/// Incremental in-memory index over a Store file, synced via `TailReader` and
+/// updated directly on `DurLog::append`.
+pub struct StoreCache {
+    tail: TailReader,
+    pub entries: Vec<Value>,
+    pub record_index: HashMap<String, usize>,
+    pub generation: u64,
+    #[cfg(test)]
+    pub parses: usize,
+}
+
+impl StoreCache {
+    pub fn open(store: &Path) -> io::Result<Self> {
+        let mut cache = Self {
+            tail: TailReader::new(store.to_path_buf()),
+            entries: Vec::new(),
+            record_index: HashMap::new(),
+            generation: 0,
+            #[cfg(test)]
+            parses: 0,
+        };
+        cache.refresh()?;
+        Ok(cache)
+    }
+
+    pub fn from_replayed(store: &Path, offset: u64, entries: Vec<Value>) -> io::Result<Self> {
+        let mut record_index = HashMap::with_capacity(entries.len());
+        for (idx, entry) in entries.iter().enumerate() {
+            if let Some(rec) = entry.get("record").and_then(Value::as_str) {
+                record_index.entry(rec.to_string()).or_insert(idx);
+            }
+        }
+        Ok(Self {
+            tail: TailReader::from_replayed(store.to_path_buf(), offset)?,
+            entries,
+            record_index,
+            generation: 0,
+            #[cfg(test)]
+            parses: 0,
         })
+    }
+
+    pub fn refresh(&mut self) -> io::Result<TailDelta> {
+        let entries = &mut self.entries;
+        let record_index = &mut self.record_index;
+        let generation = &mut self.generation;
+        #[cfg(test)]
+        let parses = &mut self.parses;
+        self.tail.refresh(|ev| match ev {
+            TailEvent::Reset => {
+                entries.clear();
+                record_index.clear();
+                *generation += 1;
+            }
+            TailEvent::Line(line) => {
+                #[cfg(test)]
+                {
+                    *parses += 1;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    if let Some(rec) = v.get("record").and_then(Value::as_str) {
+                        if !record_index.contains_key(rec) {
+                            let idx = entries.len();
+                            record_index.insert(rec.to_string(), idx);
+                            entries.push(v);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn push_appended(&mut self, entry: Value, span: AppendSpan) -> io::Result<()> {
+        if self.tail.advance_from(span) {
+            if let Some(rec) = entry.get("record").and_then(Value::as_str) {
+                if !self.record_index.contains_key(rec) {
+                    self.record_index
+                        .insert(rec.to_string(), self.entries.len());
+                    self.entries.push(entry);
+                }
+            }
+            Ok(())
+        } else {
+            self.refresh().map(|_| ())
+        }
+    }
+
+    pub fn entries_after(&self, consumed: Option<&str>, limit: usize) -> Vec<Value> {
+        entries_after_indexed(&self.entries, &self.record_index, consumed, limit)
+    }
+
+    pub fn is_empty(&mut self) -> io::Result<bool> {
+        self.refresh()?;
+        Ok(self.entries.is_empty())
+    }
+}
+
+pub fn entries_after_indexed(
+    all: &[Value],
+    record_index: &HashMap<String, usize>,
+    consumed: Option<&str>,
+    limit: usize,
+) -> Vec<Value> {
+    let start = consumed
+        .and_then(|c| record_index.get(c).copied())
         .map_or(0, |i| i + 1);
     all[start..]
         .iter()
@@ -273,6 +152,16 @@ pub fn entries_after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec
         .collect()
 }
 
+/// Entries after `consumed`, up to `limit`, shaped identically to `roger mcp`.
+pub fn entries_after(all: &[Value], consumed: Option<&str>, limit: usize) -> Vec<Value> {
+    let mut index = HashMap::new();
+    for (i, e) in all.iter().enumerate() {
+        if let Some(rec) = e.get("record").and_then(Value::as_str) {
+            index.entry(rec.to_string()).or_insert(i);
+        }
+    }
+    entries_after_indexed(all, &index, consumed, limit)
+}
 /// Shape one Store entry keeping keys in `["record", "mail", "from", "body", "kind", "headers"]` order.
 pub fn shape_mail_entry(entry: &Value) -> Value {
     let mut out = Map::new();
@@ -284,47 +173,6 @@ pub fn shape_mail_entry(entry: &Value) -> Value {
         }
     }
     Value::Object(out)
-}
-
-fn fill_random(b: &mut [u8; 16]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        File::open("/dev/urandom")?.read_exact(b)
-    }
-    #[cfg(windows)]
-    {
-        #[link(name = "bcrypt", kind = "raw-dylib")]
-        unsafe extern "system" {
-            fn BCryptGenRandom(
-                algorithm: *mut std::ffi::c_void,
-                buffer: *mut u8,
-                bytes: u32,
-                flags: u32,
-            ) -> i32;
-        }
-        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), b.as_mut_ptr(), 16, 2) };
-        if status < 0 {
-            Err(io::Error::other(format!(
-                "expected BCryptGenRandom to succeed, saw NTSTATUS {status:#x}"
-            )))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Generate a fresh RFC 4122 UUIDv4 using the OS cryptographic RNG.
-pub fn gen_uuid() -> io::Result<String> {
-    let mut b = [0u8; 16];
-    fill_random(&mut b)?;
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15]
-    ))
 }
 
 #[cfg(test)]
@@ -387,6 +235,77 @@ mod tests {
         let page = entries_after(&entries, Some("r-1"), 50);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0]["record"], "r-2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_cache_updates_on_append_tails_incrementally_and_resets_on_truncate() {
+        let dir = std::env::temp_dir().join(format!("roger-gw-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.store");
+        std::fs::write(
+            &path,
+            "{\"record\":\"r-1\",\"mail\":\"m1\",\"from\":\"a\",\"body\":\"hi\",\"kind\":\"directed\",\"headers\":{}}\n{\"record\":\"r-torn\"",
+        )
+        .unwrap();
+
+        let (mut log, mut replay) = DurLog::open(&path).unwrap();
+        let mut initial = Vec::new();
+        for line in &mut replay {
+            let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            initial.push(v);
+        }
+        let mut cache = StoreCache::from_replayed(&path, replay.offset(), initial).unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.parses, 0);
+
+        // Append via DurLog and push directly into cache -> refresh reads 0 bytes and parses 0 lines.
+        let entry2 = serde_json::json!({"record":"r-2","mail":"m2","from":"a","body":"ok","kind":"directed","headers":{}});
+        let line2 = serde_json::to_string(&entry2).unwrap();
+        let span2 = log.append_at(&line2).unwrap();
+        cache.push_appended(entry2, span2).unwrap();
+        let d = cache.refresh().unwrap();
+        assert_eq!(d.bytes_read, 0);
+        assert_eq!(cache.parses, 0);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries_after(Some("r-1"), 10).len(), 1);
+        drop(replay);
+        drop(log);
+
+        // External append followed by misaligned push_appended -> falls back to refresh without offset drift.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{{\"record\":\"r-3\",\"mail\":\"m3\",\"from\":\"a\",\"body\":\"ext\",\"kind\":\"directed\",\"headers\":{{}}}}").unwrap();
+        }
+        let (mut log2, replay2) = DurLog::open(&path).unwrap();
+        let _: Vec<String> = replay2.collect::<io::Result<Vec<_>>>().unwrap();
+        let entry4 = serde_json::json!({"record":"r-4","mail":"m4","from":"a","body":"sync","kind":"directed","headers":{}});
+        let line4 = serde_json::to_string(&entry4).unwrap();
+        let span4 = log2.append_at(&line4).unwrap();
+        // cache.tail.offset is still before r-3, so span4.pre_offset != cache.tail.offset -> refreshes both r-3 and r-4 cleanly!
+        cache.push_appended(entry4, span4).unwrap();
+        assert_eq!(cache.entries.len(), 4);
+        assert_eq!(cache.entries[2]["record"], "r-3");
+        assert_eq!(cache.entries[3]["record"], "r-4");
+        drop(log2);
+
+        // Truncate/replace -> resets generation and re-reads cleanly.
+        std::fs::write(
+            &path,
+            "{\"record\":\"r-9\",\"mail\":\"m9\",\"from\":\"a\",\"body\":\"new\",\"kind\":\"directed\",\"headers\":{}}\n",
+        )
+        .unwrap();
+        let d3 = cache.refresh().unwrap();
+        assert!(d3.reset);
+        assert_eq!(cache.generation, 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0]["record"], "r-9");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

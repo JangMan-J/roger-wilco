@@ -13,19 +13,30 @@
 //! later append may commit on top of that split. Every later append returns
 //! an error naming the first failure; the owner restarts and replays.
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::{self, File, Metadata};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendSpan {
+    pub pre_offset: u64,
+    pub bytes: u64,
+    pub file_id: Option<(u64, u64)>,
+}
 
 pub struct DurLog {
     file: File,
+    file_id: Option<(u64, u64)>,
     /// The first append failure, kept so every later append refuses.
     poison: Option<String>,
     /// Set by `Replay` when it has read to the end and cut any torn tail. An
     /// append before that could glue onto a fragment, so it is refused.
     replayed: Arc<AtomicBool>,
+    /// Byte offset recorded by `Replay` when it finishes, then advanced by each append.
+    replayed_offset: Arc<AtomicU64>,
+    written: Option<u64>,
 }
 
 /// The complete lines a log held when it was opened, in order, empty lines
@@ -36,6 +47,14 @@ pub struct Replay {
     keep: u64,
     done: bool,
     replayed: Arc<AtomicBool>,
+    replayed_offset: Arc<AtomicU64>,
+}
+
+impl Replay {
+    /// Verified byte offset of the end of all complete lines read so far.
+    pub fn offset(&self) -> u64 {
+        self.keep
+    }
 }
 
 impl Iterator for Replay {
@@ -56,10 +75,16 @@ impl Iterator for Replay {
                 // onto it and corrupt a record.
                 self.done = true;
                 if n > 0 {
-                    if let Err(e) = self.reader.get_ref().set_len(self.keep) {
+                    if let Err(e) = self
+                        .reader
+                        .get_ref()
+                        .set_len(self.keep)
+                        .and_then(|()| self.reader.get_ref().sync_all())
+                    {
                         return Some(Err(e));
                     }
                 }
+                self.replayed_offset.store(self.keep, Ordering::SeqCst);
                 self.replayed.store(true, Ordering::SeqCst);
                 break;
             }
@@ -95,7 +120,7 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 pub fn open_exclusive_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
     }
     let existed = path.exists();
@@ -113,7 +138,7 @@ pub fn open_exclusive_lock(path: &Path) -> io::Result<File> {
 fn open_exclusive(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
-        let file = std::fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -136,7 +161,7 @@ fn open_exclusive(path: &Path) -> io::Result<File> {
         // FILE_SHARE_READ (1) only: refuses a second writer at open while still
         // letting read-only callers (`roger mcp` inbox, `roger audit`) read the
         // file without hitting a mandatory byte-range lock violation.
-        std::fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -162,7 +187,7 @@ impl DurLog {
     pub fn open(path: &Path) -> io::Result<(DurLog, Replay)> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent)?;
             }
         }
         let existed = path.exists();
@@ -175,19 +200,25 @@ impl DurLog {
                 }
             }
         }
+        let file_id = file.metadata().ok().and_then(|m| meta_file_id(&m));
         let replayed = Arc::new(AtomicBool::new(false));
+        let replayed_offset = Arc::new(AtomicU64::new(0));
         // The same open file, so the lock above covers the replay too.
         let replay = Replay {
             reader: BufReader::new(file.try_clone()?),
             keep: 0,
             done: false,
             replayed: Arc::clone(&replayed),
+            replayed_offset: Arc::clone(&replayed_offset),
         };
         Ok((
             DurLog {
                 file,
+                file_id,
                 poison: None,
                 replayed,
+                replayed_offset,
+                written: None,
             },
             replay,
         ))
@@ -197,8 +228,11 @@ impl DurLog {
     fn from_file(file: File) -> DurLog {
         DurLog {
             file,
+            file_id: None,
             poison: None,
             replayed: Arc::new(AtomicBool::new(true)),
+            replayed_offset: Arc::new(AtomicU64::new(0)),
+            written: Some(0),
         }
     }
 
@@ -208,6 +242,11 @@ impl DurLog {
     }
 
     pub fn append(&mut self, line: &str) -> io::Result<()> {
+        self.append_at(line).map(|_| ())
+    }
+
+    /// Append `line` and return its `AppendSpan` once `sync_all()` succeeds.
+    pub fn append_at(&mut self, line: &str) -> io::Result<AppendSpan> {
         debug_assert!(!line.contains('\n'));
         if !self.replayed.load(Ordering::SeqCst) {
             return Err(io::Error::other(
@@ -219,15 +258,211 @@ impl DurLog {
                 "expected a durable log, saw one poisoned by an earlier append failure: {first}"
             )));
         }
+        let pre = *self
+            .written
+            .get_or_insert_with(|| self.replayed_offset.load(Ordering::SeqCst));
+        let bytes = (line.len() + 1) as u64;
         self.write_line(line)
-            .inspect_err(|e| self.poison = Some(e.to_string()))
+            .inspect_err(|e| self.poison = Some(e.to_string()))?;
+        self.written = Some(pre + bytes);
+        Ok(AppendSpan {
+            pre_offset: pre,
+            bytes,
+            file_id: self.file_id,
+        })
     }
 
     fn write_line(&mut self, line: &str) -> io::Result<()> {
-        use std::io::Write;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.sync_all()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailEvent<'a> {
+    Reset,
+    Line(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailDelta {
+    pub reset: bool,
+    pub bytes_read: u64,
+    pub lines_parsed: usize,
+}
+#[cfg(unix)]
+fn meta_file_id(meta: &Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn meta_file_id(_meta: &Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Incremental byte-offset tail reader for append-only JSONL Store files.
+/// Reads only newly appended `\n`-terminated lines from `offset..EOF`, ignores
+/// any trailing fragment without `\n`, and resets cleanly if the file is
+/// truncated, deleted, or replaced.
+pub struct TailReader {
+    path: PathBuf,
+    offset: u64,
+    initialized: bool,
+    file_id: Option<(u64, u64)>,
+}
+
+impl TailReader {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            initialized: false,
+            file_id: None,
+        }
+    }
+
+    pub fn from_replayed(path: PathBuf, offset: u64) -> io::Result<Self> {
+        match fs::metadata(&path) {
+            Ok(meta) => Ok(Self {
+                path,
+                offset,
+                initialized: true,
+                file_id: meta_file_id(&meta),
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::new(path)),
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("expected to read {}, saw {e}", path.display()),
+            )),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Advance the tail offset in-memory only when this reader is already
+    /// initialized on the exact same `file_id` at `expected_offset`.
+    pub fn advance_from(&mut self, span: AppendSpan) -> bool {
+        if self.initialized && self.offset == span.pre_offset && self.file_id == span.file_id {
+            self.offset += span.bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn refresh(&mut self, mut on_event: impl FnMut(TailEvent<'_>)) -> io::Result<TailDelta> {
+        let meta = match fs::metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let reset = self.initialized;
+                if reset {
+                    on_event(TailEvent::Reset);
+                }
+                self.offset = 0;
+                self.initialized = false;
+                self.file_id = None;
+                return Ok(TailDelta {
+                    reset,
+                    bytes_read: 0,
+                    lines_parsed: 0,
+                });
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("expected to read {}, saw {e}", self.path.display()),
+                ))
+            }
+        };
+        let id = meta_file_id(&meta);
+        let len = meta.len();
+        if self.initialized && id == self.file_id && len == self.offset {
+            return Ok(TailDelta {
+                reset: false,
+                bytes_read: 0,
+                lines_parsed: 0,
+            });
+        }
+
+        let mut f = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let reset = self.initialized;
+                if reset {
+                    on_event(TailEvent::Reset);
+                }
+                self.offset = 0;
+                self.initialized = false;
+                self.file_id = None;
+                return Ok(TailDelta {
+                    reset,
+                    bytes_read: 0,
+                    lines_parsed: 0,
+                });
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("expected to read {}, saw {e}", self.path.display()),
+                ))
+            }
+        };
+        let meta = f.metadata()?;
+        let id = meta_file_id(&meta);
+        let len = meta.len();
+        let mut reset = false;
+        if !self.initialized || id != self.file_id || len < self.offset {
+            if self.initialized {
+                reset = true;
+                on_event(TailEvent::Reset);
+            }
+            self.offset = 0;
+        }
+        self.file_id = id;
+        self.initialized = true;
+        if len == self.offset {
+            return Ok(TailDelta {
+                reset,
+                bytes_read: 0,
+                lines_parsed: 0,
+            });
+        }
+
+        f.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = Vec::with_capacity((len - self.offset) as usize);
+        f.read_to_end(&mut buf)?;
+        let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if end == 0 {
+            return Ok(TailDelta {
+                reset,
+                bytes_read: 0,
+                lines_parsed: 0,
+            });
+        }
+        let mut lines_parsed = 0usize;
+        for raw in buf[..end].split(|&b| b == b'\n') {
+            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if raw.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(raw);
+            on_event(TailEvent::Line(&text));
+            lines_parsed += 1;
+        }
+        self.offset += end as u64;
+        Ok(TailDelta {
+            reset,
+            bytes_read: end as u64,
+            lines_parsed,
+        })
     }
 }
 
@@ -243,7 +478,7 @@ mod tests {
         Ok((log, replay.collect::<io::Result<Vec<String>>>()?))
     }
 
-    fn temp_path(tag: &str) -> std::path::PathBuf {
+    fn temp_path(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("roger-durlog-{}-{tag}.log", std::process::id()));
         let _ = fs::remove_file(&p);
         p
@@ -268,9 +503,6 @@ mod tests {
 
     #[test]
     fn one_failed_append_poisons_every_later_append() {
-        // /dev/full accepts the open and fails every write with ENOSPC, so
-        // the first append fails for a real filesystem reason and the second
-        // must fail for the poison alone.
         let file = fs::OpenOptions::new()
             .write(true)
             .open("/dev/full")
@@ -345,7 +577,7 @@ mod tests {
         let path = temp_path("partial");
         {
             let mut f = File::create(&path).unwrap();
-            f.write_all(b"{\"a\":1}\n{\"b\":2").unwrap(); // crash mid-append
+            f.write_all(b"{\"a\":1}\n{\"b\":2").unwrap();
         }
         let (_log, lines) = open(&path).unwrap();
         assert_eq!(lines, vec!["{\"a\":1}".to_string()]);
@@ -357,7 +589,7 @@ mod tests {
         let path = temp_path("glue");
         {
             let mut f = File::create(&path).unwrap();
-            f.write_all(b"{\"a\":1}\n{\"b\":2").unwrap(); // crash mid-append
+            f.write_all(b"{\"a\":1}\n{\"b\":2").unwrap();
         }
         {
             let (mut log, _) = open(&path).unwrap();
@@ -371,5 +603,89 @@ mod tests {
             vec!["{\"a\":1}".to_string(), "{\"c\":3}".to_string()],
             "raw file: {raw:?}"
         );
+    }
+
+    #[test]
+    fn tail_reader_reads_incrementally_ignores_torn_tail_and_resets_on_truncate_or_replace() {
+        let path = temp_path("tail");
+        let mut tail = TailReader::new(path.clone());
+        let mut items: Vec<String> = Vec::new();
+        let apply = |items: &mut Vec<String>, ev: TailEvent<'_>| match ev {
+            TailEvent::Reset => items.clear(),
+            TailEvent::Line(l) => items.push(l.to_string()),
+        };
+
+        // Missing file -> 0 bytes, no reset.
+        let d0 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert_eq!(
+            d0,
+            TailDelta {
+                reset: false,
+                bytes_read: 0,
+                lines_parsed: 0
+            }
+        );
+
+        // Initial write with 2 complete lines + torn tail.
+        let l1 = "{\"record\":\"r-1\"}\n";
+        let l2 = "{\"record\":\"r-2\"}\n";
+        fs::write(&path, format!("{l1}{l2}{{\"record\":\"r-3\"")).unwrap();
+        let d1 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert_eq!(
+            d1,
+            TailDelta {
+                reset: false,
+                bytes_read: (l1.len() + l2.len()) as u64,
+                lines_parsed: 2
+            }
+        );
+        assert_eq!(items, vec!["{\"record\":\"r-1\"}", "{\"record\":\"r-2\"}"]);
+
+        // No change -> 0 bytes read, 0 lines parsed.
+        let d2 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert_eq!(
+            d2,
+            TailDelta {
+                reset: false,
+                bytes_read: 0,
+                lines_parsed: 0
+            }
+        );
+
+        // DurLog::open truncates torn tail and appends r-3 -> only r-3 is read & parsed.
+        {
+            let (mut log, replay) = DurLog::open(&path).unwrap();
+            let replayed: Vec<String> = replay.collect::<io::Result<Vec<_>>>().unwrap();
+            assert_eq!(replayed.len(), 2);
+            log.append("{\"record\":\"r-3\"}").unwrap();
+        }
+        let d3 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert_eq!(
+            d3,
+            TailDelta {
+                reset: false,
+                bytes_read: "{\"record\":\"r-3\"}\n".len() as u64,
+                lines_parsed: 1
+            }
+        );
+        assert_eq!(items.len(), 3);
+
+        // Truncate file -> resets cleanly and re-reads from 0.
+        fs::write(&path, "{\"record\":\"r-new\"}\n").unwrap();
+        let d4 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert!(d4.reset);
+        assert_eq!(d4.lines_parsed, 1);
+        assert_eq!(items, vec!["{\"record\":\"r-new\"}"]);
+
+        // Atomic replace with same-length file -> inode change triggers reset.
+        let tmp = temp_path("tail-replace");
+        fs::write(&tmp, "{\"record\":\"r-rep\"}\n").unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        let d5 = tail.refresh(|ev| apply(&mut items, ev)).unwrap();
+        assert!(d5.reset);
+        assert_eq!(d5.lines_parsed, 1);
+        assert_eq!(items, vec!["{\"record\":\"r-rep\"}"]);
+
+        let _ = fs::remove_file(&path);
     }
 }

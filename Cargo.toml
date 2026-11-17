@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.37.0", default-features = false }
+roger-wire = { path = "crates/roger-wire" }
 
 [features]
 default = ["bundled-sqlite"]
