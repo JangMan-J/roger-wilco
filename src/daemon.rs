@@ -86,7 +86,7 @@ impl State {
     }
 }
 
-/// How long a session's send or ack waits for the coordinator to answer.
+/// How long a session's send waits for the coordinator to answer.
 const UPSTREAM_WAIT: Duration = Duration::from_secs(10);
 
 /// How long a TCP peer has to send its auth line before it is dropped.
@@ -549,7 +549,7 @@ fn upstream_link(
                     // A forwarded receipt upstream refuses stays queued, so
                     // say so: silence here would look like a confirmed receipt.
                     None if kind == "error" => eprintln!(
-                        "upstream refused the receipt for {}: {}",
+                        "upstream refused the replayed receipt for {}: {}",
                         net::field(&v, "mail").unwrap_or("?"),
                         net::field(&v, "reason").unwrap_or("unexplained")
                     ),
