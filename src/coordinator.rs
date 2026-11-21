@@ -86,20 +86,16 @@ pub struct Config {
     pub cold_sweep: bool,
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+fn invalid(reason: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, reason)
 }
 
-/// `name`'s value as an integer of at least `min`, or `default` when absent.
-fn int_flag(args: &[String], name: &str, min: i64, default: i64) -> io::Result<i64> {
-    let Some(text) = flag(args, name) else {
-        return Ok(default);
-    };
+fn integer(name: &str, text: &str, min: i64) -> io::Result<i64> {
     match text.parse::<i64>() {
         Ok(n) if n >= min => Ok(n),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{name} expects an integer of at least {min}, saw {text}"),
+            format!("{name}: expected an integer of at least {min}, saw {text}"),
         )),
     }
 }
@@ -107,36 +103,58 @@ fn int_flag(args: &[String], name: &str, min: i64, default: i64) -> io::Result<i
 impl Config {
     /// Read the coordinator's flags; the token comes from the environment.
     pub fn from_args(args: &[String], token: String) -> io::Result<Config> {
-        let need = |name: &str| {
-            flag(args, name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}"))
-            })
-        };
-        let days = int_flag(args, "--cold-retain-days", 1, sql::DEFAULT_RETAIN_DAYS)?;
-        #[allow(unused_mut)]
-        let mut cold_retain_ms = days.saturating_mul(sql::DAY_MS);
-        #[allow(unused_mut)]
-        let mut cold_day_ms = sql::DAY_MS;
+        let (mut bind, mut data, mut port_file) = (None, None, None);
+        let mut unregister_after_ms = UNREGISTER_AFTER_MS;
+        let mut slices = 1;
+        let mut days = sql::DEFAULT_RETAIN_DAYS;
+        let mut cold_sweep = true;
         #[cfg(feature = "test-hooks")]
-        {
-            cold_retain_ms = int_flag(args, "--cold-retain-ms", 1, cold_retain_ms)?;
-            cold_day_ms = int_flag(args, "--cold-day-ms", 1, cold_day_ms)?;
+        let (mut retain_override, mut cold_day_ms) = (None, sql::DAY_MS);
+        let mut args = args.iter().skip(2).map(String::as_str);
+        while let Some(name) = args.next() {
+            let mut value = || {
+                args.next().ok_or_else(|| {
+                    invalid(format!("expected a value for {name}, saw end of arguments"))
+                })
+            };
+            match name {
+                "--bind" => bind = Some(value()?.to_owned()),
+                "--data" => data = Some(value()?.into()),
+                "--port-file" => port_file = Some(value()?.into()),
+                "--no-cold-sweep" => cold_sweep = false,
+                "--unregister-after-ms" => unregister_after_ms = integer(name, value()?, i64::MIN)?,
+                "--slices" => slices = integer(name, value()?, 1)? as usize,
+                "--cold-retain-days" => days = integer(name, value()?, 1)?,
+                #[cfg(feature = "test-hooks")]
+                "--cold-retain-ms" => retain_override = Some(integer(name, value()?, 1)?),
+                #[cfg(feature = "test-hooks")]
+                "--cold-day-ms" => cold_day_ms = integer(name, value()?, 1)?,
+                #[cfg(feature = "test-hooks")]
+                "--link-pace-ms" => {
+                    integer(name, value()?, 0)?;
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "expected a coordinator option, saw {name}"
+                    )))
+                }
+            }
         }
+        let cold_retain_ms = days.saturating_mul(sql::DAY_MS);
+        #[cfg(feature = "test-hooks")]
+        let cold_retain_ms = retain_override.unwrap_or(cold_retain_ms);
+        #[cfg(not(feature = "test-hooks"))]
+        let cold_day_ms = sql::DAY_MS;
         Ok(Config {
-            bind: need("--bind")?,
-            data: PathBuf::from(need("--data")?),
-            port_file: flag(args, "--port-file").map(PathBuf::from),
+            bind: bind.ok_or_else(|| invalid("expected --bind, saw none".into()))?,
+            data: data.ok_or_else(|| invalid("expected --data, saw none".into()))?,
+            port_file,
             token,
-            unregister_after_ms: int_flag(
-                args,
-                "--unregister-after-ms",
-                i64::MIN,
-                UNREGISTER_AFTER_MS,
-            )?,
-            slices: int_flag(args, "--slices", 1, 1)? as usize,
+            unregister_after_ms,
+            slices,
             cold_retain_ms,
             cold_day_ms,
-            cold_sweep: !args.iter().any(|a| a == "--no-cold-sweep"),
+            cold_sweep,
         })
     }
 
@@ -181,7 +199,7 @@ struct State {
     takeovers: HashMap<String, Option<(String, i64)>>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
-    notice_writers: HashMap<u64, std::sync::mpsc::Sender<Value>>,
+    notice_writers: HashMap<u64, Writer>,
     /// Host links whose hello asked for `board_event` lines, by connection
     /// id: each committed session or claim change is offered to them once.
     watchers: HashMap<u64, Writer>,
@@ -595,6 +613,24 @@ fn serve(
 ) -> io::Result<()> {
     // One line is one segment, sent when it is written.
     conn.set_nodelay(true)?;
+    let mut lines = net::lines(Box::new(conn.try_clone()?));
+    lines.set_cap(HELLO_MAX);
+    // no-poll: bound the wait for an unauthenticated peer's hello.
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let (host, board_events) = match read_hello(&mut lines, token) {
+        Ok(hello) => hello,
+        Err(e) => {
+            eprintln!("coordinator connection ended: {e}");
+            let _ = net::send(
+                &net::writer(Box::new(conn)),
+                &error_reply(0, None, &e.to_string()),
+            );
+            return Err(e);
+        }
+    };
+    // no-poll: authenticated links wait for incoming records without a deadline.
+    conn.set_read_timeout(None)?;
+    lines.set_cap(net::MAX_LINE_BYTES);
     let conn = Arc::new(conn);
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
@@ -605,7 +641,8 @@ fn serve(
         state,
         timeline_mu,
         &store,
-        token,
+        lines,
+        (host, board_events),
     );
     // coordinator has committed. It is written before the link ends, unless
     // the link ended because the peer went silent; then nothing can reach it,
@@ -654,45 +691,42 @@ fn send_shape_error(mail: &str, group: Option<&str>) -> Option<String> {
     }
 }
 
+fn read_hello(lines: &mut net::Lines, token: &str) -> io::Result<(String, bool)> {
+    let hello = lines.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "expected hello, saw end of stream",
+        )
+    })??;
+    if net::field(&hello, "type")? != "hello"
+        || !net::same_secret(net::field(&hello, "token")?, token)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "expected authenticated hello, saw invalid type or token",
+        ));
+    }
+    let host = net::field(&hello, "host")?.to_string();
+    Ok((host, hello.get("board_events") == Some(&Value::Bool(true))))
+}
+
 fn serve_link(
     conn: &TcpStream,
     writer: Writer,
     state: Arc<Mutex<State>>,
     timeline_mu: Arc<Mutex<()>>,
     store: &Store,
-    token: &str,
+    lines: net::Lines,
+    (host, board_events): (String, bool),
 ) -> io::Result<()> {
-    let mut lines = net::lines(Box::new(conn.try_clone()?));
-    // Until the token is seen the peer is anyone who can reach the port.
-    lines.set_cap(HELLO_MAX);
-
-    let hello = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no hello"))??;
-    if net::field(&hello, "type")? != "hello"
-        || !net::same_secret(net::field(&hello, "token")?, token)
-    {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "bad hello"));
-    }
-    let host = net::field(&hello, "host")?.to_string();
-    lines.set_cap(usize::MAX);
     let (conn_id, host_sessions) = {
         let mut st = state.lock().unwrap();
         let id = st.next_conn;
         st.next_conn += 1;
         st.hosts.insert(host.clone(), (id, Arc::clone(&writer)));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let observer = writer.clone();
-        std::thread::spawn(move || {
-            for notice in rx {
-                if net::send(&observer, &notice).is_err() {
-                    break;
-                }
-            }
-        });
-        st.notice_writers.insert(id, tx);
+        st.notice_writers.insert(id, Arc::clone(&writer));
         // A host daemon that never asks is never sent a `board_event`.
-        if hello.get("board_events") == Some(&Value::Bool(true)) {
+        if board_events {
             st.watchers.insert(id, Arc::clone(&writer));
         }
         let mut on_host: Vec<String> = st
@@ -767,8 +801,8 @@ fn serve_link(
                             Ok((events, notice))
                         },
                         |st, notice| {
-                            if let Some(tx) = st.notice_writers.get(&conn_id) {
-                                let _ = tx.send(notice);
+                            if let Some(w) = st.notice_writers.get(&conn_id) {
+                                let _ = net::send(w, &notice);
                             }
                         },
                     )?;
@@ -862,8 +896,8 @@ fn serve_link(
                         },
                         |st, (at, notices)| {
                             for (target_conn, notice) in notices {
-                                if let Some(tx) = st.notice_writers.get(&target_conn) {
-                                    let _ = tx.send(notice);
+                                if let Some(w) = st.notice_writers.get(&target_conn) {
+                                    let _ = net::send(w, &notice);
                                 }
                             }
                             st.seen.insert(session.clone(), at);
@@ -1070,6 +1104,16 @@ fn serve_link(
                 }
                 let page = store.articles(&group, after, limit)?;
                 net::send(&writer, &articles_reply(req, &page, follow))?;
+            }
+            "unwatch_articles" => {
+                let group = net::field(&v, "group")?;
+                let mut st = state.lock().unwrap();
+                if let Some(list) = st.article_watchers.get_mut(group) {
+                    list.retain(|(id, _)| *id != conn_id);
+                    if list.is_empty() {
+                        st.article_watchers.remove(group);
+                    }
+                }
             }
             "group_policy" => {
                 let req = req_of(&v);
@@ -1850,7 +1894,11 @@ mod tests {
     use crate::json::stringify;
 
     fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|a| a.to_string()).collect()
+        ["roger", "coordinator"]
+            .into_iter()
+            .chain(list.iter().copied())
+            .map(str::to_string)
+            .collect()
     }
 
     fn line(pairs: Vec<(&'static str, Value)>) -> String {
@@ -1920,6 +1968,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--data"));
+    }
+
+    #[test]
+    fn coordinator_rejects_unknown_or_incomplete_options() {
+        for (tail, saw) in [
+            (vec!["--unknown"], "--unknown"),
+            (vec!["stray"], "stray"),
+            (vec!["--port-file"], "end of arguments"),
+        ] {
+            let mut argv = args(&["--bind", "addr", "--data", "path"]);
+            argv.extend(tail.into_iter().map(str::to_owned));
+            let err = Config::from_args(&argv, String::new()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("expected"));
+            assert!(err.to_string().contains(&format!("saw {saw}")));
+        }
+    }
+
+    #[test]
+    fn coordinator_consumes_flag_like_data_path() {
+        let cfg = Config::from_args(
+            &args(&["--bind", "addr", "--data", "--no-cold-sweep"]),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.data, PathBuf::from("--no-cold-sweep"));
+        assert!(cfg.cold_sweep);
+    }
+
+    #[test]
+    fn hello_authentication_preserves_buffered_requests() {
+        let input = b"{\"type\":\"hello\",\"host\":\"h\",\"token\":\"ok\",\"board_events\":true}\n{\"type\":\"ping\"}\n";
+        let mut lines = net::lines(Box::new(&input[..]));
+        assert_eq!(read_hello(&mut lines, "ok").unwrap(), ("h".into(), true));
+        assert_eq!(lines.next().unwrap().unwrap().get("type"), Some(&s("ping")));
+        let mut lines = net::lines(Box::new(&input[..]));
+        assert_eq!(
+            read_hello(&mut lines, "wrong").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[cfg(feature = "test-hooks")]
