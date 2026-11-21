@@ -89,20 +89,34 @@ cat ~/.local/share/roger/deployed
 
 ## Backups
 
-Take one on every host before a deploy that changes the binary, units or env. The coordinator
-log is the fleet's durable state (Mail, Receipts, sessions, claims); each host's daemon log is
-its local inbox.
+Back up every host before a deploy that changes the binary, units or env. Do not use a raw
+`cp -rp` on the data directory while the coordinator or daemon is running. Each coordinator
+slice's `hot.sqlite` has live `-wal` and `-shm` files. A copy taken between writes may pair
+the database with a WAL that does not match it, leaving a torn database.
+
+Use `roger backup --data <path> --dest <dir> [--kind coordinator|daemon]`. The destination
+must be absent or empty; the command detects the kind if omitted. It runs `VACUUM INTO` on
+a read-only connection to each live database, taking one consistent snapshot per database
+while writers continue. It checks each copy with `PRAGMA integrity_check`, then copies each
+slice's sealed `cold/day-*.cold` files and verifies them by SHA-256. Copying hot before cold
+means a concurrent sweep can add overlap but cannot leave a record out.
 
 ```sh
 b=~/.local/share/roger-backup-$(date -u +%Y%m%d-%H%M%S)
-mkdir -p "$b"/{bin,config,share,units}
+mkdir -p "$b"/{bin,config,units}
 cp -p ~/.local/bin/roger "$b/bin/"
 cp -rp ~/.config/roger "$b/config/"
-cp -rp ~/.local/share/roger "$b/share/"
 cp -p ~/.config/systemd/user/roger-*.service "$b/units/"
+
+# Every host:
+roger backup --data ~/.local/share/roger/daemon.log --dest "$b/daemon"
+# Coordinator host only:
+roger backup --data ~/.local/share/roger/coordinator.log --dest "$b/coordinator"
 ```
 
-A client keeps its own state (its Stores); back that up per its README.
+Each backup prints `BACKUP_FILE path=… bytes=… sha256=…` per file and finishes with
+`BACKUP kind=… files=… dest=…`. A client keeps its own state (its Stores); back that up per
+its README.
 
 ## Procedure
 
@@ -147,4 +161,10 @@ daemon keeps its socket.
 ## Roll back
 
 Deploy an earlier commit: `scripts/deploy <host> <commit>`. `~/.local/bin/roger.prev` holds
-the binary the last deploy replaced, and a backup holds the env, units and logs as they were.
+the binary the last deploy replaced.
+
+To restore data to the backup point, stop the affected service with `systemctl --user stop`.
+Move the current slice directory (`~/.local/share/roger/coordinator.log.slices`) or daemon
+database (`~/.local/share/roger/daemon.log.sqlite`, including any `-wal` and `-shm` files)
+aside. Put the backed-up slices from `$b/coordinator` or the database from `$b/daemon` in
+its place, then start the service with `systemctl --user start`.
