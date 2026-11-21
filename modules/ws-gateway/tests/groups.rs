@@ -507,9 +507,15 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     let both = client
         .call(json!({"type":"send", "to":"reader-2", "group":"staff", "body":"no"}))
         .await;
-    assert_eq!(both["error"], "send accepts either to or group, not both");
+    assert_eq!(
+        both["error"],
+        "expected either to or group on send, saw both"
+    );
     let neither = client.call(json!({"type":"send", "body":"no"})).await;
-    assert_eq!(neither["error"], "send requires either to or group");
+    assert_eq!(
+        neither["error"],
+        "expected to or group on send, saw neither"
+    );
     client.close().await;
 }
 
@@ -544,7 +550,7 @@ async fn group_delivery_store_ack_and_resume_keep_positions_and_other_kinds_unch
     );
     assert_eq!(
         daemon.line().await,
-        json!({"type":"ack", "mail":"m-g1", "record":"r-1"})
+        json!({"type":"ack", "req":1, "mail":"m-g1", "record":"r-1"})
     );
 
     for (mail, kind, body, record, req) in [
