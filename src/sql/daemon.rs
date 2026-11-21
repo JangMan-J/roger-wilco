@@ -62,6 +62,7 @@ impl Store {
         }
         let lock = crate::durlog::open_exclusive_lock(&daemon_lock_path(data))?;
         let mut conn = Connection::open(daemon_db_path(data)).map_err(err)?;
+        // no-poll: bounds SQLite lock contention; no delivery depends on a timer.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(err)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")

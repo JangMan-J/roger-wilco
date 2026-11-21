@@ -1371,22 +1371,24 @@ fn receipt_survives_a_host_daemon_restart() {
     rig.send("m-restart", "acked before the host daemon restarts");
     wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
 
-    // Coordinator down, so the ack can only be committed on the host.
-    rig.kill(0);
+    // The link stays open but cannot answer. The receipt must outlive both ends.
+    signal(&rig, rig.coord_idx, "-STOP");
+    rig.coord_unreachable = true;
     rig.kill(recipient);
-    rig.start_recipient("recipient2.out", true);
+    let restarted = rig.start_recipient("recipient2.out", true);
     // The session prints DELIVERED once the host daemon committed the receipt.
     wait_for_text(
         &rig.p("recipient2.out"),
         "DELIVERED mail=m-restart record=r-1",
-        Duration::from_secs(10),
+        Duration::from_secs(3),
     );
     assert_host_holds_receipt(&rig, "m-restart");
 
     // Nothing live may be able to produce the receipt from here on: the
     // session is gone and the daemon that committed it is replaced by one
     // whose receipts come only from what it committed to disk.
-    rig.kill(4);
+    rig.kill(restarted);
+    rig.kill(rig.coord_idx);
     rig.restart_recipient_daemon();
     rig.restart_coordinator();
 
@@ -2842,6 +2844,11 @@ fn a_second_daemon_on_a_live_socket_is_refused_and_the_first_keeps_serving() {
     rig.start_stack();
     rig.start_recipient("recipient1.out", false);
     let sock = rig.p("b.sock");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let Some((status, err)) = second_daemon(&rig, &sock, "c.log") else {
         panic!("a second daemon on a live socket kept running");
     };
@@ -2963,7 +2970,7 @@ fn the_core_has_no_default_socket_or_data_path() {
         ),
         (
             vec!["coordinator", "--bind", "127.0.0.1:0"],
-            "missing --data",
+            "expected --data, saw none",
         ),
         (vec!["board"], "missing --socket"),
     ] {
@@ -3236,13 +3243,9 @@ fn unstamped_log_rows_replay_with_their_stamps_absent() {
     );
 }
 
-/// The host daemon's wait for the coordinator to answer a forwarded ack runs
-/// out while the link stays up (the coordinator is stopped, not gone). The
-/// forward is already on the link, so the coordinator records the Receipt as
-/// soon as it runs again, with no reconnect and no replay: its
-/// `receipted_at_ms` follows the stall, not the next reconnect.
+/// Ack does not wait on the stalled link. No reconnect is needed to forward it.
 #[test]
-fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resumes() {
+fn a_receipt_is_acked_locally_and_forwarded_when_the_coordinator_resumes() {
     let mut rig = Rig::new("ack-time-stall");
     rig.start_stack();
     let recipient = rig.start_recipient("recipient1.out", true);
@@ -3261,12 +3264,12 @@ fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resum
     rig.coord_unreachable = true;
     rig.kill(recipient);
     rig.start_recipient("recipient2.out", true);
-    // The daemon's 10 s wait ran out with the link still up.
     wait_for_text(
-        &rig.p("daemon-b.out.err"),
-        "receipt m-stall committed, upstream forward deferred: upstream did not answer",
-        Duration::from_secs(15),
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-stall record=r-1",
+        Duration::from_secs(3),
     );
+    assert_host_holds_receipt(&rig, "m-stall");
     let coord = rig.coord_records("coord.log");
     assert_eq!(receipts_held(&coord), 0, "{coord:?}");
     let resumed = epoch_ms();
@@ -3901,6 +3904,69 @@ impl RawConn {
     }
 }
 
+/// A refused request answers under its own req, without closing the socket or
+/// leaving a failed article follow subscribed to future frames.
+#[test]
+fn local_refusals_leave_the_same_connection_usable() {
+    let mut rig = Rig::new("local-refusals");
+    rig.start_stack();
+    let mut c = RawConn::open(&rig, "a.sock");
+    // no-poll: fail the test if a request is left unanswered.
+    c.conn
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    let exchange = |c: &mut RawConn, line: &str, ty: &str, req: i64| {
+        c.say(line);
+        let reply = c.line();
+        let v = json::parse(&reply).unwrap_or_else(|e| panic!("{line}: {e}: {reply:?}"));
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some(ty), "{reply}");
+        assert_eq!(v.get("req").and_then(|x| x.as_i64()), Some(req), "{reply}");
+        if ty == "error" {
+            assert!(!str_field(&v, "reason").is_empty(), "{reply}");
+        }
+    };
+    for (req, fields) in [(1, ""), (2, r#","to":"r","group":"g""#)] {
+        exchange(
+            &mut c,
+            &format!(
+                r#"{{"type":"send","req":{req},"mail":"bad","from":"{SENDER}","body":"x"{fields}}}"#
+            ),
+            "error",
+            req,
+        );
+    }
+    rig.kill(rig.coord_idx);
+    exchange(&mut c, r#"{"type":"board","req":3}"#, "error", 3);
+    exchange(
+        &mut c,
+        r#"{"type":"articles","group":"test","follow":true,"req":4}"#,
+        "error",
+        4,
+    );
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    // Ensure an article is pushed on this host link. Only the successful
+    // follower may receive it, not the connection whose follow failed.
+    let mut follower = RawConn::open(&rig, "a.sock");
+    // no-poll: fail the test if the article never arrives.
+    follower
+        .conn
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    exchange(
+        &mut follower,
+        r#"{"type":"articles","group":"test","follow":true,"req":5}"#,
+        "articles",
+        5,
+    );
+    group_send(&rig, "test", "m-follow", "test");
+    assert_eq!(
+        str_field(&json::parse(&follower.line()).unwrap(), "type"),
+        "article"
+    );
+    exchange(&mut c, r#"{"type":"board","req":6}"#, "board", 6);
+}
+
 /// After REGISTERED the Board lists the Address at once, and REGISTERED is printed once.
 #[test]
 fn registered_means_the_coordinator_holds_the_register() {
@@ -4446,8 +4512,8 @@ fn coordinator_answer(rig: &Rig, bytes: &[u8]) -> String {
 
 /// A connection that has not shown the token can end only itself. A line of
 /// nothing but opening brackets, a line longer than a hello may be, and a
-/// stream with no newline at all each get no answer and an ended connection;
-/// the coordinator stays up and its fleet keeps working.
+/// stream with no newline at all each get an error reply and an ended
+/// connection; the coordinator stays up and its fleet keeps working.
 #[test]
 fn a_hostile_line_before_the_hello_ends_that_connection_and_nothing_else() {
     let mut rig = Rig::new("hostile-hello");
@@ -4459,8 +4525,26 @@ fn a_hostile_line_before_the_hello_ends_that_connection_and_nothing_else() {
         "x".repeat(200_000)
     );
     let endless = "[".repeat(400_000);
-    for (what, bytes) in [("deep", &deep), ("long", &long), ("endless", &endless)] {
-        assert_eq!(coordinator_answer(&rig, bytes.as_bytes()), "", "{what}");
+    for (what, bytes, expected) in [
+        ("deep", &deep, "expected nesting of at most 64 levels"),
+        (
+            "long",
+            &long,
+            "expected a line of at most 65536 bytes, saw at least ",
+        ),
+        (
+            "endless",
+            &endless,
+            "expected a line of at most 65536 bytes, saw at least ",
+        ),
+    ] {
+        let answer = coordinator_answer(&rig, bytes.as_bytes());
+        let v = json::parse(&answer).unwrap_or_else(|e| panic!("{what}: {e}: {answer:?}"));
+        assert_eq!(str_field(&v, "type"), "error", "{what}: {answer:?}");
+        assert!(
+            str_field(&v, "reason").contains(expected),
+            "{what}: {answer:?}"
+        );
         assert!(
             rig.children[rig.coord_idx].try_wait().unwrap().is_none(),
             "the coordinator ended on the {what} line: {}",
@@ -4473,7 +4557,7 @@ fn a_hostile_line_before_the_hello_ends_that_connection_and_nothing_else() {
         "{err}"
     );
     assert!(
-        err.contains("expected a line of at most 65536 bytes, saw a longer one"),
+        err.contains("expected a line of at most 65536 bytes, saw at least "),
         "{err}"
     );
     rig.send("after", "the fleet is still here");
