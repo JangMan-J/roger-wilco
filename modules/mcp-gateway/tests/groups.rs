@@ -17,7 +17,22 @@ fn group_tool_isolation() {
     assert_eq!(base_tools.len(), 11);
     let opt = mcp::tools_list(true);
     let opt_tools = opt["tools"].as_array().unwrap();
-    assert_eq!(opt_tools.len(), 14);
+    assert_eq!(opt_tools.len(), 16);
+    let schema = |name: &str| {
+        assert!(!base_tools.iter().any(|tool| tool["name"] == name));
+        &opt_tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]
+    };
+    let articles = schema("roger_articles");
+    assert_eq!(articles["required"], json!(["session", "group"]));
+    assert_eq!(articles["properties"]["after"]["minimum"], 0);
+    assert_eq!(articles["properties"]["limit"]["minimum"], 1);
+    assert_eq!(articles["properties"]["limit"]["maximum"], 500);
+    let policy = schema("roger_group_policy");
+    assert_eq!(policy["required"], json!(["session", "group"]));
+    for field in ["keep_last", "ttl_ms"] {
+        assert!(policy["properties"][field].is_object());
+    }
+    assert_eq!(policy["properties"]["retired"]["type"], "boolean");
     assert_eq!(opt_tools[11]["name"], "roger_subscribe");
     // tools[2] is roger_send
     assert_eq!(
@@ -111,7 +126,10 @@ async fn group_request_frames() {
         let (registered, _) = listener.accept().await.unwrap();
         let mut registration = BufReader::new(registered).lines();
         registration.next_line().await.unwrap();
-        for (expected, response) in [
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut requests = BufReader::new(r).lines();
+        for (index, (mut expected, mut response)) in [
             (
                 json!({"type":"subscribe","req":1,"session":"reader","group":"news","after":0,"latest":false}),
                 json!({"type":"subscribed","session":"reader","group":"news","position":0,"high_water":7}),
@@ -140,15 +158,22 @@ async fn group_request_frames() {
                 json!({"type":"groups","req":1,"session":"reader","prefix":"ne","include_retired":true}),
                 json!({"type":"groups","groups":[]}),
             ),
-        ] {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (r, mut w) = stream.into_split();
-            let line = BufReader::new(r)
-                .lines()
-                .next_line()
-                .await
-                .unwrap()
-                .unwrap();
+            (
+                json!({"type":"articles","group":"news","after":7,"limit":1}),
+                json!({"type":"articles","group":"news","high_water":9,"retired":false,"articles":[{"article":8,"mail":"posted","from":"reader","body":"text","headers":{"x":"y"}}]}),
+            ),
+            (
+                json!({"type":"group_policy","group":"news","keep_last":3,"retired":false}),
+                json!({"type":"group_policy","group":"news","high_water":9,"subscribers":0,"retired":false,"keep_last":3}),
+            ),
+            (
+                json!({"type":"group_policy","group":"news","keep_last":null,"ttl_ms":0}),
+                json!({"type":"group_policy","group":"news","high_water":9,"subscribers":0,"retired":false,"ttl_ms":0}),
+            ),
+        ].into_iter().enumerate() {
+            expected["req"] = json!(index + 1);
+            response["req"] = expected["req"].clone();
+            let line = requests.next_line().await.unwrap().unwrap();
             assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), expected);
             w.write_all(format!("{}\n", response).as_bytes())
                 .await
@@ -245,6 +270,30 @@ async fn group_request_frames() {
     .await
     .unwrap();
     assert_eq!(filtered_groups, json!({"groups":[]}));
+    for (tool, args, result) in [
+        (
+            "roger_articles",
+            json!({"session": sid,"group":"news","after":7,"limit":1}),
+            json!({"group":"news","high_water":9,"retired":false,"articles":[{"article":8,"mail":"posted","from":"reader","body":"text","headers":{"x":"y"}}]}),
+        ),
+        (
+            "roger_group_policy",
+            json!({"session": sid,"group":"news","keep_last":3,"retired":false}),
+            json!({"group":"news","high_water":9,"subscribers":0,"retired":false,"keep_last":3}),
+        ),
+        (
+            "roger_group_policy",
+            json!({"session": sid,"group":"news","keep_last":null,"ttl_ms":0}),
+            json!({"group":"news","high_water":9,"subscribers":0,"retired":false,"ttl_ms":0}),
+        ),
+    ] {
+        assert_eq!(
+            mcp::call_tool(&manager, &json!({"name":tool,"arguments":args}))
+                .await
+                .unwrap(),
+            result
+        );
+    }
     let prefix_req = mcp::validate_event_req(
         &manager,
         &json!({"name":"roger.mail","cursor":"r-0","arguments":{"session": sid, "groupPrefix":"ne"}}),

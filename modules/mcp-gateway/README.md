@@ -21,7 +21,7 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 - `--port-file <path>`: optional path atomically populated (`<path>.tmp` -> `fsync` -> `rename`) with the bound TCP port immediately after `bind`.
 - `--endpoint <path>`: MCP HTTP endpoint path (default `"/mcp"`). `GET /healthz` is always served (`200 OK` `{"ok":true}`).
 - `--token-env <NAME>`: optional environment variable holding the required Bearer secret. When set, every request to `<endpoint>` must carry `Authorization: Bearer <token>` (checked in constant time) or receives `401 Unauthorized` with `WWW-Authenticate: Bearer`.
-- `--groups`: enable Named Group tools (`roger_subscribe`, `roger_unsubscribe`, `roger_groups`) and `group` sends on `roger_send` statically across this gateway deployment.
+- `--groups`: enable Named Group tools (`roger_subscribe`, `roger_unsubscribe`, `roger_groups`, `roger_articles`, `roger_group_policy`) and `group` sends on `roger_send` statically across this gateway deployment.
 
 ## MCP `2026-07-28` Streamable HTTP
 
@@ -34,8 +34,13 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 ## Explicit Session Handles (`roger_register` / `roger_unregister`)
 
 1. Call `roger_register` (`{ id?, label?, declare?, watch? }`) to register or reattach an Address and receive `{ session, address }`. The handle survives across HTTP requests; re-registering the same `id` cleanly replaces the previous handle in this gateway without sending `unregister`.
-2. Pass `session` to `roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_renew`, `roger_release`, `roger_receipt`, `roger_registered` (plus `roger_subscribe`, `roger_unsubscribe`, `roger_groups` with `--groups`), and `events/poll` / `events/stream` `arguments`.
+2. Pass `session` to `roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_renew`, `roger_release`, `roger_receipt`, `roger_registered` (plus all Named Group tools with `--groups`), and `events/poll` / `events/stream` `arguments`.
 3. Call `roger_unregister` (`{ session }`) to send `unregister` to `roger daemon`, close active streams, release the Store lock, and remove empty Store/Cursor files.
+
+## Group history and retention (`--groups`)
+
+- `roger_articles` (`{ session, group, after?, limit? }`) reads a page of retained articles without subscribing. `after` is an exclusive article number (default `0`); `limit` is `1`–`500` (default `100`). The result includes `group`, `high_water`, `retired`, and `articles`. Pass the last returned article number as `after` for the next page.
+- `roger_group_policy` (`{ session, group, keep_last?, ttl_ms?, retired? }`) returns the resulting group policy and counts. Omit a field to leave it unchanged. Set `keep_last` or `ttl_ms` to a non-negative integer to set the respective count or age limit, or to `null` to clear that limit. `retired` takes a boolean.
 
 ## SEP-3415 (`io.modelcontextprotocol/events`)
 
