@@ -9,8 +9,13 @@ use std::future::Future;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_WS_BYTES: usize = 16 * 1024 * 1024;
 
 struct Shared {
     ctx: Arc<Ctx>,
@@ -67,7 +72,12 @@ async fn handle(shared: Arc<Shared>, stream: TcpStream) {
         slot = Some(opened);
         Ok(resp)
     };
-    let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_BYTES))
+        .max_frame_size(Some(MAX_WS_BYTES));
+    let handshake = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config));
+    // no-poll: one deadline to close incomplete upgrades; no delivery work depends on it.
+    let Ok(Ok(ws)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await else {
         return;
     };
     let Some(opened) = slot.take() else {

@@ -764,6 +764,53 @@ async fn bearer_and_upgrade_refusals_happen_before_any_session() {
     a.close().await;
 }
 
+// ---- Test 3b: handshake deadline and size caps ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_connection_is_closed_at_the_handshake_deadline() {
+    use tokio::io::AsyncReadExt;
+    let mut rig = TestRig::start("hs-timeout").await;
+    let (_, port) = rig.spawn_gateway(&[], &[]).await;
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(20), tcp.read(&mut buf))
+        .await
+        .expect("gateway kept an incomplete upgrade open past its deadline")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF from the gateway, saw {n} bytes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversize_frame_and_oversize_message_close_the_connection() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    const MIB: usize = 1024 * 1024;
+    let mut rig = TestRig::start("ws-caps").await;
+    let (_, port) = rig.spawn_gateway(&[], &[]).await;
+
+    // One frame over the cap.
+    let mut a = ws_open(port, &format!("id={ADDR_A}"), None).await.unwrap();
+    a.expect_ready(ADDR_A, false).await;
+    let _ = a.ws.send(Message::text("x".repeat(17 * MIB))).await;
+    assert!(
+        a.read_frame().await.is_none(),
+        "oversize frame kept the connection"
+    );
+
+    // Fragments each under the frame cap whose sum is over the message cap.
+    let mut b = ws_open(port, &format!("id={ADDR_B}"), None).await.unwrap();
+    b.expect_ready(ADDR_B, false).await;
+    let chunk = "x".repeat(10 * MIB).into_bytes();
+    let first = Frame::message(chunk.clone(), OpCode::Data(Data::Text), false);
+    let last = Frame::message(chunk, OpCode::Data(Data::Continue), true);
+    let _ = b.ws.send(Message::Frame(first)).await;
+    let _ = b.ws.send(Message::Frame(last)).await;
+    assert!(
+        b.read_frame().await.is_none(),
+        "oversize message kept the connection"
+    );
+}
+
 // ---- Test 4: resume with after=<record> over a tcp:// daemon connection ----
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
