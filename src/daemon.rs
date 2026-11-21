@@ -650,12 +650,8 @@ fn confirm(state: &Arc<Mutex<State>>, mail: &str, session: Option<&str>) -> io::
     Ok(())
 }
 
-fn upstream_request(state: &Arc<Mutex<State>>, v: Value) -> io::Result<Value> {
-    request_with_wait(state, v, UPSTREAM_WAIT)
-}
-
-fn request_with_wait(state: &Mutex<State>, mut v: Value, wait: Duration) -> io::Result<Value> {
-    let (req, writer, rx) = {
+fn upstream_request(state: &Arc<Mutex<State>>, mut v: Value) -> io::Result<Value> {
+    let (writer, rx) = {
         let mut st = state.lock().unwrap();
         let req = st.next_req;
         st.next_req += 1;
@@ -668,53 +664,24 @@ fn request_with_wait(state: &Mutex<State>, mut v: Value, wait: Duration) -> io::
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream"))?;
         let (tx, rx) = mpsc::channel();
         st.waiters.insert(req, tx);
-        (req, writer, rx)
+        (writer, rx)
     };
-    let result = net::send(&writer, &v).and_then(|()| {
-        // no-poll: one bounded wait for a single reply, turning a silent coordinator into an error.
-        rx.recv_timeout(wait).map_err(|e| match e {
-            mpsc::RecvTimeoutError::Timeout => {
-                io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
-            }
-            mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "upstream wait dropped")
-            }
-        })
-    });
-    if result.is_err() {
-        state.lock().unwrap().waiters.remove(&req);
-    }
-    result
+    net::send(&writer, &v)?;
+    // Bounded: a coordinator that accepts a request and never answers must
+    // not hang the session's send or ack forever.
+    // no-poll: one bounded wait for a single reply, turning a silent coordinator into an error.
+    rx.recv_timeout(UPSTREAM_WAIT).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => {
+            io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
+        }
+        mpsc::RecvTimeoutError::Disconnected => {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "upstream wait dropped")
+        }
+    })
 }
 
-#[test]
-fn failed_requests_release_their_waiter() {
-    let dir = std::env::temp_dir().join(crate::session::gen_uuid().unwrap());
-    let (store, _) = Store::open(&dir.join("daemon.log")).unwrap();
-    let state = Mutex::new(State::new(store));
-    for (writer, expected) in [
-        (net::writer(Box::new(io::sink())), io::ErrorKind::TimedOut),
-        (
-            net::writer(Box::new(io::Cursor::new([0u8; 0]))),
-            io::ErrorKind::WriteZero,
-        ),
-    ] {
-        state.lock().unwrap().upstream = Some(writer);
-        let err = request_with_wait(&state, obj(vec![]), Duration::ZERO).unwrap_err();
-        assert_eq!(err.kind(), expected);
-        assert!(state.lock().unwrap().waiters.is_empty());
-    }
-    drop(state);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-fn error_value(reason: &str) -> Value {
-    obj(vec![("type", s("error")), ("reason", s(reason))])
-}
-
-/// An upstream reply or transport error, tagged with the local request it answers.
-fn with_req(result: io::Result<Value>, req: i64) -> Value {
-    let mut v = result.unwrap_or_else(|e| error_value(&e.to_string()));
+/// An upstream reply, re-tagged with the local request number it answers.
+fn with_req(mut v: Value, req: i64) -> Value {
     if let Value::Obj(pairs) = &mut v {
         pairs.retain(|(k, _)| k != "req");
         pairs.push(("req".to_string(), Value::Int(req)));
@@ -969,14 +936,11 @@ fn local_loop(
                 match (v.get("to"), v.get("group")) {
                     (Some(to), None) => up.push(("to", to.clone())),
                     (None, Some(group)) => up.push(("group", group.clone())),
-                    (to, _) => {
-                        let reason = if to.is_some() {
-                            "expected to or group, saw both"
-                        } else {
-                            "expected to or group, saw neither"
-                        };
-                        net::send(writer, &with_req(Ok(error_value(reason)), req))?;
-                        continue;
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "expected to or group",
+                        ))
                     }
                 }
                 // Headers are the coordinator's to check; this hop forwards them as given.
@@ -986,8 +950,7 @@ fn local_loop(
                 if let Some(exp) = v.get("expected_article") {
                     up.push(("expected_article", exp.clone()));
                 }
-                let resp = upstream_request(state, obj(up))
-                    .unwrap_or_else(|e| error_value(&e.to_string()));
+                let resp = upstream_request(state, obj(up))?;
                 let mut answer = if net::field(&resp, "type")? == "error" {
                     obj(vec![
                         ("type", s("error")),
@@ -1021,7 +984,7 @@ fn local_loop(
                         ("session", s(&session)),
                         ("label", s(&label)),
                     ]),
-                );
+                )?;
                 net::send(writer, &with_req(resp, req))?;
             }
             "ack" => {
@@ -1080,7 +1043,7 @@ fn local_loop(
                         }
                     }
                 }
-                net::send(writer, &with_req(resp, req))?;
+                net::send(writer, &with_req(resp?, req))?;
             }
             "claim" | "board" | "receipt" | "subscribe" | "unsubscribe" | "groups"
             | "group_policy" => {
@@ -1089,7 +1052,7 @@ fn local_loop(
                 if let Value::Obj(pairs) = &mut upstream {
                     pairs.retain(|(k, _)| k != "req");
                 }
-                net::send(writer, &with_req(upstream_request(state, upstream), req))?;
+                net::send(writer, &with_req(upstream_request(state, upstream)?, req))?;
             }
             other => {
                 return Err(io::Error::new(
@@ -1195,6 +1158,8 @@ mod store_order {
 
         confirm(&state, "m", Some("b")).unwrap();
         assert!(state.lock().unwrap().receipts.is_empty());
+        // Release the DB handle before removing its directory (Windows).
+        drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
