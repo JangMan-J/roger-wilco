@@ -1209,6 +1209,125 @@ fn max_seq(c: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
+/// The slice a stream or Mail id lives on; the same hash as `Inner::shard`.
+fn slice_of(key: &str, n: usize) -> usize {
+    hash_pair(key.as_bytes()).0 as usize % n
+}
+
+/// Validate (or record) the slice count before any further slice is created.
+/// An existing store keeps `num_slices` in slice 0's meta table; a store from
+/// before that key backfills it from the slice directories on disk.
+fn check_slice_count(root: &Path, want: usize) -> io::Result<()> {
+    let hot0 = shard_dir(root, 0).join("hot.sqlite");
+    if !hot0.exists() {
+        let dir = shard_dir(root, 0);
+        fs::create_dir_all(&dir)?;
+        let c = open_conn(&dir.join("hot.sqlite"), true)?;
+        c.execute(
+            "INSERT OR REPLACE INTO meta (key, val) VALUES ('num_slices', ?1)",
+            [want.to_string()],
+        )
+        .map_err(sq)?;
+        return Ok(());
+    }
+    let c = open_conn(&hot0, true)?;
+    let stored = match meta(&c, "num_slices").map_err(sq)? {
+        Some(v) => v.parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected a slice count in meta num_slices of {}, saw {v:?}",
+                    hot0.display()
+                ),
+            )
+        })?,
+        None => {
+            let on_disk = (0..)
+                .take_while(|&i| shard_dir(root, i).join("hot.sqlite").exists())
+                .count();
+            c.execute(
+                "INSERT OR REPLACE INTO meta (key, val) VALUES ('num_slices', ?1)",
+                [on_disk.to_string()],
+            )
+            .map_err(sq)?;
+            on_disk
+        }
+    };
+    if stored != want {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expected --slices {stored} for existing coordinator store {}, saw --slices {want}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Restore Mail-id records lost between a cross-slice envelope commit and its
+/// `seen_ids` commit. Each slice scans only envelopes past its
+/// `seen_reconciled_seq` watermark, so the cost tracks recent writes.
+fn reconcile_seen(conns: &[Connection]) -> rusqlite::Result<()> {
+    let n = conns.len();
+    if n < 2 {
+        return Ok(());
+    }
+    // mail_id, kind, sender, target, body_len, body_sha256, article_num, stream
+    type SeenFields = (String, String, String, String, i64, String, i64, String);
+    for (st_idx, c) in conns.iter().enumerate() {
+        let mark: i64 = meta(c, "seen_reconciled_seq")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut st = c.prepare(
+            "SELECT seq, mail_id, kind, sender, recipient, body_len, body_sha256, article_num, stream
+             FROM envelopes WHERE seq > ?1 AND kind IN ('directed', 'group') ORDER BY seq",
+        )?;
+        let mut by_slice: Vec<Vec<SeenFields>> = vec![Vec::new(); n];
+        let mut top = mark;
+        let mut rows = st.query([mark])?;
+        while let Some(r) = rows.next()? {
+            top = top.max(r.get(0)?);
+            let mail_id: String = r.get(1)?;
+            let seen_idx = slice_of(&mail_id, n);
+            if seen_idx != st_idx {
+                by_slice[seen_idx].push((
+                    mail_id,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ));
+            }
+        }
+        if top == mark {
+            continue;
+        }
+        for (seen_idx, rows) in by_slice.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let tx = conns[seen_idx].unchecked_transaction()?;
+            for (mail_id, kind, sender, target, len, sha, art, stream) in rows {
+                tx.execute(
+                    "INSERT OR IGNORE INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num, stream)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![mail_id, kind, sender, target, len, sha, art, stream],
+                )?;
+            }
+            tx.commit()?;
+        }
+        c.execute(
+            "INSERT OR REPLACE INTO meta (key, val) VALUES ('seen_reconciled_seq', ?1)",
+            [top.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(cfg: Config) -> io::Result<(Self, Startup)> {
         if cfg.num_slices == 0 || cfg.day_ms <= 0 {
@@ -1223,6 +1342,7 @@ impl Store {
         let root = coord_root(&cfg.data);
         fs::create_dir_all(&root)?;
         let lock = crate::durlog::open_exclusive_lock(&root.join("LOCK"))?;
+        check_slice_count(&root, cfg.num_slices)?;
         let mut dirs = Vec::with_capacity(cfg.num_slices);
         let mut conns = Vec::with_capacity(cfg.num_slices);
         for idx in 0..cfg.num_slices {
@@ -1243,6 +1363,7 @@ impl Store {
                 )
                 .map_err(sq)?;
         }
+        reconcile_seen(&conns).map_err(sq)?;
         let startup = load_startup(&conns[0]).map_err(sq)?;
         let mut top = 0;
         let mut sub_map: HashMap<String, HashMap<usize, HashSet<String>>> = HashMap::new();
@@ -2631,6 +2752,88 @@ mod tests {
         assert_eq!(store.pending_session(&addrs[0]).unwrap().len(), 1);
         let q = store.receipt("id-0", None).unwrap().unwrap();
         assert_eq!(q.record_id.as_deref(), Some("r-1"));
+    }
+
+    #[test]
+    fn slice_count_is_recorded_and_a_mismatch_is_refused_before_creating_slices() {
+        let dir = tempdir("slicecount");
+        let root = coord_root(&cfg(&dir, 2).data);
+        drop(Store::open(cfg(&dir, 2)).unwrap());
+        let refused = |n: usize| {
+            let Err(e) = Store::open(cfg(&dir, n)) else {
+                panic!("expected --slices {n} to be refused");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            let msg = e.to_string();
+            assert!(
+                msg.contains("--slices 2") && msg.contains(&format!("--slices {n}")),
+                "{msg}"
+            );
+        };
+        refused(3);
+        assert!(
+            !root.join("slice-02").exists(),
+            "no slice created on refusal"
+        );
+        drop(Store::open(cfg(&dir, 2)).unwrap());
+
+        let hot0 = shard_dir(&root, 0).join("hot.sqlite");
+        let stored = |want: Option<&str>| {
+            let c = Connection::open(&hot0).unwrap();
+            assert_eq!(meta(&c, "num_slices").unwrap().as_deref(), want);
+            c
+        };
+        stored(Some("2"))
+            .execute("DELETE FROM meta WHERE key = 'num_slices'", [])
+            .unwrap();
+        stored(None);
+        drop(Store::open(cfg(&dir, 2)).unwrap());
+        stored(Some("2"));
+        refused(1);
+        refused(3);
+        assert!(
+            !root.join("slice-02").exists(),
+            "no slice created on refusal"
+        );
+    }
+
+    #[test]
+    fn lost_cross_slice_seen_record_is_restored_on_open() {
+        let dir = tempdir("reconcile");
+        let n = 4;
+        let root = coord_root(&cfg(&dir, n).data);
+        let to = "[[x:r]]rcpt";
+        let st = slice_of(&format!("m:{to}"), n);
+        let id = (0..)
+            .map(|i| format!("split-{i}"))
+            .find(|id| slice_of(id, n) != st)
+            .unwrap();
+        {
+            let (store, _) = Store::open(cfg(&dir, n)).unwrap();
+            committed(store.send_directed(directed(&id, "s", to, "body")).unwrap());
+            store.flush_cold().unwrap(); // a background sweep holds the store lock until it ends
+        }
+        let seen_hot = shard_dir(&root, slice_of(&id, n)).join("hot.sqlite");
+        let gone = Connection::open(&seen_hot)
+            .unwrap()
+            .execute("DELETE FROM seen_ids WHERE mail_id = ?1", [&id])
+            .unwrap();
+        assert_eq!(gone, 1, "seen record lived on the id's slice");
+        let (store, _) = Store::open(cfg(&dir, n)).unwrap();
+        assert!(matches!(
+            store.ack(&id, to, "rec-1", 5).unwrap(),
+            AckResult::Recorded { .. }
+        ));
+        assert!(store.receipt(&id, None).unwrap().is_some());
+        conflict(
+            store
+                .send_directed(directed(&id, "s", to, "other"))
+                .unwrap(),
+        );
+        assert!(matches!(
+            store.send_directed(directed(&id, "s", to, "body")).unwrap(),
+            Status::DuplicateAccepted { .. }
+        ));
     }
 
     #[test]
