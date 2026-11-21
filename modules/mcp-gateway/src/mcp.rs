@@ -391,6 +391,16 @@ pub fn tools_list(groups: bool) -> Value {
                 "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
                 serde_json::json!({"type":"object","properties":{"session":{"type":"string"},"prefix":{"type":"string"},"include_retired":{"type":"boolean"}},"required":["session"],"additionalProperties":false}),
             ),
+            (
+                "roger_articles",
+                "Read a page of Group articles after an article number without changing the subscription position.",
+                serde_json::json!({"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string","minLength":1},"after":{"type":["integer","null"],"minimum":0,"default":0},"limit":{"type":["integer","null"],"minimum":1,"maximum":500,"default":100}},"required":["session","group"],"additionalProperties":false}),
+            ),
+            (
+                "roger_group_policy",
+                "Set Group retention and retirement. Omitted fields stay unchanged; null clears keep_last or ttl_ms.",
+                serde_json::json!({"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string","minLength":1},"keep_last":{"type":["integer","null"],"minimum":0},"ttl_ms":{"type":["integer","null"],"minimum":0},"retired":{"type":"boolean"}},"required":["session","group"],"additionalProperties":false}),
+            ),
         ] {
             tools.push(serde_json::json!({
                 "name": name,
@@ -555,7 +565,13 @@ pub async fn call_tool(sessions: &Arc<SessionManager>, params: &Value) -> Result
     let mut known: Vec<&str> = vec!["roger_register", "roger_unregister"];
     known.extend(SESSION_TOOLS.iter().map(|t| t.0));
     if sessions.groups() {
-        known.extend(["roger_subscribe", "roger_unsubscribe", "roger_groups"]);
+        known.extend([
+            "roger_subscribe",
+            "roger_unsubscribe",
+            "roger_groups",
+            "roger_articles",
+            "roger_group_policy",
+        ]);
     }
     if !known.contains(&name) {
         return Err(format!(
@@ -658,7 +674,9 @@ pub async fn call_session_tool(
                 if let Some(exp) = expected_article {
                     req["expected_article"] = serde_json::json!(exp);
                 }
-                return daemon::request(&session.socket, &req)
+                return session
+                    .client
+                    .request(&req)
                     .await
                     .map(without_envelope)
                     .map_err(io_err);
@@ -672,19 +690,75 @@ pub async fn call_session_tool(
                 Some(m) => m.to_string(),
                 None => blocking_io(gen_uuid).map_err(io_err)?,
             };
-            let accepted = daemon::send_mail(
-                &session.socket,
-                &session.address,
-                to,
-                &mail,
-                body,
-                args.get("headers"),
-            )
-            .await
-            .map_err(io_err)?;
+            let accepted = session
+                .client
+                .send_mail(&session.address, to, &mail, body, args.get("headers"))
+                .await
+                .map_err(io_err)?;
             let mut out = Map::new();
             out.insert("mail".into(), Value::String(accepted));
             Ok(Value::Object(out))
+        }
+        "roger_articles" | "roger_group_policy" => {
+            if !session.groups {
+                return Err(format!("tool {name} requires --groups"));
+            }
+            let group = need_str(name, args, "group")?;
+            if group.is_empty() {
+                return Err("expected a non-empty group, saw none".into());
+            }
+            let mut req =
+                serde_json::json!({"type":name.strip_prefix("roger_").unwrap(), "group":group});
+            if name == "roger_articles" {
+                if let Some(m) = args.as_object() {
+                    check_no_extra_keys(name, m, &["session", "group", "after", "limit"])?;
+                }
+                for (key, range, default, error) in [
+                    (
+                        "after",
+                        0..=i64::MAX,
+                        0,
+                        "expected after to be a non-negative integer",
+                    ),
+                    ("limit", 1..=500, 100, "expected limit to be in 1..=500"),
+                ] {
+                    let n = match args.get(key) {
+                        None | Some(Value::Null) => default,
+                        Some(v) => v.as_i64().filter(|n| range.contains(n)).ok_or(error)?,
+                    };
+                    req[key] = n.into();
+                }
+            } else {
+                if let Some(m) = args.as_object() {
+                    check_no_extra_keys(
+                        name,
+                        m,
+                        &["session", "group", "keep_last", "ttl_ms", "retired"],
+                    )?;
+                }
+                for key in ["keep_last", "ttl_ms"] {
+                    if let Some(v) = args.get(key) {
+                        if !v.is_null() && !v.as_i64().is_some_and(|n| n >= 0) {
+                            return Err(format!(
+                                "expected {key} to be a non-negative integer or null"
+                            ));
+                        }
+                        req[key] = v.clone();
+                    }
+                }
+                if let Some(v) = args.get("retired") {
+                    req["retired"] = v
+                        .as_bool()
+                        .ok_or("expected retired to be a boolean")?
+                        .into();
+                }
+            }
+            session
+                .client
+                .request(&req)
+                .await
+                .map(without_envelope)
+                .map_err(io_err)
         }
         "roger_subscribe" | "roger_unsubscribe" | "roger_groups" => {
             if !session.groups {
@@ -719,7 +793,9 @@ pub async fn call_session_tool(
                     req["latest"] = opt_bool(name, args, "latest")?.into();
                 }
             }
-            daemon::request(&session.socket, &req)
+            session
+                .client
+                .request(&req)
                 .await
                 .map(without_envelope)
                 .map_err(io_err)
@@ -784,7 +860,9 @@ pub async fn call_session_tool(
             req.insert("type".into(), Value::String("board".into()));
             req.insert("req".into(), Value::Number(1.into()));
             req.insert("session".into(), Value::String(session.address.clone()));
-            let reply = daemon::request(&session.socket, &Value::Object(req))
+            let reply = session
+                .client
+                .request(&Value::Object(req))
                 .await
                 .map_err(io_err)?;
             let now = reply.get("now_ms").and_then(Value::as_i64).unwrap_or(0);
@@ -814,7 +892,9 @@ pub async fn call_session_tool(
             req.insert("req".into(), Value::Number(1.into()));
             req.insert("session".into(), Value::String(session.address.clone()));
             req.insert("label".into(), Value::String(label.into()));
-            let reply = daemon::request(&session.socket, &Value::Object(req))
+            let reply = session
+                .client
+                .request(&Value::Object(req))
                 .await
                 .map_err(io_err)?;
             let sess_out = daemon::field(&reply, "session")
@@ -856,7 +936,9 @@ pub async fn call_session_tool(
             req.insert("key".into(), Value::String(key.into()));
             req.insert("owner".into(), Value::String(session.address.clone()));
             req.insert("ttl_ms".into(), Value::Number(ttl_ms.into()));
-            let reply = daemon::request(&session.socket, &Value::Object(req))
+            let reply = session
+                .client
+                .request(&Value::Object(req))
                 .await
                 .map_err(io_err)?;
             Ok(without_envelope(reply))
@@ -867,7 +949,9 @@ pub async fn call_session_tool(
             req.insert("type".into(), Value::String("receipt".into()));
             req.insert("req".into(), Value::Number(1.into()));
             req.insert("mail".into(), Value::String(mail.into()));
-            let reply = daemon::request(&session.socket, &Value::Object(req))
+            let reply = session
+                .client
+                .request(&Value::Object(req))
                 .await
                 .map_err(io_err)?;
             Ok(without_envelope(reply))
@@ -1429,7 +1513,7 @@ mod tests {
 
         let g_list = tools_list(true);
         let g_tools = g_list["tools"].as_array().unwrap();
-        assert_eq!(g_tools.len(), 14);
+        assert_eq!(g_tools.len(), 16);
     }
 
     #[test]
