@@ -199,6 +199,7 @@ fn migrate_streams(c: &Connection) -> rusqlite::Result<()> {
         ("keep_last", "INTEGER"),
         ("ttl_ms", "INTEGER"),
         ("retired_at_ms", "INTEGER"),
+        ("pruned_through", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !cols.iter().any(|c| c == name) {
             c.execute(&format!("ALTER TABLE streams ADD COLUMN {name} {ty}"), [])?;
@@ -419,17 +420,26 @@ enum SingleWrite {
     Conflict(String),
 }
 
+/// Raise `stream`'s pruned floor to `max_drop_art` and drop the hot bodies of the
+/// newly pruned articles. Envelopes stay (ack and receipt still resolve); cold
+/// copies stay sealed but are never served.
 fn prune_hot_group(c: &Connection, stream: &str, max_drop_art: i64) -> rusqlite::Result<()> {
-    c.execute(
+    let old: i64 = c
+        .prepare_cached("SELECT pruned_through FROM streams WHERE stream = ?1")?
+        .query_row([stream], |r| r.get(0))
+        .optional()?
+        .unwrap_or(0);
+    if max_drop_art <= old {
+        return Ok(());
+    }
+    c.prepare_cached(
         "DELETE FROM hot_bodies WHERE mail_id IN (
-             SELECT mail_id FROM envelopes WHERE stream = ?1 AND article_num <= ?2 AND in_cold = 0
+             SELECT mail_id FROM envelopes WHERE stream = ?1 AND article_num > ?2 AND article_num <= ?3
          )",
-        params![stream, max_drop_art],
-    )?;
-    c.execute(
-        "DELETE FROM envelopes WHERE stream = ?1 AND article_num <= ?2 AND in_cold = 0",
-        params![stream, max_drop_art],
-    )?;
+    )?
+    .execute(params![stream, old, max_drop_art])?;
+    c.prepare_cached("UPDATE streams SET pruned_through = ?2 WHERE stream = ?1")?
+        .execute(params![stream, max_drop_art])?;
     Ok(())
 }
 
@@ -588,19 +598,23 @@ fn subscribers_of(c: &Connection, stream: &str) -> rusqlite::Result<Vec<String>>
     rows.collect()
 }
 
-/// Move `reader`'s position on `stream` forward across every contiguous receipted article.
+/// Move `reader`'s position on `stream` to at least the stream's pruned floor,
+/// then forward across every contiguous receipted article.
 fn advance_position(c: &Connection, stream: &str, reader: &str, now: i64) -> rusqlite::Result<()> {
-    let pos: i64 = c.query_row(
-        "SELECT position FROM positions WHERE stream = ?1 AND reader = ?2",
-        params![stream, reader],
-        |r| r.get(0),
-    )?;
-    let mut st = c.prepare(
+    let (pos, floor): (i64, i64) = c
+        .prepare_cached(
+            "SELECT p.position, COALESCE(s.pruned_through, 0) FROM positions p
+             LEFT JOIN streams s ON s.stream = p.stream
+             WHERE p.stream = ?1 AND p.reader = ?2",
+        )?
+        .query_row(params![stream, reader], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let start = pos.max(floor);
+    let mut st = c.prepare_cached(
         "SELECT article_num, record_id, receipted_at_ms FROM receipts
          WHERE stream = ?1 AND reader = ?2 AND article_num > ?3 ORDER BY article_num",
     )?;
-    let mut rows = st.query(params![stream, reader, pos])?;
-    let mut cur = pos;
+    let mut rows = st.query(params![stream, reader, start])?;
+    let mut cur = start;
     let mut last: Option<(String, Option<i64>)> = None;
     while let Some(r) = rows.next()? {
         let art: i64 = r.get(0)?;
@@ -610,12 +624,16 @@ fn advance_position(c: &Connection, stream: &str, reader: &str, now: i64) -> rus
         cur = art;
         last = Some((r.get(1)?, r.get(2)?));
     }
-    if let Some((record_id, at)) = last {
-        c.execute(
-            "UPDATE positions SET position = ?3, record_id = ?4, receipted_at_ms = ?5, updated_at_ms = ?6
+    if cur != pos {
+        let (record_id, at) = last.unzip();
+        c.prepare_cached(
+            "UPDATE positions SET position = ?3,
+                    record_id = CASE WHEN ?4 IS NULL THEN record_id ELSE ?4 END,
+                    receipted_at_ms = CASE WHEN ?4 IS NULL THEN receipted_at_ms ELSE ?5 END,
+                    updated_at_ms = ?6
              WHERE stream = ?1 AND reader = ?2",
-            params![stream, reader, cur, record_id, at, now],
-        )?;
+        )?
+        .execute(params![stream, reader, cur, record_id, at.flatten(), now])?;
     }
     Ok(())
 }
@@ -755,9 +773,11 @@ impl Inner {
         stream: Option<&str>,
     ) -> io::Result<Vec<Delivery>> {
         let raws = self.read(idx, |c| {
-            let mut st = c.prepare(&format!(
+            let mut st = c.prepare_cached(&format!(
                 "SELECT {PENDING_COLS} FROM positions p
-                 JOIN envelopes e ON e.stream = p.stream AND e.article_num > p.position
+                 LEFT JOIN streams s ON s.stream = p.stream
+                 JOIN envelopes e ON e.stream = p.stream
+                   AND e.article_num > max(p.position, COALESCE(s.pruned_through, 0))
                  LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
                  WHERE p.reader = ?1 AND p.subscribed = 1 AND e.kind = 'group'
                    AND (?2 IS NULL OR p.stream = ?2)
@@ -1552,7 +1572,8 @@ impl Store {
                 "SELECT e.article_num, e.mail_id, e.sender, e.headers_json, e.day_bucket, e.in_cold, h.body, e.accepted_at_ms
                  FROM envelopes e
                  LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
-                 WHERE e.stream = ?1 AND e.kind = 'group' AND e.article_num > ?2
+                 WHERE e.stream = ?1 AND e.kind = 'group'
+                   AND e.article_num > max(?2, COALESCE((SELECT pruned_through FROM streams WHERE stream = ?1), 0))
                  ORDER BY e.article_num
                  LIMIT ?3",
             )?;
@@ -3043,8 +3064,17 @@ mod tests {
                 0,
                 "SELECT COUNT(*) FROM envelopes WHERE mail_id = 'g1'"
             ),
+            1,
+            "g1's envelope stays after keep_last=1 prunes it"
+        );
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM hot_bodies WHERE mail_id = 'g1'"
+            ),
             0,
-            "g1 was pruned from envelopes by keep_last=1"
+            "g1's hot body was dropped by keep_last=1"
         );
         // Reset after count() helper; verify send_single itself performs zero read-conn queries.
         reset_reads(&store);
@@ -3095,5 +3125,163 @@ mod tests {
                 .ends_with("different recipient")
         );
         assert_eq!(slice_reads(&store)[0], 0);
+    }
+
+    #[test]
+    fn keep_last_prune_keeps_envelope_receipt_metadata_and_ack_records() {
+        let dir = tempdir("prune-ack");
+        let (store, _) = Store::open(cfg(&dir, 2)).unwrap();
+        let idx = store.inner.shard("g:K");
+        store.subscribe("r", "K", None, false, 1).unwrap();
+        for i in 1..=3 {
+            let id = format!("k{i}");
+            assert_eq!(
+                committed(store.send_group(group(&id, "s", "K", "b")).unwrap()),
+                i
+            );
+        }
+        assert_eq!(store.pending_session("r").unwrap().len(), 3);
+        store
+            .group_policy("K", Some(Some(1)), None, None, 2)
+            .unwrap();
+        assert_eq!(
+            count(
+                &store,
+                idx,
+                "SELECT COUNT(*) FROM envelopes WHERE stream = 'g:K'"
+            ),
+            3
+        );
+        assert_eq!(
+            count(
+                &store,
+                idx,
+                "SELECT pruned_through FROM streams WHERE stream = 'g:K'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(&store, idx, "SELECT COUNT(*) FROM hot_bodies"),
+            1,
+            "only k3's hot body remains"
+        );
+        assert_eq!(
+            store.ack("k1", "r", "rec-1", 3).unwrap(),
+            AckResult::Recorded {
+                newly_receipted: true
+            }
+        );
+        let rc = store
+            .receipt("k1", Some("r"))
+            .unwrap()
+            .expect("receipt for k1");
+        assert_eq!(rc.article_num, Some(1));
+        assert_eq!(rc.record_id.as_deref(), Some("rec-1"));
+        assert!(store.receipt("k2", None).unwrap().is_some());
+        let left: Vec<i64> = store
+            .pending_session("r")
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.article_num)
+            .collect();
+        assert_eq!(left, [3]);
+    }
+
+    #[test]
+    fn articles_skip_pruned_across_hot_and_cold_and_floor_survives_reopen() {
+        let dir = tempdir("prune-cold");
+        let mk = || {
+            let mut c = cfg(&dir, 1);
+            c.retain_ms = 500;
+            c.day_ms = 10_000;
+            c.sweep_enabled = false;
+            c
+        };
+        let (store, _) = Store::open(mk()).unwrap();
+        for (i, at) in [(1, 100), (2, 200), (3, 300), (4, 5_000), (5, 5_100)] {
+            let mut gm = group(&format!("c{i}"), "s", "C", &format!("b{i}"));
+            gm.accepted_at_ms = Some(at);
+            assert_eq!(committed(store.send_group(gm).unwrap()), i);
+        }
+        store.inner.sweep(1_000).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM envelopes WHERE in_cold = 1"
+            ),
+            3
+        );
+        store
+            .group_policy("C", Some(Some(3)), None, None, 6_000)
+            .unwrap();
+        let nums = |s: &Store, after: i64, limit: usize| -> Vec<(i64, String)> {
+            s.articles("C", after, limit)
+                .unwrap()
+                .articles
+                .into_iter()
+                .map(|a| (a.article_num, a.body))
+                .collect()
+        };
+        let want = vec![(3, "b3".to_string()), (4, "b4".into()), (5, "b5".into())];
+        assert_eq!(nums(&store, 0, 10), want);
+        assert_eq!(nums(&store, 0, 1), want[..1]);
+        assert_eq!(nums(&store, 3, 10), want[1..]);
+        drop(store);
+        let (store, _) = Store::open(mk()).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT pruned_through FROM streams WHERE stream = 'g:C'"
+            ),
+            2
+        );
+        assert_eq!(nums(&store, 0, 10), want);
+    }
+
+    #[test]
+    fn reader_below_floor_gets_unpruned_and_advances_past_gap() {
+        let dir = tempdir("prune-gap");
+        let (store, _) = Store::open(cfg(&dir, 1)).unwrap();
+        store.subscribe("r", "Q", None, false, 1).unwrap();
+        for i in 1..=5 {
+            committed(
+                store
+                    .send_group(group(&format!("q{i}"), "s", "Q", "b"))
+                    .unwrap(),
+            );
+        }
+        store
+            .group_policy("Q", Some(Some(2)), None, None, 2)
+            .unwrap();
+        let pend: Vec<i64> = store
+            .pending_session("r")
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.article_num)
+            .collect();
+        assert_eq!(pend, [4, 5]);
+        let pos = |s: &Store| {
+            count(
+                s,
+                0,
+                "SELECT position FROM positions WHERE stream = 'g:Q' AND reader = 'r'",
+            )
+        };
+        assert_eq!(pos(&store), 0);
+        store.ack("q4", "r", "rec-4", 3).unwrap();
+        assert_eq!(pos(&store), 4);
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT record_id = 'rec-4' FROM positions WHERE stream = 'g:Q' AND reader = 'r'",
+            ),
+            1
+        );
+        store.ack("q5", "r", "rec-5", 4).unwrap();
+        assert_eq!(pos(&store), 5);
+        assert!(store.pending_session("r").unwrap().is_empty());
     }
 }
