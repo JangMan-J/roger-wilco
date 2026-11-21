@@ -3,7 +3,7 @@
 //! One text frame carries one JSON line in either direction.
 
 use crate::cli::Dialer;
-use crate::daemon::{self, DaemonReader, DaemonWriter};
+use crate::daemon::{self, DaemonClient, DaemonReader, DaemonWriter};
 use crate::durlog::{blocking_io, gen_uuid, DurLog};
 use crate::upgrade::{replay_start, Opened};
 use futures_util::stream::{SplitSink, StreamExt};
@@ -110,6 +110,7 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
         confirm,
         superseded,
         groups,
+        watch,
         after,
         store,
         entries,
@@ -138,6 +139,9 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
         register.push(("confirm_register", Value::Bool(true)));
     }
     register.push(("notify_superseded", Value::Bool(true)));
+    if watch {
+        register.push(("watch", Value::Bool(true)));
+    }
     if let Err(e) = dwriter.send(&obj(register)).await {
         warn(&format!(
             "expected to register with the host daemon, saw {e}"
@@ -194,6 +198,7 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
         address.clone(),
         confirm,
         superseded,
+        watch,
     ));
 
     // Requests run one at a time, in order, so replies pair with requests by order;
@@ -203,9 +208,10 @@ pub async fn run(ctx: Arc<Ctx>, ws: WebSocketStream<TcpStream>, opened: Opened) 
     let worker_ctx = Arc::clone(&ctx);
     let me = address.clone();
     tokio::spawn(async move {
+        let mut client = DaemonClient::new(worker_ctx.dialer.clone());
         while let Some(frame) = rx.recv().await {
             let reply = match frame {
-                Ok(text) => client_request(&worker_ctx.dialer, &me, groups, &text).await,
+                Ok(text) => client_request(&mut client, &me, groups, &text).await,
                 Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
             };
             let reply = reply
@@ -267,9 +273,15 @@ async fn reader_loop(
     address: String,
     confirm: bool,
     superseded: bool,
+    watch: bool,
 ) {
     let _ = &ctx;
-    let mut next_record = records.len() as u64 + 1;
+    let mut next_record = records
+        .values()
+        .filter_map(|r| r.strip_prefix("r-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
     let mut req = 0i64;
     loop {
         let v = match dreader.next_value().await {
@@ -388,6 +400,11 @@ async fn reader_loop(
                     let _ = send_line(&out, &notice).await;
                 }
             }
+            "board_event" if watch => {
+                if send_line(&out, &v).await.is_err() {
+                    return;
+                }
+            }
             "registered" if confirm => {
                 let line = obj(vec![("type", s("registered")), ("session", s(&address))]);
                 if send_line(&out, &line).await.is_err() {
@@ -410,142 +427,136 @@ fn without_req(mut reply: Value) -> Value {
     reply
 }
 
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
 /// One client request, answered by exactly one reply line.
-async fn client_request(dialer: &Dialer, me: &str, groups: bool, text: &str) -> io::Result<Value> {
+async fn client_request(
+    client: &mut DaemonClient,
+    me: &str,
+    groups: bool,
+    text: &str,
+) -> io::Result<Value> {
     let v: Value = serde_json::from_str(text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let one = Value::Number(1.into());
     match daemon::field(&v, "type")? {
-        "send" => {
-            let mail = match v.get("mail") {
-                None => blocking_io(gen_uuid)?,
-                Some(m) => m
-                    .as_str()
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "mail must be a string")
-                    })?
-                    .to_string(),
-            };
-            if groups && v.get("to").is_some() && v.get("group").is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "send accepts either to or group, not both",
-                ));
-            }
-            if groups && v.get("group").is_some() {
-                let group = daemon::field(&v, "group")?;
-                let (mail, article) = daemon::send_group(
-                    dialer,
-                    me,
-                    group,
-                    &mail,
-                    daemon::field(&v, "body")?,
-                    v.get("headers"),
-                )
-                .await?;
-                return Ok(obj(vec![
-                    ("type", s("accepted")),
-                    ("mail", s(&mail)),
-                    ("group", s(group)),
-                    ("article", Value::Number(article.into())),
-                ]));
-            }
-            if groups && v.get("to").is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "send requires either to or group",
-                ));
-            }
-            let mail = daemon::send_mail(
-                dialer,
-                me,
-                daemon::field(&v, "to")?,
-                &mail,
-                daemon::field(&v, "body")?,
-                v.get("headers"),
-            )
-            .await?;
-            Ok(obj(vec![("type", s("accepted")), ("mail", s(&mail))]))
-        }
+        "send" => client_send(client, me, &v, groups).await,
         "board" => {
-            daemon::request(
-                dialer,
-                &obj(vec![
+            client
+                .request(&obj(vec![
                     ("type", s("board")),
-                    ("req", Value::Number(1.into())),
+                    ("req", one),
                     ("session", s(me)),
-                ]),
-            )
-            .await
+                ]))
+                .await
+        }
+        "receipt" => {
+            client
+                .request(&obj(vec![
+                    ("type", s("receipt")),
+                    ("req", one),
+                    ("mail", s(daemon::field(&v, "mail")?)),
+                ]))
+                .await
         }
         "claim" => {
             let ttl = v.get("ttl_ms").and_then(Value::as_i64).unwrap_or(0);
-            daemon::request(
-                dialer,
-                &obj(vec![
+            client
+                .request(&obj(vec![
                     ("type", s("claim")),
-                    ("req", Value::Number(1.into())),
+                    ("req", one),
                     ("op", s(daemon::field(&v, "op")?)),
                     ("key", s(daemon::field(&v, "key")?)),
                     ("owner", s(me)),
                     ("ttl_ms", Value::Number(ttl.into())),
-                ]),
-            )
-            .await
+                ]))
+                .await
         }
         "relabel" => {
             let session = v.get("session").and_then(Value::as_str).unwrap_or(me);
-            daemon::request(
-                dialer,
-                &obj(vec![
+            client
+                .request(&obj(vec![
                     ("type", s("relabel")),
-                    ("req", Value::Number(1.into())),
+                    ("req", one),
                     ("session", s(session)),
                     ("label", s(daemon::field(&v, "label")?)),
-                ]),
-            )
-            .await
+                ]))
+                .await
         }
         "subscribe" if groups => {
             let mut request = vec![
                 ("type", s("subscribe")),
-                ("req", Value::Number(1.into())),
+                ("req", one),
                 ("session", s(me)),
                 ("group", s(daemon::field(&v, "group")?)),
             ];
-            if let Some(after) = v.get("after") {
-                let after = after.as_i64().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "after must be an integer")
-                })?;
-                request.push(("after", Value::Number(after.into())));
+            match v.get("after") {
+                None | Some(Value::Null) => {}
+                Some(after) => {
+                    let after = after
+                        .as_i64()
+                        .ok_or_else(|| invalid("after must be an integer"))?;
+                    request.push(("after", Value::Number(after.into())));
+                }
             }
-            if v.get("latest").and_then(Value::as_bool) == Some(true) {
-                request.push(("latest", Value::Bool(true)));
+            match v.get("latest") {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+                Some(Value::Bool(true)) => request.push(("latest", Value::Bool(true))),
+                Some(_) => return Err(invalid("latest must be a boolean")),
             }
-            Ok(without_req(daemon::request(dialer, &obj(request)).await?))
+            Ok(without_req(client.request(&obj(request)).await?))
         }
         "unsubscribe" if groups => Ok(without_req(
-            daemon::request(
-                dialer,
-                &obj(vec![
+            client
+                .request(&obj(vec![
                     ("type", s("unsubscribe")),
-                    ("req", Value::Number(1.into())),
+                    ("req", one),
                     ("session", s(me)),
                     ("group", s(daemon::field(&v, "group")?)),
-                ]),
-            )
-            .await?,
+                ]))
+                .await?,
         )),
-        "groups" if groups => Ok(without_req(
-            daemon::request(
-                dialer,
-                &obj(vec![
-                    ("type", s("groups")),
-                    ("req", Value::Number(1.into())),
-                    ("session", s(me)),
-                ]),
-            )
-            .await?,
-        )),
+        "groups" if groups => {
+            let session = v.get("session").and_then(Value::as_str).unwrap_or(me);
+            let mut request = vec![("type", s("groups")), ("req", one), ("session", s(session))];
+            if let Some(prefix) = v.get("prefix").and_then(Value::as_str) {
+                request.push(("prefix", s(prefix)));
+            }
+            if v.get("include_retired") == Some(&Value::Bool(true)) {
+                request.push(("include_retired", Value::Bool(true)));
+            }
+            Ok(without_req(client.request(&obj(request)).await?))
+        }
+        "articles" if groups => {
+            let after = v.get("after").and_then(Value::as_i64).unwrap_or(0);
+            let limit = v.get("limit").and_then(Value::as_i64).unwrap_or(100);
+            Ok(without_req(
+                client
+                    .request(&obj(vec![
+                        ("type", s("articles")),
+                        ("req", one),
+                        ("group", s(daemon::field(&v, "group")?)),
+                        ("after", Value::Number(after.into())),
+                        ("limit", Value::Number(limit.into())),
+                    ]))
+                    .await?,
+            ))
+        }
+        "group_policy" if groups => {
+            let mut request = vec![
+                ("type", s("group_policy")),
+                ("req", one),
+                ("group", s(daemon::field(&v, "group")?)),
+            ];
+            for key in ["keep_last", "ttl_ms", "retired"] {
+                if let Some(val) = v.get(key) {
+                    request.push((key, val.clone()));
+                }
+            }
+            Ok(without_req(client.request(&obj(request)).await?))
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             if groups {
@@ -557,6 +568,63 @@ async fn client_request(dialer: &Dialer, me: &str, groups: bool, text: &str) -> 
             },
         )),
     }
+}
+
+async fn client_send(
+    client: &mut DaemonClient,
+    me: &str,
+    v: &Value,
+    groups: bool,
+) -> io::Result<Value> {
+    // A missing mail id is generated; a present one of the wrong type is a
+    // malformed send, not a request to pick another id.
+    let mail = match v.get("mail") {
+        None => blocking_io(gen_uuid)?,
+        Some(m) => m
+            .as_str()
+            .ok_or_else(|| invalid("mail must be a string"))?
+            .to_string(),
+    };
+    let to = match (groups, v.get("to"), v.get("group")) {
+        (false, _, _) => daemon::field(v, "to")?,
+        (true, Some(_), Some(_)) => {
+            return Err(invalid("expected either to or group on send, saw both"))
+        }
+        (true, None, None) => return Err(invalid("expected to or group on send, saw neither")),
+        (true, Some(to), None) => to.as_str().ok_or_else(|| invalid("to must be a string"))?,
+        (true, None, Some(group)) => {
+            let group = group
+                .as_str()
+                .ok_or_else(|| invalid("group must be a string"))?;
+            let expected_article =
+                match v.get("expected_article") {
+                    None | Some(Value::Null) => None,
+                    Some(x) => Some(x.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                        invalid("expected_article must be a non-negative integer")
+                    })?),
+                };
+            let (mail, article) = client
+                .send_group(
+                    me,
+                    group,
+                    &mail,
+                    daemon::field(v, "body")?,
+                    v.get("headers"),
+                    expected_article,
+                )
+                .await?;
+            return Ok(obj(vec![
+                ("type", s("accepted")),
+                ("mail", s(&mail)),
+                ("group", s(group)),
+                ("article", Value::Number(article.into())),
+            ]));
+        }
+    };
+    let mail = client
+        .send_mail(me, to, &mail, daemon::field(v, "body")?, v.get("headers"))
+        .await?;
+    Ok(obj(vec![("type", s("accepted")), ("mail", s(&mail))]))
 }
 
 #[cfg(test)]
@@ -571,8 +639,9 @@ mod tests {
             socket: DaemonSocket::Unix(PathBuf::from("unused-daemon.socket")),
             client_token: None,
         };
+        let mut client = DaemonClient::new(dialer);
         let send = client_request(
-            &dialer,
+            &mut client,
             "reader-1",
             false,
             r#"{"type":"send","group":"staff","body":"hello"}"#,
@@ -582,7 +651,7 @@ mod tests {
         assert_eq!(send.to_string(), "missing to");
         for request in ["subscribe", "unsubscribe", "groups"] {
             let error = client_request(
-                &dialer,
+                &mut client,
                 "reader-1",
                 false,
                 &format!(r#"{{"type":"{request}","group":"staff"}}"#),

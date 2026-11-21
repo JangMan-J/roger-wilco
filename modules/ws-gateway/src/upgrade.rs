@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
 use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
 
 /// Query keys accepted on `GET /`.
-const KEYS: &str = "id, session, label, declare, registered, superseded, after, groups";
+const KEYS: &str = "id, session, label, declare, registered, superseded, after, groups, watch";
 
 /// One session's parameters and its open Store, ready for the session loop.
 pub struct Opened {
@@ -21,6 +21,8 @@ pub struct Opened {
     pub superseded: bool,
     /// Whether Named Groups requests are enabled for this connection.
     pub groups: bool,
+    /// Whether `board_event` lines are streamed to the client.
+    pub watch: bool,
     /// `Some(record)`: replay Store entries after that record (`Some("")`: every entry).
     pub after: Option<String>,
     pub store: DurLog,
@@ -37,6 +39,7 @@ pub struct Params {
     pub confirm: bool,
     pub superseded: bool,
     pub groups: bool,
+    pub watch: bool,
     pub after: Option<String>,
 }
 
@@ -135,6 +138,7 @@ pub fn parse_query(query: Option<&str>) -> Result<Params, String> {
             "registered" => p.confirm = flag("registered", &val)?,
             "superseded" => p.superseded = flag("superseded", &val)?,
             "groups" => p.groups = flag("groups", &val)?,
+            "watch" => p.watch = flag("watch", &val)?,
             "after" => p.after = Some(val),
             _ => return Err(format!("expected query keys {KEYS}; saw {key}")),
         }
@@ -210,6 +214,7 @@ pub fn prepare(req: &Request, bearer: Option<&str>, store_dir: &Path) -> Result<
         confirm: p.confirm,
         superseded: p.superseded,
         groups: p.groups,
+        watch: p.watch,
         after: p.after,
         store,
         entries,
@@ -264,6 +269,9 @@ mod tests {
         assert!(parse_query(Some("groups=true")).unwrap().groups);
         assert!(!parse_query(Some("groups=0")).unwrap().groups);
         assert!(!parse_query(Some("groups=false")).unwrap().groups);
+        assert!(parse_query(Some("watch=1")).unwrap().watch);
+        assert!(parse_query(Some("watch=true")).unwrap().watch);
+        assert!(!parse_query(Some("watch=0")).unwrap().watch);
         assert!(parse_query(Some("groups=yes"))
             .unwrap_err()
             .contains("saw groups=yes"));
