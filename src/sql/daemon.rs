@@ -62,6 +62,8 @@ impl Store {
         }
         let lock = crate::durlog::open_exclusive_lock(&daemon_lock_path(data))?;
         let mut conn = Connection::open(daemon_db_path(data)).map_err(err)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(err)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(err)?;
         conn.execute_batch(DAEMON_SCHEMA).map_err(err)?;
@@ -105,33 +107,33 @@ impl Store {
     }
     pub fn insert_deliver(&self, r: &Delivery) -> io::Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA synchronous=FULL;")
-            .map_err(err)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(err)?;
-        let changed = tx.execute("INSERT OR IGNORE INTO pending_deliveries (mail_id,sender,recipient,group_name,article_num,body,kind,headers_json) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS (SELECT 1 FROM unconfirmed_receipts WHERE mail_id=?1 AND session=?3)", params![r.mail_id,r.from,r.to,r.group,r.article_num,r.body,r.kind,crate::json::stringify(&r.headers)]).map_err(err)?;
+        let changed = tx.prepare_cached("INSERT OR IGNORE INTO pending_deliveries (mail_id,sender,recipient,group_name,article_num,body,kind,headers_json) SELECT ?1,?2,?3,?4,?5,?6,?7,?8 WHERE NOT EXISTS (SELECT 1 FROM unconfirmed_receipts WHERE mail_id=?1 AND session=?3)").map_err(err)?.execute(params![r.mail_id,r.from,r.to,r.group,r.article_num,r.body,r.kind,crate::json::stringify(&r.headers)]).map_err(err)?;
         tx.commit().map_err(err)?;
         Ok(changed != 0)
     }
     pub fn pending_for_session(&self, session: &str) -> io::Result<Vec<Delivery>> {
         let conn = self.conn.lock().unwrap();
-        let result = conn.prepare("SELECT mail_id,sender,recipient,group_name,article_num,body,kind,seq,headers_json FROM pending_deliveries WHERE recipient=?1 ORDER BY seq").map_err(err)?.query_map([session], row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err);
+        let result = conn.prepare_cached("SELECT mail_id,sender,recipient,group_name,article_num,body,kind,seq,headers_json FROM pending_deliveries WHERE recipient=?1 ORDER BY seq").map_err(err)?.query_map([session], row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err);
         result
+    }
+    pub fn pending_delivery(&self, mail: &str, session: &str) -> io::Result<Option<Delivery>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT mail_id,sender,recipient,group_name,article_num,body,kind,seq,headers_json FROM pending_deliveries WHERE mail_id=?1 AND recipient=?2").map_err(err)?;
+        stmt.query_row([mail, session], row).optional().map_err(err)
     }
     pub fn settle_ack(&self, mail_id: &str, session: &str, record_id: &str) -> io::Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA synchronous=FULL;")
-            .map_err(err)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(err)?;
-        tx.execute(
-            "DELETE FROM pending_deliveries WHERE mail_id=?1 AND recipient=?2",
-            params![mail_id, session],
-        )
-        .map_err(err)?;
-        let n = tx.execute("INSERT OR IGNORE INTO unconfirmed_receipts (mail_id,session,record_id) VALUES (?1,?2,?3)", params![mail_id,session,record_id]).map_err(err)?;
+        tx.prepare_cached("DELETE FROM pending_deliveries WHERE mail_id=?1 AND recipient=?2")
+            .map_err(err)?
+            .execute(params![mail_id, session])
+            .map_err(err)?;
+        let n = tx.prepare_cached("INSERT OR IGNORE INTO unconfirmed_receipts (mail_id,session,record_id) VALUES (?1,?2,?3)").map_err(err)?.execute(params![mail_id,session,record_id]).map_err(err)?;
         tx.commit().map_err(err)?;
         Ok(n != 0)
     }
@@ -140,15 +142,17 @@ impl Store {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(err)?;
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM unconfirmed_receipts WHERE mail_id=?1 AND (?2 IS NULL OR session=?2)",
-            params![mail_id, session],
         )
+        .map_err(err)?
+        .execute(params![mail_id, session])
         .map_err(err)?;
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM pending_deliveries WHERE mail_id=?1 AND (?2 IS NULL OR recipient=?2)",
-            params![mail_id, session],
         )
+        .map_err(err)?
+        .execute(params![mail_id, session])
         .map_err(err)?;
         tx.commit().map_err(err)
     }
@@ -179,7 +183,11 @@ mod tests {
         let (s, startup) = Store::open(&path).unwrap();
         assert_eq!(startup.pending.len(), 1);
         assert_eq!(startup.pending[0].article_num, Some(7));
+        assert!(s.pending_delivery("other", "b").unwrap().is_none());
+        assert!(s.pending_delivery("m", "other").unwrap().is_none());
+        assert_eq!(s.pending_delivery("m", "b").unwrap().unwrap().body, r.body);
         assert!(s.settle_ack("m", "b", "r").unwrap());
+        assert!(s.pending_delivery("m", "b").unwrap().is_none());
         assert!(!s.insert_deliver(&r).unwrap());
         drop(s);
         let (s, startup) = Store::open(&path).unwrap();
