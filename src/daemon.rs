@@ -39,7 +39,10 @@ struct Registration {
 }
 
 struct State {
-    store: Arc<Store>,
+    /// The local log, behind its own lock. That lock orders each DB write
+    /// with the State change that goes with it: take it first, then State,
+    /// and never wait for it while holding State (see `db`).
+    store: Arc<Mutex<Store>>,
     /// Receipts committed locally and not yet confirmed upstream, in commit
     /// order. Replayed after every reconnect, because the coordinator's ack
     /// handler is idempotent and a locally committed receipt that never
@@ -66,7 +69,7 @@ impl State {
     /// Nothing delivered or acked yet: what a replay starts from.
     fn new(store: Store) -> State {
         State {
-            store: Arc::new(store),
+            store: Arc::new(Mutex::new(store)),
             receipts: Vec::new(),
             sessions: HashMap::new(),
             declared: HashMap::new(),
@@ -517,12 +520,7 @@ fn upstream_link(
                 // Upstream has this receipt now, so it leaves the replay list.
                 if kind == "acked" {
                     if let Ok(mail) = net::field(&v, "mail") {
-                        let mail = mail.to_string();
-                        let session = v.get("session").and_then(Value::as_str);
-                        let mut st = state.lock().unwrap();
-                        st.store.confirm_receipt(&mail, session)?;
-                        st.receipts
-                            .retain(|r| r.mail != mail || session.is_some_and(|s| s != r.session));
+                        confirm(state, mail, v.get("session").and_then(Value::as_str))?;
                     }
                 }
                 let waiter = v
@@ -533,10 +531,10 @@ fn upstream_link(
                     Some(tx) => {
                         let _ = tx.send(v);
                     }
-                    // A replayed receipt upstream refuses stays queued, so say
-                    // so: silence here would look like a confirmed receipt.
+                    // A forwarded receipt upstream refuses stays queued, so
+                    // say so: silence here would look like a confirmed receipt.
                     None if kind == "error" => eprintln!(
-                        "upstream refused the replayed receipt for {}: {}",
+                        "upstream refused the receipt for {}: {}",
                         net::field(&v, "mail").unwrap_or("?"),
                         net::field(&v, "reason").unwrap_or("unexplained")
                     ),
@@ -580,36 +578,75 @@ fn register_msg(
     obj(pairs)
 }
 
+/// The local log's lock. Taking it releases State before waiting, so DB
+/// I/O never runs under State and the order is always log, then State.
+fn db(state: &Arc<Mutex<State>>) -> Arc<Mutex<Store>> {
+    Arc::clone(&state.lock().unwrap().store)
+}
+
 fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
-    let mail_id = net::field(v, "mail")?.to_string();
-    let mut push: Option<(Writer, Value)> = None;
-    {
-        let st = state.lock().unwrap();
-        let row = Delivery {
-            mail_id: mail_id.clone(),
-            from: net::field(v, "from")?.into(),
-            to: net::field(v, "to")?.into(),
-            body: net::field(v, "body")?.into(),
-            kind: net::kind_of(v),
-            headers: net::headers_of(v),
-            group: v.get("group").and_then(Value::as_str).map(str::to_string),
-            article_num: v.get("article").and_then(Value::as_i64),
-        };
-        st.store.insert_deliver(&row)?;
-        if let Some(m) = st
-            .store
-            .pending_for_session(&row.to)?
-            .iter()
-            .find(|m| m.mail_id == mail_id)
-        {
-            if let Some(w) = st.sessions.get(&m.to) {
-                push = Some((Arc::clone(w), delivery(m)));
-            }
+    let row = Delivery {
+        mail_id: net::field(v, "mail")?.to_string(),
+        from: net::field(v, "from")?.into(),
+        to: net::field(v, "to")?.into(),
+        body: net::field(v, "body")?.into(),
+        kind: net::kind_of(v),
+        headers: net::headers_of(v),
+        group: v.get("group").and_then(Value::as_str).map(str::to_string),
+        article_num: v.get("article").and_then(Value::as_i64),
+    };
+    let db = db(state);
+    let store = db.lock().unwrap();
+    // A fresh row is the pending Mail itself. A repeated one is pushed again
+    // only while it is still pending for its recipient, not once acked.
+    let pending = if store.insert_deliver(&row)? {
+        Some(row)
+    } else {
+        store.pending_delivery(&row.mail_id, &row.to)?
+    };
+    if let Some(m) = pending {
+        let w = state.lock().unwrap().sessions.get(&m.to).cloned();
+        // Pushed under the log's lock, so a Register's pending replay is
+        // either before this Mail's commit or includes it, never both.
+        if let Some(w) = w {
+            let _ = net::send(&w, &delivery(&m));
         }
     }
-    if let Some((w, msg)) = push {
-        let _ = net::send(&w, &msg);
+    Ok(())
+}
+
+/// Commit a session's ack locally, then forward it on the upstream queue
+/// with no waiter. The Receipt is durable here, so the session is answered
+/// at once; the coordinator's `acked` trims the replay list in `confirm`,
+/// and a link that drops first replays it after the next hello_ok.
+fn local_ack(state: &Arc<Mutex<State>>, mail: &str, session: &str, record: &str) -> io::Result<()> {
+    let db = db(state);
+    let store = db.lock().unwrap();
+    let fresh = store.settle_ack(mail, session, record)?;
+    let mut st = state.lock().unwrap();
+    if fresh {
+        st.receipts.push(Receipt {
+            mail: mail.to_string(),
+            session: session.to_string(),
+            record: record.to_string(),
+        });
     }
+    if let Some(up) = &st.upstream {
+        let _ = net::send(up, &net::ack_msg(mail, session, record));
+    }
+    Ok(())
+}
+
+/// Upstream has this receipt now, so it leaves the log and the replay list.
+fn confirm(state: &Arc<Mutex<State>>, mail: &str, session: Option<&str>) -> io::Result<()> {
+    let db = db(state);
+    let store = db.lock().unwrap();
+    store.confirm_receipt(mail, session)?;
+    state
+        .lock()
+        .unwrap()
+        .receipts
+        .retain(|r| r.mail != mail || session.is_some_and(|s| s != r.session));
     Ok(())
 }
 
@@ -832,7 +869,11 @@ fn local_loop(
                 let label = v.get("label").and_then(|x| x.as_str()).map(str::to_string);
                 *session_id = Some(session.clone());
                 let declared = net::declared_of(&v);
-                let pending = {
+                // The log's lock spans the State change and the replay, so a
+                // delivery commits wholly before (replayed) or after (pushed).
+                let db = db(state);
+                let store = db.lock().unwrap();
+                {
                     let mut st = state.lock().unwrap();
                     if v.get("watch") == Some(&Value::Bool(true)) {
                         watch(&mut st, writer);
@@ -881,12 +922,6 @@ fn local_loop(
                         Some(d) => st.declared.insert(session.clone(), d.clone()),
                         None => st.declared.remove(&session),
                     };
-                    let pending: Vec<Value> = st
-                        .store
-                        .pending_for_session(&session)?
-                        .iter()
-                        .map(delivery)
-                        .collect();
                     let mut msg = register_msg(
                         &session,
                         &registration,
@@ -902,10 +937,9 @@ fn local_loop(
                     if let Some(up) = &st.upstream {
                         let _ = net::send(up, &msg);
                     }
-                    pending
-                };
-                for p in pending {
-                    let _ = net::send(writer, &p);
+                }
+                for p in store.pending_for_session(&session)? {
+                    let _ = net::send(writer, &delivery(&p));
                 }
             }
             // Board changes as the coordinator commits them, on this
@@ -997,36 +1031,7 @@ fn local_loop(
                 })?;
                 let mail = net::field(&v, "mail")?.to_string();
                 let record = net::field(&v, "record")?.to_string();
-                {
-                    let mut st = state.lock().unwrap();
-                    if st.store.settle_ack(&mail, &session, &record)? {
-                        st.receipts.push(Receipt {
-                            mail: mail.clone(),
-                            session: session.clone(),
-                            record: record.clone(),
-                        });
-                    }
-                }
-                // Forwarding is retryable, not part of the ack: the Receipt is
-                // already durable in this host daemon, which is core, so the
-                // session is answered now and the receipt is replayed after
-                // the next hello_ok if this forward fails. A forward whose
-                // answer outlasts UPSTREAM_WAIT is still on the link: the
-                // coordinator commits it when it reads it, and its late
-                // `acked` trims the replay list in `upstream_once`.
-                match upstream_request(state, net::ack_msg(&mail, &session, &record)) {
-                    Err(e) => {
-                        eprintln!("receipt {mail} committed, upstream forward deferred: {e}")
-                    }
-                    // A refusal means upstream never accepted that mail, so the
-                    // receipt stays queued and is replayed after the next
-                    // hello_ok rather than being treated as confirmed.
-                    Ok(resp) if net::field(&resp, "type").unwrap_or("") == "error" => eprintln!(
-                        "receipt {mail} committed, upstream refused it: {}",
-                        net::field(&resp, "reason").unwrap_or("unexplained")
-                    ),
-                    Ok(_) => {}
-                }
+                local_ack(state, &mail, &session, &record)?;
                 net::send(
                     writer,
                     &obj(vec![
@@ -1128,5 +1133,68 @@ mod tests {
         let v = delivery(&m);
         assert_eq!(v.get("group").and_then(Value::as_str), Some("g"));
         assert_eq!(v.get("article").and_then(Value::as_i64), Some(9));
+    }
+}
+
+#[cfg(test)]
+mod store_order {
+    use super::*;
+
+    /// Lines written to one peer, read back as JSON.
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Seen {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seen {
+        fn lines(&self) -> Vec<Value> {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            text.lines()
+                .map(|l| crate::json::parse(l).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn ack_forwards_with_no_waiter_and_acked_mail_is_not_pushed_again() {
+        let dir = std::env::temp_dir().join(crate::session::gen_uuid().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (store, _) = Store::open(&dir.join("daemon")).unwrap();
+        let (session, upstream) = (Seen::default(), Seen::default());
+        let mut st = State::new(store);
+        st.sessions
+            .insert("b".into(), net::writer(Box::new(session.clone())));
+        st.upstream = Some(net::writer(Box::new(upstream.clone())));
+        let state = Arc::new(Mutex::new(st));
+        let deliver = net::deliver_msg("m", "a", "b", "text", net::DIRECTED, &obj(vec![]));
+
+        handle_deliver(&state, &deliver).unwrap();
+        // A repeat while still pending is pushed again, as before.
+        handle_deliver(&state, &deliver).unwrap();
+        assert_eq!(session.lines().len(), 2);
+
+        local_ack(&state, "m", "b", "r").unwrap();
+        let up = upstream.lines();
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].get("type").and_then(Value::as_str), Some("ack"));
+        assert!(
+            up[0].get("req").is_none(),
+            "forward must not wait on a reply"
+        );
+        assert_eq!(state.lock().unwrap().receipts.len(), 1);
+
+        // Acked locally: a repeated delivery is not pushed.
+        handle_deliver(&state, &deliver).unwrap();
+        assert_eq!(session.lines().len(), 2);
+
+        confirm(&state, "m", Some("b")).unwrap();
+        assert!(state.lock().unwrap().receipts.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
