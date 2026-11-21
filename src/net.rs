@@ -252,6 +252,9 @@ pub fn send(w: &Writer, v: &Value) -> io::Result<()> {
     }
 }
 
+/// The longest line any `Lines` accepts, in bytes, newline excluded.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct Lines {
     inner: BufReader<Box<dyn Read + Send>>,
     /// The longest line accepted, in bytes, newline excluded.
@@ -261,16 +264,16 @@ pub struct Lines {
 pub fn lines(r: Box<dyn Read + Send>) -> Lines {
     Lines {
         inner: BufReader::new(r),
-        cap: usize::MAX,
+        cap: MAX_LINE_BYTES,
     }
 }
 
 impl Lines {
     /// Accept no line longer than `bytes` from here on. A longer one is an
     /// `InvalidData` error as soon as it passes the bound, before the rest of
-    /// it is read.
+    /// it is read. The bound never exceeds `MAX_LINE_BYTES`.
     pub fn set_cap(&mut self, bytes: usize) {
-        self.cap = bytes;
+        self.cap = bytes.min(MAX_LINE_BYTES);
     }
 
     /// The next line without its newline; `None` at end of stream. A last
@@ -293,14 +296,20 @@ impl Lines {
                 Some(i) => (i, true),
                 None => (available.len(), false),
             };
-            if line.len() + take > self.cap {
+            let need = line.len() + take;
+            if need > self.cap {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "expected a line of at most {} bytes, saw a longer one",
+                        "expected a line of at most {} bytes, saw at least {need}",
                         self.cap
                     ),
                 ));
+            }
+            if need > line.capacity() {
+                // Grow by doubling, but never past the cap.
+                let to = need.max(line.capacity() * 2).min(self.cap);
+                line.reserve_exact(to - line.len());
             }
             line.extend_from_slice(&available[..take]);
             self.inner.consume(take + usize::from(ended));
@@ -399,13 +408,36 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(
             e.to_string()
-                .contains("expected a line of at most 100 bytes, saw a longer one"),
+                .contains("expected a line of at most 100 bytes, saw at least 101"),
             "{e}"
         );
         // A stream with no newline at all is refused at the bound too.
         let mut endless = read(&[b'['; 100_000]);
         endless.set_cap(100);
         assert!(endless.next().unwrap().is_err());
+    }
+
+    #[test]
+    fn the_default_and_any_larger_cap_is_max_line_bytes() {
+        let body = |n: usize| format!("\"{}\"", "x".repeat(n - 2));
+        let at = body(MAX_LINE_BYTES);
+        assert_eq!(at.len(), MAX_LINE_BYTES);
+        let mut ok = read(format!("{at}\n").as_bytes());
+        assert!(ok.next().unwrap().is_ok());
+        let over = body(MAX_LINE_BYTES + 1);
+        for widen in [false, true] {
+            let mut long = read(format!("{over}\n").as_bytes());
+            if widen {
+                long.set_cap(usize::MAX);
+            }
+            let e = long.next().unwrap().unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            let want = format!(
+                "expected a line of at most {MAX_LINE_BYTES} bytes, saw at least {}",
+                MAX_LINE_BYTES + 1
+            );
+            assert!(e.to_string().contains(&want), "{e}");
+        }
     }
 
     /// A stream whose every write waits until the test lets it through, and
