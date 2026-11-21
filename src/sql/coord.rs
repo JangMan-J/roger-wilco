@@ -225,6 +225,8 @@ fn open_conn(path: &Path, schema: bool) -> io::Result<Connection> {
         .map_err(sq)?;
     c.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")
         .map_err(sq)?;
+    c.set_prepared_statement_cache_capacity(64);
+    c.execute_batch("PRAGMA busy_timeout = 5000;").map_err(sq)?; // no-poll: SQLite lock wait bound, not a scan
     if schema {
         c.execute_batch(COORD_SLICE_SCHEMA).map_err(sq)?;
         migrate_streams(&c).map_err(sq)?;
@@ -537,56 +539,54 @@ fn insert_envelope(c: &Connection, e: &NewEnvelope) -> rusqlite::Result<InsertOu
 }
 
 fn insert_seen(c: &Connection, s: &NewSeen, article_num: i64) -> rusqlite::Result<()> {
-    c.execute(
+    let mut st = c.prepare_cached(
         "INSERT OR IGNORE INTO seen_ids (mail_id, kind, sender, target, body_len, body_sha256, article_num, stream)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            s.mail_id,
-            s.kind,
-            s.sender,
-            s.target,
-            s.body_len,
-            s.body_sha256,
-            article_num,
-            s.stream
-        ],
     )?;
+    st.execute(params![
+        s.mail_id,
+        s.kind,
+        s.sender,
+        s.target,
+        s.body_len,
+        s.body_sha256,
+        article_num,
+        s.stream
+    ])?;
     Ok(())
 }
 
 fn query_seen(c: &Connection, mail_id: &str) -> rusqlite::Result<Option<SeenRow>> {
-    c.query_row(
+    let mut st = c.prepare_cached(
         "SELECT kind, sender, target, body_len, body_sha256, article_num FROM seen_ids WHERE mail_id = ?1",
-        [mail_id],
-        |r| {
-            Ok(SeenRow {
-                kind: r.get(0)?,
-                sender: r.get(1)?,
-                target: r.get(2)?,
-                body_len: r.get(3)?,
-                body_sha256: r.get(4)?,
-                article_num: r.get(5)?,
-            })
-        },
-    )
+    )?;
+    st.query_row([mail_id], |r| {
+        Ok(SeenRow {
+            kind: r.get(0)?,
+            sender: r.get(1)?,
+            target: r.get(2)?,
+            body_len: r.get(3)?,
+            body_sha256: r.get(4)?,
+            article_num: r.get(5)?,
+        })
+    })
     .optional()
 }
 
 fn query_broadcast(c: &Connection, mail_id: &str) -> rusqlite::Result<Option<SeenRow>> {
-    c.query_row(
+    let mut st = c.prepare_cached(
         "SELECT sender, body_len, body_sha256 FROM broadcasts WHERE mail_id = ?1",
-        [mail_id],
-        |r| {
-            Ok(SeenRow {
-                kind: "broadcast".into(),
-                sender: r.get(0)?,
-                target: None,
-                body_len: r.get(1)?,
-                body_sha256: r.get(2)?,
-                article_num: 0,
-            })
-        },
-    )
+    )?;
+    st.query_row([mail_id], |r| {
+        Ok(SeenRow {
+            kind: "broadcast".into(),
+            sender: r.get(0)?,
+            target: None,
+            body_len: r.get(1)?,
+            body_sha256: r.get(2)?,
+            article_num: 0,
+        })
+    })
     .optional()
 }
 
@@ -796,14 +796,13 @@ impl Inner {
         let stream = format!("m:{session}");
         let idx = self.shard(&stream);
         let raws = self.read(idx, |c| {
-            let mut st = c.prepare(&format!(
+            let mut st = c.prepare_cached(&format!(
                 "SELECT {PENDING_COLS} FROM envelopes e
                  LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id
-                 WHERE e.stream = ?1 AND e.kind IN ('directed', 'broadcast')
-                   AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.mail_id = e.mail_id)
+                 WHERE e.stream = ?1 AND e.article_num > COALESCE((SELECT position FROM positions WHERE stream = ?1 AND reader = ?2), 0) AND e.kind IN ('directed', 'broadcast') AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.mail_id = e.mail_id)
                  ORDER BY e.seq"
             ))?;
-            let rows = st.query_map([&stream], raw_pending)?;
+            let rows = st.query_map(params![&stream, session], raw_pending)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         let mut out = raws
@@ -846,11 +845,20 @@ impl Inner {
         )>,
     > {
         let row = self.read(idx, |c| {
-            c.query_row(
+            let mut st = c.prepare_cached(
                 "SELECT stream, article_num, kind, sender, recipient, headers_json, accepted_at_ms FROM envelopes WHERE mail_id = ?1",
-                [mail_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-            )
+            )?;
+            st.query_row([mail_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
             .optional()
         })?;
         Ok(row.map(|r| (idx, r)))
@@ -1903,25 +1911,32 @@ impl Store {
         let receipt_seq = inner.seq();
         let (mail_id, record_id) = (mail_id.to_string(), record_id.to_string());
         let newly = inner.slices[idx].writer.exec(move |c| {
-            if !group
-                && c.query_row("SELECT 1 FROM receipts WHERE mail_id = ?1", [&mail_id], |_| Ok(()))
-                    .optional()?
-                    .is_some()
-            {
-                return Ok(false);
+            if !group {
+                let mut st = c.prepare_cached("SELECT 1 FROM receipts WHERE mail_id = ?1")?;
+                if st.query_row([&mail_id], |_| Ok(())).optional()?.is_some() {
+                    return Ok(false);
+                }
             }
-            let n = c.execute(
+            let mut st = c.prepare_cached(
                 "INSERT OR IGNORE INTO receipts (mail_id, reader, stream, article_num, record_id, receipted_at_ms, receipt_seq)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![mail_id, reader, stream, article_num, record_id, now_ms, receipt_seq],
             )?;
+            let n = st.execute(params![
+                mail_id,
+                reader,
+                stream,
+                article_num,
+                record_id,
+                now_ms,
+                receipt_seq
+            ])?;
             if n == 0 {
                 return Ok(false);
             }
-            c.execute(
+            let mut st = c.prepare_cached(
                 "INSERT OR IGNORE INTO positions (stream, reader, subscribed, position, updated_at_ms) VALUES (?1, ?2, ?3, 0, ?4)",
-                params![stream, reader, i64::from(!group), now_ms],
             )?;
+            st.execute(params![stream, reader, i64::from(!group), now_ms])?;
             advance_position(c, &stream, &reader, now_ms)?;
             Ok(true)
         })?;
@@ -1952,20 +1967,21 @@ impl Store {
         else {
             return Ok(None);
         };
-        let receipt: Option<(String, Option<i64>)> = inner.read(idx, |c| {
-            match reader {
-                Some(r) => c.query_row(
+        let receipt: Option<(String, Option<i64>)> = inner.read(idx, |c| match reader {
+            Some(r) => {
+                let mut st = c.prepare_cached(
                     "SELECT record_id, receipted_at_ms FROM receipts WHERE mail_id = ?1 AND reader = ?2",
-                    params![mail_id, r],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                ),
-                None => c.query_row(
-                    "SELECT record_id, receipted_at_ms FROM receipts WHERE mail_id = ?1 ORDER BY receipt_seq LIMIT 1",
-                    [mail_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                ),
+                )?;
+                st.query_row(params![mail_id, r], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()
             }
-            .optional()
+            None => {
+                let mut st = c.prepare_cached(
+                    "SELECT record_id, receipted_at_ms FROM receipts WHERE mail_id = ?1 ORDER BY receipt_seq LIMIT 1",
+                )?;
+                st.query_row([mail_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()
+            }
         })?;
         let group = kind == "group";
         let (record_id, receipted_at_ms) = match receipt {
@@ -3039,6 +3055,32 @@ mod tests {
         }
         let (leg_store, _) = Store::open(cfg(&legacy_dir, 1)).unwrap();
         assert!(leg_store.receipt("leg-1", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn pending_session_skips_acked_prefix_and_keeps_out_of_order_gap() {
+        let dir = tempdir("pending-prefix");
+        let (store, _) = Store::open(cfg(&dir, 2)).unwrap();
+        for i in 1..=6 {
+            committed(
+                store
+                    .send_directed(directed(&format!("p{i}"), "s", "r", "b"))
+                    .unwrap(),
+            );
+        }
+        for i in 1..=4 {
+            store.ack(&format!("p{i}"), "r", "rec", 10).unwrap();
+        }
+        let ids = |s: &Store| -> Vec<String> {
+            s.pending_session("r")
+                .unwrap()
+                .into_iter()
+                .map(|d| d.mail_id)
+                .collect()
+        };
+        assert_eq!(ids(&store), ["p5", "p6"]);
+        store.ack("p6", "r", "rec", 11).unwrap();
+        assert_eq!(ids(&store), ["p5"]);
     }
 
     #[test]
