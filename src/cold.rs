@@ -10,19 +10,29 @@
 //! place, marked read-only, and directory-fsynced before hot bodies are removed.
 //! Reading any cold file verifies its SHA-256 trailer first, and `read_body`
 //! consults the file's in-memory `Filter` before touching the filesystem.
+//!
+//! Each day file may have a derived sidecar `day-<bucket>.idx`:
+//!   line 1:   `RWCIDX01`
+//!   line 2:   JSON `{"size","trailer","bloom","spans"}` holding the cold file's
+//!             byte size, its trailer SHA-256 hex, the Bloom filter words, and
+//!             `[mail_id, offset, length]` spans of each record's JSON line.
+//! A sidecar is used only when the cold file's current size and trailer match;
+//! otherwise the cold file is parsed. It is rebuildable and never trusted for
+//! body reads, which always verify the whole cold file.
 
 use crate::durlog;
 use crate::json::{self, obj, s, Value};
 use crate::sha256::{hash_pair, hex_digest};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 pub const COLD_HEADER: &str = "RWCOLD01\n";
 const TRAILER_PREFIX: &str = "SHA256:";
+const IDX_HEADER: &str = "RWCIDX01\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -91,11 +101,26 @@ pub struct Day {
 pub struct Index {
     days: RwLock<BTreeMap<i64, Day>>,
     opens: AtomicU64,
+    parses: AtomicU64,
 }
 
 impl Index {
+    /// Read-only load: uses a valid sidecar when present, else parses the
+    /// cold file in memory. Never writes.
     pub fn load(cold_dir: &Path) -> io::Result<Self> {
+        Self::load_with(cold_dir, false)
+    }
+
+    /// Like `load`, but writes or rebuilds a missing or stale sidecar per day.
+    /// Sidecar write failures are ignored: it is derived data.
+    #[allow(dead_code)]
+    pub fn load_indexed(cold_dir: &Path) -> io::Result<Self> {
+        Self::load_with(cold_dir, true)
+    }
+
+    fn load_with(cold_dir: &Path, write_index: bool) -> io::Result<Self> {
         let mut map = BTreeMap::new();
+        let mut parses = 0u64;
         if cold_dir.exists() {
             let mut entries: Vec<PathBuf> = Vec::new();
             for entry in fs::read_dir(cold_dir)? {
@@ -107,9 +132,33 @@ impl Index {
             entries.sort();
             for path in entries {
                 if let Some(day) = parse_day(&path) {
-                    let records = read_file(&path)?;
-                    let filter =
-                        Filter::build(records.iter().map(|r| r.mail_id.as_str()), records.len());
+                    let filter = match load_sidecar(&path) {
+                        Some(filter) => filter,
+                        None => {
+                            parses += 1;
+                            let parsed = parse_cold(&path)?;
+                            let filter = Filter::build(
+                                parsed.records.iter().map(|r| r.mail_id.as_str()),
+                                parsed.records.len(),
+                            );
+                            if write_index {
+                                let spans: Vec<(&str, usize, usize)> = parsed
+                                    .records
+                                    .iter()
+                                    .zip(&parsed.spans)
+                                    .map(|(r, &(off, len))| (r.mail_id.as_str(), off, len))
+                                    .collect();
+                                let _ = write_sidecar(
+                                    &path,
+                                    parsed.size,
+                                    &parsed.trailer,
+                                    &filter,
+                                    &spans,
+                                );
+                            }
+                            filter
+                        }
+                    };
                     map.insert(
                         day,
                         Day {
@@ -124,12 +173,24 @@ impl Index {
         Ok(Self {
             days: RwLock::new(map),
             opens: AtomicU64::new(0),
+            parses: AtomicU64::new(parses),
         })
     }
 
     /// Number of cold file disk opens performed through `read_body` / `contains_id`.
     pub fn file_opens(&self) -> u64 {
         self.opens.load(Ordering::SeqCst)
+    }
+
+    /// Number of full cold file parses done through this Index, load included.
+    #[allow(dead_code)]
+    pub fn file_parses(&self) -> u64 {
+        self.parses.load(Ordering::SeqCst)
+    }
+
+    fn parse(&self, path: &Path) -> io::Result<Vec<Record>> {
+        self.parses.fetch_add(1, Ordering::SeqCst);
+        read_file(path)
     }
 
     /// Seal `records` into `<cold_dir>/day-<day_bucket>.cold`. If that day file
@@ -146,7 +207,7 @@ impl Index {
         let final_path = file_path(cold_dir, day_bucket);
         let mut merged: BTreeMap<String, Record> = BTreeMap::new();
         if final_path.exists() {
-            for existing in read_file(&final_path)? {
+            for existing in self.parse(&final_path)? {
                 merged.insert(existing.mail_id.clone(), existing);
             }
         }
@@ -155,9 +216,11 @@ impl Index {
         }
 
         let mut payload = String::from(COLD_HEADER);
+        let mut spans: Vec<(&str, usize, usize)> = Vec::with_capacity(merged.len());
         for rec in merged.values() {
-            let line = encode_record(rec);
-            payload.push_str(&json::stringify(&line));
+            let line = json::stringify(&encode_record(rec));
+            spans.push((rec.mail_id.as_str(), payload.len(), line.len()));
+            payload.push_str(&line);
             payload.push('\n');
         }
         let digest = hex_digest(payload.as_bytes());
@@ -194,6 +257,7 @@ impl Index {
         }
 
         let filter = Filter::build(merged.keys().map(String::as_str), merged.len());
+        let _ = write_sidecar(&final_path, full.len(), &digest, &filter, &spans);
         self.days.write().unwrap().insert(
             day_bucket,
             Day {
@@ -227,7 +291,7 @@ impl Index {
         };
         for path in candidates {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            let records = read_file(&path)?;
+            let records = self.parse(&path)?;
             for rec in records {
                 if rec.mail_id == mail_id {
                     return Ok(Some(rec.body));
@@ -235,6 +299,51 @@ impl Index {
             }
         }
         Ok(None)
+    }
+
+    /// Bodies for `(day_bucket, mail_id)` pairs, keyed by mail_id. Wants are
+    /// grouped by day so each candidate file is read, verified and parsed at
+    /// most once per call; an unindexed day falls back across every day's
+    /// filter, as `read_body` does. Filter misses never open a file.
+    // ## YAGNI: reads parse the whole verified file; sidecar spans are not
+    // consulted here because the whole-file SHA-256 read dominates anyway.
+    #[allow(dead_code)]
+    pub fn read_bodies(&self, wants: &[(i64, &str)]) -> io::Result<HashMap<String, String>> {
+        let mut by_day: BTreeMap<i64, (PathBuf, HashSet<&str>)> = BTreeMap::new();
+        {
+            let guard = self.days.read().unwrap();
+            let mut add = |e: &Day, id| {
+                by_day
+                    .entry(e.day_bucket)
+                    .or_insert_with(|| (e.path.clone(), HashSet::new()))
+                    .1
+                    .insert(id);
+            };
+            for &(day, id) in wants {
+                match guard.get(&day) {
+                    Some(e) if e.filter.may_contain(id) => add(e, id),
+                    Some(_) => {}
+                    None => guard
+                        .values()
+                        .filter(|e| e.filter.may_contain(id))
+                        .for_each(|e| add(e, id)),
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for (path, mut ids) in by_day.into_values() {
+            ids.retain(|id| !out.contains_key(*id));
+            if ids.is_empty() {
+                continue;
+            }
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            for rec in self.parse(&path)? {
+                if ids.contains(rec.mail_id.as_str()) {
+                    out.insert(rec.mail_id, rec.body);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Check exact membership of `mail_id` across all sealed cold day files,
@@ -250,7 +359,7 @@ impl Index {
         };
         for path in candidates {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            for rec in read_file(&path)? {
+            for rec in self.parse(&path)? {
                 if rec.mail_id == mail_id {
                     return Ok(Some(rec));
                 }
@@ -282,6 +391,19 @@ pub fn parse_day(path: &Path) -> Option<i64> {
 /// Verify the `RWCOLD01` header, the whole-payload `SHA256:` trailer, and each
 /// record's `body_sha256` before returning any record.
 pub fn read_file(path: &Path) -> io::Result<Vec<Record>> {
+    parse_cold(path).map(|p| p.records)
+}
+
+/// A verified cold file: records, each record line's `(offset, length)`,
+/// the file's byte size, and its trailer digest hex.
+struct Parsed {
+    records: Vec<Record>,
+    spans: Vec<(usize, usize)>,
+    size: usize,
+    trailer: String,
+}
+
+fn parse_cold(path: &Path) -> io::Result<Parsed> {
     let raw = fs::read_to_string(path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -336,7 +458,16 @@ pub fn read_file(path: &Path) -> io::Result<Vec<Record>> {
     }
 
     let mut out = Vec::new();
-    for (idx, line) in body_part[COLD_HEADER.len()..].lines().enumerate() {
+    let mut spans = Vec::new();
+    let mut offset = COLD_HEADER.len();
+    for (idx, chunk) in body_part[COLD_HEADER.len()..]
+        .split_inclusive('\n')
+        .enumerate()
+    {
+        let start = offset;
+        offset += chunk.len();
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             continue;
         }
@@ -363,8 +494,102 @@ pub fn read_file(path: &Path) -> io::Result<Vec<Record>> {
             ));
         }
         out.push(rec);
+        spans.push((start, line.len()));
     }
-    Ok(out)
+    Ok(Parsed {
+        records: out,
+        spans,
+        size: raw.len(),
+        trailer: expected_hex.to_string(),
+    })
+}
+
+fn sidecar_path(cold_path: &Path) -> PathBuf {
+    cold_path.with_extension("idx")
+}
+
+/// Best-effort write of the derived sidecar for `cold_path` (tmp, fsync, rename).
+fn write_sidecar(
+    cold_path: &Path,
+    size: usize,
+    trailer: &str,
+    filter: &Filter,
+    spans: &[(&str, usize, usize)],
+) -> io::Result<()> {
+    let to_int = |n: usize| Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
+    let body = obj(vec![
+        ("size", to_int(size)),
+        ("trailer", s(trailer)),
+        (
+            "bloom",
+            Value::Arr(filter.bits.iter().map(|&w| Value::Int(w as i64)).collect()),
+        ),
+        (
+            "spans",
+            Value::Arr(
+                spans
+                    .iter()
+                    .map(|&(id, off, len)| Value::Arr(vec![s(id), to_int(off), to_int(len)]))
+                    .collect(),
+            ),
+        ),
+    ]);
+    let mut text = String::from(IDX_HEADER);
+    text.push_str(&json::stringify(&body));
+    text.push('\n');
+
+    let final_path = sidecar_path(cold_path);
+    let dir = cold_path.parent().unwrap_or(Path::new("."));
+    let name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("day.idx");
+    let tmp_path = dir.join(format!("{name}.tmp.{}", std::process::id()));
+    let res = (|| -> io::Result<()> {
+        let mut f = File::create(&tmp_path)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp_path, &final_path)?;
+        durlog::sync_dir(dir)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// The Bloom filter from `cold_path`'s sidecar, if the sidecar parses and the
+/// cold file's current size and trailer digest match it; `None` means stale.
+fn load_sidecar(cold_path: &Path) -> Option<Filter> {
+    let text = fs::read_to_string(sidecar_path(cold_path)).ok()?;
+    let v = json::parse(text.strip_prefix(IDX_HEADER)?.strip_suffix('\n')?).ok()?;
+    let size = u64::try_from(v.get("size")?.as_i64()?).ok()?;
+    let trailer = v.get("trailer")?.as_str()?;
+    let Some(Value::Arr(words)) = v.get("bloom") else {
+        return None;
+    };
+    let bits = words
+        .iter()
+        .map(|w| w.as_i64().map(|w| w as u64))
+        .collect::<Option<Vec<u64>>>()?;
+    if bits.is_empty() || !matches!(v.get("spans"), Some(Value::Arr(_))) {
+        return None;
+    }
+
+    let expect = format!("{TRAILER_PREFIX}{trailer}\n");
+    let mut f = File::open(cold_path).ok()?;
+    if f.metadata().ok()?.len() != size || size < expect.len() as u64 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-(expect.len() as i64))).ok()?;
+    let mut tail = vec![0u8; expect.len()];
+    f.read_exact(&mut tail).ok()?;
+    if tail != expect.as_bytes() {
+        return None;
+    }
+    let num_bits = bits.len() as u64 * 64;
+    Some(Filter { bits, num_bits })
 }
 
 fn encode_record(r: &Record) -> Value {
@@ -521,5 +746,129 @@ mod tests {
         assert!(err.to_string().contains("checksum"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("roger-cold-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn make_writable(path: &Path) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn read_bodies_opens_each_day_once_and_detects_tamper() {
+        let dir = temp_dir("batch");
+        let idx = Index::load(&dir).unwrap();
+        let day1: Vec<Record> = (0..8)
+            .map(|n| sample_record(&format!("b-{n}"), n, &format!("body {n}")))
+            .collect();
+        let path = idx.seal_day(&dir, 1, &day1).unwrap();
+        idx.seal_day(&dir, 2, &[sample_record("other", 9, "other body")])
+            .unwrap();
+
+        let (opens, parses) = (idx.file_opens(), idx.file_parses());
+        let wants: Vec<(i64, &str)> = day1.iter().map(|r| (1, r.mail_id.as_str())).collect();
+        let got = idx.read_bodies(&wants).unwrap();
+        assert_eq!(idx.file_opens() - opens, 1);
+        assert_eq!(idx.file_parses() - parses, 1);
+        assert_eq!(got.len(), 8);
+        for r in &day1 {
+            assert_eq!(got.get(&r.mail_id), Some(&r.body));
+        }
+
+        // Unindexed day falls back across all filters; misses open nothing.
+        let got = idx.read_bodies(&[(999, "other")]).unwrap();
+        assert_eq!(got.get("other").map(String::as_str), Some("other body"));
+        let opens = idx.file_opens();
+        let misses: Vec<String> = (0..50).map(|n| format!("absent-{n}")).collect();
+        let wants: Vec<(i64, &str)> = misses.iter().map(|m| (1, m.as_str())).collect();
+        assert!(idx.read_bodies(&wants).unwrap().is_empty());
+        assert!(idx.file_opens() - opens <= 1);
+
+        make_writable(&path);
+        let content = fs::read_to_string(&path)
+            .unwrap()
+            .replacen("body 3", "bodx 3", 1);
+        fs::write(&path, content).unwrap();
+        let err = idx.read_bodies(&[(1, "b-3")]).unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_written_used_and_rebuilt_when_stale() {
+        let dir = temp_dir("sidecar");
+        let recs = vec![
+            sample_record("s-1", 1, "first"),
+            sample_record("s-2", 2, "second"),
+        ];
+        let cold = Index::load(&dir).unwrap().seal_day(&dir, 7, &recs).unwrap();
+        let idx_path = dir.join("day-7.idx");
+        assert!(idx_path.exists(), "seal_day writes the sidecar");
+
+        // `load` never writes: without a sidecar it parses and leaves none.
+        fs::remove_file(&idx_path).unwrap();
+        let plain = Index::load(&dir).unwrap();
+        assert_eq!(plain.file_parses(), 1);
+        assert!(!idx_path.exists());
+
+        let built = Index::load_indexed(&dir).unwrap();
+        assert_eq!(built.file_parses(), 1);
+        assert!(idx_path.exists());
+
+        let fast = Index::load(&dir).unwrap();
+        assert_eq!(fast.file_parses(), 0);
+        let got = fast.read_bodies(&[(7, "s-1"), (7, "s-2")]).unwrap();
+        assert_eq!(got.get("s-1").map(String::as_str), Some("first"));
+        assert_eq!(got.get("s-2").map(String::as_str), Some("second"));
+
+        // Corrupt sidecar: parse, then rebuild.
+        fs::write(&idx_path, "RWCIDX01\n{not json\n").unwrap();
+        assert_eq!(Index::load(&dir).unwrap().file_parses(), 1);
+        assert_eq!(Index::load_indexed(&dir).unwrap().file_parses(), 1);
+        assert_eq!(Index::load(&dir).unwrap().file_parses(), 0);
+
+        // Same size, different trailer: stale, so the cold file is parsed
+        // (and fails verification) rather than trusting the sidecar.
+        let original = fs::read(&cold).unwrap();
+        make_writable(&cold);
+        let mut bad = original.clone();
+        let n = bad.len();
+        bad[n - 2] = if bad[n - 2] == b'0' { b'1' } else { b'0' };
+        fs::write(&cold, &bad).unwrap();
+        let err = Index::load(&dir)
+            .err()
+            .expect("stale sidecar must not be used");
+        assert!(err.to_string().contains("checksum"), "{err}");
+
+        // Different content and size (sealed elsewhere, copied in): rebuild.
+        let other = temp_dir("sidecar-other");
+        let new_recs = vec![sample_record("s-3", 3, "third body, longer")];
+        let other_cold = Index::load(&other)
+            .unwrap()
+            .seal_day(&other, 7, &new_recs)
+            .unwrap();
+        fs::remove_file(&cold).unwrap();
+        fs::copy(&other_cold, &cold).unwrap();
+        let rebuilt = Index::load_indexed(&dir).unwrap();
+        assert_eq!(rebuilt.file_parses(), 1);
+        let fast = Index::load(&dir).unwrap();
+        assert_eq!(fast.file_parses(), 0);
+        let got = fast.read_bodies(&[(7, "s-3"), (7, "s-1")]).unwrap();
+        assert_eq!(
+            got.get("s-3").map(String::as_str),
+            Some("third body, longer")
+        );
+        assert!(!got.contains_key("s-1"));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other);
     }
 }
