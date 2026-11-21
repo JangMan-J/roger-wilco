@@ -221,8 +221,9 @@ fn client_io(
     // while a send waits.
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Value>>();
     std::thread::spawn(move || {
+        let mut client = Client::new(socket);
         for line in rx {
-            let reply = line.and_then(|v| client_request(&socket, &me, &v, groups_enabled));
+            let reply = line.and_then(|v| client_request(&mut client, &me, &v, groups_enabled));
             let _ = net::send(
                 &to_client,
                 &reply.unwrap_or_else(|e| {
@@ -247,43 +248,37 @@ fn client_io(
     });
 }
 
-fn client_request(socket: &Path, me: &str, v: &Value, groups_enabled: bool) -> io::Result<Value> {
+fn client_request(
+    client: &mut Client,
+    me: &str,
+    v: &Value,
+    groups_enabled: bool,
+) -> io::Result<Value> {
     match net::field(v, "type")? {
-        "send" => client_send(socket, me, v, groups_enabled),
-        "board" => request(
-            socket,
-            &obj(vec![
-                ("type", s("board")),
-                ("req", Value::Int(1)),
-                ("session", s(me)),
-            ]),
-        ),
-        "claim" => request(
-            socket,
-            &obj(vec![
-                ("type", s("claim")),
-                ("req", Value::Int(1)),
-                ("op", s(net::field(v, "op")?)),
-                ("key", s(net::field(v, "key")?)),
-                ("owner", s(me)),
-                (
-                    "ttl_ms",
-                    Value::Int(v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0)),
-                ),
-            ]),
-        ),
-        "relabel" => request(
-            socket,
-            &obj(vec![
-                ("type", s("relabel")),
-                ("req", Value::Int(1)),
-                (
-                    "session",
-                    s(v.get("session").and_then(|x| x.as_str()).unwrap_or(me)),
-                ),
-                ("label", s(net::field(v, "label")?)),
-            ]),
-        ),
+        "send" => client_send(client, me, v, groups_enabled),
+        "board" => client.request(obj(vec![("type", s("board")), ("session", s(me))])),
+        "claim" => client.request(obj(vec![
+            ("type", s("claim")),
+            ("op", s(net::field(v, "op")?)),
+            ("key", s(net::field(v, "key")?)),
+            ("owner", s(me)),
+            (
+                "ttl_ms",
+                Value::Int(v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0)),
+            ),
+        ])),
+        "relabel" => client.request(obj(vec![
+            ("type", s("relabel")),
+            (
+                "session",
+                s(v.get("session").and_then(|x| x.as_str()).unwrap_or(me)),
+            ),
+            ("label", s(net::field(v, "label")?)),
+        ])),
+        "receipt" => client.request(obj(vec![
+            ("type", s("receipt")),
+            ("mail", s(net::field(v, "mail")?)),
+        ])),
         "subscribe" if groups_enabled => {
             let group = net::field(v, "group")?;
             let after = match v.get("after") {
@@ -306,39 +301,40 @@ fn client_request(socket: &Path, me: &str, v: &Value, groups_enabled: bool) -> i
                     ))
                 }
             };
-            subscribe_req(socket, me, group, after, latest)
+            subscribe_req_on(client, me, group, after, latest)
         }
-        "unsubscribe" if groups_enabled => unsubscribe_req(socket, me, net::field(v, "group")?),
+        "unsubscribe" if groups_enabled => unsubscribe_req_on(client, me, net::field(v, "group")?),
         "groups" if groups_enabled => {
             let sess = v.get("session").and_then(Value::as_str).unwrap_or(me);
             let prefix = v.get("prefix").and_then(Value::as_str);
             let include_retired = v.get("include_retired") == Some(&Value::Bool(true));
-            groups_req_filtered(socket, Some(sess), prefix, include_retired)
+            groups_req_filtered_on(client, Some(sess), prefix, include_retired)
         }
         "articles" if groups_enabled => {
             let group = net::field(v, "group")?;
             let after = v.get("after").and_then(Value::as_i64).unwrap_or(0);
             let limit = v.get("limit").and_then(Value::as_i64).unwrap_or(100) as usize;
-            articles_req(socket, group, after, limit)
+            client.request(obj(vec![
+                ("type", s("articles")),
+                ("group", s(group)),
+                ("after", Value::Int(after)),
+                ("limit", Value::Int(limit as i64)),
+            ]))
         }
         "group_policy" if groups_enabled => {
             let group = net::field(v, "group")?;
-            let mut ask = vec![
-                ("type", s("group_policy")),
-                ("req", Value::Int(1)),
-                ("group", s(group)),
-            ];
+            let mut ask = vec![("type", s("group_policy")), ("group", s(group))];
             for key in ["keep_last", "ttl_ms", "retired"] {
                 if let Some(val) = v.get(key) {
                     ask.push((key, val.clone()));
                 }
             }
-            request(socket, &obj(ask))
+            client.request(obj(ask))
         }
         other if groups_enabled => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "expected request send, board, relabel, claim, subscribe, unsubscribe, or groups; saw {other}"
+                "expected request send, board, relabel, claim, receipt, subscribe, unsubscribe, groups, articles, or group_policy; saw {other}"
             ),
         )),
         other => Err(io::Error::new(
@@ -348,7 +344,12 @@ fn client_request(socket: &Path, me: &str, v: &Value, groups_enabled: bool) -> i
     }
 }
 
-fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io::Result<Value> {
+fn client_send(
+    client: &mut Client,
+    from: &str,
+    v: &Value,
+    groups_enabled: bool,
+) -> io::Result<Value> {
     // A missing mail id is generated; a present one of the wrong type is a
     // malformed send, not a request to pick another id.
     let mail = match v.get("mail") {
@@ -359,8 +360,8 @@ fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io
             .to_string(),
     };
     if !groups_enabled {
-        let mail = send_mail(
-            socket,
+        let mail = send_mail_on(
+            client,
             from,
             net::field(v, "to")?,
             &mail,
@@ -382,8 +383,8 @@ fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io
             let to = to_val.as_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "to must be a string")
             })?;
-            let mail = send_mail(
-                socket,
+            let mail = send_mail_on(
+                client,
                 from,
                 to,
                 &mail,
@@ -405,8 +406,8 @@ fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io
                     )
                 })?),
             };
-            let (mail, grp, article) = send_group_mail_with(
-                socket,
+            let (mail, grp, article) = send_group_mail_on(
+                client,
                 from,
                 group,
                 &mail,
@@ -427,6 +428,16 @@ fn client_send(socket: &Path, from: &str, v: &Value, groups_enabled: bool) -> io
 /// The session loop all three faces share: register, write each delivery to
 /// the Store, then ack naming its Record id. Returns when the host daemon
 /// connection ends.
+fn next_record_after(records: &HashMap<String, String>) -> u64 {
+    records
+        .values()
+        .filter_map(|r| r.strip_prefix("r-"))
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .max()
+        .map_or(1, |n| n + 1)
+}
+
 pub fn serve(
     socket: PathBuf,
     id: String,
@@ -496,7 +507,7 @@ fn serve_inner(
             }
         }
     }
-    let mut next_record = records.len() as u64 + 1;
+    let mut next_record = next_record_after(&records);
 
     let (writer, lines) = connect(&socket)?;
     let mut register = vec![("type", s("register")), ("session", s(&id))];
@@ -1435,19 +1446,6 @@ pub fn groups_req_filtered(
     groups_req_filtered_on(&mut client, session, prefix, include_retired)
 }
 
-pub fn articles_req(socket: &Path, group: &str, after: i64, limit: usize) -> io::Result<Value> {
-    request(
-        socket,
-        &obj(vec![
-            ("type", s("articles")),
-            ("req", Value::Int(1)),
-            ("group", s(group)),
-            ("after", Value::Int(after)),
-            ("limit", Value::Int(limit as i64)),
-        ]),
-    )
-}
-
 /// The line that follows a Mail's own line when it has headers: the set as
 /// one JSON object, key order as the sender gave it.
 fn write_headers(out: &mut dyn Write, mail: &str, headers: &Value) -> io::Result<()> {
@@ -1931,7 +1929,7 @@ mod tests {
         let unused = PathBuf::from("tcp://127.0.0.1:1");
         for kind in ["subscribe", "unsubscribe", "groups"] {
             let err = client_request(
-                &unused,
+                &mut Client::new(unused.clone()),
                 "me-1",
                 &obj(vec![("type", s(kind)), ("group", s("ops"))]),
                 false,
@@ -1942,8 +1940,19 @@ mod tests {
                 format!("expected request send, board, relabel, or claim; saw {kind}")
             );
         }
+        let unknown_groups = client_request(
+            &mut Client::new(unused.clone()),
+            "me-1",
+            &obj(vec![("type", s("bogus"))]),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            unknown_groups.to_string(),
+            "expected request send, board, relabel, claim, receipt, subscribe, unsubscribe, groups, articles, or group_policy; saw bogus"
+        );
         let send_no_groups = client_request(
-            &unused,
+            &mut Client::new(unused.clone()),
             "me-1",
             &obj(vec![
                 ("type", s("send")),
@@ -1956,7 +1965,7 @@ mod tests {
         assert!(send_no_groups.to_string().contains("missing to"));
 
         let both = client_request(
-            &unused,
+            &mut Client::new(unused.clone()),
             "me-1",
             &obj(vec![
                 ("type", s("send")),
@@ -1969,7 +1978,7 @@ mod tests {
         .unwrap_err();
         assert!(both.to_string().contains("expected either to or group"));
         let neither = client_request(
-            &unused,
+            &mut Client::new(unused),
             "me-1",
             &obj(vec![("type", s("send")), ("body", s("hi"))]),
             true,
@@ -2039,7 +2048,7 @@ mod tests {
 
         assert_eq!(
             client_request(
-                &req_target,
+                &mut Client::new(req_target.clone()),
                 "me-1",
                 &json::parse(r#"{"type":"send","group":"ops","mail":"mg1","body":"hello"}"#)
                     .unwrap(),
@@ -2050,7 +2059,7 @@ mod tests {
         );
         assert_eq!(
             client_request(
-                &req_target,
+                &mut Client::new(req_target.clone()),
                 "me-1",
                 &json::parse(r#"{"type":"send","to":"peer","mail":"md1","body":"direct"}"#)
                     .unwrap(),
@@ -2060,7 +2069,7 @@ mod tests {
             json::parse(r#"{"type":"accepted","mail":"md1"}"#).unwrap()
         );
         let sub_after = client_request(
-            &req_target,
+            &mut Client::new(req_target.clone()),
             "me-1",
             &json::parse(r#"{"type":"subscribe","group":"ops","after":2}"#).unwrap(),
             true,
@@ -2068,7 +2077,7 @@ mod tests {
         .unwrap();
         assert_eq!(sub_after.get("position"), Some(&Value::Int(2)));
         let sub_latest = client_request(
-            &req_target,
+            &mut Client::new(req_target.clone()),
             "me-1",
             &json::parse(r#"{"type":"subscribe","group":"ops","latest":true}"#).unwrap(),
             true,
@@ -2076,7 +2085,7 @@ mod tests {
         .unwrap();
         assert_eq!(sub_latest.get("position"), Some(&Value::Int(6)));
         let unsub = client_request(
-            &req_target,
+            &mut Client::new(req_target.clone()),
             "me-1",
             &json::parse(r#"{"type":"unsubscribe","group":"ops"}"#).unwrap(),
             true,
@@ -2084,7 +2093,7 @@ mod tests {
         .unwrap();
         assert_eq!(net::field(&unsub, "type").unwrap(), "unsubscribed");
         let grps = client_request(
-            &req_target,
+            &mut Client::new(req_target),
             "me-1",
             &json::parse(r#"{"type":"groups"}"#).unwrap(),
             true,
@@ -2238,6 +2247,108 @@ mod tests {
         let mail = send_mail_on(&mut client, "a", "b", "m-4", "hi", None).unwrap();
         assert_eq!(mail, "m-4");
         assert_eq!(client.connects(), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn next_record_after_handles_gaps_empty_and_junk_ids() {
+        assert_eq!(next_record_after(&HashMap::new()), 1);
+
+        let mut with_gaps = HashMap::new();
+        with_gaps.insert("m1".into(), "r-1".into());
+        with_gaps.insert("m2".into(), "r-5".into());
+        assert_eq!(next_record_after(&with_gaps), 6);
+
+        let mut junk_only = HashMap::new();
+        junk_only.insert("m1".into(), "bad".into());
+        junk_only.insert("m2".into(), "r-abc".into());
+        junk_only.insert("m3".into(), "r-".into());
+        junk_only.insert("m4".into(), "x-9".into());
+        junk_only.insert("m5".into(), "r-+4".into());
+        assert_eq!(next_record_after(&junk_only), 1);
+
+        junk_only.insert("m6".into(), "r-3".into());
+        assert_eq!(next_record_after(&junk_only), 4);
+    }
+
+    #[test]
+    fn client_request_receipt_works_with_and_without_groups_and_pools_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut lines = net::lines(Box::new(conn.try_clone().unwrap()));
+            let w = net::writer(Box::new(conn));
+            for expected_req in 1..=4 {
+                let req = lines.next().unwrap().unwrap();
+                assert_eq!(req.get("req").and_then(Value::as_i64), Some(expected_req));
+                let resp = match net::field(&req, "type").unwrap() {
+                    "receipt" => obj(vec![
+                        ("type", s("receipt")),
+                        ("req", Value::Int(expected_req)),
+                        ("mail", s(net::field(&req, "mail").unwrap())),
+                        ("to", s("peer")),
+                        ("record", s("r-2")),
+                    ]),
+                    "board" => obj(vec![
+                        ("type", s("board")),
+                        ("req", Value::Int(expected_req)),
+                        ("sessions", Value::Arr(vec![])),
+                        ("claims", Value::Arr(vec![])),
+                    ]),
+                    "articles" => obj(vec![
+                        ("type", s("articles")),
+                        ("req", Value::Int(expected_req)),
+                        ("group", s(net::field(&req, "group").unwrap())),
+                        ("articles", Value::Arr(vec![])),
+                    ]),
+                    other => panic!("unexpected {other}"),
+                };
+                net::send(&w, &resp).unwrap();
+            }
+        });
+
+        let mut client = Client::new(target);
+        let r_off = client_request(
+            &mut client,
+            "me-1",
+            &json::parse(r#"{"type":"receipt","mail":"m-1"}"#).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(net::field(&r_off, "type").unwrap(), "receipt");
+        assert_eq!(net::field(&r_off, "mail").unwrap(), "m-1");
+        assert_eq!(net::field(&r_off, "record").unwrap(), "r-2");
+
+        let r_on = client_request(
+            &mut client,
+            "me-1",
+            &json::parse(r#"{"type":"receipt","mail":"m-2"}"#).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(net::field(&r_on, "type").unwrap(), "receipt");
+        assert_eq!(net::field(&r_on, "mail").unwrap(), "m-2");
+
+        let b = client_request(
+            &mut client,
+            "me-1",
+            &json::parse(r#"{"type":"board"}"#).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(net::field(&b, "type").unwrap(), "board");
+
+        let a = client_request(
+            &mut client,
+            "me-1",
+            &json::parse(r#"{"type":"articles","group":"ops","after":1,"limit":10}"#).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(net::field(&a, "type").unwrap(), "articles");
+
+        assert_eq!(client.connects(), 1);
         server.join().unwrap();
     }
 }
