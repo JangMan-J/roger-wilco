@@ -281,9 +281,15 @@ fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> i
     // marks cold names a day file that was sealed before that commit.
     if include_bodies && envelopes.iter().any(|(_, _, cold)| *cold != 0) {
         let cold = Index::load(&dir.join("cold"))?;
-        for (env, day, in_cold) in envelopes.iter_mut() {
+        let wants: Vec<(i64, &str)> = envelopes
+            .iter()
+            .filter(|(env, _, in_cold)| *in_cold != 0 && !env.pruned)
+            .map(|(env, day, _)| (*day, env.mail_id.as_str()))
+            .collect();
+        let mut bodies = cold.read_bodies(&wants)?;
+        for (env, _, in_cold) in envelopes.iter_mut() {
             if *in_cold != 0 && !env.pruned {
-                env.body = cold.read_body(*day, &env.mail_id)?;
+                env.body = bodies.remove(&env.mail_id);
             }
         }
     }

@@ -718,9 +718,10 @@ impl Inner {
         })
     }
 
+    /// Resolves a body from the hot row or from `cold`, the map one
+    /// `cold_bodies` call produced for this batch.
     fn resolve_body(
-        &self,
-        idx: usize,
+        cold: &mut std::collections::HashMap<String, String>,
         mail_id: &str,
         day_bucket: i64,
         in_cold: bool,
@@ -728,17 +729,16 @@ impl Inner {
     ) -> io::Result<String> {
         match body {
             Some(b) => Ok(b),
-            None if in_cold => self.slices[idx]
-                .cold
-                .read_body(day_bucket, mail_id)?
-                .ok_or_else(|| {
+            None if in_cold => {
+                cold.remove(mail_id).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "expected mail {mail_id} in cold day {day_bucket}, saw no such record",
                         ),
                     )
-                }),
+                })
+            }
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("expected a hot body for mail {mail_id}, saw none"),
@@ -746,8 +746,12 @@ impl Inner {
         }
     }
 
-    fn resolve(&self, idx: usize, raw: RawPending, reader: &str) -> io::Result<Delivery> {
-        let body = self.resolve_body(idx, &raw.mail_id, raw.day_bucket, raw.in_cold, raw.body)?;
+    fn resolve(
+        cold: &mut std::collections::HashMap<String, String>,
+        raw: RawPending,
+        reader: &str,
+    ) -> io::Result<Delivery> {
+        let body = Self::resolve_body(cold, &raw.mail_id, raw.day_bucket, raw.in_cold, raw.body)?;
         let group = raw.kind == "group";
         Ok(Delivery {
             seq: raw.seq,
@@ -764,6 +768,45 @@ impl Inner {
             kind: raw.kind,
             headers: headers_value(raw.headers_json.as_deref()),
         })
+    }
+
+    /// Cold bodies for every `(day_bucket, mail_id, in_cold, has_hot_body)`
+    /// row needing one, read with a single `read_bodies` call on slice `idx`.
+    fn cold_bodies<'a>(
+        &self,
+        idx: usize,
+        rows: impl Iterator<Item = (i64, &'a str, bool, bool)>,
+    ) -> io::Result<std::collections::HashMap<String, String>> {
+        let wants: Vec<(i64, &str)> = rows
+            .filter(|&(_, _, in_cold, hot)| in_cold && !hot)
+            .map(|(day, id, _, _)| (day, id))
+            .collect();
+        if wants.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.slices[idx].cold.read_bodies(&wants)
+    }
+
+    fn resolve_all(
+        &self,
+        idx: usize,
+        raws: Vec<RawPending>,
+        reader: &str,
+    ) -> io::Result<Vec<Delivery>> {
+        let mut cold = self.cold_bodies(
+            idx,
+            raws.iter().map(|r| {
+                (
+                    r.day_bucket,
+                    r.mail_id.as_str(),
+                    r.in_cold,
+                    r.body.is_some(),
+                )
+            }),
+        )?;
+        raws.into_iter()
+            .map(|r| Self::resolve(&mut cold, r, reader))
+            .collect()
     }
 
     /// Group articles above `reader`'s position on subscribed streams in slice
@@ -789,9 +832,7 @@ impl Inner {
             let rows = st.query_map(params![reader, stream], raw_pending)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
-        raws.into_iter()
-            .map(|r| self.resolve(idx, r, reader))
-            .collect()
+        self.resolve_all(idx, raws, reader)
     }
 
     fn pending_for(&self, session: &str) -> io::Result<Vec<Delivery>> {
@@ -807,10 +848,7 @@ impl Inner {
             let rows = st.query_map(params![&stream, session], raw_pending)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
-        let mut out = raws
-            .into_iter()
-            .map(|r| self.resolve(idx, r, session))
-            .collect::<io::Result<Vec<_>>>()?;
+        let mut out = self.resolve_all(idx, raws, session)?;
         let group_shards: Vec<usize> = {
             let subs = self.subscribed_groups.lock().unwrap();
             let mut idxs: Vec<usize> = subs
@@ -1409,7 +1447,7 @@ impl Store {
         for (idx, (conn, dir)) in conns.into_iter().zip(dirs).enumerate() {
             let cold_dir = dir.join("cold");
             slices.push(Shard {
-                cold: Arc::new(Index::load(&cold_dir)?),
+                cold: Arc::new(Index::load_indexed(&cold_dir)?),
                 cold_dir,
                 read: Mutex::new(open_conn(&dir.join("hot.sqlite"), false)?),
                 writer: Writer::spawn(conn, idx)?,
@@ -1759,13 +1797,17 @@ impl Store {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })?;
+        let mut cold = self.inner.cold_bodies(
+            idx,
+            raws.iter().map(|(_, id, _, _, day, in_cold, body, _)| {
+                (*day, id.as_str(), *in_cold, body.is_some())
+            }),
+        )?;
         let mut articles = Vec::with_capacity(raws.len());
         for (article_num, mail_id, from, headers_json, day_bucket, in_cold, body, accepted_at_ms) in
             raws
         {
-            let body = self
-                .inner
-                .resolve_body(idx, &mail_id, day_bucket, in_cold, body)?;
+            let body = Inner::resolve_body(&mut cold, &mail_id, day_bucket, in_cold, body)?;
             articles.push(Article {
                 article_num,
                 mail_id,
@@ -3057,6 +3099,96 @@ mod tests {
         assert_eq!(page2.articles[0].body, "third");
         assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM positions"), 0);
         assert_eq!(count(&store, idx, "SELECT COUNT(*) FROM receipts"), 0);
+    }
+
+    fn cold_files(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        for e in fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                cold_files(&p, ext, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some(ext)
+                && p.file_name().unwrap().to_string_lossy().starts_with("day-")
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    fn batch_cfg(dir: &TempDir) -> Config {
+        let mut c = cfg(dir, 1);
+        c.retain_ms = 1_000;
+        c.day_ms = 1_000;
+        c.sweep_enabled = false;
+        c
+    }
+
+    #[test]
+    fn pending_restores_cold_day_with_one_file_open_and_reopen_writes_sidecar() {
+        let dir = tempdir("batch-pending");
+        let (store, _) = Store::open(batch_cfg(&dir)).unwrap();
+        for i in 0..5 {
+            let mut m = directed(&format!("d{i}"), "s", "r", &format!("body {i}"));
+            m.accepted_at_ms = Some(100 + i * 100);
+            store.send_directed(m).unwrap();
+        }
+        store.inner.sweep(10_000).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM envelopes WHERE in_cold = 1"
+            ),
+            5
+        );
+        let before = store.inner.slices[0].cold.file_opens();
+        let got = store.pending_session("r").unwrap();
+        let bodies: Vec<&str> = got.iter().map(|d| d.body.as_str()).collect();
+        assert_eq!(bodies, ["body 0", "body 1", "body 2", "body 3", "body 4"]);
+        assert_eq!(store.inner.slices[0].cold.file_opens() - before, 1);
+        drop(store);
+
+        let mut idx_files = Vec::new();
+        cold_files(&dir.0, "idx", &mut idx_files);
+        for p in &idx_files {
+            fs::remove_file(p).unwrap();
+        }
+        let mut days = Vec::new();
+        cold_files(&dir.0, "cold", &mut days);
+        assert!(!days.is_empty(), "expected a cold day file, saw none");
+        let (store, _) = Store::open(batch_cfg(&dir)).unwrap();
+        let mut idx_files = Vec::new();
+        cold_files(&dir.0, "idx", &mut idx_files);
+        let names: Vec<String> = idx_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "day-0.idx"), "{names:?}");
+        assert_eq!(store.pending_session("r").unwrap().len(), 5);
+    }
+
+    #[test]
+    fn articles_restore_cold_day_with_one_file_open() {
+        let dir = tempdir("batch-articles");
+        let (store, _) = Store::open(batch_cfg(&dir)).unwrap();
+        for i in 0..4 {
+            let mut m = group(&format!("a{i}"), "s", "card.2", &format!("art {i}"));
+            m.accepted_at_ms = Some(100 + i * 100);
+            store.send_group(m).unwrap();
+        }
+        store.inner.sweep(10_000).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                0,
+                "SELECT COUNT(*) FROM envelopes WHERE in_cold = 1"
+            ),
+            4
+        );
+        let before = store.inner.slices[0].cold.file_opens();
+        let page = store.articles("card.2", 0, 10).unwrap();
+        let bodies: Vec<&str> = page.articles.iter().map(|a| a.body.as_str()).collect();
+        assert_eq!(bodies, ["art 0", "art 1", "art 2", "art 3"]);
+        assert_eq!(store.inner.slices[0].cold.file_opens() - before, 1);
     }
 
     #[test]
