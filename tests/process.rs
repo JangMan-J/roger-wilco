@@ -3039,6 +3039,7 @@ fn receipt_carries_accepted_and_receipted_stamps_on_the_coordinator_clock() {
         &format!("DELIVERED mail={copy} record=r-2"),
         Duration::from_secs(10),
     );
+    rig.wait_receipt("coord.log", &copy, Duration::from_secs(10));
     let after = epoch_ms();
 
     let mut lines = Vec::new();
@@ -4579,7 +4580,11 @@ fn a_deeply_nested_line_ends_one_local_connection_and_not_the_host_daemon() {
     conn.say(&"[".repeat(400_000));
     assert_eq!(conn.line(), "");
     assert!(rig.children[2].try_wait().unwrap().is_none());
-    assert!(read(&rig.p("daemon-b.out.err")).contains("expected nesting of at most 64 levels"));
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        "expected nesting of at most 64 levels",
+        Duration::from_secs(5),
+    );
     rig.send("after", "the daemon is still here");
     wait_for_text(
         &rig.p("recipient.out"),
@@ -4672,6 +4677,7 @@ fn a_mail_does_not_wait_on_the_link_for_more_to_send() {
             &format!("DELIVERED mail={mail}"),
             Duration::from_secs(10),
         );
+        rig.wait_receipt("coord.log", &mail, Duration::from_secs(10));
         let line = receipt_line(&rig, &mail);
         quickest = quickest.min(stamp_in(&line, "latency_ms"));
     }
