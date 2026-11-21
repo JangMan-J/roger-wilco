@@ -1,4 +1,5 @@
 mod audit;
+mod backup;
 mod claims;
 #[allow(dead_code)]
 mod cold;
@@ -89,6 +90,7 @@ Commands:
   receipt     --socket <path> --mail <id>
   audit       [--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]...
               [--address <address>] [--bodies] [--json]   (concurrent read-only)
+  backup      --data <path> --dest <dir> [--kind coordinator|daemon]   (live, crash-safe copy)
 
 Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
 Client --socket accepts a Unix socket path or tcp://<address:port>; over tcp:// a
@@ -374,6 +376,7 @@ fn main() -> io::Result<()> {
         ),
         "watch" => session::watch(PathBuf::from(need(&args, "--socket")?)),
         "audit" => audit::run(&args[2..]),
+        "backup" => backup::run(&args[2..]),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
