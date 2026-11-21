@@ -6,6 +6,7 @@ compile_error!("integration tests require `--features test-hooks`");
 use futures_util::{SinkExt, StreamExt};
 use roger_ws_gateway::durlog::store_path;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -94,7 +95,8 @@ async fn wait_file(path: &Path) -> String {
 
 enum MockEvent {
     Session(Value, OwnedWriteHalf),
-    Request(Value),
+    /// A request and the id of the daemon connection that carried it.
+    Request(u64, Value),
     Line(Value),
 }
 
@@ -102,6 +104,9 @@ struct MockDaemon {
     address: String,
     events: mpsc::UnboundedReceiver<MockEvent>,
     accept: JoinHandle<()>,
+    /// Last `req` seen per daemon connection: request sockets may persist, so
+    /// `req` must rise strictly on each one.
+    last_req: HashMap<u64, i64>,
 }
 
 impl MockDaemon {
@@ -110,13 +115,15 @@ impl MockDaemon {
         let address = listener.local_addr().unwrap().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
         let accept = tokio::spawn(async move {
+            let mut conn = 0u64;
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                conn += 1;
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    serve_connection(stream, tx).await;
+                    serve_connection(conn, stream, tx).await;
                 });
             }
         });
@@ -124,6 +131,7 @@ impl MockDaemon {
             address,
             events: rx,
             accept,
+            last_req: HashMap::new(),
         }
     }
 
@@ -139,14 +147,27 @@ impl MockDaemon {
             match self.event().await {
                 MockEvent::Session(request, writer) => return (request, writer),
                 MockEvent::Line(_) => {}
-                MockEvent::Request(v) => panic!("expected Register, saw request {v}"),
+                MockEvent::Request(_, v) => panic!("expected Register, saw request {v}"),
             }
         }
     }
 
+    /// The next request with its `req` checked (an integer rising strictly on
+    /// its daemon connection) and removed.
     async fn request(&mut self) -> Value {
         match self.event().await {
-            MockEvent::Request(v) => v,
+            MockEvent::Request(conn, mut v) => {
+                let req = v["req"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("expected integer req, saw {v}"));
+                let last = self.last_req.insert(conn, req).unwrap_or(0);
+                assert!(
+                    req > last,
+                    "expected req > {last} on connection {conn}, saw {v}"
+                );
+                v.as_object_mut().unwrap().remove("req");
+                v
+            }
             MockEvent::Session(v, _) => panic!("expected a request, saw Register {v}"),
             MockEvent::Line(v) => panic!("expected a request, saw session line {v}"),
         }
@@ -155,7 +176,7 @@ impl MockDaemon {
     async fn line(&mut self) -> Value {
         match self.event().await {
             MockEvent::Line(v) => v,
-            MockEvent::Request(v) => panic!("expected a session line, saw request {v}"),
+            MockEvent::Request(_, v) => panic!("expected a session line, saw request {v}"),
             MockEvent::Session(v, _) => panic!("expected a session line, saw Register {v}"),
         }
     }
@@ -167,7 +188,7 @@ impl Drop for MockDaemon {
     }
 }
 
-async fn serve_connection(stream: TcpStream, events: mpsc::UnboundedSender<MockEvent>) {
+async fn serve_connection(conn: u64, stream: TcpStream, events: mpsc::UnboundedSender<MockEvent>) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let Some(line) = lines.next_line().await.unwrap() else {
@@ -186,20 +207,39 @@ async fn serve_connection(stream: TcpStream, events: mpsc::UnboundedSender<MockE
         }
         return;
     }
-    events
-        .send(MockEvent::Request(request.clone()))
-        .expect("request event receiver is live");
-    let reply = mock_reply(&request);
-    write
-        .write_all(format!("{reply}\n").as_bytes())
-        .await
-        .unwrap();
-    write.flush().await.unwrap();
+    // A request connection may carry any number of requests, one reply each.
+    let mut request = request;
+    loop {
+        if events
+            .send(MockEvent::Request(conn, request.clone()))
+            .is_err()
+        {
+            return;
+        }
+        let reply = mock_reply(&request);
+        if write
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = write.flush().await;
+        match lines.next_line().await {
+            Ok(Some(line)) => request = serde_json::from_str(&line).unwrap(),
+            _ => return,
+        }
+    }
 }
 
 fn mock_reply(request: &Value) -> Value {
     let req = request["req"].clone();
     match request["type"].as_str().unwrap() {
+        // The mock Group's high water is 7: any other expected_article loses.
+        "send" if request.get("expected_article").is_some_and(|e| e != 7) => json!({
+            "type":"error", "req":req,
+            "reason":format!("expected_article {} but the Group is at 7", request["expected_article"])
+        }),
         "send" if request.get("group").is_some() => json!({
             "type":"accepted", "req":req, "mail":request["mail"],
             "group":request["group"], "article":7
@@ -219,6 +259,25 @@ fn mock_reply(request: &Value) -> Value {
         "unsubscribe" => json!({
             "type":"unsubscribed", "req":req, "session":request["session"],
             "group":request["group"], "position":3
+        }),
+        "groups" if request.get("prefix").is_some() => json!({
+            "type":"groups", "req":req, "groups":[{
+                "group":"st-old", "high_water":2, "subscribers":0,
+                "subscribed":false, "retired":true
+            }]
+        }),
+        "articles" => json!({
+            "type":"articles", "req":req, "group":request["group"], "high_water":12,
+            "articles":[{"article":3, "mail":"m-3", "from":"author-1", "body":"three", "headers":{}}]
+        }),
+        "group_policy" => json!({
+            "type":"group_policy", "req":req, "group":request["group"],
+            "keep_last":request["keep_last"], "ttl_ms":request["ttl_ms"],
+            "retired":request["retired"]
+        }),
+        "receipt" => json!({
+            "type":"receipt", "req":req, "mail":request["mail"], "to":"reader-2",
+            "kind":"directed", "accepted_at_ms":100, "record":"r-9", "acked_at_ms":150
         }),
         "groups" => json!({
             "type":"groups", "req":req, "groups":[{
@@ -312,18 +371,22 @@ async fn groups_stay_disabled_without_upgrade_opt_in() {
         .call(json!({"type":"send", "group":"staff", "body":"hello"}))
         .await;
     assert_eq!(reply, json!({"type":"error", "error":"missing to"}));
-    for request_type in ["subscribe", "unsubscribe", "groups"] {
+    for request_type in [
+        "subscribe",
+        "unsubscribe",
+        "groups",
+        "articles",
+        "group_policy",
+    ] {
         let reply = client
             .call(json!({"type":request_type, "group":"staff"}))
             .await;
-        assert_eq!(
-            reply,
-            json!({
-                "type":"error",
-                "error":format!(
-                    "expected request send, board, relabel, or claim; saw {request_type}"
-                )
-            })
+        assert_eq!(reply["type"], "error", "{reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("expected request send, board")
+                && error.ends_with(&format!("; saw {request_type}")),
+            "{error}"
         );
     }
 
@@ -334,7 +397,7 @@ async fn groups_stay_disabled_without_upgrade_opt_in() {
     assert_eq!(
         daemon.request().await,
         json!({
-            "type":"send", "req":1, "mail":"m-direct", "from":ADDRESS,
+            "type":"send", "mail":"m-direct", "from":ADDRESS,
             "to":"reader-2", "body":"hello"
         })
     );
@@ -364,7 +427,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     assert_eq!(
         daemon.request().await,
         json!({
-            "type":"subscribe", "req":1, "session":ADDRESS,
+            "type":"subscribe", "session":ADDRESS,
             "group":"staff", "after":2
         })
     );
@@ -377,7 +440,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     assert_eq!(
         daemon.request().await,
         json!({
-            "type":"subscribe", "req":1, "session":ADDRESS,
+            "type":"subscribe", "session":ADDRESS,
             "group":"staff", "latest":true
         })
     );
@@ -393,7 +456,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     );
     assert_eq!(
         daemon.request().await,
-        json!({"type":"unsubscribe", "req":1, "session":ADDRESS, "group":"staff"})
+        json!({"type":"unsubscribe", "session":ADDRESS, "group":"staff"})
     );
 
     let reply = client.call(json!({"type":"groups"})).await;
@@ -408,7 +471,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     );
     assert_eq!(
         daemon.request().await,
-        json!({"type":"groups", "req":1, "session":ADDRESS})
+        json!({"type":"groups", "session":ADDRESS})
     );
 
     let reply = client
@@ -424,7 +487,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     assert_eq!(
         daemon.request().await,
         json!({
-            "type":"send", "req":1, "mail":"m-group", "from":ADDRESS,
+            "type":"send", "mail":"m-group", "from":ADDRESS,
             "group":"staff", "body":"article", "headers":{"x-note":"1"}
         })
     );
@@ -436,7 +499,7 @@ async fn groups_opt_in_relays_positions_lists_and_either_send_target() {
     assert_eq!(
         daemon.request().await,
         json!({
-            "type":"send", "req":1, "mail":"m-direct", "from":ADDRESS,
+            "type":"send", "mail":"m-direct", "from":ADDRESS,
             "to":"reader-2", "body":"direct"
         })
     );
@@ -481,7 +544,7 @@ async fn group_delivery_store_ack_and_resume_keep_positions_and_other_kinds_unch
     );
     assert_eq!(
         daemon.line().await,
-        json!({"type":"ack", "req":1, "mail":"m-g1", "record":"r-1"})
+        json!({"type":"ack", "mail":"m-g1", "record":"r-1"})
     );
 
     for (mail, kind, body, record, req) in [
@@ -572,5 +635,207 @@ async fn group_delivery_store_ack_and_resume_keep_positions_and_other_kinds_unch
             entry.get("group").is_none() && entry.get("article").is_none()
         }
     }));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_send_relays_expected_article_and_surfaces_a_lost_race() {
+    let dir = TestDir::new("expected");
+    let mut daemon = MockDaemon::start().await;
+    let (_gateway, port, _) = spawn_gateway(&dir.0, &daemon.address).await;
+    let mut client = Client::open(port, &format!("id={ADDRESS}&groups=1")).await;
+    client.ready().await;
+    let _session = daemon.session().await;
+
+    let reply = client
+        .call(json!({
+            "type":"send", "group":"staff", "mail":"m-cas", "body":"next",
+            "expected_article":7
+        }))
+        .await;
+    assert_eq!(
+        reply,
+        json!({"type":"accepted", "mail":"m-cas", "group":"staff", "article":7})
+    );
+    assert_eq!(
+        daemon.request().await,
+        json!({
+            "type":"send", "mail":"m-cas", "from":ADDRESS, "group":"staff",
+            "body":"next", "expected_article":7
+        })
+    );
+
+    let reply = client
+        .call(json!({
+            "type":"send", "group":"staff", "mail":"m-late", "body":"late",
+            "expected_article":3
+        }))
+        .await;
+    assert_eq!(reply["type"], "error", "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected_article 3 but the Group is at 7"),
+        "{reply}"
+    );
+    assert_eq!(daemon.request().await["expected_article"], 3);
+
+    // Refused before reaching the host daemon.
+    for bad in [json!(-1), json!("7"), json!(1.5)] {
+        let reply = client
+            .call(json!({"type":"send", "group":"staff", "body":"x", "expected_article":bad}))
+            .await;
+        assert_eq!(reply["type"], "error", "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("expected_article"),
+            "{reply}"
+        );
+    }
+
+    // A later request proves no refused send reached the daemon.
+    client.call(json!({"type":"groups"})).await;
+    assert_eq!(daemon.request().await["type"], "groups");
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_articles_and_group_policy_relay_their_fields() {
+    let dir = TestDir::new("listing");
+    let mut daemon = MockDaemon::start().await;
+    let (_gateway, port, _) = spawn_gateway(&dir.0, &daemon.address).await;
+    let mut client = Client::open(port, &format!("id={ADDRESS}&groups=1")).await;
+    client.ready().await;
+    let _session = daemon.session().await;
+
+    let reply = client
+        .call(json!({"type":"groups", "prefix":"st", "include_retired":true}))
+        .await;
+    assert_eq!(
+        reply,
+        json!({
+            "type":"groups", "groups":[{
+                "group":"st-old", "high_water":2, "subscribers":0,
+                "subscribed":false, "retired":true
+            }]
+        })
+    );
+    assert_eq!(
+        daemon.request().await,
+        json!({
+            "type":"groups", "session":ADDRESS, "prefix":"st", "include_retired":true
+        })
+    );
+
+    let reply = client
+        .call(json!({"type":"articles", "group":"staff", "after":2, "limit":5}))
+        .await;
+    assert_eq!(
+        reply,
+        json!({
+            "type":"articles", "group":"staff", "high_water":12,
+            "articles":[{"article":3, "mail":"m-3", "from":"author-1", "body":"three", "headers":{}}]
+        })
+    );
+    let request = daemon.request().await;
+    assert_eq!(request["type"], "articles");
+    assert_eq!(request["group"], "staff");
+    assert_eq!(request["after"], 2);
+    assert_eq!(request["limit"], 5);
+    assert_ne!(request["follow"], true, "a request socket never follows");
+
+    let reply = client
+        .call(json!({
+            "type":"group_policy", "group":"staff", "keep_last":10,
+            "ttl_ms":null, "retired":true
+        }))
+        .await;
+    assert_eq!(
+        reply,
+        json!({
+            "type":"group_policy", "group":"staff", "keep_last":10,
+            "ttl_ms":null, "retired":true
+        })
+    );
+    assert_eq!(
+        daemon.request().await,
+        json!({
+            "type":"group_policy", "group":"staff", "keep_last":10,
+            "ttl_ms":null, "retired":true
+        })
+    );
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_is_available_with_and_without_groups() {
+    let dir = TestDir::new("receipt");
+    let mut daemon = MockDaemon::start().await;
+    let (_gateway, port, _) = spawn_gateway(&dir.0, &daemon.address).await;
+    for query in [format!("id={ADDRESS}"), format!("id={ADDRESS}&groups=1")] {
+        let mut client = Client::open(port, &query).await;
+        client.ready().await;
+        let _session = daemon.session().await;
+        // Two requests in a row: req rises on a persistent request socket.
+        for _ in 0..2 {
+            let reply = client
+                .call(json!({"type":"receipt", "mail":"m-direct"}))
+                .await;
+            assert_eq!(
+                reply,
+                json!({
+                    "type":"receipt", "mail":"m-direct", "to":"reader-2", "kind":"directed",
+                    "accepted_at_ms":100, "record":"r-9", "acked_at_ms":150
+                })
+            );
+            assert_eq!(
+                daemon.request().await,
+                json!({"type":"receipt", "mail":"m-direct"})
+            );
+        }
+        let reply = client.call(json!({"type":"receipt"})).await;
+        assert_eq!(reply["type"], "error", "{reply}");
+        client.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_registers_for_and_relays_committed_board_events() {
+    let dir = TestDir::new("watch");
+    let mut daemon = MockDaemon::start().await;
+    let (_gateway, port, _) = spawn_gateway(&dir.0, &daemon.address).await;
+    let event = json!({
+        "type":"board_event", "event":"register", "session":"peer-1",
+        "host":"host-a", "at_ms":42
+    });
+
+    let mut client = Client::open(port, &format!("id={ADDRESS}&watch=1")).await;
+    client.ready().await;
+    let (register, mut writer) = daemon.session().await;
+    assert_eq!(register["watch"], true, "{register}");
+    deliver(&mut writer, event.clone()).await;
+    let (frame, _) = client.frame().await;
+    assert_eq!(frame, event);
+    client.close().await;
+
+    // Without watch=1 the Register asks for nothing and no board_event reaches the client.
+    let mut client = Client::open(port, &format!("id={ADDRESS}")).await;
+    client.ready().await;
+    let (register, mut writer) = daemon.session().await;
+    assert!(register.get("watch").is_none(), "{register}");
+    deliver(&mut writer, event).await;
+    deliver(
+        &mut writer,
+        json!({
+            "type":"deliver", "mail":"m-after", "from":"author-1", "to":ADDRESS,
+            "body":"after", "kind":"directed", "headers":{}
+        }),
+    )
+    .await;
+    let (mail, _) = client.event().await;
+    assert_eq!(mail["mail"], "m-after");
     client.close().await;
 }

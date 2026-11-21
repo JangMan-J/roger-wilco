@@ -37,7 +37,7 @@ connections never send it.
 ## Upgrade
 
 ```text
-GET /?id=<address>[&label=<text>][&declare=<text>][&registered=1][&superseded=1][&groups=1][&after=<record>]
+GET /?id=<address>[&label=<text>][&declare=<text>][&registered=1][&superseded=1][&groups=1][&watch=1][&after=<record>]
 ```
 
 - `id` (alias `session`): the Address, percent-decoded and otherwise passed through
@@ -47,7 +47,14 @@ GET /?id=<address>[&label=<text>][&declare=<text>][&registered=1][&superseded=1]
 - `registered=1`: as `--registered`; `superseded=1`: as `--superseded` (`0` or absent: off).
 - `groups=1`: opt this connection into Named Groups and Positions. `groups=true` is equivalent;
   `groups=0`, `groups=false`, or an absent flag keeps the original protocol unchanged.
+- `watch=1`: as `--watch`; the Register carries `"watch":true` and each committed Board change
+  the host daemon sends as `board_event` is passed to the client as one text frame, unchanged.
+  Without it the Register omits `watch` and no `board_event` reaches the client.
 - `after=<record>`: resume (below). `after=` with an empty value replays the whole Store.
+
+An upgrade must complete within 10 seconds of the TCP accept or the connection is dropped.
+Every frame and message is limited to 16 MiB in both directions; a larger one closes the
+connection.
 
 Refusals, all before the upgrade: `401` (Bearer), `404` (path other than `/`), `400` (unknown
 or repeated query key, bad flag value or percent escape, `after` naming no record in this
@@ -57,18 +64,27 @@ Address's Store), `409` (the Address's Store is held by another live connection)
 
 Client to gateway: `{"type":"send","to","body"}` (optional `"mail"`, `"headers"`),
 `{"type":"board"}`, `{"type":"relabel","label"}` (optional `"session"`),
-`{"type":"claim","op","key"}` (optional `"ttl_ms"`). Each is answered, in order, by one of
-`accepted`, `board`, `relabeled`, `claim_result`, or `{"type":"error","error":"..."}`. A frame
+`{"type":"claim","op","key"}` (optional `"ttl_ms"`), `{"type":"receipt","mail"}`. Each is
+answered, in order, by one of `accepted`, `board`, `relabeled`, `claim_result`, `receipt` (the
+coordinator's lifecycle of that Mail, available with or without `groups=1`), or
+`{"type":"error","error":"..."}`. Requests to the host daemon travel on a persistent request
+connection with a `req` that rises strictly on it; `req` is stripped from replies. A frame
 that is not JSON, or a binary frame, is answered with `error`.
 
 With `groups=1`, a `send` takes either `"to"` or `"group"` (never both). A Group send is answered
-by `{"type":"accepted","mail","group","article"}`. The connection also accepts
-`{"type":"subscribe","group"}` (optional integer `"after"` or `"latest":true`),
-`{"type":"unsubscribe","group"}`, and `{"type":"groups"}`. These are relayed to the host daemon
-with this connection's Address as `"session"`; their replies are `subscribed` (with `session`,
-`group`, `position`, and `high_water`), `unsubscribed` (with `session`, `group`, and `position`),
-and `groups` (with the daemon's `groups` array). Without `groups=1`, a Group-only `send` still
-requires `to`, and those three request types are refused as unknown.
+by `{"type":"accepted","mail","group","article"}`. A Group send may carry a non-negative integer
+`"expected_article"`: the host daemon accepts it only if that is the Group's next article, and a
+lost race is answered with `error`; any other value is refused before reaching the daemon. The
+connection also accepts `{"type":"subscribe","group"}` (optional integer `"after"` or
+`"latest":true`), `{"type":"unsubscribe","group"}`, `{"type":"groups"}` (optional string
+`"prefix"` and `"include_retired":true`), `{"type":"articles","group"}` (optional `"after"` and
+`"limit"`; one page, never a follow), and `{"type":"group_policy","group"}` (optional
+`"keep_last"`, `"ttl_ms"`, either may be `null` to clear, and `"retired"`). `subscribe`,
+`unsubscribe`, and `groups` are relayed with this connection's Address as `"session"`; replies
+are `subscribed` (with `session`, `group`, `position`, and `high_water`), `unsubscribed` (with
+`session`, `group`, and `position`), `groups` (the daemon's `groups` array), `articles`, and
+`group_policy`, as the host daemon sends them. Without `groups=1`, a Group-only `send` still
+requires `to`, and those five request types are refused as unknown.
 
 Gateway to client, unsolicited: `{"type":"ready","session"}` once the Register is written;
 `{"type":"registered","session"}` (only with `registered=1`); `{"type":"superseded","session",
