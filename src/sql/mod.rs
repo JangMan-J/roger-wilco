@@ -229,7 +229,8 @@ CREATE TABLE IF NOT EXISTS streams (
     next_article INTEGER NOT NULL,
     keep_last INTEGER,
     ttl_ms INTEGER,
-    retired_at_ms INTEGER
+    retired_at_ms INTEGER,
+    pruned_through INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS seen_ids (
     mail_id TEXT PRIMARY KEY,

@@ -1272,8 +1272,7 @@ mod tests {
         rusqlite::Connection::open(&db)
             .unwrap()
             .execute_batch(
-                "ALTER TABLE streams ADD COLUMN pruned_through INTEGER NOT NULL DEFAULT 0; \
-                 INSERT INTO streams(stream, kind, next_article, pruned_through) \
+                "INSERT INTO streams(stream, kind, next_article, pruned_through) \
                  VALUES ('g:news','group',2,1);",
             )
             .unwrap();
