@@ -452,15 +452,14 @@ async fn client_request(
                 ]))
                 .await
         }
-        "receipt" => {
-            client
-                .request(&obj(vec![
-                    ("type", s("receipt")),
-                    ("req", one),
-                    ("mail", s(daemon::field(&v, "mail")?)),
-                ]))
-                .await
-        }
+        "receipt" => client
+            .request(&obj(vec![
+                ("type", s("receipt")),
+                ("req", one),
+                ("mail", s(daemon::field(&v, "mail")?)),
+            ]))
+            .await
+            .map(without_req),
         "claim" => {
             let ttl = v.get("ttl_ms").and_then(Value::as_i64).unwrap_or(0);
             client
