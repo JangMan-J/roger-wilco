@@ -832,3 +832,115 @@ fn audit_lists_every_line_generation_in_log_order_byte_identical() {
         "audit changed an input"
     );
 }
+
+// Pruned group articles in a coordinator slice store.
+// The DDL is the coordinator slice schema's tables audit reads, verbatim,
+// with the prune floor column on `streams`.
+const SLICE_DDL: &str = "
+CREATE TABLE meta (key TEXT PRIMARY KEY, val TEXT NOT NULL);
+CREATE TABLE live_sessions (address TEXT PRIMARY KEY, host TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '', declared TEXT, at_ms INTEGER);
+CREATE TABLE live_claims (claim_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_ms INTEGER NOT NULL);
+CREATE TABLE timeline (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, addr TEXT, host TEXT,
+    old_host TEXT, label TEXT, declared TEXT, registration TEXT, claim_key TEXT,
+    expires_ms INTEGER, mail_id TEXT, at_ms INTEGER, raw_line INTEGER);
+CREATE TABLE streams (stream TEXT PRIMARY KEY, kind TEXT NOT NULL, next_article INTEGER NOT NULL,
+    keep_last INTEGER, ttl_ms INTEGER, retired_at_ms INTEGER,
+    pruned_through INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE seen_ids (mail_id TEXT PRIMARY KEY, kind TEXT NOT NULL, sender TEXT NOT NULL,
+    target TEXT, body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL,
+    article_num INTEGER NOT NULL DEFAULT 0, stream TEXT);
+CREATE TABLE broadcasts (mail_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, sender TEXT NOT NULL,
+    body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL, headers_json TEXT,
+    recipients_json TEXT NOT NULL, accepted_at_ms INTEGER, raw_line INTEGER);
+CREATE TABLE envelopes (seq INTEGER PRIMARY KEY, mail_id TEXT NOT NULL UNIQUE,
+    stream TEXT NOT NULL, article_num INTEGER NOT NULL, kind TEXT NOT NULL,
+    sender TEXT NOT NULL, recipient TEXT NOT NULL, headers_json TEXT,
+    body_len INTEGER NOT NULL, body_sha256 TEXT NOT NULL, accepted_at_ms INTEGER,
+    day_bucket INTEGER NOT NULL, in_cold INTEGER NOT NULL DEFAULT 0, raw_line INTEGER,
+    UNIQUE(stream, article_num));
+CREATE TABLE hot_bodies (mail_id TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE positions (stream TEXT NOT NULL, reader TEXT NOT NULL,
+    subscribed INTEGER NOT NULL DEFAULT 1, position INTEGER NOT NULL DEFAULT 0,
+    record_id TEXT, receipted_at_ms INTEGER, updated_at_ms INTEGER,
+    PRIMARY KEY(stream, reader));
+CREATE TABLE receipts (mail_id TEXT NOT NULL, reader TEXT NOT NULL, stream TEXT NOT NULL,
+    article_num INTEGER NOT NULL, record_id TEXT NOT NULL, receipted_at_ms INTEGER,
+    receipt_seq INTEGER NOT NULL, raw_line INTEGER, PRIMARY KEY(mail_id, reader));
+";
+
+/// A slice store at `<dir>/coord.slices/slice-00/hot.sqlite` holding Group
+/// `news` pruned through article 1: g-1 (pruned, no hot body) and g-2 (hot
+/// body), with subscriber r3 holding no receipts. Returns the slice dir.
+fn pruned_slice(dir: &Dir) -> PathBuf {
+    let slice = dir.0.join("coord.slices").join("slice-00");
+    fs::create_dir_all(&slice).unwrap();
+    let conn = rusqlite::Connection::open(slice.join("hot.sqlite")).unwrap();
+    conn.execute_batch(SLICE_DDL).unwrap();
+    conn.execute_batch(
+        "INSERT INTO streams(stream, kind, next_article, pruned_through) VALUES ('g:news', 'group', 3, 1);
+         INSERT INTO envelopes VALUES (1, 'g-1', 'g:news', 1, 'group', 's', 'news', NULL, 3, 'x', 100, 0, 0, NULL);
+         INSERT INTO envelopes VALUES (2, 'g-2', 'g:news', 2, 'group', 's', 'news', NULL, 4, 'x', 200, 0, 0, NULL);
+         INSERT INTO hot_bodies VALUES ('g-2', 'kept');
+         INSERT INTO positions(stream, reader, position) VALUES ('g:news', 'r3', 0);",
+    )
+    .unwrap();
+    slice
+}
+
+#[test]
+fn pruned_group_article_is_marked_absent_and_not_owed() {
+    let dir = Dir::new("pruned");
+    let slice = pruned_slice(&dir);
+    let db = slice.join("hot.sqlite");
+    let out = audit_ok(&["--coordinator", db.to_str().unwrap(), "--bodies"]);
+    let lines: Vec<&str> = out.lines().collect();
+    let mail = |id: &str| {
+        lines
+            .iter()
+            .find(|l| l.starts_with(&format!("MAIL mail={id} ")))
+            .unwrap_or_else(|| panic!("no MAIL line for {id}: {out}"))
+            .to_string()
+    };
+    let g1 = mail("g-1");
+    assert!(g1.ends_with(" pruned=true"), "{g1}");
+    assert!(g1.contains(" line="), "{g1}");
+    let g2 = mail("g-2");
+    assert!(!g2.contains("pruned"), "{g2}");
+    assert!(lines.contains(&"BODY mail=g-1 absent"), "{out}");
+    assert!(lines.contains(&"BODY mail=g-2 \"kept\""), "{out}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("UNRECEIPTED mail=g-2 ")),
+        "{out}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("UNRECEIPTED mail=g-1 ")),
+        "{out}"
+    );
+}
+
+#[test]
+fn audit_with_junk_cold_index_writes_nothing() {
+    let dir = Dir::new("cold-junk");
+    let slice = pruned_slice(&dir);
+    let cold = slice.join("cold");
+    fs::create_dir_all(cold.join("empty")).unwrap();
+    fs::write(cold.join("day-0.idx"), b"junk \x00\xff not an index\n").unwrap();
+    let snapshot = |p: &std::path::Path| {
+        let mut entries: Vec<(PathBuf, Option<Vec<u8>>)> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                let bytes = path.is_file().then(|| fs::read(&path).unwrap());
+                (path, bytes)
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = (snapshot(&cold), snapshot(&cold.join("empty")));
+    let db = slice.join("hot.sqlite");
+    let out = audit_ok(&["--coordinator", db.to_str().unwrap(), "--bodies"]);
+    assert!(out.contains("MAIL mail=g-2 "), "{out}");
+    assert_eq!((snapshot(&cold), snapshot(&cold.join("empty"))), before);
+}
