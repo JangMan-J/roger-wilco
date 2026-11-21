@@ -1661,9 +1661,54 @@ impl Store {
         })
     }
 
+    fn broadcast_flights(&self, req: &Broadcast) -> Vec<Flight<'_>> {
+        let mut ids: Vec<_> = req
+            .recipients
+            .iter()
+            .map(|r| format!("{}/{r}", req.mail_id))
+            .collect();
+        ids.push(req.mail_id.clone());
+        ids.sort_unstable();
+        ids.dedup();
+        ids.iter().map(|id| self.inner.hold(id)).collect()
+    }
+
+    fn copy_conflict(
+        c: &Connection,
+        list: &[NewEnvelope],
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let mut st = c.prepare("SELECT kind, sender, recipient, body_len, body_sha256, article_num FROM envelopes WHERE mail_id = ?1")?;
+        for e in list {
+            let existing = st
+                .query_row([&e.mail_id], |r| {
+                    Ok(SeenRow {
+                        kind: r.get(0)?,
+                        sender: r.get(1)?,
+                        target: r.get(2)?,
+                        body_len: r.get(3)?,
+                        body_sha256: r.get(4)?,
+                        article_num: r.get(5)?,
+                    })
+                })
+                .optional()?;
+            if let Some(w) = existing.and_then(|s| {
+                s.differs(
+                    e.kind,
+                    &e.sender,
+                    Some(&e.recipient),
+                    e.body.len() as i64,
+                    &e.body_sha256,
+                )
+            }) {
+                return Ok(Some((e.mail_id.clone(), w)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn send_broadcast(&self, req: Broadcast) -> io::Result<Status> {
         let inner = &self.inner;
-        let _flight = inner.hold(&req.mail_id);
+        let _flight = self.broadcast_flights(&req);
         let sha = hex_digest(req.body.as_bytes());
         let len = req.body.len() as i64;
         let (seen, bcast) = inner.seen(&req.mail_id)?;
@@ -1682,7 +1727,10 @@ impl Store {
         let mut seens: Vec<Vec<NewSeen>> = (0..n).map(|_| Vec::new()).collect();
         for rcpt in &req.recipients {
             let copy = format!("{}/{rcpt}", req.mail_id);
-            let (copy_seen, _) = inner.seen(&copy)?;
+            let (copy_seen, copy_bcast) = inner.seen(&copy)?;
+            if copy_bcast.is_some() {
+                return Ok(Status::Conflict(resend_refusal(&copy, "recipient")));
+            }
             // A copy already recorded by this same broadcast is a resume after a
             // partial write; anything else under the copy id is a conflict.
             if let Some(s) = copy_seen {
@@ -1717,10 +1765,20 @@ impl Store {
                 stream: Some(stream),
             });
         }
+        // Check every stream slice before submitting any writes. The flights keep these
+        // ids reserved until both the envelopes and the Mail-id records are committed.
+        for (idx, list) in envs.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+            if let Some((id, what)) = inner.read(idx, |c| Self::copy_conflict(c, list))? {
+                return Ok(Status::Conflict(resend_refusal(&id, &what)));
+            }
+        }
         // Phase 1: every copy's envelope, all slices at once.
         let mut waits = Vec::new();
         for (idx, list) in envs.into_iter().enumerate().filter(|(_, l)| !l.is_empty()) {
             waits.push(inner.slices[idx].writer.submit(move |c| {
+                if let Some((id, what)) = Self::copy_conflict(c, &list)? {
+                    return Ok(vec![(id, InsertOutcome::ResendConflict(what))]);
+                }
                 let mut out = Vec::new();
                 for e in &list {
                     out.push((e.mail_id.clone(), insert_envelope(c, e)?));
@@ -2260,6 +2318,69 @@ mod tests {
                 .sum();
             assert_eq!(total, 4, "m1, b1/x, b1/y, g1 once each");
         }
+    }
+
+    #[test]
+    fn conflicting_broadcast_copy_leaves_other_slices_unchanged() {
+        let dir = tempdir("broadcast-conflict");
+        let (store, _) = Store::open(cfg(&dir, 4)).unwrap();
+        let mut shards = HashSet::new();
+        let recipients: Vec<_> = (0..100)
+            .map(|n| format!("r{n}"))
+            .filter(|r| shards.insert(store.inner.shard(&format!("m:{r}"))))
+            .take(3)
+            .collect();
+        let rs: Vec<_> = recipients.iter().map(String::as_str).collect();
+        assert_eq!(rs.len(), 3);
+        let copy = format!("B/{}", rs[1]);
+        committed(
+            store
+                .send_directed(directed(&copy, "s", rs[1], "other"))
+                .unwrap(),
+        );
+        let shard = &store.inner.slices[store.inner.shard(&copy)];
+        let db = Connection::open(shard.cold_dir.parent().unwrap().join("hot.sqlite")).unwrap();
+        assert_eq!(
+            db.execute("DELETE FROM seen_ids WHERE mail_id = ?1", [&copy])
+                .unwrap(),
+            1
+        );
+        let reason = conflict(store.send_broadcast(bcast("B", "s", &rs, "all")).unwrap());
+        assert!(reason.contains(&copy), "{reason}");
+        for i in 0..4 {
+            assert_eq!(
+                count(
+                    &store,
+                    i,
+                    &format!(
+                        "SELECT COUNT(*) FROM envelopes WHERE mail_id IN ('B/{}','B/{}')",
+                        rs[0], rs[2]
+                    )
+                ),
+                0
+            );
+            assert_eq!(
+                count(
+                    &store,
+                    i,
+                    "SELECT COUNT(*) FROM broadcasts WHERE mail_id = 'B'"
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn identical_broadcast_is_accepted_once() {
+        let dir = tempdir("broadcast-repeat");
+        let (store, _) = Store::open(cfg(&dir, 4)).unwrap();
+        let send = || {
+            store
+                .send_broadcast(bcast("B", "s", &["r1", "r2"], "all"))
+                .unwrap()
+        };
+        committed(send());
+        assert!(matches!(send(), Status::DuplicateAccepted { .. }));
     }
 
     #[test]
