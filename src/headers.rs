@@ -12,7 +12,7 @@ fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
-        Value::Int(_) => "a number",
+        Value::Int(_) | Value::Float(_) => "a number",
         Value::Str(_) => "a string",
         Value::Arr(_) => "an array",
         Value::Obj(_) => "an object",
@@ -117,6 +117,12 @@ mod tests {
         assert!(validate(Some(&no_key))
             .unwrap_err()
             .contains("1 to 128 bytes"));
+    }
+
+    #[test]
+    fn a_float_header_value_is_refused() {
+        let v = parse(r#"{"n":0.5}"#).unwrap();
+        assert!(validate(Some(&v)).unwrap_err().contains("a number"));
     }
 
     #[test]

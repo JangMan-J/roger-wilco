@@ -1,11 +1,13 @@
 //! Minimal JSON codec for the shapes this program emits and accepts.
-//! Objects keep insertion order. Numbers are integers only.
+//! Objects keep insertion order. A number with no fraction or exponent that
+//! fits an `i64` is an `Int`; any other number is a `Float`.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
+    Float(f64),
     Str(String),
     Arr(Vec<Value>),
     Obj(Vec<(String, Value)>),
@@ -32,6 +34,14 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            Value::Int(n) => Some(*n as f64),
+            _ => None,
+        }
+    }
 }
 
 pub fn s(v: &str) -> Value {
@@ -48,23 +58,25 @@ pub fn obj(pairs: Vec<(&str, Value)>) -> Value {
 pub const MAX_DEPTH: usize = 64;
 
 pub fn parse(text: &str) -> Result<Value, String> {
-    let chars: Vec<char> = text.chars().collect();
     let mut p = Parser {
-        chars: &chars,
+        s: text,
+        b: text.as_bytes(),
         i: 0,
         depth: 0,
     };
     p.ws();
     let v = p.value()?;
     p.ws();
-    if p.i != p.chars.len() {
+    if p.i != p.b.len() {
         return Err(format!("trailing input at {}", p.i));
     }
     Ok(v)
 }
 
 struct Parser<'a> {
-    chars: &'a [char],
+    s: &'a str,
+    b: &'a [u8],
+    /// Byte index; always on a char boundary between tokens.
     i: usize,
     /// How many objects and arrays enclose the value being read.
     depth: usize,
@@ -72,42 +84,83 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn ws(&mut self) {
-        while self.i < self.chars.len() && self.chars[self.i].is_whitespace() {
+        while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             self.i += 1;
         }
     }
 
-    fn peek(&self) -> Result<char, String> {
-        self.chars
+    fn peek(&self) -> Result<u8, String> {
+        self.b
             .get(self.i)
             .copied()
             .ok_or_else(|| "unexpected end".to_string())
     }
 
+    /// The char at `i`, for error text.
+    fn ch(&self) -> char {
+        self.s[self.i..].chars().next().unwrap_or('\u{fffd}')
+    }
+
     fn value(&mut self) -> Result<Value, String> {
         self.ws();
         match self.peek()? {
-            '{' => self.nested(Self::object),
-            '[' => self.nested(Self::array),
-            '"' => Ok(Value::Str(self.string()?)),
-            't' => self.lit("true", Value::Bool(true)),
-            'f' => self.lit("false", Value::Bool(false)),
-            'n' => self.lit("null", Value::Null),
-            '-' | '0'..='9' => {
-                let start = self.i;
-                if self.chars[self.i] == '-' {
-                    self.i += 1;
-                }
-                while self.i < self.chars.len() && self.chars[self.i].is_ascii_digit() {
-                    self.i += 1;
-                }
-                let text: String = self.chars[start..self.i].iter().collect();
-                text.parse::<i64>()
-                    .map(Value::Int)
-                    .map_err(|e| e.to_string())
-            }
-            c => Err(format!("unexpected {c}")),
+            b'{' => self.nested(Self::object),
+            b'[' => self.nested(Self::array),
+            b'"' => Ok(Value::Str(self.string()?)),
+            b't' => self.lit("true", Value::Bool(true)),
+            b'f' => self.lit("false", Value::Bool(false)),
+            b'n' => self.lit("null", Value::Null),
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => Err(format!("unexpected {}", self.ch())),
         }
+    }
+
+    fn digits(&mut self, what: &str) -> Result<(), String> {
+        let start = self.i;
+        while self.b.get(self.i).is_some_and(u8::is_ascii_digit) {
+            self.i += 1;
+        }
+        if self.i == start {
+            let seen = if self.i < self.b.len() {
+                format!("{:?}", self.ch())
+            } else {
+                "end of input".to_string()
+            };
+            return Err(format!("expected {what} at {}, saw {seen}", self.i));
+        }
+        Ok(())
+    }
+
+    /// `-?digits(.digits)?([eE][+-]?digits)?`
+    fn number(&mut self) -> Result<Value, String> {
+        let start = self.i;
+        if self.b[self.i] == b'-' {
+            self.i += 1;
+        }
+        self.digits("a digit")?;
+        let mut float = false;
+        if self.b.get(self.i) == Some(&b'.') {
+            float = true;
+            self.i += 1;
+            self.digits("a digit after the decimal point")?;
+        }
+        if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
+            float = true;
+            self.i += 1;
+            if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            self.digits("a digit in the exponent")?;
+        }
+        let text = &self.s[start..self.i];
+        if !float {
+            if let Ok(n) = text.parse::<i64>() {
+                return Ok(Value::Int(n));
+            }
+        }
+        text.parse::<f64>()
+            .map(Value::Float)
+            .map_err(|e| format!("bad number {text}: {e}"))
     }
 
     /// Read one object or array, counted against `MAX_DEPTH`.
@@ -128,7 +181,7 @@ impl Parser<'_> {
         self.i += 1;
         let mut pairs = Vec::new();
         self.ws();
-        if self.peek()? == '}' {
+        if self.peek()? == b'}' {
             self.i += 1;
             return Ok(Value::Obj(pairs));
         }
@@ -138,7 +191,7 @@ impl Parser<'_> {
                 return Err("object key must be string".into());
             };
             self.ws();
-            if self.peek()? != ':' {
+            if self.peek()? != b':' {
                 return Err("expected :".into());
             }
             self.i += 1;
@@ -146,12 +199,12 @@ impl Parser<'_> {
             pairs.push((k, v));
             self.ws();
             match self.peek()? {
-                ',' => self.i += 1,
-                '}' => {
+                b',' => self.i += 1,
+                b'}' => {
                     self.i += 1;
                     return Ok(Value::Obj(pairs));
                 }
-                c => return Err(format!("expected , or }} got {c}")),
+                _ => return Err(format!("expected , or }} got {}", self.ch())),
             }
         }
     }
@@ -160,7 +213,7 @@ impl Parser<'_> {
         self.i += 1;
         let mut xs = Vec::new();
         self.ws();
-        if self.peek()? == ']' {
+        if self.peek()? == b']' {
             self.i += 1;
             return Ok(Value::Arr(xs));
         }
@@ -168,18 +221,18 @@ impl Parser<'_> {
             xs.push(self.value()?);
             self.ws();
             match self.peek()? {
-                ',' => self.i += 1,
-                ']' => {
+                b',' => self.i += 1,
+                b']' => {
                     self.i += 1;
                     return Ok(Value::Arr(xs));
                 }
-                c => return Err(format!("expected , or ] got {c}")),
+                _ => return Err(format!("expected , or ] got {}", self.ch())),
             }
         }
     }
 
     fn lit(&mut self, word: &str, v: Value) -> Result<Value, String> {
-        for c in word.chars() {
+        for c in word.bytes() {
             if self.peek()? != c {
                 return Err(format!("bad literal, expected {word}"));
             }
@@ -189,36 +242,45 @@ impl Parser<'_> {
     }
 
     fn string(&mut self) -> Result<String, String> {
-        if self.peek()? != '"' {
+        if self.peek()? != b'"' {
             return Err("expected string".into());
         }
         self.i += 1;
         let mut out = String::new();
+        let mut run = self.i;
         loop {
             let c = self.peek()?;
-            self.i += 1;
             match c {
-                '"' => return Ok(out),
-                '\\' => {
-                    let e = self.peek()?;
+                b'"' => {
+                    out.push_str(&self.s[run..self.i]);
                     self.i += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    out.push_str(&self.s[run..self.i]);
+                    self.i += 1;
+                    let e = self.peek()?;
                     match e {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        '/' => out.push('/'),
-                        'b' => out.push('\u{8}'),
-                        'f' => out.push('\u{c}'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
-                        'u' => {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                            self.i += 1;
+                            out.push(match e {
+                                b'b' => '\u{8}',
+                                b'f' => '\u{c}',
+                                b'n' => '\n',
+                                b'r' => '\r',
+                                b't' => '\t',
+                                other => other as char,
+                            });
+                        }
+                        b'u' => {
+                            self.i += 1;
                             let hi = self.hex4()?;
                             if (0xD800..0xDC00).contains(&hi) {
-                                if self.peek()? != '\\' {
+                                if self.peek()? != b'\\' {
                                     return Err("lone surrogate".into());
                                 }
                                 self.i += 1;
-                                if self.peek()? != 'u' {
+                                if self.peek()? != b'u' {
                                     return Err("lone surrogate".into());
                                 }
                                 self.i += 1;
@@ -234,10 +296,11 @@ impl Parser<'_> {
                                 out.push(char::from_u32(hi).ok_or("bad codepoint")?);
                             }
                         }
-                        other => return Err(format!("bad escape {other}")),
+                        _ => return Err(format!("bad escape {}", self.ch())),
                     }
+                    run = self.i;
                 }
-                other => out.push(other),
+                _ => self.i += 1,
             }
         }
     }
@@ -246,7 +309,7 @@ impl Parser<'_> {
         let mut n: u32 = 0;
         for _ in 0..4 {
             let c = self.peek()?;
-            n = n * 16 + c.to_digit(16).ok_or("bad hex")?;
+            n = n * 16 + (c as char).to_digit(16).ok_or("bad hex")?;
             self.i += 1;
         }
         Ok(n)
@@ -264,6 +327,10 @@ fn write_value(v: &Value, out: &mut String) {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Int(n) => out.push_str(&n.to_string()),
+        // JSON has no NaN or infinity.
+        Value::Float(f) if !f.is_finite() => out.push_str("null"),
+        // `{:?}` is the shortest text that reads back to the same bits.
+        Value::Float(f) => out.push_str(&format!("{f:?}")),
         Value::Str(s) => write_string(s, out),
         Value::Arr(xs) => {
             out.push('[');
@@ -402,5 +469,52 @@ mod tests {
         assert!(parse("{not json").is_err());
         assert!(parse("").is_err());
         assert!(parse("{} trailing").is_err());
+    }
+
+    fn float(text: &str) -> f64 {
+        parse(text).unwrap().as_f64().unwrap()
+    }
+
+    #[test]
+    fn parses_floats_exponents_and_integer_overflow() {
+        assert_eq!(float("0.5").to_bits(), 0.5f64.to_bits());
+        assert_eq!(float("-2.25e2").to_bits(), (-225.0f64).to_bits());
+        assert_eq!(float("1E-3").to_bits(), 0.001f64.to_bits());
+        assert_eq!(parse("42").unwrap(), Value::Int(42));
+        assert!(matches!(
+            parse("99999999999999999999").unwrap(),
+            Value::Float(_)
+        ));
+        assert!(float("1e400").is_infinite());
+        for bad in ["-", "1.", "1e", "1e+", ".5", "-.5"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn floats_round_trip_and_non_finite_is_null() {
+        for f in [0.5, -1.0, 1e300, 0.1 + 0.2, f64::MIN_POSITIVE] {
+            let text = stringify(&Value::Float(f));
+            assert_eq!(float(&text).to_bits(), f.to_bits(), "{text}");
+        }
+        assert_eq!(stringify(&Value::Float(f64::NAN)), "null");
+        assert_eq!(stringify(&Value::Float(f64::INFINITY)), "null");
+    }
+
+    #[test]
+    fn reads_multibyte_utf8_and_an_mcp_progress_line() {
+        let v = parse(r#"{"k":"hé 日 😀 \ud83d\ude00"}"#).unwrap();
+        assert_eq!(v.get("k").unwrap().as_str(), Some("hé 日 😀 😀"));
+        let line =
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"progress":0.5}}}"#;
+        let v = parse(line).unwrap();
+        let p = v
+            .get("params")
+            .unwrap()
+            .get("_meta")
+            .unwrap()
+            .get("progress");
+        assert_eq!(p.unwrap().as_f64().unwrap().to_bits(), 0.5f64.to_bits());
+        assert_eq!(stringify(&v), line);
     }
 }

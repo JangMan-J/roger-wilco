@@ -537,6 +537,7 @@ fn type_name(v: Option<&Value>) -> &'static str {
         Some(Value::Null) => "null",
         Some(Value::Bool(_)) => "a boolean",
         Some(Value::Int(_)) => "an integer",
+        Some(Value::Float(_)) => "a number",
         Some(Value::Str(_)) => "a string",
         Some(Value::Arr(_)) => "an array",
         Some(Value::Obj(_)) => "an object",
