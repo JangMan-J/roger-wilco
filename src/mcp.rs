@@ -50,10 +50,6 @@ pub struct Config {
     pub groups: bool,
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
-}
-
 /// A variable that is set and not empty.
 fn set(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
     env(name).filter(|v| !v.is_empty())
@@ -66,10 +62,23 @@ pub fn resolve(
     env: &dyn Fn(&str) -> Option<String>,
     fresh: &dyn Fn() -> io::Result<String>,
 ) -> io::Result<Config> {
+    let f = crate::parse_flags(
+        "mcp",
+        args,
+        &[
+            "--socket",
+            "--store",
+            "--id",
+            "--id-env",
+            "--label",
+            "--declare",
+        ],
+        &["--groups"],
+    )?;
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
-    let address = match flag(args, "--id") {
+    let address = match f.get("--id") {
         Some(id) => id,
-        None => match flag(args, "--id-env").and_then(|name| set(env, &name)) {
+        None => match f.get("--id-env").and_then(|name| set(env, &name)) {
             Some(id) => id,
             None => match set(env, "ROGER_ADDRESS") {
                 Some(id) => id,
@@ -77,7 +86,7 @@ pub fn resolve(
             },
         },
     };
-    let socket = match flag(args, "--socket").or_else(|| set(env, "ROGER_SOCKET")) {
+    let socket = match f.get("--socket").or_else(|| set(env, "ROGER_SOCKET")) {
         Some(p) => PathBuf::from(p),
         None => match set(env, "XDG_RUNTIME_DIR") {
             Some(dir) => PathBuf::from(dir).join("roger").join("daemon.sock"),
@@ -88,8 +97,7 @@ pub fn resolve(
             }
         },
     };
-    let (store, store_is_default) = match flag(args, "--store").or_else(|| set(env, "ROGER_STORE"))
-    {
+    let (store, store_is_default) = match f.get("--store").or_else(|| set(env, "ROGER_STORE")) {
         Some(p) => (PathBuf::from(p), false),
         None => {
             let state = match set(env, "XDG_STATE_HOME").or_else(|| set(env, "LOCALAPPDATA")) {
@@ -125,9 +133,9 @@ pub fn resolve(
         address,
         store,
         store_is_default,
-        label: flag(args, "--label"),
-        declared: flag(args, "--declare"),
-        groups: args.iter().any(|a| a == "--groups"),
+        label: f.get("--label"),
+        declared: f.get("--declare"),
+        groups: f.has("--groups"),
     })
 }
 
@@ -2406,7 +2414,7 @@ enum Event {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    let cfg = resolve(args, &|n| std::env::var(n).ok(), &session::gen_uuid)?;
+    let cfg = resolve(&args[2..], &|n| std::env::var(n).ok(), &session::gen_uuid)?;
     if !cfg.socket.to_str().is_some_and(|s| s.starts_with("tcp://")) && !cfg.socket.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -2804,6 +2812,24 @@ mod tests {
         let err = resolved(&["--id", "a/b"], &e).unwrap_err().to_string();
         assert!(err.contains("a/b") && err.contains("--store"), "{err}");
         assert!(resolved(&["--id", "a/b", "--store", "/x"], &e).is_ok());
+    }
+
+    #[test]
+    fn groups_as_a_label_does_not_enable_groups() {
+        let cfg = resolved(
+            &["--label", "--groups"],
+            &[("ROGER_SOCKET", "/s"), ("ROGER_STORE", "/x")],
+        )
+        .unwrap();
+        assert_eq!(cfg.label.as_deref(), Some("--groups"));
+        assert!(!cfg.groups);
+    }
+
+    #[test]
+    fn unknown_mcp_flag_is_rejected() {
+        let err = resolved(&["--unknown"], &[]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().ends_with("for mcp, saw --unknown"));
     }
 
     #[test]

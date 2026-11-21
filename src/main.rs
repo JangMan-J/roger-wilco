@@ -17,31 +17,174 @@ pub use roger_wire::{durlog, json, sha256};
 use std::io;
 use std::path::PathBuf;
 
-fn arg(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+#[derive(Default)]
+pub(crate) struct Flags {
+    values: Vec<(String, String)>,
+    switches: Vec<String>,
 }
 
-fn args_named(args: &[String], name: &str) -> Vec<String> {
-    args.windows(2)
-        .filter(|w| w[0] == name)
-        .map(|w| w[1].clone())
-        .collect()
+impl Flags {
+    fn get(&self, name: &str) -> Option<String> {
+        self.values
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn all(&self, name: &str) -> Vec<String> {
+        self.values
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.switches.iter().any(|key| key == name)
+    }
+
+    fn need(&self, name: &str) -> io::Result<String> {
+        self.get(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
+    }
 }
 
-fn need(args: &[String], name: &str) -> io::Result<String> {
-    arg(args, name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
+pub(crate) fn parse_flags(
+    cmd: &str,
+    args: &[String],
+    valued: &[&str],
+    switches: &[&str],
+) -> io::Result<Flags> {
+    const HOOKS: &[&str] = &["--hold-before-ack", "--link-pace-ms"];
+    let mut flags = Flags::default();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let flag = arg.as_str();
+        if valued.contains(&flag) || HOOKS.contains(&flag) {
+            let value = args.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("expected a value after {flag}, saw none"),
+                )
+            })?;
+            flags.values.push((arg.clone(), value.clone()));
+        } else if switches.contains(&flag) {
+            flags.switches.push(arg.clone());
+        } else {
+            let expected = [valued, switches, HOOKS].concat().join(", ");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("expected one of {expected} for {cmd}, saw {arg}"),
+            ));
+        }
+    }
+    Ok(flags)
+}
+
+type FlagSpec = (&'static [&'static str], &'static [&'static str]);
+
+fn flag_spec(cmd: &str) -> Option<FlagSpec> {
+    Some(match cmd {
+        "backup" => (&["--data", "--dest", "--kind"], &[]),
+        "coordinator" => (
+            &[
+                "--bind",
+                "--data",
+                "--port-file",
+                "--unregister-after-ms",
+                "--slices",
+                "--cold-retain-days",
+                "--cold-retain-ms",
+                "--cold-day-ms",
+            ],
+            &["--no-cold-sweep"],
+        ),
+        "daemon" => (
+            &[
+                "--coordinator",
+                "--host-id",
+                "--socket",
+                "--listen",
+                "--port-file",
+                "--client-token-env",
+                "--data",
+            ],
+            &[],
+        ),
+        "session" => (
+            &[
+                "--socket",
+                "--store",
+                "--id",
+                "--label",
+                "--declare",
+                "--subscribe",
+            ],
+            &[],
+        ),
+        "adapter" => (
+            &["--socket", "--store", "--id", "--label", "--declare"],
+            &["--registered", "--superseded", "--watch", "--groups"],
+        ),
+        "mcp" => (
+            &[
+                "--socket",
+                "--store",
+                "--id",
+                "--id-env",
+                "--label",
+                "--declare",
+            ],
+            &["--groups"],
+        ),
+        "send" => (
+            &[
+                "--socket",
+                "--from",
+                "--to",
+                "--group",
+                "--body",
+                "--mail",
+                "--header",
+                "--expected-article",
+            ],
+            &[],
+        ),
+        "subscribe" => (
+            &["--socket", "--session", "--group", "--after"],
+            &["--latest"],
+        ),
+        "unsubscribe" => (&["--socket", "--session", "--group"], &[]),
+        "groups" => (
+            &["--socket", "--session", "--prefix"],
+            &["--include-retired"],
+        ),
+        "articles" => (
+            &["--socket", "--group", "--after", "--limit"],
+            &["--follow", "--json"],
+        ),
+        "group-policy" => (
+            &["--socket", "--group", "--keep-last", "--ttl-ms"],
+            &["--retire", "--reopen"],
+        ),
+        "claim" | "renew" | "release" => (&["--socket", "--owner", "--key", "--ttl-ms"], &[]),
+        "board" => (&["--socket", "--from"], &[]),
+        "watch" => (&["--socket"], &[]),
+        "label" => (&["--socket", "--from", "--label"], &[]),
+        "receipt" => (&["--socket", "--mail"], &[]),
+        _ => return None,
+    })
 }
 
 /// Every `--header key=value`, split at the first `=`, as the object a send
 /// carries; None when there is none. Bounds are the coordinator's to check.
-fn headers(args: &[String]) -> io::Result<Option<json::Value>> {
+fn headers(flags: &Flags) -> io::Result<Option<json::Value>> {
     let mut pairs = Vec::new();
-    for w in args.windows(2).filter(|w| w[0] == "--header") {
-        let (k, v) = w[1].split_once('=').ok_or_else(|| {
+    for header in flags.all("--header") {
+        let (k, v) = header.split_once('=').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("--header expects key=value, saw {}", w[1]),
+                format!("--header expects key=value, saw {header}"),
             )
         })?;
         pairs.push((k.to_string(), json::s(v)));
@@ -101,29 +244,33 @@ Use --help or -h for this help.";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    #[cfg(feature = "test-hooks")]
-    if let Some(marker) = arg(&args, "--hold-before-ack") {
-        let _ = session::HOLD_BEFORE_ACK.set(marker.into());
-    }
-    #[cfg(feature = "test-hooks")]
-    if let Some(ms) = arg(&args, "--link-pace-ms").and_then(|ms| ms.parse().ok()) {
-        let _ = net::LINK_PACE.set(std::time::Duration::from_millis(ms));
-    }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     if matches!(cmd, "--help" | "-h" | "help") {
         println!("{USAGE}");
         return Ok(());
     }
+    let flags = match flag_spec(cmd) {
+        Some((v, sw)) => parse_flags(cmd, &args[2..], v, sw)?,
+        None => Flags::default(),
+    };
+    #[cfg(feature = "test-hooks")]
+    if let Some(marker) = flags.get("--hold-before-ack") {
+        let _ = session::HOLD_BEFORE_ACK.set(marker.into());
+    }
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = flags.get("--link-pace-ms").and_then(|ms| ms.parse().ok()) {
+        let _ = net::LINK_PACE.set(std::time::Duration::from_millis(ms));
+    }
     match cmd {
         "coordinator" => coordinator::run(coordinator::Config::from_args(&args, token()?)?),
         "daemon" => {
-            let coordinator = need(&args, "--coordinator")?;
+            let coordinator = flags.need("--coordinator")?;
             let token = token()?;
-            let host_id = need(&args, "--host-id")?;
-            let socket = arg(&args, "--socket").map(PathBuf::from);
-            let listen = arg(&args, "--listen");
-            let port_file = arg(&args, "--port-file").map(PathBuf::from);
-            let client_token = match arg(&args, "--client-token-env") {
+            let host_id = flags.need("--host-id")?;
+            let socket = flags.get("--socket").map(PathBuf::from);
+            let listen = flags.get("--listen");
+            let port_file = flags.get("--port-file").map(PathBuf::from);
+            let client_token = match flags.get("--client-token-env") {
                 Some(name) => Some(
                     std::env::var(&name)
                         .ok()
@@ -157,49 +304,49 @@ fn main() -> io::Result<()> {
                 listen,
                 port_file,
                 client_token,
-                data: PathBuf::from(need(&args, "--data")?),
+                data: PathBuf::from(flags.need("--data")?),
             })
         }
         "session" => session::run_with_groups(
-            PathBuf::from(need(&args, "--socket")?),
-            match arg(&args, "--id") {
+            PathBuf::from(flags.need("--socket")?),
+            match flags.get("--id") {
                 Some(id) => id,
                 None => session::gen_uuid()?,
             },
-            arg(&args, "--label"),
-            PathBuf::from(need(&args, "--store")?),
-            arg(&args, "--declare"),
-            args_named(&args, "--subscribe"),
+            flags.get("--label"),
+            PathBuf::from(flags.need("--store")?),
+            flags.get("--declare"),
+            flags.all("--subscribe"),
         ),
         "adapter" => session::adapter_with_groups(
-            PathBuf::from(need(&args, "--socket")?),
-            match arg(&args, "--id") {
+            PathBuf::from(flags.need("--socket")?),
+            match flags.get("--id") {
                 Some(id) => id,
                 None => session::gen_uuid()?,
             },
-            arg(&args, "--label"),
-            PathBuf::from(need(&args, "--store")?),
-            arg(&args, "--declare"),
+            flags.get("--label"),
+            PathBuf::from(flags.need("--store")?),
+            flags.get("--declare"),
             (
-                args.iter().any(|a| a == "--registered"),
-                args.iter().any(|a| a == "--superseded"),
-                args.iter().any(|a| a == "--watch"),
-                args.iter().any(|a| a == "--groups"),
+                flags.has("--registered"),
+                flags.has("--superseded"),
+                flags.has("--watch"),
+                flags.has("--groups"),
             ),
         ),
         "mcp" => mcp::run(&args),
         "send" => {
-            let socket = PathBuf::from(need(&args, "--socket")?);
-            let from = need(&args, "--from")?;
-            let to = arg(&args, "--to");
-            let group = arg(&args, "--group");
-            let mail = match arg(&args, "--mail") {
+            let socket = PathBuf::from(flags.need("--socket")?);
+            let from = flags.need("--from")?;
+            let to = flags.get("--to");
+            let group = flags.get("--group");
+            let mail = match flags.get("--mail") {
                 Some(m) => m,
                 None => session::gen_uuid()?,
             };
-            let body = need(&args, "--body")?;
-            let hdrs = headers(&args)?;
-            let expected_article = match arg(&args, "--expected-article") {
+            let body = flags.need("--body")?;
+            let hdrs = headers(&flags)?;
+            let expected_article = match flags.get("--expected-article") {
                 Some(n) => Some(n.parse::<i64>().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -229,7 +376,7 @@ fn main() -> io::Result<()> {
             }
         }
         "subscribe" => {
-            let after = match arg(&args, "--after") {
+            let after = match flags.get("--after") {
                 Some(n) => Some(n.parse::<i64>().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -238,7 +385,7 @@ fn main() -> io::Result<()> {
                 })?),
                 None => None,
             };
-            let latest = args.iter().any(|a| a == "--latest");
+            let latest = flags.has("--latest");
             if after.is_some() && latest {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -246,26 +393,26 @@ fn main() -> io::Result<()> {
                 ));
             }
             session::subscribe(
-                PathBuf::from(need(&args, "--socket")?),
-                need(&args, "--session")?,
-                need(&args, "--group")?,
+                PathBuf::from(flags.need("--socket")?),
+                flags.need("--session")?,
+                flags.need("--group")?,
                 after,
                 latest,
             )
         }
         "unsubscribe" => session::unsubscribe(
-            PathBuf::from(need(&args, "--socket")?),
-            need(&args, "--session")?,
-            need(&args, "--group")?,
+            PathBuf::from(flags.need("--socket")?),
+            flags.need("--session")?,
+            flags.need("--group")?,
         ),
         "groups" => session::groups(
-            PathBuf::from(need(&args, "--socket")?),
-            arg(&args, "--session"),
-            arg(&args, "--prefix"),
-            args.iter().any(|a| a == "--include-retired"),
+            PathBuf::from(flags.need("--socket")?),
+            flags.get("--session"),
+            flags.get("--prefix"),
+            flags.has("--include-retired"),
         ),
         "articles" => {
-            let after = match arg(&args, "--after") {
+            let after = match flags.get("--after") {
                 Some(n) => n.parse::<i64>().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -274,7 +421,7 @@ fn main() -> io::Result<()> {
                 })?,
                 None => 0,
             };
-            let limit = match arg(&args, "--limit") {
+            let limit = match flags.get("--limit") {
                 Some(n) => n.parse::<usize>().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -284,17 +431,17 @@ fn main() -> io::Result<()> {
                 None => 100,
             };
             session::articles(
-                PathBuf::from(need(&args, "--socket")?),
-                need(&args, "--group")?,
+                PathBuf::from(flags.need("--socket")?),
+                flags.need("--group")?,
                 after,
                 limit,
-                args.iter().any(|a| a == "--follow"),
-                args.iter().any(|a| a == "--json"),
+                flags.has("--follow"),
+                flags.has("--json"),
             )
         }
         "group-policy" => {
             let parse_clearable = |flag: &str| -> io::Result<Option<Option<i64>>> {
-                match arg(&args, flag) {
+                match flags.get(flag) {
                     None => Ok(None),
                     Some(v) if v == "none" => Ok(Some(None)),
                     Some(v) => {
@@ -314,8 +461,8 @@ fn main() -> io::Result<()> {
                     }
                 }
             };
-            let retire = args.iter().any(|a| a == "--retire");
-            let reopen = args.iter().any(|a| a == "--reopen");
+            let retire = flags.has("--retire");
+            let reopen = flags.has("--reopen");
             if retire && reopen {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -330,8 +477,8 @@ fn main() -> io::Result<()> {
                 None
             };
             session::group_policy(
-                PathBuf::from(need(&args, "--socket")?),
-                need(&args, "--group")?,
+                PathBuf::from(flags.need("--socket")?),
+                flags.need("--group")?,
                 parse_clearable("--keep-last")?,
                 parse_clearable("--ttl-ms")?,
                 retired,
@@ -340,7 +487,7 @@ fn main() -> io::Result<()> {
         "claim" | "renew" | "release" => {
             let op = claims::Op::parse(if cmd == "claim" { "acquire" } else { cmd })
                 .expect("the match arm names only claim ops");
-            let ttl_ms = match arg(&args, "--ttl-ms") {
+            let ttl_ms = match flags.get("--ttl-ms") {
                 Some(t) => t.parse().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -350,10 +497,10 @@ fn main() -> io::Result<()> {
                 None => 0,
             };
             let granted = session::claim(
-                PathBuf::from(need(&args, "--socket")?),
+                PathBuf::from(flags.need("--socket")?),
                 &op,
-                need(&args, "--owner")?,
-                need(&args, "--key")?,
+                flags.need("--owner")?,
+                flags.need("--key")?,
                 ttl_ms,
             )?;
             if !granted {
@@ -361,25 +508,84 @@ fn main() -> io::Result<()> {
             }
             Ok(())
         }
-        "board" => session::board(
-            PathBuf::from(need(&args, "--socket")?),
-            arg(&args, "--from"),
-        ),
+        "board" => session::board(PathBuf::from(flags.need("--socket")?), flags.get("--from")),
         "receipt" => session::receipt(
-            PathBuf::from(need(&args, "--socket")?),
-            need(&args, "--mail")?,
+            PathBuf::from(flags.need("--socket")?),
+            flags.need("--mail")?,
         ),
         "label" => session::relabel(
-            PathBuf::from(need(&args, "--socket")?),
-            need(&args, "--from")?,
-            need(&args, "--label")?,
+            PathBuf::from(flags.need("--socket")?),
+            flags.need("--from")?,
+            flags.need("--label")?,
         ),
-        "watch" => session::watch(PathBuf::from(need(&args, "--socket")?)),
+        "watch" => session::watch(PathBuf::from(flags.need("--socket")?)),
         "audit" => audit::run(&args[2..]),
         "backup" => backup::run(&args[2..]),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(cmd: &str, args: &[&str]) -> io::Result<Flags> {
+        let (valued, switches) = flag_spec(cmd).unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string()).collect();
+        parse_flags(cmd, &args, valued, switches)
+    }
+
+    #[test]
+    fn a_value_can_look_like_a_flag() {
+        let flags = parse("send", &["--body", "--group", "--to", "recipient"]).unwrap();
+        assert_eq!(flags.need("--body").unwrap(), "--group");
+        assert_eq!(flags.need("--to").unwrap(), "recipient");
+        assert_eq!(flags.get("--group"), None);
+    }
+
+    #[test]
+    fn repeated_headers_keep_their_order() {
+        let flags = parse("send", &["--header", "a=1", "--header", "b=2"]).unwrap();
+        assert_eq!(flags.get("--header").as_deref(), Some("a=1"));
+        assert_eq!(flags.all("--header"), ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn a_valued_flag_requires_an_argument() {
+        let err = parse("send", &["--body"]).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "expected a value after --body, saw none");
+    }
+
+    #[test]
+    fn an_unknown_flag_names_the_expected_flags_and_token() {
+        let err = parse("watch", &["--unknown"]).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "expected one of --socket, --hold-before-ack, --link-pace-ms for watch, saw --unknown"
+        );
+    }
+
+    #[test]
+    fn switches_take_no_value() {
+        let flags = parse("adapter", &["--registered", "--label", "--watch"]).unwrap();
+        assert!(flags.has("--registered"));
+        assert!(!flags.has("--watch"));
+        assert_eq!(flags.get("--label").as_deref(), Some("--watch"));
+    }
+
+    #[test]
+    fn test_hook_flags_are_valued() {
+        let flags = parse(
+            "watch",
+            &["--hold-before-ack", "marker", "--link-pace-ms", "10"],
+        )
+        .unwrap();
+        assert_eq!(flags.get("--hold-before-ack").as_deref(), Some("marker"));
+        assert_eq!(flags.get("--link-pace-ms").as_deref(), Some("10"));
     }
 }
