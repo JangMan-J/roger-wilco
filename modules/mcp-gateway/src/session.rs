@@ -2,7 +2,7 @@
 //! and concurrent async Inbox reader.
 
 use crate::cli::DaemonSocket;
-use crate::daemon::{self, DaemonReader, DaemonWriter};
+use crate::daemon::{self, DaemonClient, DaemonReader, DaemonWriter};
 use crate::durlog::{
     blocking_io, cursor_path, gen_uuid, load_cursor, save_cursor, store_path, DurLog, StoreCache,
 };
@@ -161,6 +161,8 @@ pub struct GatewaySession {
     pub session_id: String,
     pub address: String,
     pub socket: DaemonSocket,
+    /// Persistent request connection to the host daemon, separate from the registered stream.
+    pub client: DaemonClient,
     pub groups: bool,
     pub store_path: PathBuf,
     pub inbox: Arc<AsyncInbox>,
@@ -430,6 +432,7 @@ impl SessionManager {
             session_id: session_id.clone(),
             address: address.clone(),
             socket: self.socket.clone(),
+            client: DaemonClient::new(self.socket.clone()),
             groups: self.groups,
             store_path: s_path,
             inbox,
@@ -492,6 +495,16 @@ impl SessionManager {
     }
 }
 
+/// The next Record number: one past the highest existing `r-N`, so gaps never reuse an id.
+fn next_record_after(records: &HashMap<String, String>) -> u64 {
+    records
+        .values()
+        .filter_map(|r| r.strip_prefix("r-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
 async fn reader_loop(
     session: Arc<GatewaySession>,
     mut reader: DaemonReader,
@@ -499,7 +512,7 @@ async fn reader_loop(
     manager: Weak<SessionManager>,
     #[cfg(feature = "test-hooks")] hold_before_ack: Option<PathBuf>,
 ) {
-    let mut next_record = records.len() as u64 + 1;
+    let mut next_record = next_record_after(&records);
     let mut req = 0i64;
 
     while let Ok(Some(v)) = reader.next_value().await {
@@ -695,5 +708,19 @@ async fn reader_loop(
     session.signal_closed();
     if let Some(mgr) = manager.upgrade() {
         mgr.remove_if_active(&session.session_id, &session.address);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_record_follows_highest_existing() {
+        let mut records = HashMap::new();
+        assert_eq!(next_record_after(&records), 1);
+        records.insert("m1".to_string(), "r-1".to_string());
+        records.insert("m7".to_string(), "r-7".to_string());
+        assert_eq!(next_record_after(&records), 8);
     }
 }

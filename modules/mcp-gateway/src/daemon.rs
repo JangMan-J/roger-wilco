@@ -3,6 +3,7 @@
 use crate::cli::DaemonSocket;
 use serde_json::{Map, Value};
 use std::io;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -162,13 +163,7 @@ pub async fn request(target: &DaemonSocket, req: &Value) -> io::Result<Value> {
         )
     })?;
     if field(&reply, "type")? == "error" {
-        return Err(io::Error::other(match field(&reply, "reason") {
-            Ok(reason) => reason.to_string(),
-            Err(_) => {
-                let raw = serde_json::to_string(&reply).unwrap_or_default();
-                format!("expected a reason in the error reply, saw {raw}")
-            }
-        }));
+        return Err(error_reply(&reply));
     }
     Ok(reply)
 }
@@ -183,6 +178,152 @@ pub async fn send_mail(
     headers: Option<&Value>,
 ) -> io::Result<String> {
     let (mut reader, writer) = connect(target).await?;
+    writer
+        .send(&send_ask(from, to, mail, body, headers))
+        .await?;
+    while let Some(v) = reader.next_value().await? {
+        if matches!(field(&v, "type")?, "accepted" | "error") {
+            return accepted_mail(&v, mail);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
+}
+
+fn is_reconnectable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
+fn error_reply(reply: &Value) -> io::Error {
+    io::Error::other(match field(reply, "reason") {
+        Ok(reason) => reason.to_string(),
+        Err(_) => {
+            let raw = serde_json::to_string(reply).unwrap_or_default();
+            format!("expected a reason in the error reply, saw {raw}")
+        }
+    })
+}
+
+/// Persistent connection to the host daemon, reused across requests and redialed once
+/// on EOF, broken pipe, or reset of a reused connection (matching `roger`'s `session::Client`).
+pub struct DaemonClient {
+    target: DaemonSocket,
+    conn: Mutex<Option<(DaemonReader, DaemonWriter)>>,
+    next_req: AtomicI64,
+    #[cfg(test)]
+    connects: std::sync::atomic::AtomicUsize,
+}
+
+impl DaemonClient {
+    pub fn new(target: DaemonSocket) -> Self {
+        Self {
+            target,
+            conn: Mutex::new(None),
+            next_req: AtomicI64::new(0),
+            #[cfg(test)]
+            connects: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Send `msg` with a fresh `req` and return the first reply line answering it
+    /// (a line naming another `req` is skipped). Replies of any `type` are returned.
+    async fn exchange(&self, msg: &Value, accept: impl Fn(&Value) -> bool) -> io::Result<Value> {
+        let req_id = self.next_req.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut msg = msg.clone();
+        if let Value::Object(map) = &mut msg {
+            map.insert("req".into(), Value::Number(req_id.into()));
+        }
+        let mut slot = self.conn.lock().await;
+        // Cancellation safety: the connection lives only in this future while a reply is
+        // outstanding; if the future is dropped, the connection drops with it and the
+        // next request dials fresh instead of reading a stale reply.
+        let reused = slot.take();
+        let had_conn = reused.is_some();
+        let mut conn = reused;
+        for attempt in 0..2 {
+            let pair = match conn.take() {
+                Some(pair) => pair,
+                None => {
+                    let pair = connect(&self.target).await?;
+                    #[cfg(test)]
+                    self.connects.fetch_add(1, Ordering::SeqCst);
+                    pair
+                }
+            };
+            match self.once(pair, &msg, req_id, &accept).await {
+                Ok((reply, pair)) => {
+                    *slot = Some(pair);
+                    return Ok(reply);
+                }
+                Err(e) if attempt == 0 && had_conn && is_reconnectable(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("second attempt always returns")
+    }
+
+    async fn once(
+        &self,
+        (mut reader, writer): (DaemonReader, DaemonWriter),
+        msg: &Value,
+        req_id: i64,
+        accept: &impl Fn(&Value) -> bool,
+    ) -> io::Result<(Value, (DaemonReader, DaemonWriter))> {
+        writer.send(msg).await?;
+        while let Some(v) = reader.next_value().await? {
+            if v.get("req")
+                .and_then(Value::as_i64)
+                .is_some_and(|r| r != req_id)
+            {
+                continue;
+            }
+            if accept(&v) {
+                return Ok((v, (reader, writer)));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected one reply line from {}, saw EOF", self.target),
+        ))
+    }
+
+    /// One request over the persistent connection, answered by one line (same contract as [`request`]).
+    pub async fn request(&self, req: &Value) -> io::Result<Value> {
+        let reply = self.exchange(req, |_| true).await?;
+        if field(&reply, "type")? == "error" {
+            return Err(error_reply(&reply));
+        }
+        Ok(reply)
+    }
+
+    /// `send` over the persistent connection (same contract as [`send_mail`]).
+    pub async fn send_mail(
+        &self,
+        from: &str,
+        to: &str,
+        mail: &str,
+        body: &str,
+        headers: Option<&Value>,
+    ) -> io::Result<String> {
+        let ask = send_ask(from, to, mail, body, headers);
+        let v = self
+            .exchange(&ask, |v| {
+                matches!(
+                    v.get("type").and_then(Value::as_str),
+                    Some("accepted" | "error")
+                )
+            })
+            .await?;
+        accepted_mail(&v, mail)
+    }
+}
+
+fn send_ask(from: &str, to: &str, mail: &str, body: &str, headers: Option<&Value>) -> Value {
     let mut ask = Map::new();
     ask.insert("type".into(), Value::String("send".into()));
     ask.insert("req".into(), Value::Number(1.into()));
@@ -193,21 +334,115 @@ pub async fn send_mail(
     if let Some(h) = headers {
         ask.insert("headers".into(), h.clone());
     }
-    writer.send(&Value::Object(ask)).await?;
-    while let Some(v) = reader.next_value().await? {
-        match field(&v, "type")? {
-            "accepted" => return Ok(field(&v, "mail")?.to_string()),
-            "error" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "send of {mail} refused: {}",
-                        field(&v, "reason").unwrap_or("unexplained")
-                    ),
-                ))
-            }
-            _ => {}
+    Value::Object(ask)
+}
+
+fn accepted_mail(v: &Value, mail: &str) -> io::Result<String> {
+    match field(v, "type")? {
+        "accepted" => Ok(field(v, "mail")?.to_string()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "send of {mail} refused: {}",
+                field(v, "reason").unwrap_or("unexplained")
+            ),
+        )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    /// Fake daemon: answers each line with `{"type":"accepted","req":N,"mail":..}`
+    /// (or `ok`), closing each connection after `per_conn` replies.
+    async fn fake_daemon(listener: UnixListener, per_conn: usize) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let (r, mut w) = stream.into_split();
+                let mut lines = BufReader::new(r).lines();
+                for _ in 0..per_conn {
+                    let Ok(Some(line)) = lines.next_line().await else {
+                        return;
+                    };
+                    let v: Value = serde_json::from_str(&line).unwrap();
+                    let reply = if v["type"] == "send" {
+                        serde_json::json!({"type":"accepted","req":v["req"],"mail":v["mail"]})
+                    } else {
+                        serde_json::json!({"type":"ok","req":v["req"]})
+                    };
+                    let mut out = serde_json::to_string(&reply).unwrap();
+                    out.push('\n');
+                    w.write_all(out.as_bytes()).await.unwrap();
+                }
+            });
         }
     }
-    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
+
+    fn setup(name: &str, per_conn: usize) -> DaemonClient {
+        let dir = std::env::temp_dir().join(format!("mcpgw-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(fake_daemon(listener, per_conn));
+        DaemonClient::new(DaemonSocket::Unix(path))
+    }
+
+    #[tokio::test]
+    async fn reuses_one_connection_with_monotonic_reqs() {
+        let client = setup("reuse", usize::MAX);
+        let a = client
+            .request(&serde_json::json!({"type":"x","req":1}))
+            .await
+            .unwrap();
+        let b = client
+            .request(&serde_json::json!({"type":"x","req":1}))
+            .await
+            .unwrap();
+        let m = client.send_mail("a", "b", "m1", "hi", None).await.unwrap();
+        assert_eq!((a["req"].as_i64(), b["req"].as_i64()), (Some(1), Some(2)));
+        assert_eq!(m, "m1");
+        assert_eq!(client.connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnects_once_after_daemon_closes() {
+        let client = setup("reconnect", 1);
+        client
+            .request(&serde_json::json!({"type":"x"}))
+            .await
+            .unwrap();
+        let m = client.send_mail("a", "b", "m2", "hi", None).await.unwrap();
+        assert_eq!(m, "m2");
+        client
+            .request(&serde_json::json!({"type":"x"}))
+            .await
+            .unwrap();
+        assert_eq!(client.connects.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_drops_its_connection() {
+        let client = setup("cancel", usize::MAX);
+        client
+            .request(&serde_json::json!({"type":"x"}))
+            .await
+            .unwrap();
+        // Dropped before its reply is read: the next request must not read the stale line.
+        let _ = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            client.request(&serde_json::json!({"type":"x"})),
+        )
+        .await;
+        let r = client
+            .request(&serde_json::json!({"type":"x"}))
+            .await
+            .unwrap();
+        assert_eq!(r["req"].as_i64(), Some(3));
+    }
 }
