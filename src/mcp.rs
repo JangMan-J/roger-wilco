@@ -460,7 +460,7 @@ const SEND_WITH_GROUPS: (&str, &str, &str) = (
     r#"{"type":"object","properties":{"session":{"type":"string"},"to":{"type":"string"},"group":{"type":"string"},"body":{"type":"string"},"mail":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}},"expected_article":{"type":"integer","minimum":0}},"required":["body"]}"#,
 );
 
-const GROUP_TOOLS: [(&str, &str, &str); 3] = [
+const GROUP_TOOLS: [(&str, &str, &str); 5] = [
     (
         "roger_subscribe",
         "Subscribe this session to a Group. Optional `after` sets the article position (>= 0); `latest` starts at the Group's current high-water mark.",
@@ -475,6 +475,16 @@ const GROUP_TOOLS: [(&str, &str, &str); 3] = [
         "roger_groups",
         "List known Groups with high-water marks, subscriber counts, and this session's subscription state and position.",
         r#"{"type":"object","properties":{"session":{"type":"string"},"prefix":{"type":"string"},"include_retired":{"type":"boolean"}},"additionalProperties":false}"#,
+    ),
+    (
+        "roger_articles",
+        "Read a Group's articles numbered above `after` (default 0), at most `limit` (1 to 500, default 100). A read only: it moves no position and writes no receipt.",
+        r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["group"],"additionalProperties":false}"#,
+    ),
+    (
+        "roger_group_policy",
+        "Set a Group's retention and retirement. `keep_last` and `ttl_ms` take an integer >= 0, or null to clear; `retired` takes a boolean. Fields left out stay as they are. Returns the Group's policy after the change.",
+        r#"{"type":"object","properties":{"session":{"type":"string"},"group":{"type":"string"},"keep_last":{"type":["integer","null"],"minimum":0},"ttl_ms":{"type":["integer","null"],"minimum":0},"retired":{"type":"boolean"}},"required":["group"],"additionalProperties":false}"#,
     ),
 ];
 
@@ -891,6 +901,50 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
                 let mut client = ctx.client.lock().unwrap();
                 session::groups_req_filtered_on(&mut client, Some(&ctx.me), prefix, include_retired)
                     .map_err(io)?
+            };
+            Ok(without_envelope(reply))
+        }
+        "roger_articles" => {
+            let group = need_str(name, args, "group")?;
+            let after = opt_int(name, args, "after", 0, (0, i64::MAX), false)?;
+            let limit = opt_int(name, args, "limit", 100, (1, 500), false)?;
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(
+                    &mut client,
+                    obj(vec![
+                        ("type", s("articles")),
+                        ("group", s(group)),
+                        ("after", Value::Int(after)),
+                        ("limit", Value::Int(limit)),
+                    ]),
+                )
+                .map_err(io)?
+            };
+            Ok(without_envelope(reply))
+        }
+        "roger_group_policy" => {
+            let group = need_str(name, args, "group")?;
+            let mut ask = vec![("type", s("group_policy")), ("group", s(group))];
+            for key in ["keep_last", "ttl_ms"] {
+                match args.get(key) {
+                    None => {}
+                    Some(Value::Null) => ask.push((key, Value::Null)),
+                    Some(Value::Int(n)) if *n >= 0 => ask.push((key, Value::Int(*n))),
+                    Some(Value::Int(n)) => {
+                        return Err(format!(
+                        "{name}: expected `{key}` to be an integer of at least 0 or null, saw {n}"
+                    ))
+                    }
+                    other => return Err(wrong(name, key, "an integer or null", other)),
+                }
+            }
+            if args.get("retired").is_some() {
+                ask.push(("retired", Value::Bool(opt_bool(name, args, "retired")?)));
+            }
+            let reply = {
+                let mut client = ctx.client.lock().unwrap();
+                session::request_on(&mut client, obj(ask)).map_err(io)?
             };
             Ok(without_envelope(reply))
         }
@@ -2988,8 +3042,10 @@ mod tests {
         assert_eq!(
             names_of(opt_in.clone()),
             vec![
+                "roger_articles",
                 "roger_board",
                 "roger_claim",
+                "roger_group_policy",
                 "roger_groups",
                 "roger_inbox",
                 "roger_label",
@@ -3031,7 +3087,13 @@ mod tests {
             Inbox::open(&dir.join("d.store")).unwrap(),
             false,
         );
-        for tool in ["roger_subscribe", "roger_unsubscribe", "roger_groups"] {
+        for tool in [
+            "roger_subscribe",
+            "roger_unsubscribe",
+            "roger_groups",
+            "roger_articles",
+            "roger_group_policy",
+        ] {
             let err = call_tool(
                 &ctx_default,
                 &json::parse(&format!(r#"{{"name":"{tool}","arguments":{{}}}}"#)).unwrap(),
@@ -3597,6 +3659,128 @@ mod tests {
         assert_eq!(res.get("mail"), Some(&s("m2")));
         assert_eq!(ctx.client.lock().unwrap().connects(), 2);
 
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_articles_and_group_policy_send_one_wire_ask_each() {
+        let dir = std::env::temp_dir().join(format!("roger-mcp-artpol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("ap.store");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = PathBuf::from(format!("tcp://{}", listener.local_addr().unwrap()));
+        // The mock echoes each ask (minus `type` and `req`) under `ask`.
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let lines = net::lines(Box::new(conn.try_clone().unwrap()));
+            let w = net::writer(Box::new(conn));
+            for line in lines {
+                let req = line.unwrap();
+                let r = req.get("req").and_then(Value::as_i64).unwrap();
+                let kind = net::field(&req, "type").unwrap().to_string();
+                let mut ask = req.clone();
+                if let Value::Obj(pairs) = &mut ask {
+                    pairs.retain(|(k, _)| k != "req");
+                }
+                net::send(
+                    &w,
+                    &obj(vec![
+                        ("type", s(&kind)),
+                        ("req", Value::Int(r)),
+                        ("ask", ask),
+                    ]),
+                )
+                .unwrap();
+            }
+        });
+
+        let ctx = Ctx::new(target, "me-ap".into(), Inbox::open(&store).unwrap(), true);
+        let call = |a: &str| call_tool(&ctx, &json::parse(a).unwrap());
+        let ask = |a: &str| call(a).unwrap().get("ask").cloned().unwrap();
+
+        assert_eq!(
+            ask(r#"{"name":"roger_articles","arguments":{"group":"ops"}}"#),
+            json::parse(r#"{"type":"articles","group":"ops","after":0,"limit":100}"#).unwrap()
+        );
+        assert_eq!(
+            ask(r#"{"name":"roger_articles","arguments":{"group":"ops","after":3,"limit":500}}"#),
+            json::parse(r#"{"type":"articles","group":"ops","after":3,"limit":500}"#).unwrap()
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_articles","arguments":{}}"#).unwrap_err(),
+            "roger_articles: expected `group` to be a string, saw nothing"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_articles","arguments":{"group":"ops","after":-1}}"#)
+                .unwrap_err(),
+            format!(
+                "roger_articles: expected `after` to be an integer from 0 to {}, saw -1",
+                i64::MAX
+            )
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_articles","arguments":{"group":"ops","limit":501}}"#)
+                .unwrap_err(),
+            "roger_articles: expected `limit` to be an integer from 1 to 500, saw 501"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_articles","arguments":{"group":"ops","limit":0}}"#).unwrap_err(),
+            "roger_articles: expected `limit` to be an integer from 1 to 500, saw 0"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_articles","arguments":{"group":"ops","after":"1"}}"#)
+                .unwrap_err(),
+            "roger_articles: expected `after` to be an integer, saw a string"
+        );
+
+        assert_eq!(
+            ask(r#"{"name":"roger_group_policy","arguments":{"group":"ops"}}"#),
+            json::parse(r#"{"type":"group_policy","group":"ops"}"#).unwrap()
+        );
+        assert_eq!(
+            ask(
+                r#"{"name":"roger_group_policy","arguments":{"group":"ops","keep_last":2,"ttl_ms":0,"retired":true}}"#
+            ),
+            json::parse(
+                r#"{"type":"group_policy","group":"ops","keep_last":2,"ttl_ms":0,"retired":true}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            ask(
+                r#"{"name":"roger_group_policy","arguments":{"group":"ops","keep_last":null,"ttl_ms":null,"retired":false}}"#
+            ),
+            json::parse(
+                r#"{"type":"group_policy","group":"ops","keep_last":null,"ttl_ms":null,"retired":false}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_group_policy","arguments":{"keep_last":1}}"#).unwrap_err(),
+            "roger_group_policy: expected `group` to be a string, saw nothing"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_group_policy","arguments":{"group":"ops","keep_last":-1}}"#)
+                .unwrap_err(),
+            "roger_group_policy: expected `keep_last` to be an integer of at least 0 or null, saw -1"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_group_policy","arguments":{"group":"ops","ttl_ms":"5"}}"#)
+                .unwrap_err(),
+            "roger_group_policy: expected `ttl_ms` to be an integer or null, saw a string"
+        );
+        assert_eq!(
+            call(r#"{"name":"roger_group_policy","arguments":{"group":"ops","retired":null}}"#)
+                .unwrap_err(),
+            "roger_group_policy: expected `retired` to be a boolean, saw null"
+        );
+
+        // One pooled connection carried every ask that reached the wire.
+        assert_eq!(ctx.client.lock().unwrap().connects(), 1);
+        drop(ctx);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

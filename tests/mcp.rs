@@ -1541,7 +1541,7 @@ fn mcp_process_groups_opt_in_and_full_lifecycle_against_mock_daemon() {
     def_mcp.close_stdin();
     assert_eq!(def_mcp.wait_exit().code(), Some(0));
 
-    // 2. Opt-in MCP server (--groups): 12 tools + full subscribe/send/deliver/inbox/groups/unsubscribe
+    // 2. Opt-in MCP server (--groups): 14 tools + full subscribe/send/deliver/inbox/groups/unsubscribe
     let grp_store = dir.join("grp.store");
     let mut cmd_grp = Command::new(BIN);
     cmd_grp.args([
@@ -1573,8 +1573,10 @@ fn mcp_process_groups_opt_in_and_full_lifecycle_against_mock_daemon() {
     assert_eq!(
         grp_tools,
         [
+            "roger_articles",
             "roger_board",
             "roger_claim",
+            "roger_group_policy",
             "roger_groups",
             "roger_inbox",
             "roger_label",
@@ -2067,4 +2069,49 @@ fn mcp_process_reuses_pooled_rpc_connection_and_reconnects_after_eof() {
     }
     daemon_thread.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mcp_groups_articles_and_group_policy_against_real_core() {
+    let rig = Rig::new("articles-policy");
+    let mut m = rig.session("g", "ap1", &["--groups"]);
+    for (id, body) in [("ap-a", "a"), ("ap-b", "b")] {
+        let r = m.ok(
+            "roger_send",
+            &format!(r#"{{"group":"ops","mail":"{id}","body":"{body}"}}"#),
+        );
+        assert_eq!(s(&r, "group"), "ops", "{r:?}");
+    }
+    let r = m.ok("roger_articles", r#"{"group":"ops"}"#);
+    assert_eq!(r.get("high_water"), Some(&Value::Int(2)), "{r:?}");
+    let bodies: Vec<String> = arr(&r, "articles").iter().map(|a| s(a, "body")).collect();
+    assert_eq!(bodies, ["a", "b"], "{r:?}");
+    let r = m.ok("roger_articles", r#"{"group":"ops","after":1,"limit":1}"#);
+    let arts = arr(&r, "articles");
+    assert_eq!(arts.len(), 1, "{r:?}");
+    assert_eq!(s(&arts[0], "body"), "b");
+    assert_eq!(arts[0].get("article"), Some(&Value::Int(2)), "{r:?}");
+
+    let r = m.ok(
+        "roger_group_policy",
+        r#"{"group":"ops","keep_last":1,"ttl_ms":60000}"#,
+    );
+    assert_eq!(r.get("keep_last"), Some(&Value::Int(1)), "{r:?}");
+    assert_eq!(r.get("ttl_ms"), Some(&Value::Int(60000)), "{r:?}");
+    let r = m.ok(
+        "roger_group_policy",
+        r#"{"group":"ops","keep_last":null,"ttl_ms":null}"#,
+    );
+    for k in ["keep_last", "ttl_ms"] {
+        assert!(
+            matches!(r.get(k), None | Some(Value::Null)),
+            "{k} not cleared: {r:?}"
+        );
+    }
+    assert!(m
+        .fails("roger_group_policy", r#"{"group":5}"#)
+        .contains("group"));
+    assert!(m
+        .fails("roger_articles", r#"{"group":5}"#)
+        .contains("group"));
 }
