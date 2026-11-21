@@ -151,6 +151,16 @@ pub fn headers_of(v: &Value) -> Value {
         .unwrap_or_else(|| Value::Object(Map::new()))
 }
 
+fn reply_error(reply: &Value) -> io::Error {
+    io::Error::other(match field(reply, "reason") {
+        Ok(reason) => reason.to_string(),
+        Err(_) => {
+            let raw = serde_json::to_string(reply).unwrap_or_default();
+            format!("expected a reason in the error reply, saw {raw}")
+        }
+    })
+}
+
 /// One short-lived request to the host daemon, answered by one line (as `session::request`).
 pub async fn request(dialer: &Dialer, req: &Value) -> io::Result<Value> {
     let (mut reader, writer) = connect(dialer).await?;
@@ -162,13 +172,7 @@ pub async fn request(dialer: &Dialer, req: &Value) -> io::Result<Value> {
         )
     })?;
     if field(&reply, "type")? == "error" {
-        return Err(io::Error::other(match field(&reply, "reason") {
-            Ok(reason) => reason.to_string(),
-            Err(_) => {
-                let raw = serde_json::to_string(&reply).unwrap_or_default();
-                format!("expected a reason in the error reply, saw {raw}")
-            }
-        }));
+        return Err(reply_error(&reply));
     }
     Ok(reply)
 }
@@ -178,15 +182,14 @@ enum SendTarget<'a> {
     Group(&'a str),
 }
 
-async fn send(
-    dialer: &Dialer,
+fn build_send_ask(
     from: &str,
     target: SendTarget<'_>,
     mail: &str,
     body: &str,
     headers: Option<&Value>,
-) -> io::Result<Value> {
-    let (mut reader, writer) = connect(dialer).await?;
+    expected_article: Option<i64>,
+) -> Value {
     let mut ask = Map::new();
     ask.insert("type".into(), Value::String("send".into()));
     ask.insert("req".into(), Value::Number(1.into()));
@@ -204,7 +207,32 @@ async fn send(
     if let Some(h) = headers {
         ask.insert("headers".into(), h.clone());
     }
-    writer.send(&Value::Object(ask)).await?;
+    if let Some(exp) = expected_article {
+        ask.insert("expected_article".into(), Value::Number(exp.into()));
+    }
+    Value::Object(ask)
+}
+
+fn parse_group_accepted(accepted: &Value) -> io::Result<(String, i64)> {
+    let mail = field(accepted, "mail")?.to_string();
+    let article = accepted
+        .get("article")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing article"))?;
+    Ok((mail, article))
+}
+
+async fn send(
+    dialer: &Dialer,
+    from: &str,
+    target: SendTarget<'_>,
+    mail: &str,
+    body: &str,
+    headers: Option<&Value>,
+) -> io::Result<Value> {
+    let (mut reader, writer) = connect(dialer).await?;
+    let ask = build_send_ask(from, target, mail, body, headers, None);
+    writer.send(&ask).await?;
     while let Some(v) = reader.next_value().await? {
         match field(&v, "type")? {
             "accepted" => return Ok(v),
@@ -215,7 +243,7 @@ async fn send(
                         "send of {mail} refused: {}",
                         field(&v, "reason").unwrap_or("unexplained")
                     ),
-                ))
+                ));
             }
             _ => {}
         }
@@ -246,12 +274,182 @@ pub async fn send_group(
     headers: Option<&Value>,
 ) -> io::Result<(String, i64)> {
     let accepted = send(dialer, from, SendTarget::Group(group), mail, body, headers).await?;
-    let mail = field(&accepted, "mail")?.to_string();
-    let article = accepted
-        .get("article")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing article"))?;
-    Ok((mail, article))
+    parse_group_accepted(&accepted)
+}
+
+struct ClientState {
+    conn: Option<(DaemonReader, DaemonWriter)>,
+    next_req: i64,
+    #[cfg(test)]
+    connects: usize,
+}
+
+/// Reusable client connection to the host daemon, reconnecting once on EOF,
+/// broken pipe, or connection reset before a complete reply.
+pub struct DaemonClient {
+    dialer: Dialer,
+    state: Mutex<ClientState>,
+}
+
+fn is_reconnectable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
+async fn exchange(
+    conn: &mut (DaemonReader, DaemonWriter),
+    msg: &Value,
+    req_id: i64,
+    socket: &DaemonSocket,
+) -> io::Result<Value> {
+    let (reader, writer) = conn;
+    writer.send(msg).await?;
+    while let Some(v) = reader.next_value().await? {
+        if let Some(r) = v.get("req").and_then(Value::as_i64) {
+            if r != req_id {
+                continue;
+            }
+        }
+        return Ok(v);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("expected one reply line from {socket}, saw EOF"),
+    ))
+}
+
+impl DaemonClient {
+    pub fn new(dialer: Dialer) -> Self {
+        Self {
+            dialer,
+            state: Mutex::new(ClientState {
+                conn: None,
+                next_req: 0,
+                #[cfg(test)]
+                connects: 0,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    async fn connects(&self) -> usize {
+        self.state.lock().await.connects
+    }
+
+    async fn raw_request(&self, req: &Value) -> io::Result<Value> {
+        let mut state = self.state.lock().await;
+        state.next_req += 1;
+        let req_id = state.next_req;
+        let mut msg = req.clone();
+        if let Value::Object(map) = &mut msg {
+            map.insert("req".into(), Value::Number(req_id.into()));
+        }
+
+        // Take the cached connection out before awaiting I/O so dropping this
+        // future mid-exchange drops the in-flight socket instead of leaving a
+        // partial request or unread reply on the shared connection.
+        if let Some(mut conn) = state.conn.take() {
+            match exchange(&mut conn, &msg, req_id, &self.dialer.socket).await {
+                Ok(reply) => {
+                    state.conn = Some(conn);
+                    return Ok(reply);
+                }
+                Err(e) if is_reconnectable(&e) => {
+                    drop(conn);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut conn = connect(&self.dialer).await?;
+        #[cfg(test)]
+        {
+            state.connects += 1;
+        }
+        let reply = exchange(&mut conn, &msg, req_id, &self.dialer.socket).await?;
+        state.conn = Some(conn);
+        Ok(reply)
+    }
+
+    /// Send one request on the persistent connection and return its reply line.
+    pub async fn request(&self, req: &Value) -> io::Result<Value> {
+        let reply = self.raw_request(req).await?;
+        if field(&reply, "type")? == "error" {
+            return Err(reply_error(&reply));
+        }
+        Ok(reply)
+    }
+
+    async fn send(
+        &self,
+        from: &str,
+        target: SendTarget<'_>,
+        mail: &str,
+        body: &str,
+        headers: Option<&Value>,
+        expected_article: Option<i64>,
+    ) -> io::Result<Value> {
+        let ask = build_send_ask(from, target, mail, body, headers, expected_article);
+        let reply = self.raw_request(&ask).await?;
+        match field(&reply, "type")? {
+            "accepted" => Ok(reply),
+            "error" => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "send of {mail} refused: {}",
+                    field(&reply, "reason").unwrap_or("unexplained")
+                ),
+            )),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected accepted or error, saw {other}"),
+            )),
+        }
+    }
+
+    /// Directed or broadcast `send` on the persistent connection.
+    pub async fn send_mail(
+        &self,
+        from: &str,
+        to: &str,
+        mail: &str,
+        body: &str,
+        headers: Option<&Value>,
+    ) -> io::Result<String> {
+        let accepted = self
+            .send(from, SendTarget::Address(to), mail, body, headers, None)
+            .await?;
+        Ok(field(&accepted, "mail")?.to_string())
+    }
+
+    /// Group `send` on the persistent connection; returns the accepted Mail id
+    /// and article position.
+    pub async fn send_group(
+        &self,
+        from: &str,
+        group: &str,
+        mail: &str,
+        body: &str,
+        headers: Option<&Value>,
+        expected_article: Option<i64>,
+    ) -> io::Result<(String, i64)> {
+        let accepted = self
+            .send(
+                from,
+                SendTarget::Group(group),
+                mail,
+                body,
+                headers,
+                expected_article,
+            )
+            .await?;
+        parse_group_accepted(&accepted)
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +520,280 @@ mod tests {
         writer.send(&Value::Object(probe)).await.unwrap();
         assert_eq!(accept.await.unwrap(), "{\"type\":\"board\"}\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn read_json_line(lines: &mut BufReader<tokio::net::TcpStream>) -> Option<Value> {
+        let mut line = String::new();
+        let n = lines.read_line(&mut line).await.unwrap();
+        if n == 0 {
+            return None;
+        }
+        Some(serde_json::from_str::<Value>(&line).unwrap())
+    }
+
+    async fn write_json_line(lines: &mut BufReader<tokio::net::TcpStream>, v: &Value) {
+        let mut raw = serde_json::to_string(v).unwrap();
+        raw.push('\n');
+        lines.get_mut().write_all(raw.as_bytes()).await.unwrap();
+        lines.get_mut().flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_client_reuses_connection_auth_and_monotonic_reqs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialer = Dialer {
+            socket: DaemonSocket::Tcp(addr.to_string()),
+            client_token: Some("tok-reuse".into()),
+        };
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = BufReader::new(stream);
+
+            let auth = read_json_line(&mut io).await.unwrap();
+            assert_eq!(auth["type"], "auth");
+            assert_eq!(auth["token"], "tok-reuse");
+
+            let r1 = read_json_line(&mut io).await.unwrap();
+            assert_eq!(r1["type"], "board");
+            assert_eq!(r1["req"], 1);
+            write_json_line(&mut io, &serde_json::json!({"type": "board", "req": 1})).await;
+
+            let r2 = read_json_line(&mut io).await.unwrap();
+            assert_eq!(r2["type"], "board");
+            assert_eq!(r2["req"], 2);
+            write_json_line(
+                &mut io,
+                &serde_json::json!({"type": "error", "req": 2, "reason": "refused"}),
+            )
+            .await;
+
+            let r3 = read_json_line(&mut io).await.unwrap();
+            assert_eq!(r3["type"], "send");
+            assert_eq!(r3["req"], 3);
+            assert_eq!(r3["from"], "alice");
+            assert_eq!(r3["to"], "bob");
+            assert_eq!(r3["mail"], "m-1");
+            assert_eq!(r3["body"], "hello");
+            assert_eq!(r3["headers"], serde_json::json!({"x": "1"}));
+            write_json_line(
+                &mut io,
+                &serde_json::json!({"type": "accepted", "req": 3, "mail": "m-1"}),
+            )
+            .await;
+
+            let r4 = read_json_line(&mut io).await.unwrap();
+            assert_eq!(r4["type"], "send");
+            assert_eq!(r4["req"], 4);
+            assert_eq!(r4["group"], "ops");
+            assert_eq!(r4["expected_article"], 4);
+            write_json_line(
+                &mut io,
+                &serde_json::json!({"type": "accepted", "req": 4, "mail": "m-2", "article": 5}),
+            )
+            .await;
+
+            let r5 = read_json_line(&mut io).await.unwrap();
+            assert_eq!(r5["type"], "send");
+            assert_eq!(r5["req"], 5);
+            assert_eq!(r5["group"], "ops");
+            assert!(r5.get("expected_article").is_none());
+            write_json_line(
+                &mut io,
+                &serde_json::json!({"type": "accepted", "req": 5, "mail": "m-3", "article": 6}),
+            )
+            .await;
+        });
+
+        let client = DaemonClient::new(dialer);
+
+        let reply = client
+            .request(&serde_json::json!({"type": "board", "req": 99}))
+            .await
+            .unwrap();
+        assert_eq!(reply["type"], "board");
+        assert_eq!(client.connects().await, 1);
+
+        let err = client
+            .request(&serde_json::json!({"type": "board"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "refused");
+        assert_eq!(client.connects().await, 1, "error reply keeps socket open");
+
+        let headers = serde_json::json!({"x": "1"});
+        let mail = client
+            .send_mail("alice", "bob", "m-1", "hello", Some(&headers))
+            .await
+            .unwrap();
+        assert_eq!(mail, "m-1");
+        assert_eq!(client.connects().await, 1);
+
+        let (mail, article) = client
+            .send_group("alice", "ops", "m-2", "post", None, Some(4))
+            .await
+            .unwrap();
+        assert_eq!(mail, "m-2");
+        assert_eq!(article, 5);
+        assert_eq!(client.connects().await, 1);
+
+        let (mail, article) = client
+            .send_group("alice", "ops", "m-3", "post2", None, None)
+            .await
+            .unwrap();
+        assert_eq!(mail, "m-3");
+        assert_eq!(article, 6);
+        assert_eq!(client.connects().await, 1);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_client_reconnects_once_on_eof_and_reauthenticates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialer = Dialer {
+            socket: DaemonSocket::Tcp(addr.to_string()),
+            client_token: Some("tok-reconn".into()),
+        };
+
+        let server = tokio::spawn(async move {
+            // Connection 1: answer req 1, then close so req 2 hits EOF/reset.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut io = BufReader::new(stream);
+                let auth = read_json_line(&mut io).await.unwrap();
+                assert_eq!(auth["type"], "auth");
+                assert_eq!(auth["token"], "tok-reconn");
+
+                let r1 = read_json_line(&mut io).await.unwrap();
+                assert_eq!(r1["req"], 1);
+                write_json_line(&mut io, &serde_json::json!({"type": "board", "req": 1})).await;
+            }
+
+            // Connection 2: client retries req 2 once with fresh auth, succeeds, then server closes.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut io = BufReader::new(stream);
+                let auth = read_json_line(&mut io).await.unwrap();
+                assert_eq!(auth["type"], "auth");
+                assert_eq!(auth["token"], "tok-reconn");
+
+                let r2 = read_json_line(&mut io).await.unwrap();
+                assert_eq!(r2["type"], "send");
+                assert_eq!(r2["req"], 2);
+                write_json_line(
+                    &mut io,
+                    &serde_json::json!({"type": "accepted", "req": 2, "mail": "m-reconn"}),
+                )
+                .await;
+            }
+
+            // Connection 3: client retries req 3 once, server drops immediately without replying.
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut io = BufReader::new(stream);
+                let _ = read_json_line(&mut io).await;
+                let _ = read_json_line(&mut io).await;
+            }
+        });
+
+        let client = DaemonClient::new(dialer);
+
+        let reply = client
+            .request(&serde_json::json!({"type": "board"}))
+            .await
+            .unwrap();
+        assert_eq!(reply["type"], "board");
+        assert_eq!(client.connects().await, 1);
+
+        let mail = client
+            .send_mail("a", "b", "m-reconn", "hi", None)
+            .await
+            .unwrap();
+        assert_eq!(mail, "m-reconn");
+        assert_eq!(client.connects().await, 2);
+
+        // Conn 2 closed and conn 3 also closes on retry: must fail after one retry.
+        let err = client
+            .request(&serde_json::json!({"type": "board"}))
+            .await
+            .unwrap_err();
+        assert!(
+            is_reconnectable(&err),
+            "expected reconnectable error, saw {err}"
+        );
+        assert_eq!(client.connects().await, 3);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_client_is_cancellation_safe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dialer = Dialer {
+            socket: DaemonSocket::Tcp(addr.to_string()),
+            client_token: None,
+        };
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: answer req 1, then hold req 2 until caller cancels.
+            let (stream1, _) = listener.accept().await.unwrap();
+            let mut io1 = BufReader::new(stream1);
+            let r1 = read_json_line(&mut io1).await.unwrap();
+            assert_eq!(r1["req"], 1);
+            write_json_line(
+                &mut io1,
+                &serde_json::json!({"type": "board", "req": 1, "tag": "first"}),
+            )
+            .await;
+
+            let r2 = read_json_line(&mut io1).await.unwrap();
+            assert_eq!(r2["req"], 2);
+            let _ = seen_tx.send(());
+            let _ = release_rx.await;
+            // Even if a delayed reply were written here, the client dropped conn 1.
+            let _ = io1
+                .get_mut()
+                .write_all(b"{\"type\":\"board\",\"req\":2,\"tag\":\"stale\"}\n")
+                .await;
+
+            // Connection 2: clean recovery for req 3.
+            let (stream2, _) = listener.accept().await.unwrap();
+            let mut io2 = BufReader::new(stream2);
+            let r3 = read_json_line(&mut io2).await.unwrap();
+            assert_eq!(r3["req"], 3);
+            write_json_line(
+                &mut io2,
+                &serde_json::json!({"type": "board", "req": 3, "tag": "fresh"}),
+            )
+            .await;
+        });
+
+        let client = DaemonClient::new(dialer);
+        let board = serde_json::json!({"type": "board"});
+
+        let first = client.request(&board).await.unwrap();
+        assert_eq!(first["tag"], "first");
+        assert_eq!(client.connects().await, 1);
+
+        // Cancel req 2 after the server has read it but before it replies.
+        tokio::select! {
+            _ = client.request(&board) => panic!("req 2 should have been cancelled"),
+            _ = seen_rx => {}
+        }
+        let _ = release_tx.send(());
+
+        // Subsequent request dials a fresh connection and never sees req 2's stale reply.
+        let fresh = client.request(&board).await.unwrap();
+        assert_eq!(fresh["tag"], "fresh");
+        assert_eq!(client.connects().await, 2);
+
+        server.await.unwrap();
     }
 }
