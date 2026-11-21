@@ -327,6 +327,8 @@ struct Inner {
     in_flight: (Mutex<HashSet<String>>, Condvar),
     subscribed_groups: Mutex<HashMap<String, HashMap<usize, HashSet<String>>>>,
     last_swept_day: AtomicI64,
+    next_sweep_due_ms: AtomicI64,
+    sweep_running: std::sync::atomic::AtomicBool,
     sweep_lock: Mutex<()>,
     sweeps: Mutex<Vec<JoinHandle<()>>>,
     _lock: File,
@@ -912,6 +914,8 @@ impl Inner {
     /// slice's cold day file, then mark it cold and drop the hot copy.
     fn sweep(&self, now: i64) -> io::Result<()> {
         let _g = self.sweep_lock.lock().unwrap();
+        self.next_sweep_due_ms.store(i64::MIN, Ordering::SeqCst);
+        let mut due = i64::MAX;
         let default_retain = self.cfg.retain_ms;
         for (idx, slice) in self.slices.iter().enumerate() {
             let rows = self.read(idx, |c| {
@@ -945,9 +949,6 @@ impl Inner {
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })?;
-            if rows.is_empty() {
-                continue;
-            }
             let mut days: BTreeMap<i64, Vec<Record>> = BTreeMap::new();
             for (day, rec) in rows {
                 days.entry(day).or_default().push(rec);
@@ -957,14 +958,31 @@ impl Inner {
                 slice.cold.seal_day(&slice.cold_dir, *day, recs)?;
                 ids.extend(recs.iter().map(|r| r.mail_id.clone()));
             }
-            slice.writer.exec(move |c| {
-                for id in &ids {
-                    c.execute("UPDATE envelopes SET in_cold = 1 WHERE mail_id = ?1", [id])?;
-                    c.execute("DELETE FROM hot_bodies WHERE mail_id = ?1", [id])?;
-                }
-                Ok(())
+            if !ids.is_empty() {
+                slice.writer.exec(move |c| {
+                    for id in &ids {
+                        c.execute("UPDATE envelopes SET in_cold = 1 WHERE mail_id = ?1", [id])?;
+                        c.execute("DELETE FROM hot_bodies WHERE mail_id = ?1", [id])?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let (hot_due, shortest_ttl): (Option<i64>, Option<i64>) = self.read(idx, |c| {
+                c.query_row(
+                    "SELECT CAST(MIN(e.accepted_at_ms + COALESCE(s.ttl_ms, ?1)) AS INTEGER),
+                            (SELECT MIN(ttl_ms) FROM streams)
+                     FROM hot_bodies h JOIN envelopes e ON e.mail_id = h.mail_id
+                     LEFT JOIN streams s ON s.stream = e.stream",
+                    [default_retain],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
             })?;
+            let ttl = default_retain.min(shortest_ttl.unwrap_or(default_retain));
+            due = due
+                .min(hot_due.unwrap_or(i64::MAX))
+                .min(now.saturating_add(ttl));
         }
+        self.next_sweep_due_ms.store(due, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1406,6 +1424,8 @@ impl Store {
             in_flight: (Mutex::new(HashSet::new()), Condvar::new()),
             subscribed_groups: Mutex::new(sub_map),
             last_swept_day: AtomicI64::new(i64::MIN),
+            next_sweep_due_ms: AtomicI64::new(i64::MIN),
+            sweep_running: std::sync::atomic::AtomicBool::new(false),
             sweep_lock: Mutex::new(()),
             sweeps: Mutex::new(Vec::new()),
             _lock: lock,
@@ -1428,24 +1448,32 @@ impl Store {
         })
     }
 
-    /// After a commit: a Mail from a later day than the last sweep starts a
-    /// background sweep, off the send path.
+    /// A committed Mail can start a due sweep, off the send path.
     fn after_send(&self, accepted_at_ms: Option<i64>) {
         let Some(at) = accepted_at_ms else { return };
         if !self.inner.cfg.sweep_enabled {
             return;
         }
         let day = at.div_euclid(self.inner.cfg.day_ms);
-        if self.inner.last_swept_day.fetch_max(day, Ordering::SeqCst) >= day {
+        if day <= self.inner.last_swept_day.load(Ordering::SeqCst)
+            && now_ms() < self.inner.next_sweep_due_ms.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if self.inner.sweep_running.swap(true, Ordering::SeqCst) {
             return;
         }
         let inner = Arc::clone(&self.inner);
         let spawned = std::thread::Builder::new()
             .name("roger-cold-sweep".into())
             .spawn(move || {
-                if let Err(e) = inner.sweep(now_ms()) {
-                    eprintln!("cold sweep failed: {e}");
+                match inner.sweep(now_ms()) {
+                    Ok(()) => {
+                        inner.last_swept_day.fetch_max(day, Ordering::SeqCst);
+                    }
+                    Err(e) => eprintln!("cold sweep failed: {e}"),
                 }
+                inner.sweep_running.store(false, Ordering::SeqCst);
             });
         match spawned {
             Ok(h) => {
@@ -1453,7 +1481,18 @@ impl Store {
                 g.retain(|h| !h.is_finished());
                 g.push(h);
             }
-            Err(e) => eprintln!("cold sweep not started: {e}"),
+            Err(e) => {
+                self.inner.sweep_running.store(false, Ordering::SeqCst);
+                eprintln!("cold sweep not started: {e}");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn join_sweeps(&self) {
+        let handles = std::mem::take(&mut *self.inner.sweeps.lock().unwrap());
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
@@ -1752,6 +1791,13 @@ impl Store {
         retired: Option<bool>,
         now_ms: i64,
     ) -> io::Result<Group> {
+        let _policy_guard = {
+            let guard = self.inner.sweep_lock.lock().unwrap();
+            self.inner
+                .next_sweep_due_ms
+                .store(i64::MIN, Ordering::SeqCst);
+            guard
+        };
         let stream = format!("g:{group}");
         let idx = self.inner.shard(&stream);
         let group_name = group.to_string();
@@ -2605,6 +2651,61 @@ mod tests {
         })
         .unwrap();
         assert_eq!(store.pending_session("a").unwrap()[0].body, "ancient body");
+    }
+
+    #[test]
+    fn failed_sweep_retries_on_same_day() {
+        let dir = tempdir("cold-retry");
+        let mut c = cfg(&dir, 1);
+        c.day_ms = i64::MAX;
+        c.retain_ms = 1_000;
+        let (store, _) = Store::open(c).unwrap();
+        let cold_dir = &store.inner.slices[0].cold_dir;
+        fs::create_dir_all(cold_dir).unwrap();
+        fs::remove_dir(cold_dir).unwrap();
+        fs::write(cold_dir, []).unwrap();
+        let mut old = directed("old", "s", "a", "old body");
+        old.accepted_at_ms = Some(now_ms() - 10_000);
+        committed(store.send_directed(old).unwrap());
+        store.join_sweeps();
+        let query = "SELECT in_cold FROM envelopes WHERE mail_id = 'old'";
+        assert_eq!(count(&store, 0, query), 0);
+        fs::remove_file(cold_dir).unwrap();
+        fs::create_dir(cold_dir).unwrap();
+        committed(
+            store
+                .send_directed(directed("new", "s", "a", "new body"))
+                .unwrap(),
+        );
+        store.join_sweeps();
+        assert_eq!(count(&store, 0, query), 1);
+    }
+
+    #[test]
+    fn short_group_ttl_triggers_same_day_sweep() {
+        let dir = tempdir("cold-ttl");
+        let (store, _) = Store::open(cfg(&dir, 1)).unwrap();
+        let at = now_ms() - 10_000;
+        let mut post = group("post", "s", "G", "body");
+        post.accepted_at_ms = Some(at);
+        committed(store.send_group(post).unwrap());
+        store.join_sweeps();
+        store
+            .group_policy("G", None, Some(Some(100)), None, at)
+            .unwrap();
+        // Model a completed sweep just before expiry, without waiting for a clock tick.
+        store.inner.sweep(at + 1).unwrap();
+        assert_eq!(
+            store.inner.next_sweep_due_ms.load(Ordering::SeqCst),
+            at + 100
+        );
+        let query = "SELECT in_cold FROM envelopes WHERE mail_id = 'post'";
+        assert_eq!(count(&store, 0, query), 0);
+        let mut fresh = directed("new", "s", "a", "new body");
+        fresh.accepted_at_ms = Some(at);
+        committed(store.send_directed(fresh).unwrap());
+        store.join_sweeps();
+        assert_eq!(count(&store, 0, query), 1);
     }
 
     #[test]
