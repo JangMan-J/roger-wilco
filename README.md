@@ -72,13 +72,16 @@ once its Ack is recorded. Stop the processes with `kill %1 %2 %3 %4`.
 from its flags. `coordinator` and `daemon` read the fleet token from `ROGER_TOKEN` in their
 environment, never from argv, which `ps` shows to every user. Every client `--socket` flag
 (and `ROGER_SOCKET` for `mcp`) accepts either a Unix socket path or `tcp://<addr:port>`.
+Flags are read left to right, a flag that takes a value always takes the next argument (so
+`--body --group` sends the text `--group`), and an unknown flag is refused with an error
+naming what was expected and what was seen.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |
 | `coordinator` | `--bind <addr:port> --data <path> [--port-file <file>] [--unregister-after-ms <n>] [--slices <n>] [--cold-retain-days <d>] [--no-cold-sweep]` | central durable store; `--port-file` receives the bound port (useful with port 0); the file appears whole, written aside and renamed into place, so a reader that sees it can use it |
 | `daemon` | `--coordinator <addr:port> --host-id <id> [--socket <path>] [--listen <addr:port>] [--port-file <file>] [--client-token-env <NAME>] --data <log>` | one per host; local inbox; serves sessions on `--socket`, `--listen`, or both (at least one is required; `--port-file` publishes `--listen`'s bound port atomically; `--client-token-env` requires TCP clients to present `ROGER_CLIENT_TOKEN`) |
 | `session` | `--socket --store <file> [--id <address>] [--label <text>] [--declare <text>]` | the Tracer: a session with no harness that reports on stdout |
-| `adapter` | same as `session`, plus `[--registered] [--superseded] [--watch]` (also send `{"type":"registered"}`, see Faces; `board_event` lines, see Watching the Board) | the same session, fronted by a stdin/stdout line stream for a client |
+| `adapter` | same as `session`, plus `[--registered] [--superseded] [--watch] [--groups]` (also send `{"type":"registered"}`, see Faces; `board_event` lines, see Watching the Board) | the same session, fronted by a stdin/stdout line stream for a client |
 | `send` | `--socket --from <address> (--to <address or '*'> \| --group <group>) --body <text> [--mail <id>] [--header <key=value>]... [--expected-article <n>]` | prints `ACCEPTED mail=<id>` (plus `group=... article=...` for Group sends); `--expected-article` fences Group head; `--mail` defaults to a fresh UUID; `--header` repeats, split at the first `=` (see Kind and headers) |
 | `subscribe` | `--socket --session <address> --group <group> [--after <n> \| --latest]` | subscribe `session` to `group` at durable reader Position |
 | `unsubscribe` | `--socket --session <address> --group <group>` | stop Group deliveries while keeping durable Position |
@@ -88,6 +91,7 @@ environment, never from argv, which `ps` shows to every user. Every client `--so
 | `mcp` | `[--socket <path>] [--store <file>] [--id <address> \| --id-env <NAME>] [--label <text>] [--declare <text>] [--groups]` | the same session as an MCP server on stdio (see Faces; `roger.mail` supports `group` and `groupPrefix`) |
 | `receipt` | `--socket --mail <id>` | one Mail's state (see Receipts and latency) |
 | `audit` | `[--coordinator-log <file>] [--daemon-log <file>]... [--store <file>]... [--address <address>] [--bodies] [--json]` | read-only history and findings from records (see Audit) |
+| `backup` | `--data <path> --dest <dir> [--kind coordinator\|daemon]` | snapshots each live SQLite database with `VACUUM INTO` on a read-only connection (one consistent WAL snapshot, writers not blocked), checks integrity of each copy, then copies each slice's sealed cold day files verified by SHA-256 (hot before cold so a concurrent sweep can only add overlap); `--dest` must be absent or empty; `--kind` is auto-detected when omitted; prints `BACKUP_FILE path= bytes= sha256=` lines and `BACKUP kind= files= dest=` |
 | `label` | `--socket --from <address> --label <text>` | relabel a registered session |
 | `claim`, `renew` | `--socket --owner <address> --key <text> --ttl-ms <n>` | grant or extend a Claim; `--ttl-ms` must be positive |
 | `release` | `--socket --owner <address> --key <text>` | give a Claim up |
@@ -401,7 +405,11 @@ what was expected and what was seen; the process keeps serving.
 A client written for a program connects through a face, in its own project; the core ships
 none. A client that wants a line stream starts
 `roger adapter` and talks to it in JSON lines (the request and reply shapes are documented at
-`adapter` in `src/session.rs`); the core never learns which program is there. When the
+`adapter` in `src/session.rs`); the core never learns which program is there. The adapter keeps
+one daemon connection for all its requests. It accepts a `receipt` request
+`{"type":"receipt","mail":"<id>"}` with or without `--groups` (the reply is the receipt reply
+`roger receipt` reads); started with `--groups`, it also accepts `subscribe`, `unsubscribe`,
+`groups`, `articles`, and `group_policy`. When the
 adapter's stdin reaches EOF it unregisters its Address (see Registration) and exits; a client
 ends its adapter by closing that stdin.
 
@@ -434,7 +442,7 @@ that speaks one needs nothing more from the core.
   `{"type":"superseded","session":"<full Address>","host":"<new host>","at_ms":<integer>}`.
   Without that opt-in no unsolicited replacement line is sent.
 - **The `roger adapter` stream.** The same session fronted by one JSON line stream on stdin and
-  stdout, for a client (see Adapters).
+  stdout over one daemon connection, for a client (see Adapters).
 - **`roger mcp`.** The same session speaking the Model Context Protocol over stdio, so a client
   that can register an MCP server needs no client code.
 
@@ -480,7 +488,7 @@ field is `confirm_register`; the host daemon does not forward it upstream.
 
 ```
 roger mcp [--socket <path>] [--store <file>] [--id <address> | --id-env <NAME>]
-          [--label <text>] [--declare <text>]
+          [--label <text>] [--declare <text>] [--groups]
 ```
 
 To register it with an MCP client, give the client the command line `roger mcp` with any of
@@ -502,19 +510,38 @@ reconnect). At exit, a Store at the default path that holds no entries is remove
 `.cursor` file, so a health check leaves nothing; an explicit `--store` is never removed.
 `--hold-before-ack <marker>` (feature `test-hooks`) works here as for `session`.
 
-The protocol is newline-delimited JSON-RPC 2.0, one message per line. `initialize` answers
-with the client's `protocolVersion` when it is `2025-06-18`, `2025-03-26` or `2024-11-05`
-(else `2025-06-18`), `capabilities` `{"tools":{}}` and `serverInfo` `roger` with the crate
-version. Notifications get no reply, `ping` gets `{}`, any other method is error -32601, and
-unparseable input is -32700 with a null id. Calls run concurrently, so a waiting
+The protocol is newline-delimited JSON-RPC 2.0, one message per line (JSON numbers may be
+integers or floats). The current protocol version is `2026-07-28`; legacy `initialize` still
+negotiates `2025-11-25`, `2025-06-18`, `2025-03-26`, or `2024-11-05` (default `2025-06-18`),
+answering with `capabilities` `{"tools":{}}` and `serverInfo` `roger` with the crate version
+(and `ping` gets `{}` on legacy sessions). Under `2026-07-28`, requests carry `params._meta`
+with `io.modelcontextprotocol/protocolVersion` (`2026-07-28`, else error -32022) and
+`io.modelcontextprotocol/clientCapabilities` (optional `clientInfo`, `logLevel`).
+`server/discover` returns `supportedVersions`, `capabilities` (`tools` and the
+`io.modelcontextprotocol/events` extension), `ttlMs`, `cacheScope`, and
+`_meta["io.modelcontextprotocol/serverInfo"]`. SEP-3415 events are served by `events/list`
+(advertising `roger.mail` for `push` and `poll` with `session`, `group`, `groupPrefix`, and
+`kind` filters, plus push-only `roger.board` and `roger.registration`), `events/poll`
+(cursor-based `roger.mail` reads with optional `maxAgeMs` and `maxEvents`, returning
+`events`, `cursor`, `truncated`, `hasMore`, and `nextPollMs`), and `events/stream` (push
+subscriptions emitting `notifications/events/active`, `notifications/events/event`, and
+`notifications/events/heartbeat` tagged with `_meta["io.modelcontextprotocol/subscriptionId"]`,
+plus `subscriptions/listen`). Notifications get no reply, any other method is error -32601,
+and unparseable input is -32700 with a null id. Calls run concurrently, so a waiting
 `roger_inbox` blocks no other call. A tool failure is a result with `isError: true` and the
 reason in its text; an unknown tool or an argument of the wrong type says what was expected
 and what was seen. Every result is one `text` item holding one compact JSON object.
 Streamable HTTP is not offered.
 
+Without `--groups`, the 9 default tools are unchanged. Passing `--groups` extends `roger_send`
+with `group` (mutually exclusive with `to`, returning `{"mail","group","article"}`) and
+`expected_article` (Group head fence: refused unless the Group's high-water equals it), and
+adds `roger_subscribe`, `roger_unsubscribe`, `roger_groups`, `roger_articles`, and
+`roger_group_policy`.
+
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `roger_send` | `to`, `body`, `mail?`, `headers?` | `{"mail"}`; `to` may be `"*"`; `headers` is an object of strings passed through unread, and the core's refusal reason is the error text |
+| `roger_send` | `to`, `body`, `mail?`, `headers?` (with `--groups`: `group`, `expected_article?`) | `{"mail"}` (or `{"mail","group","article"}` for a Group); `to` may be `"*"`; `headers` is an object of strings passed through unread, and the core's refusal reason is the error text |
 | `roger_inbox` | `limit?` (50, max 200), `wait_seconds?` (10, max 60, 0 = no wait), `peek?` | `{"mail":[{"record","mail","from","body","kind","headers"}],"cursor"}` |
 | `roger_board` | `all?`, `window_seconds?` (600) | `{"me","sessions","claims","now_ms"}`, rows as the Board gave them; by default only sessions connected or seen within the window of `now_ms` |
 | `roger_label` | `label` | `{"session","label"}` |
@@ -523,6 +550,11 @@ Streamable HTTP is not offered.
 | `roger_release` | `key` | the same claim result |
 | `roger_registered` | `wait_seconds?` (0, at most 60) | `{"registered":true,"superseded":null}` once confirmed; otherwise false after the bounded wait, or immediately with the sticky notice when superseded |
 | `roger_receipt` | `mail` | the receipt reply: `mail`, `to`, `from`, `kind`, `headers`, `accepted_at_ms`, and `record` and `receipted_at_ms` once acked; an unknown mail is an error |
+| `roger_subscribe` (`--groups`) | `group`, `after?` (>= 0), `latest?` | subscribes this session to `group` at durable Position (`after` and `latest` are mutually exclusive) |
+| `roger_unsubscribe` (`--groups`) | `group` | unsubscribes this session from `group` while keeping its durable Position |
+| `roger_groups` (`--groups`) | `prefix?`, `include_retired?` | lists Groups with high-water marks, subscriber counts, retention policy, and this session's Position |
+| `roger_articles` (`--groups`) | `group`, `after?` (0), `limit?` (100, 1..=500) | the coordinator's articles reply (`group`, `high_water`, `articles` with `article`, `mail`, `from`, `body`, `headers`); a stateless read: no Position moves, no receipt |
+| `roger_group_policy` (`--groups`) | `group`, `keep_last?` (integer or null to clear), `ttl_ms?` (integer or null to clear), `retired?` | the policy reply (`group`, `high_water`, `keep_last`, `ttl_ms`, `retired`) |
 
 `roger_inbox` returns the Store entries after this session's read position, oldest first. With
 none it waits up to `wait_seconds` for the next delivery to reach the Store; that write ends
@@ -595,9 +627,10 @@ core log grows while nobody asks.
 | `src/session.rs` | contract-shaped session (Tracer), adapter, and the clients |
 | `src/mcp.rs` | the MCP stdio face: protocol, tools, the inbox position |
 | `src/sql/`, `src/cold.rs` | isolated SQLite slice/daemon storage and sealed `RWCOLD01` cold day files ([docs/STORAGE.md](docs/STORAGE.md)) |
-| `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
-| `src/json.rs`, `src/net.rs` | JSON codec; one-object-per-line framing, per-peer outgoing queues and message helpers |
+| `src/backup.rs` | live, crash-safe backup of coordinator slices and daemon databases |
+| `src/net.rs` | one-object-per-line framing, per-peer outgoing queues and message helpers |
 | `src/headers.rs` | the bounds on a Mail's headers, checked once by the coordinator |
+| `crates/roger-wire/` | zero-dependency shared library: JSON codec over UTF-8 bytes with integers and floats, SHA-256, the append-only fsynced durable log whose replay drops a crash-truncated tail, and wire constants |
 | `tests/process.rs` | process seam, including the SIGKILL window |
 | `tests/audit.rs` | exact history fixtures, filtering, findings, JSON, live read-only audit |
 | `tests/mcp.rs` | `roger mcp` over stdio against a real coordinator and daemon |
