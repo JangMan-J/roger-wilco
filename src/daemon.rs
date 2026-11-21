@@ -9,7 +9,7 @@ use crate::json::{obj, s, Value};
 use crate::net::{self, Writer};
 use crate::sql::daemon::{Delivery, Store};
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -30,8 +30,9 @@ struct Receipt {
 }
 
 struct Registration {
+    /// The connection's queued writer: a notice sent under the state lock
+    /// only appends to its queue.
     writer: Writer,
-    notices: mpsc::Sender<Value>,
     confirm: bool,
     confirmed: bool,
     notify: bool,
@@ -87,6 +88,13 @@ impl State {
 
 /// How long a session's send or ack waits for the coordinator to answer.
 const UPSTREAM_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a TCP peer has to send its auth line before it is dropped.
+const AUTH_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(10)
+};
 
 pub struct Config {
     pub coordinator: String,
@@ -285,7 +293,14 @@ fn bind_socket(path: &Path) -> io::Result<UnixListener> {
             }
         },
     }
-    UnixListener::bind(path)
+    let listener = UnixListener::bind(path)?;
+    // The socket asks no token, so only this user may connect to it.
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(listener)
 }
 
 fn upstream_loop(cfg: Arc<Config>, state: Arc<Mutex<State>>) {
@@ -511,7 +526,7 @@ fn upstream_link(
                         if let Value::Obj(pairs) = &mut notice {
                             pairs.retain(|(k, _)| k != "registration");
                         }
-                        let _ = r.notices.send(notice);
+                        let _ = net::send(&r.writer, &notice);
                     }
                 }
             }
@@ -544,18 +559,6 @@ fn upstream_link(
         }
     }
     Ok(())
-}
-
-fn notice_sender(writer: Writer) -> mpsc::Sender<Value> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for notice in rx {
-            if net::send(&writer, &notice).is_err() {
-                break;
-            }
-        }
-    });
-    tx
 }
 
 fn register_msg(
@@ -650,8 +653,12 @@ fn confirm(state: &Arc<Mutex<State>>, mail: &str, session: Option<&str>) -> io::
     Ok(())
 }
 
-fn upstream_request(state: &Arc<Mutex<State>>, mut v: Value) -> io::Result<Value> {
-    let (writer, rx) = {
+fn upstream_request(state: &Arc<Mutex<State>>, v: Value) -> io::Result<Value> {
+    request_with_wait(state, v, UPSTREAM_WAIT)
+}
+
+fn request_with_wait(state: &Mutex<State>, mut v: Value, wait: Duration) -> io::Result<Value> {
+    let (req, writer, rx) = {
         let mut st = state.lock().unwrap();
         let req = st.next_req;
         st.next_req += 1;
@@ -664,24 +671,53 @@ fn upstream_request(state: &Arc<Mutex<State>>, mut v: Value) -> io::Result<Value
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream"))?;
         let (tx, rx) = mpsc::channel();
         st.waiters.insert(req, tx);
-        (writer, rx)
+        (req, writer, rx)
     };
-    net::send(&writer, &v)?;
-    // Bounded: a coordinator that accepts a request and never answers must
-    // not hang the session's send or ack forever.
-    // no-poll: one bounded wait for a single reply, turning a silent coordinator into an error.
-    rx.recv_timeout(UPSTREAM_WAIT).map_err(|e| match e {
-        mpsc::RecvTimeoutError::Timeout => {
-            io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
-        }
-        mpsc::RecvTimeoutError::Disconnected => {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "upstream wait dropped")
-        }
-    })
+    let result = net::send(&writer, &v).and_then(|()| {
+        // no-poll: one bounded wait for a single reply, turning a silent coordinator into an error.
+        rx.recv_timeout(wait).map_err(|e| match e {
+            mpsc::RecvTimeoutError::Timeout => {
+                io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "upstream wait dropped")
+            }
+        })
+    });
+    if result.is_err() {
+        state.lock().unwrap().waiters.remove(&req);
+    }
+    result
 }
 
-/// An upstream reply, re-tagged with the local request number it answers.
-fn with_req(mut v: Value, req: i64) -> Value {
+#[test]
+fn failed_requests_release_their_waiter() {
+    let dir = std::env::temp_dir().join(crate::session::gen_uuid().unwrap());
+    let (store, _) = Store::open(&dir.join("daemon.log")).unwrap();
+    let state = Mutex::new(State::new(store));
+    for (writer, expected) in [
+        (net::writer(Box::new(io::sink())), io::ErrorKind::TimedOut),
+        (
+            net::writer(Box::new(io::Cursor::new([0u8; 0]))),
+            io::ErrorKind::WriteZero,
+        ),
+    ] {
+        state.lock().unwrap().upstream = Some(writer);
+        let err = request_with_wait(&state, obj(vec![]), Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), expected);
+        assert!(state.lock().unwrap().waiters.is_empty());
+    }
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn error_value(reason: &str) -> Value {
+    obj(vec![("type", s("error")), ("reason", s(reason))])
+}
+
+/// An upstream reply or transport error, tagged with the local request it answers.
+fn with_req(result: io::Result<Value>, req: i64) -> Value {
+    let mut v = result.unwrap_or_else(|e| error_value(&e.to_string()));
     if let Value::Obj(pairs) = &mut v {
         pairs.retain(|(k, _)| k != "req");
         pairs.push(("req".to_string(), Value::Int(req)));
@@ -706,20 +742,28 @@ fn serve_tcp(
 ) -> io::Result<()> {
     conn.set_nodelay(true)?;
     let mut lines = net::lines(Box::new(conn.try_clone()?));
+    if let Some(expected) = client_token {
+        // no-poll: a bounded wait for the auth line, turning a silent unauthenticated peer into an error.
+        conn.set_read_timeout(Some(AUTH_WAIT))?;
+        if let Err(e) = client_auth(&mut lines, expected) {
+            // No queue or writer thread for an unauthenticated peer: one
+            // direct line into a fresh socket buffer, then hang up.
+            let mut line = crate::json::stringify(&obj(vec![
+                ("type", s("error")),
+                ("error", s(&e.to_string())),
+            ]));
+            line.push('\n');
+            let _ = (&conn).write_all(line.as_bytes());
+            let _ = conn.shutdown(Shutdown::Both);
+            return Err(e);
+        }
+        // no-poll: clears the auth bound; an authenticated session may stay silent.
+        conn.set_read_timeout(None)?;
+    }
     let conn = Arc::new(conn);
     let writer = net::queued(Arc::clone(&conn), |c| {
         let _ = c.shutdown(Shutdown::Both);
     });
-    if let Some(expected) = client_token {
-        if let Err(e) = client_auth(&mut lines, expected) {
-            let _ = net::send(
-                &writer,
-                &obj(vec![("type", s("error")), ("error", s(&e.to_string()))]),
-            );
-            net::close(&writer, true);
-            return Err(e);
-        }
-    }
     serve_local(writer, lines, state)
 }
 
@@ -747,7 +791,7 @@ fn client_auth(lines: &mut net::Lines, expected: &str) -> io::Result<()> {
             "expected the client token, saw a different one",
         ));
     }
-    lines.set_cap(usize::MAX);
+    lines.set_cap(net::MAX_LINE_BYTES);
     Ok(())
 }
 
@@ -767,10 +811,10 @@ fn serve_local(writer: Writer, lines: net::Lines, state: Arc<Mutex<State>>) -> i
     {
         let mut st = state.lock().unwrap();
         st.watchers.retain(|w| !Arc::ptr_eq(w, &writer));
-        for list in st.article_watchers.values_mut() {
-            list.retain(|w| !Arc::ptr_eq(w, &writer));
+        let groups: Vec<String> = st.article_watchers.keys().cloned().collect();
+        for g in groups {
+            unwatch_article(&mut st, &g, &writer);
         }
-        st.article_watchers.retain(|_, list| !list.is_empty());
     }
     // What is already queued is written before the connection ends: a
     // client may still be reading the answers to what it asked.
@@ -819,6 +863,25 @@ fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
 fn watch(st: &mut State, writer: &Writer) {
     if !st.watchers.iter().any(|w| Arc::ptr_eq(w, writer)) {
         st.watchers.push(Arc::clone(writer));
+    }
+}
+
+/// Stop passing `group`'s article frames to `writer`. The Group leaves the
+/// map with its last watcher, so a reconnect no longer follows it upstream,
+/// and the coordinator is told to stop sending its frames now.
+fn unwatch_article(st: &mut State, group: &str, writer: &Writer) {
+    let Some(list) = st.article_watchers.get_mut(group) else {
+        return;
+    };
+    list.retain(|w| !Arc::ptr_eq(w, writer));
+    if list.is_empty() {
+        st.article_watchers.remove(group);
+        if let Some(up) = &st.upstream {
+            let _ = net::send(
+                up,
+                &obj(vec![("type", s("unwatch_articles")), ("group", s(group))]),
+            );
+        }
     }
 }
 
@@ -875,7 +938,6 @@ fn local_loop(
                         .registrations
                         .entry(registration.clone())
                         .or_insert_with(|| Registration {
-                            notices: notice_sender(writer.clone()),
                             writer: writer.clone(),
                             confirm: matches!(v.get("confirm_register"), Some(Value::Bool(true))),
                             confirmed: false,
@@ -936,11 +998,14 @@ fn local_loop(
                 match (v.get("to"), v.get("group")) {
                     (Some(to), None) => up.push(("to", to.clone())),
                     (None, Some(group)) => up.push(("group", group.clone())),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "expected to or group",
-                        ))
+                    (to, _) => {
+                        let reason = if to.is_some() {
+                            "expected to or group, saw both"
+                        } else {
+                            "expected to or group, saw neither"
+                        };
+                        net::send(writer, &with_req(Ok(error_value(reason)), req))?;
+                        continue;
                     }
                 }
                 // Headers are the coordinator's to check; this hop forwards them as given.
@@ -950,7 +1015,8 @@ fn local_loop(
                 if let Some(exp) = v.get("expected_article") {
                     up.push(("expected_article", exp.clone()));
                 }
-                let resp = upstream_request(state, obj(up))?;
+                let resp = upstream_request(state, obj(up))
+                    .unwrap_or_else(|e| error_value(&e.to_string()));
                 let mut answer = if net::field(&resp, "type")? == "error" {
                     obj(vec![
                         ("type", s("error")),
@@ -984,7 +1050,7 @@ fn local_loop(
                         ("session", s(&session)),
                         ("label", s(&label)),
                     ]),
-                )?;
+                );
                 net::send(writer, &with_req(resp, req))?;
             }
             "ack" => {
@@ -1011,6 +1077,9 @@ fn local_loop(
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let follow = v.get("follow") == Some(&Value::Bool(true));
                 let group = v.get("group").and_then(Value::as_str).map(str::to_string);
+                // Only a watch this request added is undone if it fails; an
+                // earlier follow that succeeded stays.
+                let mut added = false;
                 if follow {
                     if let Some(ref g) = group {
                         if !g.is_empty() {
@@ -1018,6 +1087,7 @@ fn local_loop(
                             let list = st.article_watchers.entry(g.clone()).or_default();
                             if !list.iter().any(|w| Arc::ptr_eq(w, writer)) {
                                 list.push(Arc::clone(writer));
+                                added = true;
                             }
                         }
                     }
@@ -1027,23 +1097,16 @@ fn local_loop(
                     pairs.retain(|(k, _)| k != "req");
                 }
                 let resp = upstream_request(state, upstream);
-                if follow
-                    && (resp.is_err()
-                        || resp
-                            .as_ref()
-                            .is_ok_and(|r| net::field(r, "type").unwrap_or("") == "error"))
+                if added
+                    && resp
+                        .as_ref()
+                        .map_or(true, |r| net::field(r, "type").unwrap_or("") == "error")
                 {
                     if let Some(ref g) = group {
-                        let mut st = state.lock().unwrap();
-                        if let Some(list) = st.article_watchers.get_mut(g) {
-                            list.retain(|w| !Arc::ptr_eq(w, writer));
-                            if list.is_empty() {
-                                st.article_watchers.remove(g);
-                            }
-                        }
+                        unwatch_article(&mut state.lock().unwrap(), g, writer);
                     }
                 }
-                net::send(writer, &with_req(resp?, req))?;
+                net::send(writer, &with_req(resp, req))?;
             }
             "claim" | "board" | "receipt" | "subscribe" | "unsubscribe" | "groups"
             | "group_policy" => {
@@ -1052,7 +1115,7 @@ fn local_loop(
                 if let Value::Obj(pairs) = &mut upstream {
                     pairs.retain(|(k, _)| k != "req");
                 }
-                net::send(writer, &with_req(upstream_request(state, upstream)?, req))?;
+                net::send(writer, &with_req(upstream_request(state, upstream), req))?;
             }
             other => {
                 return Err(io::Error::new(
@@ -1096,6 +1159,145 @@ mod tests {
         let v = delivery(&m);
         assert_eq!(v.get("group").and_then(Value::as_str), Some("g"));
         assert_eq!(v.get("article").and_then(Value::as_i64), Some(9));
+    }
+
+    /// A temp dir removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!(
+            "roger-daemon-{tag}-{}",
+            crate::session::gen_uuid().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("sock");
+        let path = dir.0.join("s");
+        let _listener = bind_socket(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// One `serve_tcp` per accepted connection on a loopback port, as
+    /// `accept_tcp` runs it, for the first `n` connections.
+    fn tcp_daemon(
+        token: Option<&'static str>,
+        n: usize,
+    ) -> (std::net::SocketAddr, Arc<Mutex<State>>, Scratch) {
+        let dir = scratch("tcp");
+        let (store, _) = Store::open(&dir.0.join("daemon")).unwrap();
+        let state = Arc::new(Mutex::new(State::new(store)));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let st = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for conn in listener.incoming().take(n) {
+                let st = Arc::clone(&st);
+                std::thread::spawn(move || serve_tcp(conn.unwrap(), st, token));
+            }
+        });
+        (addr, state, dir)
+    }
+
+    fn client(addr: std::net::SocketAddr) -> (TcpStream, net::Lines) {
+        let c = TcpStream::connect(addr).unwrap();
+        // no-poll: a test bound, so a regressed daemon fails instead of hanging the gate.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let lines = net::lines(Box::new(c.try_clone().unwrap()));
+        (c, lines)
+    }
+
+    fn say(mut c: &TcpStream, line: &str) {
+        c.write_all(format!("{line}\n").as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn serve_tcp_refuses_bad_or_missing_auth_and_clears_the_bound_after_good_auth() {
+        let (addr, _, _dir) = tcp_daemon(Some("tok"), 3);
+
+        let (c, mut lines) = client(addr);
+        say(&c, r#"{"type":"auth","token":"wrong"}"#);
+        let v = lines.next().unwrap().unwrap();
+        assert_eq!(net::field(&v, "type").unwrap(), "error");
+        assert!(lines.next().is_none());
+
+        // Silent past the auth bound: dropped with an error, then end of stream.
+        let (_c, mut lines) = client(addr);
+        let v = lines.next().unwrap().unwrap();
+        assert_eq!(net::field(&v, "type").unwrap(), "error");
+        assert!(lines.next().is_none());
+
+        let (c, mut lines) = client(addr);
+        say(&c, r#"{"type":"auth","token":"tok"}"#);
+        // no-poll: outlasts the auth bound to show success cleared it.
+        std::thread::sleep(AUTH_WAIT * 2);
+        say(&c, r#"{"type":"watch","req":4}"#);
+        let v = lines.next().unwrap().unwrap();
+        assert_eq!(net::field(&v, "type").unwrap(), "watching");
+        assert_eq!(v.get("req").and_then(Value::as_i64), Some(4));
+    }
+
+    #[test]
+    fn failed_follow_leaves_no_article_watch() {
+        let (addr, state, _dir) = tcp_daemon(None, 1);
+        let (c, mut lines) = client(addr);
+        // No upstream: only the follow request fails.
+        say(
+            &c,
+            r#"{"type":"articles","req":1,"group":"g","follow":true}"#,
+        );
+        let reply = lines.next().unwrap().unwrap();
+        assert_eq!(net::field(&reply, "type").unwrap(), "error");
+        assert_eq!(reply.get("req").and_then(Value::as_i64), Some(1));
+        assert!(state.lock().unwrap().article_watchers.is_empty());
+    }
+
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_the_last_article_watcher_leaving_unwatches_upstream() {
+        let dir = scratch("unwatch");
+        let (store, _) = Store::open(&dir.0.join("daemon")).unwrap();
+        let mut st = State::new(store);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        st.upstream = Some(net::writer(Box::new(Sink(Arc::clone(&sent)))));
+        let a = net::writer(Box::new(io::sink()));
+        let b = net::writer(Box::new(io::sink()));
+        st.article_watchers
+            .insert("g".into(), vec![Arc::clone(&a), Arc::clone(&b)]);
+
+        unwatch_article(&mut st, "g", &a);
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(st.article_watchers.contains_key("g"));
+
+        unwatch_article(&mut st, "g", &b);
+        assert!(!st.article_watchers.contains_key("g"));
+        assert_eq!(
+            String::from_utf8(sent.lock().unwrap().clone()).unwrap(),
+            "{\"type\":\"unwatch_articles\",\"group\":\"g\"}\n"
+        );
     }
 }
 
