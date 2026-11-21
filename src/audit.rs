@@ -308,6 +308,8 @@ struct MailRow {
     receipts: Vec<ReceiptRow>,
     /// Readers holding a position on a Group article's Group.
     readers: Vec<String>,
+    /// A Group article below its Group's prune floor: never deliverable again.
+    pruned: bool,
 }
 
 struct ReceiptRow {
@@ -455,6 +457,7 @@ fn coordinator_lines(input: &Input) -> (Vec<Item>, Vec<MailRow>) {
             line: int(n),
             receipts: Vec::new(),
             readers: Vec::new(),
+            pruned: false,
         };
     for (n, v) in input
         .lines()
@@ -599,6 +602,7 @@ fn coordinator_snapshot(snapshot: &Coord) -> (Vec<Item>, Vec<MailRow>) {
                         })
                         .collect(),
                     readers: e.subscribers.clone(),
+                    pruned: e.pruned,
                 });
                 items.push(Item::Mail(mails.len() - 1));
                 continue;
@@ -889,17 +893,18 @@ impl Audit<'_> {
             fields.extend(extra);
             fields
         };
-        self.out.push(line(
-            "MAIL",
-            head(vec![
-                ("receipted_at_ms", opt_int(receipted_at)),
-                ("latency_ms", opt_int(latency)),
-                ("record", record),
-                ("receipt_line", receipt_line),
-                ("body_bytes", row.body_bytes.clone()),
-                ("line", row.line.clone()),
-            ]),
-        ));
+        let mut fields = vec![
+            ("receipted_at_ms", opt_int(receipted_at)),
+            ("latency_ms", opt_int(latency)),
+            ("record", record),
+            ("receipt_line", receipt_line),
+            ("body_bytes", row.body_bytes.clone()),
+            ("line", row.line.clone()),
+        ];
+        if row.pruned {
+            fields.push(("pruned", Value::Bool(true)));
+        }
+        self.out.push(line("MAIL", head(fields)));
         self.out.extend(headers_line(&row.id, &row.headers));
         if self.opts.bodies {
             self.out.push(body_line(&row.id, row.body.as_deref()));
@@ -922,6 +927,8 @@ impl Audit<'_> {
                     self.record(&row.id, Source::Coordinator, &r.record);
                 }
             }
+            // A pruned article can no longer be delivered, so it is not owed.
+            None if row.pruned => {}
             None => self
                 .unreceipted
                 .push(line("UNRECEIPTED", head(vec![("line", row.line.clone())]))),
@@ -1255,10 +1262,33 @@ mod tests {
     /// The text listing of the SQLite fixture: a hot body, a body sealed in
     /// a cold day file, and a Group article read by two of three readers.
     fn audit_fixture(tag: &str, address: Option<&str>) -> (Vec<String>, String, String) {
+        audit_fixture_with(tag, address, write_test_fixture)
+    }
+
+    /// The fixture with Group `news` pruned through article 1, so g-1 is pruned.
+    fn write_pruned_fixture(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (c, d) = write_test_fixture(dir);
+        let db = crate::sql::coord_root(&c).join("slice-00/hot.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE streams ADD COLUMN pruned_through INTEGER NOT NULL DEFAULT 0; \
+                 INSERT INTO streams(stream, kind, next_article, pruned_through) \
+                 VALUES ('g:news','group',2,1);",
+            )
+            .unwrap();
+        (c, d)
+    }
+
+    fn audit_fixture_with(
+        tag: &str,
+        address: Option<&str>,
+        fixture: fn(&std::path::Path) -> (std::path::PathBuf, std::path::PathBuf),
+    ) -> (Vec<String>, String, String) {
         let dir = std::env::temp_dir().join(format!("roger-audit-ro-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (c, d) = write_test_fixture(&dir);
+        let (c, d) = fixture(&dir);
         let (c, d) = (
             c.to_str().unwrap().to_string(),
             d.to_str().unwrap().to_string(),
@@ -1335,6 +1365,21 @@ mod tests {
                 "UNRECEIPTED mail=g-1 kind=group from=s to=news article=1 accepted_at_ms=300 line=5".into(),
                 "AUDIT sources=2 registers=0 unregisters=0 mails=1 receipted=0 unreceipted=1 duplicates=0 mismatches=0 torn=0 skipped=0".into(),
             ]
+        );
+    }
+
+    #[test]
+    fn sqlite_audit_marks_pruned_group_articles() {
+        let (out, _, _) = audit_fixture_with("pruned", Some("r3"), write_pruned_fixture);
+        let mail = out
+            .iter()
+            .find(|l| l.starts_with("MAIL mail=g-1 "))
+            .unwrap();
+        assert!(mail.ends_with(" line=5 pruned=true"), "{mail}");
+        assert!(out.iter().any(|l| l == "BODY mail=g-1 absent"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("UNRECEIPTED mail=g-1 ")),
+            "{out:?}"
         );
     }
 }

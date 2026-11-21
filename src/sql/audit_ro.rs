@@ -55,6 +55,8 @@ pub struct Envelope {
     pub receipts: Vec<Receipt>,
     /// Readers holding a position on this envelope's stream (Group articles).
     pub subscribers: Vec<String>,
+    /// A Group article at or below its stream's prune floor.
+    pub pruned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -216,13 +218,29 @@ fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> i
     }
     drop(stmt);
 
+    // Older stores lack the prune floor column; then nothing is pruned.
+    let mut stmt = conn.prepare("PRAGMA table_info(streams)").map_err(e)?;
+    let has_floor = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(e)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(e)?
+        .iter()
+        .any(|name| name == "pruned_through");
+    drop(stmt);
+    let pruned_expr = if has_floor {
+        "(e.kind = 'group' AND e.article_num <= COALESCE((SELECT s.pruned_through \
+         FROM streams s WHERE s.stream = e.stream), 0))"
+    } else {
+        "0"
+    };
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT e.seq, e.raw_line, e.mail_id, e.stream, e.article_num, e.kind, e.sender, \
              e.recipient, e.headers_json, e.body_len, e.accepted_at_ms, e.day_bucket, e.in_cold, \
-             CASE WHEN ?1 THEN h.body END \
-             FROM envelopes e LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id ORDER BY e.seq",
-        )
+             CASE WHEN ?1 THEN h.body END, {pruned_expr} \
+             FROM envelopes e LEFT JOIN hot_bodies h ON h.mail_id = e.mail_id ORDER BY e.seq"
+        ))
         .map_err(e)?;
     let mut envelopes = Vec::new();
     for row in stmt
@@ -230,6 +248,7 @@ fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> i
             let seq: i64 = r.get(0)?;
             let stream: String = r.get(3)?;
             let mail_id: String = r.get(2)?;
+            let pruned = r.get::<_, i64>(14)? != 0;
             Ok((
                 Envelope {
                     seq,
@@ -245,7 +264,8 @@ fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> i
                     headers_json: r.get(8)?,
                     body_len: r.get(9)?,
                     accepted_at_ms: r.get(10)?,
-                    body: r.get(13)?,
+                    body: if pruned { None } else { r.get(13)? },
+                    pruned,
                 },
                 r.get::<_, i64>(11)?,
                 r.get::<_, i64>(12)?,
@@ -262,7 +282,7 @@ fn read_slice(db: &Path, dir: &Path, include_bodies: bool, out: &mut Coord) -> i
     if include_bodies && envelopes.iter().any(|(_, _, cold)| *cold != 0) {
         let cold = Index::load(&dir.join("cold"))?;
         for (env, day, in_cold) in envelopes.iter_mut() {
-            if *in_cold != 0 {
+            if *in_cold != 0 && !env.pruned {
                 env.body = cold.read_body(*day, &env.mail_id)?;
             }
         }
