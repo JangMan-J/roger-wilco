@@ -55,7 +55,10 @@ pub(crate) fn parse_flags(
     valued: &[&str],
     switches: &[&str],
 ) -> io::Result<Flags> {
+    #[cfg(feature = "test-hooks")]
     const HOOKS: &[&str] = &["--hold-before-ack", "--link-pace-ms"];
+    #[cfg(not(feature = "test-hooks"))]
+    const HOOKS: &[&str] = &[];
     let mut flags = Flags::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -564,10 +567,11 @@ mod tests {
     fn an_unknown_flag_names_the_expected_flags_and_token() {
         let err = parse("watch", &["--unknown"]).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            err.to_string(),
-            "expected one of --socket, --hold-before-ack, --link-pace-ms for watch, saw --unknown"
-        );
+        #[cfg(feature = "test-hooks")]
+        let expected = "expected one of --socket, --hold-before-ack, --link-pace-ms for watch, saw --unknown";
+        #[cfg(not(feature = "test-hooks"))]
+        let expected = "expected one of --socket for watch, saw --unknown";
+        assert_eq!(err.to_string(), expected);
     }
 
     #[test]
@@ -578,6 +582,7 @@ mod tests {
         assert_eq!(flags.get("--label").as_deref(), Some("--watch"));
     }
 
+    #[cfg(feature = "test-hooks")]
     #[test]
     fn test_hook_flags_are_valued() {
         let flags = parse(
