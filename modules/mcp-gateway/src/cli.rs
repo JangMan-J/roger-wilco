@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "\
 Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port> --store-dir <dir>
-                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>] [--groups]";
+                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>]
+                         [--public-url <url>] [--auth-server <issuer-url>] [--scope <scope>] [--groups]";
 
 /// Target address of the host `roger daemon`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,11 +54,15 @@ pub struct Config {
     pub port_file: Option<PathBuf>,
     pub endpoint: String,
     pub bearer_token: Option<String>,
+    pub public_url: Option<String>,
+    pub auth_servers: Vec<String>,
+    pub scopes: Vec<String>,
     pub groups: bool,
     #[cfg(feature = "test-hooks")]
     pub hold_before_ack: Option<PathBuf>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
     Help,
@@ -84,6 +89,9 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
     let mut port_file: Option<PathBuf> = None;
     let mut endpoint = "/mcp".to_string();
     let mut token_env: Option<String> = None;
+    let mut public_url: Option<String> = None;
+    let mut auth_servers: Vec<String> = Vec::new();
+    let mut scopes: Vec<String> = Vec::new();
     let mut groups = false;
     #[cfg(feature = "test-hooks")]
     let mut hold_before_ack: Option<PathBuf> = None;
@@ -128,10 +136,10 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
                         "expected --endpoint to start with '/', saw {v}"
                     )));
                 }
-                if v == "/healthz" {
-                    return Err(bad(
-                        "expected --endpoint distinct from /healthz, saw /healthz".into(),
-                    ));
+                if v == "/healthz" || v.starts_with("/.well-known/") {
+                    return Err(bad(format!(
+                        "expected --endpoint distinct from /healthz and /.well-known/*, saw {v}"
+                    )));
                 }
                 endpoint = v;
             }
@@ -143,6 +151,33 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
                     ));
                 }
                 token_env = Some(v);
+            }
+            "--public-url" => {
+                let v = next_val()?;
+                if !(v.starts_with("http://") || v.starts_with("https://")) {
+                    return Err(bad(format!(
+                        "expected --public-url to start with http:// or https://, saw {v}"
+                    )));
+                }
+                public_url = Some(v.trim_end_matches('/').to_string());
+            }
+            "--auth-server" => {
+                let v = next_val()?;
+                if !(v.starts_with("http://") || v.starts_with("https://")) {
+                    return Err(bad(format!(
+                        "expected --auth-server to start with http:// or https://, saw {v}"
+                    )));
+                }
+                auth_servers.push(v);
+            }
+            "--scope" => {
+                let v = next_val()?;
+                if v.is_empty() || v.contains(['"', '\\', '\r', '\n']) {
+                    return Err(bad(format!(
+                        "expected non-empty RFC 6750 scope token for --scope, saw {v:?}"
+                    )));
+                }
+                scopes.push(v);
             }
             "--groups" => {
                 groups = true;
@@ -159,7 +194,7 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
             }
             other => {
                 return Err(bad(format!(
-                    "expected a flag (--bind, --socket, --store-dir, --port-file, --endpoint, --token-env, --groups, --help), saw {other}"
+                    "expected a flag (--bind, --socket, --store-dir, --port-file, --endpoint, --token-env, --public-url, --auth-server, --scope, --groups, --help), saw {other}"
                 )))
             }
         }
@@ -188,6 +223,9 @@ pub fn parse_args(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> io::
         port_file,
         endpoint,
         bearer_token,
+        public_url,
+        auth_servers,
+        scopes,
         groups,
         #[cfg(feature = "test-hooks")]
         hold_before_ack,

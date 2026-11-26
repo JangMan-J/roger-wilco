@@ -138,10 +138,20 @@ impl RpcErr {
         }
     }
 
+    pub fn missing_capability(required_capabilities: Value) -> Self {
+        Self {
+            code: -32021,
+            message: "Missing required client capability".into(),
+            data: Some(serde_json::json!({
+                "requiredCapabilities": required_capabilities,
+            })),
+        }
+    }
+
     pub fn unsupported_version(requested: &str) -> Self {
         Self {
             code: -32022,
-            message: "Unsupported protocol version".into(),
+            message: format!("Unsupported protocol version (supported: {VERSION})"),
             data: Some(serde_json::json!({
                 "supported": [VERSION],
                 "requested": requested,
@@ -245,14 +255,6 @@ pub fn validate_meta(params: &Value) -> Result<&str, RpcErr> {
             )));
         }
     }
-    if let Some(level) = meta_obj.get("io.modelcontextprotocol/logLevel") {
-        if !level.is_string() {
-            return Err(RpcErr::invalid_params(format!(
-                "expected _meta[\"io.modelcontextprotocol/logLevel\"] to be a string, saw {}",
-                type_name(Some(level))
-            )));
-        }
-    }
     if pv != VERSION {
         return Err(RpcErr::unsupported_version(pv));
     }
@@ -265,14 +267,29 @@ pub fn discover_result() -> Value {
         "supportedVersions": [VERSION],
         "capabilities": {
             "tools": { "listChanged": false },
+            "resources": { "listChanged": false },
             "extensions": {
-                "io.modelcontextprotocol/events": { "listChanged": false }
+                "io.modelcontextprotocol/events": { "listChanged": false },
+                "io.modelcontextprotocol/skills": { "directoryRead": true },
+                "io.modelcontextprotocol/tasks": {}
             }
         },
         "_meta": server_info_meta(),
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": "public",
     })
+}
+
+pub fn client_declares_ext(params: &Value, ext_id: &str) -> bool {
+    params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("extensions"))
+        .and_then(Value::as_object)
+        .and_then(|e| e.get(ext_id))
+        .is_some_and(Value::is_object)
 }
 
 const SESSION_TOOLS: [(&str, &str, &str); 9] = [
@@ -323,7 +340,67 @@ const SESSION_TOOLS: [(&str, &str, &str); 9] = [
     ),
 ];
 
+pub fn tool_annotations(name: &str) -> Value {
+    let read_only = matches!(
+        name,
+        "roger_board" | "roger_receipt" | "roger_registered" | "roger_groups" | "roger_articles"
+    );
+    let idempotent = read_only
+        || matches!(
+            name,
+            "roger_unregister"
+                | "roger_label"
+                | "roger_claim"
+                | "roger_release"
+                | "roger_unsubscribe"
+        );
+    serde_json::json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": name == "roger_unregister",
+        "idempotentHint": idempotent,
+        "openWorldHint": false,
+    })
+}
+
+pub fn paginate_values(
+    items: Vec<Value>,
+    params: &Value,
+    page_size: usize,
+) -> Result<(Vec<Value>, Option<String>), RpcErr> {
+    let offset = match params.get("cursor") {
+        None | Some(Value::Null) => 0usize,
+        Some(Value::String(cur)) if !cur.is_empty() && cur.bytes().all(|b| b.is_ascii_digit()) => {
+            let parsed = cur
+                .parse::<usize>()
+                .map_err(|_| RpcErr::invalid_params("invalid pagination cursor"))?;
+            if parsed > items.len() {
+                return Err(RpcErr::invalid_params("invalid pagination cursor"));
+            }
+            parsed
+        }
+        _ => return Err(RpcErr::invalid_params("invalid pagination cursor")),
+    };
+    let end = offset.saturating_add(page_size).min(items.len());
+    let next = (end < items.len()).then(|| end.to_string());
+    Ok((items[offset..end].to_vec(), next))
+}
+
 pub fn tools_list(groups: bool) -> Value {
+    tools_list_paged(groups, &Value::Object(Map::new())).expect("unpaged tools_list succeeds")
+}
+
+pub fn tool_schema(groups: bool, name: &str) -> Option<Value> {
+    tools_list(groups)
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                .cloned()
+        })
+}
+
+pub fn tools_list_paged(groups: bool, params: &Value) -> Result<Value, RpcErr> {
     let mut tools = vec![
         serde_json::json!({
             "name": "roger_register",
@@ -410,22 +487,41 @@ pub fn tools_list(groups: bool) -> Value {
         }
     }
 
-    serde_json::json!({
-        "resultType": "complete",
-        "tools": tools,
-        "ttlMs": DISCOVER_TTL_MS,
-        "cacheScope": "public",
-        "_meta": server_info_meta(),
-    })
+    for tool in &mut tools {
+        if let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) {
+            if let Some(obj) = tool.as_object_mut() {
+                obj.insert("annotations".into(), tool_annotations(&name));
+            }
+        }
+    }
+
+    let (paged, next_cursor) = paginate_values(tools, params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("tools".into(), Value::Array(paged));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
 }
 
 pub fn tool_result(text: &str, is_error: bool) -> Value {
+    tool_result_structured(text, None, is_error)
+}
+
+pub fn tool_result_structured(text: &str, structured: Option<Value>, is_error: bool) -> Value {
     let mut out = Map::new();
     out.insert("resultType".into(), Value::String("complete".into()));
     out.insert(
         "content".into(),
         serde_json::json!([{"type": "text", "text": text}]),
     );
+    if let Some(sc) = structured {
+        out.insert("structuredContent".into(), sc);
+    }
     if is_error {
         out.insert("isError".into(), Value::Bool(true));
     }
@@ -1056,6 +1152,57 @@ pub fn events_list_result() -> Value {
     })
 }
 
+pub fn event_schema(name: &str) -> Option<Value> {
+    events_list_result()
+        .get("events")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|ev| ev.get("name").and_then(Value::as_str) == Some(name))
+                .cloned()
+        })
+}
+
+pub fn events_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    let base = events_list_result();
+    let all = base
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let (paged, next_cursor) = paginate_values(all, params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("events".into(), Value::Array(paged));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
+}
+
+pub fn events_webhook_unsupported(params: &Value) -> RpcErr {
+    let name = match params.get("name") {
+        Some(Value::String(n)) if !n.is_empty() => n.as_str(),
+        other => {
+            return RpcErr::invalid_params(format!(
+                "expected name to be a non-empty string, saw {}",
+                type_name(other)
+            ))
+        }
+    };
+    if !matches!(name, "roger.mail" | "roger.board" | "roger.registration") {
+        return RpcErr::not_found("event", format!("unknown event {name}"));
+    }
+    RpcErr::unsupported(
+        "deliveryMode",
+        "webhook",
+        format!("event {name} does not support webhook delivery"),
+    )
+}
+
 #[derive(Clone, Default)]
 pub struct MailFilter {
     pub group: Option<String>,
@@ -1425,6 +1572,204 @@ pub async fn events_poll(sessions: &Arc<SessionManager>, params: &Value) -> Resu
         "nextPollMs": DEFAULT_POLL_NEXT_MS,
         "_meta": server_info_meta(),
     }))
+}
+
+// ---- SEP-2640 skills + resources ----
+
+pub fn skill_entry_value() -> Value {
+    use roger_wire::wire::{
+        roger_skill_digests, ROGER_SKILL_DESCRIPTION, ROGER_SKILL_MD, ROGER_SKILL_NAME,
+        ROGER_SKILL_REF_MD, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let (md_sha, ref_sha) = roger_skill_digests();
+    let md_size = ROGER_SKILL_MD.len() as i64;
+    let ref_size = ROGER_SKILL_REF_MD.len() as i64;
+    serde_json::json!({
+        "uri": ROGER_SKILL_URI,
+        "name": ROGER_SKILL_NAME,
+        "description": ROGER_SKILL_DESCRIPTION,
+        "frontmatter": {
+            "name": ROGER_SKILL_NAME,
+            "description": ROGER_SKILL_DESCRIPTION,
+            "license": "Apache-2.0"
+        },
+        "resources": [
+            {
+                "uri": ROGER_SKILL_URI,
+                "digest": format!("sha256:{md_sha}"),
+                "size": md_size
+            },
+            {
+                "uri": ROGER_SKILL_REF_URI,
+                "digest": format!("sha256:{ref_sha}"),
+                "size": ref_size
+            }
+        ],
+        "files": [
+            {
+                "uri": ROGER_SKILL_URI,
+                "sha256": md_sha,
+                "size": md_size,
+                "mimeType": "text/markdown"
+            },
+            {
+                "uri": ROGER_SKILL_REF_URI,
+                "sha256": ref_sha,
+                "size": ref_size,
+                "mimeType": "text/markdown"
+            }
+        ]
+    })
+}
+
+pub fn skills_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    let (skills, next_cursor) = paginate_values(vec![skill_entry_value()], params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("skills".into(), Value::Array(skills));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
+}
+
+pub fn skills_get_result(params: &Value) -> Result<Value, RpcErr> {
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    if uri != roger_wire::wire::ROGER_SKILL_URI {
+        return Err(RpcErr::invalid_params(format!("unknown skill: {uri}")));
+    }
+    Ok(serde_json::json!({
+        "resultType": "complete",
+        "skill": skill_entry_value(),
+        "ttlMs": DISCOVER_TTL_MS,
+        "cacheScope": "public",
+        "_meta": server_info_meta(),
+    }))
+}
+
+pub fn resources_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_DESCRIPTION, ROGER_SKILL_NAME, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let all = vec![
+        serde_json::json!({
+            "uri": ROGER_SKILL_URI,
+            "name": ROGER_SKILL_NAME,
+            "description": ROGER_SKILL_DESCRIPTION,
+            "mimeType": "text/markdown"
+        }),
+        serde_json::json!({
+            "uri": ROGER_SKILL_REF_URI,
+            "name": "protocol.md",
+            "mimeType": "text/markdown"
+        }),
+    ];
+    let (resources, next_cursor) = paginate_values(all, params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("resources".into(), Value::Array(resources));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
+}
+
+pub fn resource_templates_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    let (templates, next_cursor) = paginate_values(Vec::new(), params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("resourceTemplates".into(), Value::Array(templates));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
+}
+
+pub fn resources_read_result(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_MD, ROGER_SKILL_REF_MD, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    let text = match uri {
+        ROGER_SKILL_URI => ROGER_SKILL_MD,
+        ROGER_SKILL_REF_URI => ROGER_SKILL_REF_MD,
+        _ => return Err(RpcErr::invalid_params(format!("resource not found: {uri}"))),
+    };
+    Ok(serde_json::json!({
+        "resultType": "complete",
+        "contents": [{
+            "uri": uri,
+            "mimeType": "text/markdown",
+            "text": text
+        }],
+        "ttlMs": DISCOVER_TTL_MS,
+        "cacheScope": "public",
+        "_meta": server_info_meta(),
+    }))
+}
+
+pub fn resources_directory_read(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_DESCRIPTION, ROGER_SKILL_NAME, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let Some(raw_uri) = params.get("uri").and_then(Value::as_str) else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    let dir = raw_uri.trim_end_matches('/');
+    let children = match dir {
+        "skill://roger-wilco" => vec![
+            serde_json::json!({
+                "uri": ROGER_SKILL_URI,
+                "name": ROGER_SKILL_NAME,
+                "description": ROGER_SKILL_DESCRIPTION,
+                "mimeType": "text/markdown"
+            }),
+            serde_json::json!({
+                "uri": "skill://roger-wilco/references",
+                "name": "references",
+                "mimeType": "inode/directory"
+            }),
+        ],
+        "skill://roger-wilco/references" => vec![serde_json::json!({
+            "uri": ROGER_SKILL_REF_URI,
+            "name": "protocol.md",
+            "mimeType": "text/markdown"
+        })],
+        _ => {
+            return Err(RpcErr::invalid_params(format!(
+                "directory not found: {raw_uri}"
+            )))
+        }
+    };
+    let uris: Vec<Value> = children
+        .iter()
+        .filter_map(|c| c.get("uri").cloned())
+        .collect();
+    let (paged, next_cursor) = paginate_values(children, params, 100)?;
+    let mut res = Map::new();
+    res.insert("resultType".into(), Value::String("complete".into()));
+    res.insert("resources".into(), Value::Array(paged));
+    res.insert("uris".into(), Value::Array(uris));
+    if let Some(nc) = next_cursor {
+        res.insert("nextCursor".into(), Value::String(nc));
+    }
+    res.insert("ttlMs".into(), Value::Number(DISCOVER_TTL_MS.into()));
+    res.insert("cacheScope".into(), Value::String("public".into()));
+    res.insert("_meta".into(), server_info_meta());
+    Ok(Value::Object(res))
 }
 
 pub fn format_notification(method: &str, mut params: Map<String, Value>, sub_id: &Value) -> String {

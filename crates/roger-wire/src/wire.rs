@@ -181,6 +181,60 @@ pub fn publish_port(path: &Path, port: u16) -> io::Result<()> {
     })
 }
 
+pub const ROGER_SKILL_NAME: &str = "roger-wilco";
+pub const ROGER_SKILL_DESCRIPTION: &str =
+    "Durable cross-host mail, presence board, exclusive TTL claims, receipts, groups, and SEP-3415 push events.";
+pub const ROGER_SKILL_URI: &str = "skill://roger-wilco/SKILL.md";
+pub const ROGER_SKILL_REF_URI: &str = "skill://roger-wilco/references/protocol.md";
+
+pub const ROGER_SKILL_MD: &str = "\
+---
+name: roger-wilco
+description: Durable cross-host mail, presence board, exclusive TTL claims, receipts, groups, and SEP-3415 push events.
+license: Apache-2.0
+---
+
+# Roger-Wilco MCP Guide
+
+Roger-Wilco provides durable Mail, Board presence, exclusive TTL Claims, Receipts, Named Groups, and SEP-3415 (`io.modelcontextprotocol/events`) push/poll streams.
+
+## Core Guidelines
+
+1. **Qualify session Addresses**: Give each session a collision-free Address (for example combining workspace/group scope and slot id) so distinct sessions do not supersede one another.
+2. **Subscribe selectively to SEP-3415 events**: Subscribe to `roger.mail` for incoming directed, broadcast, and group Mail. Subscribe to `roger.board` only when watching Board or Claim transitions across all sessions is explicitly needed.
+3. **Claims are exclusive with coordinator TTL**: Call `roger_claim` with `key` and `ttl_seconds`, `roger_renew` before expiry, and `roger_release` when finished.
+4. **Store-before-Ack durability**: Every delivered Mail is fsynced to the session Store before acknowledgement; `roger_inbox` advances `.store.cursor`, while `events/poll` and `events/stream` read from the Store with independent cursors.
+
+See `references/protocol.md` (`skill://roger-wilco/references/protocol.md`) for tool parameters, Group CAS (`expected_article`), and task/event details.
+";
+
+pub const ROGER_SKILL_REF_MD: &str = "\
+# Roger-Wilco Tool & Event Reference
+
+## Tools
+
+- `roger_send`: Send directed (`to`), broadcast (`to: \"*\"`), or group (`group`, optional `expected_article` CAS) Mail with optional opaque string `headers`.
+- `roger_inbox`: Read Mail after the durable Store read position (`limit`, `wait_seconds`, `peek`).
+- `roger_board`: Inspect connected or recently active sessions (`window_seconds`, `all`) and live Claims.
+- `roger_claim` / `roger_renew` / `roger_release`: Acquire, extend, or release an exclusive coordinator key.
+- `roger_receipt`: Inspect Accepted and Receipted timestamps and recipient Record id for a Mail id.
+- `roger_registered`: Confirm coordinator registration and check sticky `superseded` state.
+- `roger_subscribe` / `roger_unsubscribe` / `roger_groups` / `roger_articles` / `roger_group_policy`: Manage Named Group subscriptions, history reads, and retention (`--groups`).
+
+## SEP-3415 Events & SEP-2663 Tasks
+
+- `roger.mail` (`push`, `poll`): Supports `group`, `groupPrefix`, and `kind` (`directed`, `broadcast`, `group`) filters, `cursor` (`null` from current tail, `\"r-0\"` from first record), and `maxAgeMs`.
+- `roger.board` & `roger.registration` (`push`): Real-time Board and registration transitions.
+- Pass `_meta[\"io.modelcontextprotocol/task\"]: true` on `tools/call` (with `io.modelcontextprotocol/tasks` in `clientCapabilities.extensions`) to run a tool asynchronously as a SEP-2663 task (`tasks/get`, `tasks/cancel`, `tasks/update`, and `notifications/tasks` via `subscriptions/listen`).
+";
+
+pub fn roger_skill_digests() -> (String, String) {
+    (
+        hex_digest(ROGER_SKILL_MD.as_bytes()),
+        hex_digest(ROGER_SKILL_REF_MD.as_bytes()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1997,3 +1997,349 @@ async fn sep3415_events_poll_stream_heartbeat_abort_and_board_watch() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn server_cards_rfc9728_auth_mrtr_ops_and_legacy_tolerance_boundary() {
+    let mut rig = TestRig::start("boundary").await;
+    let (_, gw_port) = rig
+        .spawn_gateway(
+            &[
+                "--token-env",
+                "GW_BEARER",
+                "--public-url",
+                "https://roger.example.net/mcp",
+                "--auth-server",
+                "https://auth.example.net",
+                "--scope",
+                "roger:rw",
+            ],
+            &[("GW_BEARER", GATEWAY_BEARER)],
+        )
+        .await;
+
+    // 1. Public SEP-2127 Server Card + AI Catalog + ETag 304 (no bearer needed, no primitives)
+    let (st, card_hdrs, card_b) =
+        h1_request(gw_port, Method::GET, "/mcp/server-card", &[], "").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        card_hdrs.get(http::header::CONTENT_TYPE).unwrap(),
+        "application/mcp-server-card+json"
+    );
+    let card_etag = card_hdrs
+        .get(http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let card: Value = serde_json::from_slice(&card_b).unwrap();
+    assert_eq!(
+        card["$schema"],
+        "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+    );
+    assert!(card.get("tools").is_none());
+    assert!(card.get("capabilities").is_none());
+    assert_eq!(card["remotes"][0]["url"], "https://roger.example.net/mcp");
+
+    let (st_304, _, _) = h1_request(
+        gw_port,
+        Method::GET,
+        "/mcp/server-card",
+        &[("if-none-match", &card_etag)],
+        "",
+    )
+    .await;
+    assert_eq!(st_304, StatusCode::NOT_MODIFIED);
+
+    let (st_cat, cat_hdrs, cat_b) = h1_request(
+        gw_port,
+        Method::GET,
+        "/.well-known/ai-catalog.json",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(st_cat, StatusCode::OK);
+    assert_eq!(
+        cat_hdrs.get(http::header::CONTENT_TYPE).unwrap(),
+        "application/ai-catalog+json"
+    );
+    let catalog: Value = serde_json::from_slice(&cat_b).unwrap();
+    assert_eq!(
+        catalog["entries"][0]["type"],
+        "application/mcp-server-card+json"
+    );
+
+    // 2. RFC 9728 Protected Resource Metadata + 401 WWW-Authenticate challenge
+    let (st_prm, _, prm_b) = h1_request(
+        gw_port,
+        Method::GET,
+        "/.well-known/oauth-protected-resource/mcp",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(st_prm, StatusCode::OK);
+    let prm: Value = serde_json::from_slice(&prm_b).unwrap();
+    assert_eq!(prm["resource"], "https://roger.example.net/mcp");
+    assert_eq!(
+        prm["authorization_servers"],
+        json!(["https://auth.example.net"])
+    );
+    assert_eq!(prm["scopes_supported"], json!(["roger:rw"]));
+
+    let (st_401, hdrs_401, _) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("server/discover", None, &[]),
+        rpc_body(json!(1), "server/discover", json!({})),
+    )
+    .await;
+    assert_eq!(st_401, StatusCode::UNAUTHORIZED);
+    let www = hdrs_401
+        .get(http::header::WWW_AUTHENTICATE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        www.contains(
+            r#"resource_metadata="https://roger.example.net/.well-known/oauth-protected-resource/mcp""#
+        ) && www.contains(r#"scope="roger:rw""#),
+        "{www}"
+    );
+
+    let auth_hdr = format!("Bearer {GATEWAY_BEARER}");
+    let auth_extra = [("authorization", auth_hdr.as_str())];
+
+    // 3. Pre-2026-07-28 legacy initialize without modern headers -> 400 + -32022 naming 2026-07-28
+    let (st_leg, _, leg_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &[
+            ("authorization", &auth_hdr),
+            ("accept", "application/json, text/event-stream"),
+        ],
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+    )
+    .await;
+    assert_eq!(st_leg, StatusCode::BAD_REQUEST);
+    let leg_v: Value = serde_json::from_slice(&leg_b).unwrap();
+    assert_eq!(leg_v["error"]["code"], -32022);
+    assert_eq!(leg_v["error"]["data"]["supported"], json!(["2026-07-28"]));
+    assert!(leg_v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("2026-07-28"));
+
+    // 4. Ops: tools/list pagination validation, annotations, structuredContent; Events webhook -32026
+    let (st_cur, _, cur_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tools/list", None, &auth_extra),
+        rpc_body(json!(2), "tools/list", json!({ "cursor": "bogus" })),
+    )
+    .await;
+    assert_eq!(st_cur, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cur_b).unwrap()["error"]["code"],
+        -32602
+    );
+
+    let (st_reg, _, reg_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tools/call", Some("roger_register"), &auth_extra),
+        rpc_body(
+            json!(3),
+            "tools/call",
+            json!({ "name": "roger_register", "arguments": { "id": ADDR_1 } }),
+        ),
+    )
+    .await;
+    assert_eq!(st_reg, StatusCode::OK);
+    let reg_v: Value = serde_json::from_slice(&reg_b).unwrap();
+    let sid = reg_v["result"]["structuredContent"]["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 5. MRTR: tampered requestState or orphan inputResponses rejected with 400 + -32602
+    let (st_mrtr, _, mrtr_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tools/call", Some("roger_board"), &auth_extra),
+        rpc_body(
+            json!(4),
+            "tools/call",
+            json!({
+                "name": "roger_board",
+                "arguments": { "session": sid },
+                "requestState": "tampered.token"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(st_mrtr, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&mrtr_b).unwrap()["error"]["code"],
+        -32602
+    );
+
+    let (st_wh, _, wh_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("events/subscribe", Some("roger.mail"), &auth_extra),
+        rpc_body(
+            json!(5),
+            "events/subscribe",
+            json!({ "name": "roger.mail", "arguments": { "session": sid } }),
+        ),
+    )
+    .await;
+    assert_eq!(st_wh, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&wh_b).unwrap()["error"]["code"],
+        -32026
+    );
+
+    // 6. SEP-2640 Skills + Resources (skills/list, skills/get, resources/directory/read, resources/read with Mcp-Name)
+    let (st_sk, _, sk_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("skills/list", None, &auth_extra),
+        rpc_body(json!(6), "skills/list", json!({})),
+    )
+    .await;
+    assert_eq!(st_sk, StatusCode::OK);
+    let sk_v: Value = serde_json::from_slice(&sk_b).unwrap();
+    assert_eq!(
+        sk_v["result"]["skills"][0]["uri"],
+        "skill://roger-wilco/SKILL.md"
+    );
+
+    let (st_dir, _, dir_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("resources/directory/read", None, &auth_extra),
+        rpc_body(
+            json!(7),
+            "resources/directory/read",
+            json!({ "uri": "skill://roger-wilco" }),
+        ),
+    )
+    .await;
+    assert_eq!(st_dir, StatusCode::OK);
+    let dir_v: Value = serde_json::from_slice(&dir_b).unwrap();
+    assert_eq!(dir_v["result"]["resources"].as_array().unwrap().len(), 2);
+
+    let (st_rr, _, rr_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers(
+            "resources/read",
+            Some("skill://roger-wilco/SKILL.md"),
+            &auth_extra,
+        ),
+        rpc_body(
+            json!(8),
+            "resources/read",
+            json!({ "uri": "skill://roger-wilco/SKILL.md" }),
+        ),
+    )
+    .await;
+    assert_eq!(st_rr, StatusCode::OK);
+    let rr_v: Value = serde_json::from_slice(&rr_b).unwrap();
+    assert!(rr_v["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("name: roger-wilco"));
+
+    // 7. SEP-2663 Tasks: missing capability -> -32021; task-capable call -> resultType "task" -> tasks/cancel
+    let (st_tcap, _, tcap_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tools/call", Some("roger_inbox"), &auth_extra),
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "roger_inbox",
+                "arguments": { "session": sid, "wait_seconds": 30 },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/task": true
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(st_tcap, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tcap_b).unwrap()["error"]["code"],
+        -32021
+    );
+
+    let (st_task, _, task_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tools/call", Some("roger_inbox"), &auth_extra),
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "roger_inbox",
+                "arguments": { "session": sid, "wait_seconds": 30 },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": { "io.modelcontextprotocol/tasks": {} }
+                    },
+                    "io.modelcontextprotocol/task": true
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(st_task, StatusCode::OK);
+    let task_v: Value = serde_json::from_slice(&task_b).unwrap();
+    assert_eq!(task_v["result"]["resultType"], "task");
+    let task_id = task_v["result"]["taskId"].as_str().unwrap().to_string();
+
+    let (st_tc, _, tc_b) = h1_request(
+        gw_port,
+        Method::POST,
+        "/mcp",
+        &rpc_headers("tasks/cancel", Some(&task_id), &auth_extra),
+        rpc_body(json!(11), "tasks/cancel", json!({ "taskId": task_id })),
+    )
+    .await;
+    assert_eq!(st_tc, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tc_b).unwrap()["result"]["status"],
+        "cancelled"
+    );
+
+    h1_call(
+        gw_port,
+        "/mcp",
+        &auth_extra,
+        "roger_unregister",
+        json!({ "session": sid }),
+    )
+    .await;
+}

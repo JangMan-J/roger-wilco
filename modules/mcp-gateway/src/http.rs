@@ -2,8 +2,9 @@
 //! over HTTP/1.1 and HTTP/2 (`h2c`).
 
 use crate::cli::{constant_time_eq, write_port_file, Config};
-use crate::durlog::blocking_io;
+use crate::durlog::{blocking_io, gen_uuid};
 use crate::mcp::{self, Parsed, RpcErr, ValidatedEventReq};
+use crate::mrtr;
 use crate::session::SessionManager;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
@@ -12,17 +13,19 @@ use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
+use roger_wire::sha256::hex_digest;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 // no-poll: Instant bounds SEP-3415 stream heartbeat and subscriptions/listen keepalive.
 use tokio::time::{Duration, Instant};
 
@@ -30,12 +33,98 @@ use tokio::time::{Duration, Instant};
 pub const MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const LISTEN_KEEPALIVE_SECS: u64 = 30;
 
+#[derive(Clone)]
+pub struct GatewayTask {
+    pub task_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub last_updated_at: String,
+    pub result: Option<Value>,
+    pub cancelled: Arc<AtomicBool>,
+    pub cancel_notify: Arc<Notify>,
+}
+
+impl GatewayTask {
+    pub fn to_value(&self, result_type: &str) -> Value {
+        let mut m = Map::new();
+        m.insert("resultType".into(), Value::String(result_type.into()));
+        m.insert("taskId".into(), Value::String(self.task_id.clone()));
+        m.insert("status".into(), Value::String(self.status.clone()));
+        m.insert("createdAt".into(), Value::String(self.created_at.clone()));
+        m.insert(
+            "lastUpdatedAt".into(),
+            Value::String(self.last_updated_at.clone()),
+        );
+        m.insert("ttlMs".into(), Value::Number(mcp::DISCOVER_TTL_MS.into()));
+        // no-poll: SEP-2663 Task wire field name, not a periodic scan.
+        m.insert("pollIntervalMs".into(), Value::Number(1_000.into()));
+        if let Some(res) = &self.result {
+            m.insert("result".into(), res.clone());
+        }
+        m.insert("_meta".into(), mcp::server_info_meta());
+        Value::Object(m)
+    }
+
+    pub fn to_notif_params(&self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("taskId".into(), Value::String(self.task_id.clone()));
+        m.insert("status".into(), Value::String(self.status.clone()));
+        m.insert("createdAt".into(), Value::String(self.created_at.clone()));
+        m.insert(
+            "lastUpdatedAt".into(),
+            Value::String(self.last_updated_at.clone()),
+        );
+        m.insert("ttlMs".into(), Value::Number(mcp::DISCOVER_TTL_MS.into()));
+        // no-poll: SEP-2663 Task wire field name, not a periodic scan.
+        m.insert("pollIntervalMs".into(), Value::Number(1_000.into()));
+        if let Some(res) = &self.result {
+            m.insert("result".into(), res.clone());
+        }
+        m
+    }
+}
+
+pub struct TaskStreamSink {
+    pub sub_id: Value,
+    pub task_ids: Vec<String>,
+    pub tx: mpsc::Sender<Bytes>,
+}
+
 pub struct GatewayState {
     pub endpoint: String,
+    pub bind_addr: SocketAddr,
     pub bind_loopback: bool,
     pub bearer_token: Option<String>,
+    pub public_url: Option<String>,
+    pub auth_servers: Vec<String>,
+    pub scopes: Vec<String>,
+    pub mrtr_secret: Vec<u8>,
+    pub tasks: Mutex<HashMap<String, GatewayTask>>,
+    pub task_sinks: Mutex<Vec<TaskStreamSink>>,
     pub sessions: Arc<SessionManager>,
     pub shutdown_rx: watch::Receiver<bool>,
+}
+
+impl GatewayState {
+    pub fn emit_task(&self, task: &GatewayTask) {
+        let targets: Vec<(Value, mpsc::Sender<Bytes>)> = {
+            let mut sinks = self.task_sinks.lock().unwrap();
+            sinks.retain(|s| !s.tx.is_closed());
+            sinks
+                .iter()
+                .filter(|s| s.task_ids.iter().any(|id| id == &task.task_id))
+                .map(|s| (s.sub_id.clone(), s.tx.clone()))
+                .collect()
+        };
+        for (sub_id, tx) in targets {
+            let frame = sse_frame_data(&mcp::format_notification(
+                "notifications/tasks",
+                task.to_notif_params(),
+                &sub_id,
+            ));
+            let _ = tx.try_send(frame);
+        }
+    }
 }
 
 pub enum GatewayBody {
@@ -120,10 +209,18 @@ pub async fn run_server(cfg: Config, shutdown: impl Future<Output = ()>) -> io::
         cfg.hold_before_ack,
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mrtr_seed = gen_uuid().unwrap_or_else(|_| "roger-mrtr-default-seed".to_string());
     let state = Arc::new(GatewayState {
         endpoint: cfg.endpoint,
+        bind_addr: local_addr,
         bind_loopback: is_loopback_bind(&cfg.bind),
         bearer_token: cfg.bearer_token,
+        public_url: cfg.public_url,
+        auth_servers: cfg.auth_servers,
+        scopes: cfg.scopes,
+        mrtr_secret: mrtr_seed.into_bytes(),
+        tasks: Mutex::new(HashMap::new()),
+        task_sinks: Mutex::new(Vec::new()),
         sessions,
         shutdown_rx,
     });
@@ -156,6 +253,98 @@ pub async fn run_server(cfg: Config, shutdown: impl Future<Output = ()>) -> io::
     Ok(local_addr)
 }
 
+fn clean_endpoint(endpoint: &str) -> &str {
+    let trimmed = endpoint.trim_end_matches('/');
+    if trimmed.is_empty() {
+        ""
+    } else {
+        trimmed
+    }
+}
+
+fn resolve_public_endpoint_url(state: &GatewayState, hdrs: &HeaderMap) -> String {
+    if let Some(pub_url) = &state.public_url {
+        return pub_url.clone();
+    }
+    let host = hdrs
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty() && !h.contains(['/', ' ', '\\', '@']))
+        .map(str::to_string)
+        .unwrap_or_else(|| state.bind_addr.to_string());
+    format!("http://{host}{}", state.endpoint)
+}
+
+fn origin_of_url(url: &str) -> &str {
+    if let Some(rest) = url.strip_prefix("https://") {
+        let end = rest.find('/').map_or(url.len(), |i| 8 + i);
+        &url[..end]
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        let end = rest.find('/').map_or(url.len(), |i| 7 + i);
+        &url[..end]
+    } else {
+        url
+    }
+}
+
+fn build_server_card(mcp_url: &str) -> Value {
+    serde_json::json!({
+        "$schema": "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
+        "name": "io.github.jangman-j/roger-mcp-gateway",
+        "version": env!("CARGO_PKG_VERSION"),
+        "title": "Roger-Wilco MCP Gateway",
+        "description": "Durable mail, presence, groups, and exclusive claims over MCP 2026-07-28 and SEP-3415 events.",
+        "remotes": [
+            {
+                "type": "streamable-http",
+                "url": mcp_url,
+                "supportedProtocolVersions": [mcp::VERSION],
+                "supportedVersions": [mcp::VERSION]
+            }
+        ]
+    })
+}
+
+fn discovery_json_response(
+    req_hdrs: &HeaderMap,
+    content_type: &'static str,
+    payload: &Value,
+) -> Response<GatewayBody> {
+    let body = serde_json::to_vec(payload).expect("discovery JSON serializes");
+    let etag = format!("\"{}\"", &hex_digest(&body)[..32]);
+    if req_hdrs
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| inm.trim() == etag)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(http::header::ETAG, etag)
+            .header(http::header::CACHE_CONTROL, "public, max-age=300")
+            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(GatewayBody::Full(Full::new(Bytes::new())))
+            .expect("valid 304 response");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::ETAG, etag)
+        .header(http::header::CACHE_CONTROL, "public, max-age=300")
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(GatewayBody::Full(Full::new(Bytes::from(body))))
+        .expect("valid discovery response")
+}
+
+fn method_not_allowed_get(path: &str, method: &Method) -> Response<GatewayBody> {
+    let mut resp = error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &format!("expected GET on {path}, saw {method}"),
+    );
+    resp.headers_mut()
+        .insert(http::header::ALLOW, HeaderValue::from_static("GET"));
+    resp
+}
+
 pub async fn handle_request(
     state: Arc<GatewayState>,
     req: Request<Incoming>,
@@ -165,14 +354,67 @@ pub async fn handle_request(
         return if req.method() == Method::GET {
             raw_json_response(StatusCode::OK, r#"{"ok":true}"#)
         } else {
-            let mut resp = error_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                &format!("expected GET on /healthz, saw {}", req.method()),
-            );
-            resp.headers_mut()
-                .insert(http::header::ALLOW, HeaderValue::from_static("GET"));
-            resp
+            method_not_allowed_get("/healthz", req.method())
         };
+    }
+
+    let clean_ep = clean_endpoint(&state.endpoint);
+    let card_path = format!("{clean_ep}/server-card");
+    if path == card_path || path == "/.well-known/ai-catalog.json" {
+        if req.method() != Method::GET {
+            return method_not_allowed_get(path, req.method());
+        }
+        let mcp_url = resolve_public_endpoint_url(&state, req.headers());
+        let card = build_server_card(&mcp_url);
+        return if path == "/.well-known/ai-catalog.json" {
+            let catalog = serde_json::json!({
+                "specVersion": "1.0",
+                "entries": [
+                    {
+                        "identifier": "urn:air:roger-wilco:mcp:gateway",
+                        "type": "application/mcp-server-card+json",
+                        "data": card
+                    }
+                ]
+            });
+            discovery_json_response(req.headers(), "application/ai-catalog+json", &catalog)
+        } else {
+            discovery_json_response(req.headers(), "application/mcp-server-card+json", &card)
+        };
+    }
+
+    let prm_subpath = format!("/.well-known/oauth-protected-resource{clean_ep}");
+    if !state.auth_servers.is_empty()
+        && (path == prm_subpath || path == "/.well-known/oauth-protected-resource")
+    {
+        if req.method() != Method::GET {
+            return method_not_allowed_get(path, req.method());
+        }
+        let mcp_url = resolve_public_endpoint_url(&state, req.headers());
+        let mut prm = Map::new();
+        prm.insert("resource".into(), Value::String(mcp_url));
+        prm.insert(
+            "authorization_servers".into(),
+            Value::Array(
+                state
+                    .auth_servers
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        prm.insert(
+            "bearer_methods_supported".into(),
+            serde_json::json!(["header"]),
+        );
+        if !state.scopes.is_empty() {
+            prm.insert(
+                "scopes_supported".into(),
+                Value::Array(state.scopes.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        return json_value_response(StatusCode::OK, &Value::Object(prm));
     }
 
     if path != state.endpoint {
@@ -188,20 +430,34 @@ pub async fn handle_request(
 
     if let Some(expected) = &state.bearer_token {
         if !authorized(req.headers(), expected.as_bytes()) {
+            let challenge = if state.auth_servers.is_empty() {
+                HeaderValue::from_static("Bearer")
+            } else {
+                let mcp_url = resolve_public_endpoint_url(&state, req.headers());
+                let origin = origin_of_url(&mcp_url);
+                let prm_url = format!("{origin}{prm_subpath}");
+                let raw = if state.scopes.is_empty() {
+                    format!("Bearer resource_metadata=\"{prm_url}\"")
+                } else {
+                    format!(
+                        "Bearer resource_metadata=\"{prm_url}\", scope=\"{}\"",
+                        state.scopes.join(" ")
+                    )
+                };
+                HeaderValue::from_str(&raw).unwrap_or_else(|_| HeaderValue::from_static("Bearer"))
+            };
             let mut resp = error_response(
                 StatusCode::UNAUTHORIZED,
                 "expected valid Authorization: Bearer token, saw missing or invalid credentials",
             );
-            resp.headers_mut().insert(
-                http::header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Bearer"),
-            );
+            resp.headers_mut()
+                .insert(http::header::WWW_AUTHENTICATE, challenge);
             return resp;
         }
     }
 
     match *req.method() {
-        Method::POST => handle_post(&state, req).await,
+        Method::POST => handle_post(Arc::clone(&state), req).await,
         Method::GET | Method::DELETE => {
             let mut resp = error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -289,6 +545,17 @@ fn header_utf8(hdrs: &HeaderMap, name: &str) -> Result<Option<String>, String> {
     Ok((!s.is_empty()).then(|| s.to_string()))
 }
 
+pub fn is_plain_header_safe(raw: &str) -> bool {
+    if raw.starts_with("=?base64?") && raw.ends_with("?=") {
+        return false;
+    }
+    if raw.starts_with([' ', '\t']) || raw.ends_with([' ', '\t']) {
+        return false;
+    }
+    raw.bytes()
+        .all(|b| (0x21..=0x7e).contains(&b) || b == b' ' || b == b'\t')
+}
+
 pub fn decode_mcp_name_header(raw: &str) -> Result<String, String> {
     if let Some(inner) = raw
         .strip_prefix("=?base64?")
@@ -296,7 +563,12 @@ pub fn decode_mcp_name_header(raw: &str) -> Result<String, String> {
     {
         let bytes = decode_base64(inner)?;
         return String::from_utf8(bytes)
-            .map_err(|_| "expected UTF-8 inside base64 Mcp-Name header".to_string());
+            .map_err(|_| "expected UTF-8 inside base64 MCP header".to_string());
+    }
+    if !is_plain_header_safe(raw) {
+        return Err(
+            "expected plain visible ASCII MCP header value without outer whitespace".into(),
+        );
     }
     Ok(raw.to_string())
 }
@@ -340,6 +612,8 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 fn accept_allows_media(hdrs: &HeaderMap, target: &str) -> bool {
     let mut saw_accept = false;
     let target_prefix = target.split('/').next().unwrap_or("");
+    let mut best_spec: i32 = -1;
+    let mut best_allowed = false;
     for val in hdrs.get_all(http::header::ACCEPT) {
         saw_accept = true;
         let Ok(text) = val.to_str() else {
@@ -348,32 +622,137 @@ fn accept_allows_media(hdrs: &HeaderMap, target: &str) -> bool {
         for item in text.split(',') {
             let mut parts = item.split(';');
             let media = parts.next().unwrap_or("").trim();
-            let mut q_zero = false;
+            if media.is_empty() {
+                continue;
+            }
+            let spec = if media.eq_ignore_ascii_case(target) {
+                2
+            } else if media
+                .strip_suffix("/*")
+                .is_some_and(|p| p.eq_ignore_ascii_case(target_prefix))
+            {
+                1
+            } else if media == "*/*" {
+                0
+            } else {
+                continue;
+            };
+            let mut q = 1.0f32;
+            let mut valid_q = true;
             for param in parts {
                 if let Some((k, v)) = param.trim().split_once('=') {
                     if k.trim().eq_ignore_ascii_case("q") {
-                        if let Ok(q) = v.trim().parse::<f32>() {
-                            if q <= 0.0 {
-                                q_zero = true;
-                            }
+                        match v.trim().parse::<f32>() {
+                            Ok(parsed) if (0.0..=1.0).contains(&parsed) => q = parsed,
+                            _ => valid_q = false,
                         }
                     }
                 }
             }
-            if q_zero {
+            if !valid_q {
                 continue;
             }
-            if media.eq_ignore_ascii_case(target)
-                || media == "*/*"
-                || media
-                    .strip_suffix("/*")
-                    .is_some_and(|p| p.eq_ignore_ascii_case(target_prefix))
-            {
-                return true;
+            if spec > best_spec {
+                best_spec = spec;
+                best_allowed = q > 0.0;
+            } else if spec == best_spec && q <= 0.0 {
+                best_allowed = false;
             }
         }
     }
-    !saw_accept
+    if !saw_accept {
+        return true;
+    }
+    best_spec >= 0 && best_allowed
+}
+
+/// Validate `Mcp-Param-*` headers against `x-mcp-header` annotations in `inputSchema`.
+pub fn validate_mcp_param_headers(
+    hdrs: &HeaderMap,
+    input_schema: &Value,
+    arguments: Option<&Value>,
+) -> Result<(), RpcErr> {
+    fn collect<'a>(
+        node: &'a Value,
+        path: &mut Vec<&'a str>,
+        out: &mut Vec<(Vec<&'a str>, &'a str, &'a str)>,
+    ) {
+        let Some(obj) = node.as_object() else {
+            return;
+        };
+        if let Some(hdr_name) = obj.get("x-mcp-header").and_then(Value::as_str) {
+            if let Some(ty) = obj.get("type").and_then(Value::as_str) {
+                out.push((path.clone(), hdr_name, ty));
+            }
+        }
+        if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+            for (k, sub) in props {
+                path.push(k.as_str());
+                collect(sub, path, out);
+                path.pop();
+            }
+        }
+    }
+
+    let mut annotated = Vec::new();
+    let mut path = Vec::new();
+    collect(input_schema, &mut path, &mut annotated);
+    if annotated.is_empty() {
+        return Ok(());
+    }
+
+    for (prop_path, hdr_suffix, prop_type) in annotated {
+        let hdr_lower = format!("mcp-param-{}", hdr_suffix.to_ascii_lowercase());
+        let raw_hdr = header_utf8(hdrs, &hdr_lower).map_err(RpcErr::header_mismatch)?;
+        let mut cur = arguments;
+        for seg in &prop_path {
+            cur = cur.and_then(Value::as_object).and_then(|m| m.get(*seg));
+        }
+        match cur {
+            None | Some(Value::Null) => {
+                if raw_hdr.is_some() {
+                    return Err(RpcErr::header_mismatch(format!(
+                        "Header mismatch: Mcp-Param-{hdr_suffix} must be omitted when body parameter is absent or null"
+                    )));
+                }
+            }
+            Some(body_val) => {
+                let Some(raw) = raw_hdr else {
+                    return Err(RpcErr::header_mismatch(format!(
+                        "Header mismatch: missing required Mcp-Param-{hdr_suffix} header"
+                    )));
+                };
+                let decoded = decode_mcp_name_header(&raw).map_err(RpcErr::header_mismatch)?;
+                let matched = match prop_type {
+                    "string" => body_val.as_str().is_some_and(|s| s == decoded),
+                    "boolean" => body_val
+                        .as_bool()
+                        .is_some_and(|b| decoded == if b { "true" } else { "false" }),
+                    "integer" => {
+                        // Compare integer header and JSON numeric value numerically (e.g. 42.0 == 42).
+                        let hdr_i = decoded.parse::<i64>().ok();
+                        let body_i = body_val.as_i64().or_else(|| {
+                            body_val.as_f64().and_then(|f| {
+                                (f.is_finite()
+                                    && f.fract() == 0.0
+                                    && (-9_007_199_254_740_991.0..=9_007_199_254_740_991.0)
+                                        .contains(&f))
+                                .then_some(f as i64)
+                            })
+                        });
+                        hdr_i.is_some() && hdr_i == body_i
+                    }
+                    _ => true,
+                };
+                if !matched {
+                    return Err(RpcErr::header_mismatch(format!(
+                        "Header mismatch: Mcp-Param-{hdr_suffix} does not match request body"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_request_headers(
@@ -424,11 +803,45 @@ fn validate_request_headers(
                 "Header mismatch: Mcp-Name header value '{decoded}' does not match body params.name '{body_name}'"
             )));
         }
+    } else if method == "resources/read" {
+        let raw_name = match header_utf8(hdrs, "mcp-name") {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err(RpcErr::header_mismatch(
+                    "expected Mcp-Name header on resources/read, saw none",
+                ))
+            }
+            Err(e) => return Err(RpcErr::header_mismatch(e)),
+        };
+        let decoded = decode_mcp_name_header(&raw_name).map_err(RpcErr::header_mismatch)?;
+        let body_uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+        if body_uri.is_empty() || decoded != body_uri {
+            return Err(RpcErr::header_mismatch(format!(
+                "Header mismatch: Mcp-Name header value '{decoded}' does not match body params.uri '{body_uri}'"
+            )));
+        }
+    } else if matches!(method, "tasks/get" | "tasks/cancel" | "tasks/update") {
+        let raw_name = match header_utf8(hdrs, "mcp-name") {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err(RpcErr::header_mismatch(
+                    "expected Mcp-Name header on tasks/*, saw none",
+                ))
+            }
+            Err(e) => return Err(RpcErr::header_mismatch(e)),
+        };
+        let decoded = decode_mcp_name_header(&raw_name).map_err(RpcErr::header_mismatch)?;
+        let body_tid = params.get("taskId").and_then(Value::as_str).unwrap_or("");
+        if body_tid.is_empty() || decoded != body_tid {
+            return Err(RpcErr::header_mismatch(format!(
+                "Header mismatch: Mcp-Name header value '{decoded}' does not match body params.taskId '{body_tid}'"
+            )));
+        }
     }
     Ok(hdr_pv)
 }
 
-async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<GatewayBody> {
+async fn handle_post(state: Arc<GatewayState>, req: Request<Incoming>) -> Response<GatewayBody> {
     if let Some(cl) = req.headers().get(http::header::CONTENT_LENGTH) {
         if let Ok(s) = cl.to_str() {
             if let Ok(len) = s.trim().parse::<u64>() {
@@ -498,10 +911,47 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
         Parsed::Request { id, method, params } => (id, method, params),
     };
 
+    // Pre-2026-07-28 backwards-compatibility tolerance: a legacy `initialize`
+    // handshake without modern headers/_meta receives a clear -32022 naming 2026-07-28.
+    if method == "initialize"
+        && (parts.headers.get("mcp-protocol-version").is_none() || params.get("_meta").is_none())
+    {
+        let requested = params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("legacy");
+        return rpc_err_response(
+            StatusCode::BAD_REQUEST,
+            &id,
+            RpcErr::unsupported_version(requested),
+        );
+    }
+
     let hdr_pv = match validate_request_headers(&parts.headers, &method, &params) {
         Ok(v) => v,
         Err(err) => return rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
     };
+
+    if matches!(
+        method.as_str(),
+        "tools/call" | "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe"
+    ) {
+        let target_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let schema_opt = if method == "tools/call" {
+            mcp::tool_schema(state.sessions.groups(), target_name)
+        } else {
+            mcp::event_schema(target_name)
+        };
+        if let Some(schema) = schema_opt {
+            if let Some(in_schema) = schema.get("inputSchema") {
+                if let Err(err) =
+                    validate_mcp_param_headers(&parts.headers, in_schema, params.get("arguments"))
+                {
+                    return rpc_err_response(StatusCode::BAD_REQUEST, &id, err);
+                }
+            }
+        }
+    }
 
     // Validate _meta and confirm MCP-Protocol-Version matches _meta["io.modelcontextprotocol/protocolVersion"].
     let body_pv = params
@@ -544,25 +994,93 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
             StatusCode::OK,
             &mcp::reply_ok(&id, mcp::discover_result()),
         ),
-        "tools/list" => json_value_response(
-            StatusCode::OK,
-            &mcp::reply_ok(&id, mcp::tools_list(state.sessions.groups())),
-        ),
+        "tools/list" => match mcp::tools_list_paged(state.sessions.groups(), &params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
         "tools/call" => {
+            let target_name = params.get("name").and_then(Value::as_str);
+            let principal = state.bearer_token.as_deref().map(|_| "bearer");
+            if let Err(err) = mrtr::validate_mrtr_params(
+                &state.mrtr_secret,
+                &params,
+                "tools/call",
+                target_name,
+                principal,
+                crate::session::now_ms(),
+            ) {
+                return rpc_err_response(StatusCode::BAD_REQUEST, &id, err);
+            }
+            if params
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("io.modelcontextprotocol/task"))
+                == Some(&Value::Bool(true))
+            {
+                return match spawn_gateway_tool_task(&state, &params) {
+                    Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+                    Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+                };
+            }
             let result = match mcp::call_tool(&state.sessions, &params).await {
                 Ok(v) => {
                     let rendered =
                         serde_json::to_string(&v).expect("tool output serializes as JSON");
-                    mcp::tool_result(&rendered, false)
+                    mcp::tool_result_structured(&rendered, Some(v), false)
                 }
                 Err(reason) => mcp::tool_result(&reason, true),
             };
             json_value_response(StatusCode::OK, &mcp::reply_ok(&id, result))
         }
-        "events/list" => json_value_response(
-            StatusCode::OK,
-            &mcp::reply_ok(&id, mcp::events_list_result()),
-        ),
+        "skills/list" => match mcp::skills_list_paged(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "skills/get" => match mcp::skills_get_result(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "resources/list" => match mcp::resources_list_paged(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "resources/templates/list" => match mcp::resource_templates_list_paged(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "resources/read" => match mcp::resources_read_result(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "resources/directory/read" => match mcp::resources_directory_read(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "tasks/get" => match gateway_tasks_get(&state, &params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "tasks/cancel" => match gateway_tasks_cancel(&state, &params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "tasks/update" => match gateway_tasks_update(&state, &params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "events/list" => match mcp::events_list_paged(&params) {
+            Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
+            Err(err) => rpc_err_response(StatusCode::BAD_REQUEST, &id, err),
+        },
+        "events/subscribe" | "events/unsubscribe" => {
+            let err = mcp::events_webhook_unsupported(&params);
+            let status = if err.code == -32602 {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            };
+            rpc_err_response(status, &id, err)
+        }
         "events/poll" => match mcp::events_poll(&state.sessions, &params).await {
             Ok(v) => json_value_response(StatusCode::OK, &mcp::reply_ok(&id, v)),
             Err(err) => {
@@ -602,16 +1120,52 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
             sse_response(spawn_events_stream(req, id, state.shutdown_rx.clone()))
         }
         "subscriptions/listen" => {
+            let mut task_ids: Vec<String> = Vec::new();
             if let Some(n) = params.get("notifications") {
-                if !n.is_object() {
+                let Some(n_obj) = n.as_object() else {
                     return rpc_err_response(
                         StatusCode::BAD_REQUEST,
                         &id,
                         RpcErr::invalid_params("expected notifications to be an object"),
                     );
+                };
+                if let Some(raw_tids) = n_obj.get("taskIds") {
+                    let Some(arr) = raw_tids.as_array() else {
+                        return rpc_err_response(
+                            StatusCode::BAD_REQUEST,
+                            &id,
+                            RpcErr::invalid_params("expected notifications.taskIds to be an array"),
+                        );
+                    };
+                    if !mcp::client_declares_ext(&params, "io.modelcontextprotocol/tasks") {
+                        return rpc_err_response(
+                            StatusCode::BAD_REQUEST,
+                            &id,
+                            RpcErr::missing_capability(serde_json::json!({
+                                "extensions": { "io.modelcontextprotocol/tasks": {} }
+                            })),
+                        );
+                    }
+                    for item in arr {
+                        let Some(tid) = item.as_str() else {
+                            return rpc_err_response(
+                                StatusCode::BAD_REQUEST,
+                                &id,
+                                RpcErr::invalid_params("expected taskIds entries to be strings"),
+                            );
+                        };
+                        if !tid.is_empty() && !task_ids.contains(&tid.to_string()) {
+                            task_ids.push(tid.to_string());
+                        }
+                    }
                 }
             }
-            sse_response(spawn_subscriptions_listen(id, state.shutdown_rx.clone()))
+            sse_response(spawn_subscriptions_listen(
+                &state,
+                id,
+                task_ids,
+                state.shutdown_rx.clone(),
+            ))
         }
         unknown => rpc_err_response(
             StatusCode::NOT_FOUND,
@@ -619,7 +1173,8 @@ async fn handle_post(state: &GatewayState, req: Request<Incoming>) -> Response<G
             RpcErr {
                 code: -32601,
                 message: format!(
-                    "expected server/discover, tools/list, tools/call, subscriptions/listen, or events/*, saw {unknown}"
+                    "expected server/discover, tools/list, tools/call, subscriptions/listen, or events/* (supported protocol versions: {}), saw {unknown}",
+                    mcp::VERSION
                 ),
                 data: None,
             },
@@ -665,11 +1220,159 @@ fn stream_terminated_frame(id: &Value, reason: &str) -> Bytes {
     ))
 }
 
-fn spawn_subscriptions_listen(id: Value, mut shutdown_rx: watch::Receiver<bool>) -> SseStreamBody {
-    let (tx, rx) = mpsc::channel::<Bytes>(16);
+fn spawn_gateway_tool_task(state: &Arc<GatewayState>, params: &Value) -> Result<Value, RpcErr> {
+    if !mcp::client_declares_ext(params, "io.modelcontextprotocol/tasks") {
+        return Err(RpcErr::missing_capability(serde_json::json!({
+            "extensions": { "io.modelcontextprotocol/tasks": {} }
+        })));
+    }
+    let task_id = blocking_io(gen_uuid).map_err(|e| RpcErr {
+        code: -32603,
+        message: e.to_string(),
+        data: None,
+    })?;
+    let ts = mcp::format_iso8601_utc(crate::session::now_ms());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_notify = Arc::new(Notify::new());
+    let seed = GatewayTask {
+        task_id: task_id.clone(),
+        status: "working".into(),
+        created_at: ts.clone(),
+        last_updated_at: ts,
+        result: None,
+        cancelled: Arc::clone(&cancelled),
+        cancel_notify: Arc::clone(&cancel_notify),
+    };
+    let created_response = seed.to_value("task");
+    state.tasks.lock().unwrap().insert(task_id.clone(), seed);
+
+    let state_c = Arc::clone(state);
+    let params_c = params.clone();
+    tokio::spawn(async move {
+        let notified = cancel_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let outcome = tokio::select! {
+            _ = &mut notified => None,
+            res = mcp::call_tool(&state_c.sessions, &params_c) => Some(res),
+        };
+
+        let snap = {
+            let mut guard = state_c.tasks.lock().unwrap();
+            let Some(entry) = guard.get_mut(&task_id) else {
+                return;
+            };
+            if entry.status != "working" {
+                return;
+            }
+            match outcome {
+                None => {
+                    entry.status = "cancelled".into();
+                }
+                Some(res) if !cancelled.load(Ordering::SeqCst) => {
+                    let tool_out = match res {
+                        Ok(v) => {
+                            let rendered =
+                                serde_json::to_string(&v).expect("tool output serializes");
+                            mcp::tool_result_structured(&rendered, Some(v), false)
+                        }
+                        Err(reason) => mcp::tool_result(&reason, true),
+                    };
+                    entry.status = "completed".into();
+                    entry.result = Some(tool_out);
+                }
+                Some(_) => {
+                    entry.status = "cancelled".into();
+                }
+            }
+            entry.last_updated_at = mcp::format_iso8601_utc(crate::session::now_ms());
+            entry.clone()
+        };
+        state_c.emit_task(&snap);
+    });
+
+    Ok(created_response)
+}
+
+fn require_gateway_task_id(params: &Value) -> Result<&str, RpcErr> {
+    params
+        .get("taskId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| RpcErr::invalid_params("expected params.taskId to be a non-empty string"))
+}
+
+fn gateway_tasks_get(state: &GatewayState, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_gateway_task_id(params)?;
+    let guard = state.tasks.lock().unwrap();
+    let Some(entry) = guard.get(tid) else {
+        return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+    };
+    Ok(entry.to_value("complete"))
+}
+
+fn gateway_tasks_cancel(state: &GatewayState, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_gateway_task_id(params)?;
+    let (changed, snap) = {
+        let mut guard = state.tasks.lock().unwrap();
+        let Some(entry) = guard.get_mut(tid) else {
+            return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+        };
+        let changed = entry.status == "working" || entry.status == "input_required";
+        if changed {
+            entry.cancelled.store(true, Ordering::SeqCst);
+            entry.status = "cancelled".into();
+            entry.last_updated_at = mcp::format_iso8601_utc(crate::session::now_ms());
+        }
+        (changed, entry.clone())
+    };
+    if changed {
+        snap.cancel_notify.notify_waiters();
+        state.emit_task(&snap);
+    }
+    Ok(snap.to_value("complete"))
+}
+
+fn gateway_tasks_update(state: &GatewayState, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_gateway_task_id(params)?;
+    if !params.get("inputResponses").is_some_and(Value::is_object) {
+        return Err(RpcErr::invalid_params(
+            "expected params.inputResponses to be an object",
+        ));
+    }
+    let guard = state.tasks.lock().unwrap();
+    let Some(entry) = guard.get(tid) else {
+        return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+    };
+    if entry.status != "input_required" {
+        return Err(RpcErr::invalid_params("task is not awaiting input"));
+    }
+    Ok(entry.to_value("complete"))
+}
+
+fn spawn_subscriptions_listen(
+    state: &GatewayState,
+    id: Value,
+    task_ids: Vec<String>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> SseStreamBody {
+    let (tx, rx) = mpsc::channel::<Bytes>(32);
+    let mut notif_map = Map::new();
+    if !task_ids.is_empty() {
+        notif_map.insert(
+            "taskIds".into(),
+            Value::Array(task_ids.iter().cloned().map(Value::String).collect()),
+        );
+        state.task_sinks.lock().unwrap().push(TaskStreamSink {
+            sub_id: id.clone(),
+            task_ids,
+            tx: tx.clone(),
+        });
+    }
     tokio::spawn(async move {
         let mut ack_params = Map::new();
-        ack_params.insert("notifications".into(), Value::Object(Map::new()));
+        ack_params.insert("notifications".into(), Value::Object(notif_map));
         let ack =
             mcp::format_notification("notifications/subscriptions/acknowledged", ack_params, &id);
         if tx.send(sse_frame_data(&ack)).await.is_err() {
@@ -1178,5 +1881,60 @@ mod tests {
         h.insert(http::header::ACCEPT, HeaderValue::from_static("text/plain"));
         assert!(!accept_allows_media(&h, "application/json"));
         assert!(!accept_allows_media(&h, "text/event-stream"));
+
+        h.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json;q=0, */*"),
+        );
+        assert!(!accept_allows_media(&h, "application/json"));
+        assert!(accept_allows_media(&h, "text/event-stream"));
+    }
+
+    #[test]
+    fn mcp_param_headers_validate_string_bool_integer_and_omission() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "region": { "type": "string", "x-mcp-header": "Region" },
+                "limit": { "type": "integer", "x-mcp-header": "Limit" },
+                "flag": { "type": "boolean", "x-mcp-header": "Flag" }
+            }
+        });
+        let mut h = HeaderMap::new();
+        h.insert("mcp-param-region", HeaderValue::from_static("us-west1"));
+        h.insert("mcp-param-limit", HeaderValue::from_static("42"));
+        h.insert("mcp-param-flag", HeaderValue::from_static("true"));
+        assert!(validate_mcp_param_headers(
+            &h,
+            &schema,
+            Some(&serde_json::json!({"region": "us-west1", "limit": 42.0, "flag": true}))
+        )
+        .is_ok());
+
+        // Missing required header when body parameter is present -> -32020
+        let mut missing = HeaderMap::new();
+        assert_eq!(
+            validate_mcp_param_headers(
+                &missing,
+                &schema,
+                Some(&serde_json::json!({"region": "us-west1"}))
+            )
+            .unwrap_err()
+            .code,
+            -32020
+        );
+
+        // Header present when body parameter is null -> -32020
+        missing.insert("mcp-param-region", HeaderValue::from_static("us-west1"));
+        assert_eq!(
+            validate_mcp_param_headers(
+                &missing,
+                &schema,
+                Some(&serde_json::json!({"region": null}))
+            )
+            .unwrap_err()
+            .code,
+            -32020
+        );
     }
 }

@@ -227,6 +227,7 @@ pub fn parse_message(line: &str) -> Parsed {
     }
 }
 
+#[derive(Debug)]
 struct RpcErr {
     code: i64,
     message: String,
@@ -255,6 +256,17 @@ impl RpcErr {
             code: -32026,
             message: message.into(),
             data: Some(obj(vec![("feature", s(feature)), ("value", s(value))])),
+        }
+    }
+
+    fn missing_capability(ext_id: &'static str) -> Self {
+        Self {
+            code: -32021,
+            message: "Missing required client capability".into(),
+            data: Some(obj(vec![(
+                "requiredCapabilities",
+                obj(vec![("extensions", obj(vec![(ext_id, obj(vec![]))]))]),
+            )])),
         }
     }
 }
@@ -344,14 +356,6 @@ fn validate_meta(params: &Value) -> Result<(), RpcErr> {
             )));
         }
     }
-    if let Some(level) = meta.get("io.modelcontextprotocol/logLevel") {
-        if !matches!(level, Value::Str(_)) {
-            return Err(RpcErr::invalid_params(format!(
-                "expected _meta[\"io.modelcontextprotocol/logLevel\"] to be a string, saw {}",
-                type_name(Some(level))
-            )));
-        }
-    }
     if pv != VERSION {
         return Err(RpcErr {
             code: -32022,
@@ -396,12 +400,20 @@ fn discover_result() -> Value {
             "capabilities",
             obj(vec![
                 ("tools", obj(vec![("listChanged", Value::Bool(false))])),
+                ("resources", obj(vec![("listChanged", Value::Bool(false))])),
                 (
                     "extensions",
-                    obj(vec![(
-                        "io.modelcontextprotocol/events",
-                        obj(vec![("listChanged", Value::Bool(false))]),
-                    )]),
+                    obj(vec![
+                        (
+                            "io.modelcontextprotocol/events",
+                            obj(vec![("listChanged", Value::Bool(false))]),
+                        ),
+                        (
+                            "io.modelcontextprotocol/skills",
+                            obj(vec![("directoryRead", Value::Bool(true))]),
+                        ),
+                        ("io.modelcontextprotocol/tasks", obj(vec![])),
+                    ]),
                 ),
             ]),
         ),
@@ -507,28 +519,86 @@ fn tool_defs(groups: bool) -> Vec<(&'static str, &'static str, &'static str)> {
     out
 }
 
+fn tool_annotations(name: &str) -> Value {
+    let read_only = matches!(
+        name,
+        "roger_board" | "roger_receipt" | "roger_registered" | "roger_groups" | "roger_articles"
+    );
+    let idempotent = read_only
+        || matches!(
+            name,
+            "roger_label" | "roger_claim" | "roger_release" | "roger_unsubscribe"
+        );
+    obj(vec![
+        ("readOnlyHint", Value::Bool(read_only)),
+        ("destructiveHint", Value::Bool(false)),
+        ("idempotentHint", Value::Bool(idempotent)),
+        ("openWorldHint", Value::Bool(false)),
+    ])
+}
+
+fn paginate_values(
+    items: Vec<Value>,
+    params: &Value,
+    page_size: usize,
+) -> Result<(Vec<Value>, Option<String>), RpcErr> {
+    let offset = match params.get("cursor") {
+        None | Some(Value::Null) => 0usize,
+        Some(Value::Str(cur)) if !cur.is_empty() && cur.bytes().all(|b| b.is_ascii_digit()) => {
+            let parsed = cur
+                .parse::<usize>()
+                .map_err(|_| RpcErr::invalid_params("invalid pagination cursor"))?;
+            if parsed > items.len() {
+                return Err(RpcErr::invalid_params("invalid pagination cursor"));
+            }
+            parsed
+        }
+        _ => return Err(RpcErr::invalid_params("invalid pagination cursor")),
+    };
+    let end = offset.saturating_add(page_size).min(items.len());
+    let next = (end < items.len()).then(|| end.to_string());
+    Ok((items[offset..end].to_vec(), next))
+}
+
+#[cfg(test)]
 fn tools_list(groups: bool, modern: bool) -> Value {
-    let tools = tool_defs(groups)
+    tools_list_paged(groups, modern, &Value::Obj(Vec::new())).expect("unpaged tools_list succeeds")
+}
+
+fn tools_list_paged(groups: bool, modern: bool, params: &Value) -> Result<Value, RpcErr> {
+    let all_tools: Vec<Value> = tool_defs(groups)
         .into_iter()
         .map(|(name, description, schema)| {
-            obj(vec![
+            let mut pairs = vec![
                 ("name", s(name)),
                 ("description", s(description)),
                 (
                     "inputSchema",
                     json::parse(schema).expect("a tool schema is valid JSON"),
                 ),
-            ])
+            ];
+            if modern {
+                pairs.push(("annotations", tool_annotations(name)));
+            }
+            obj(pairs)
         })
         .collect();
+    let (tools, next_cursor) = if modern {
+        paginate_values(all_tools, params, 100)?
+    } else {
+        (all_tools, None)
+    };
     let mut pairs = vec![("tools", Value::Arr(tools))];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
     if modern {
         pairs.push(("resultType", s("complete")));
         pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
         pairs.push(("cacheScope", s("public")));
         pairs.push(("_meta", server_info_meta()));
     }
-    obj(pairs)
+    Ok(obj(pairs))
 }
 
 fn type_name(v: Option<&Value>) -> &'static str {
@@ -661,6 +731,57 @@ struct RegNotice {
     data: Value,
 }
 
+struct TaskEntry {
+    task_id: String,
+    status: String,
+    created_at: String,
+    last_updated_at: String,
+    result: Option<Value>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TaskEntry {
+    fn to_value(&self, result_type: &str) -> Value {
+        let mut pairs = vec![
+            ("resultType", s(result_type)),
+            ("taskId", s(&self.task_id)),
+            ("status", s(&self.status)),
+            ("createdAt", s(&self.created_at)),
+            ("lastUpdatedAt", s(&self.last_updated_at)),
+            ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+            // no-poll: SEP-2663 Task wire field name, not a periodic scan.
+            ("pollIntervalMs", Value::Int(1_000)),
+        ];
+        if let Some(res) = &self.result {
+            pairs.push(("result", res.clone()));
+        }
+        pairs.push(("_meta", server_info_meta()));
+        obj(pairs)
+    }
+
+    fn to_notif_pairs(&self) -> Vec<(&'static str, Value)> {
+        let mut pairs = vec![
+            ("taskId", s(&self.task_id)),
+            ("status", s(&self.status)),
+            ("createdAt", s(&self.created_at)),
+            ("lastUpdatedAt", s(&self.last_updated_at)),
+            ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+            // no-poll: SEP-2663 Task wire field name, not a periodic scan.
+            ("pollIntervalMs", Value::Int(1_000)),
+        ];
+        if let Some(res) = &self.result {
+            pairs.push(("result", res.clone()));
+        }
+        pairs
+    }
+}
+
+struct TaskListener {
+    id: Value,
+    out: net::Writer,
+    task_ids: Vec<String>,
+}
+
 /// Everything a tool call or event subscription needs.
 struct Ctx {
     me: String,
@@ -681,6 +802,9 @@ struct Ctx {
     reg_cv: Condvar,
     subs: Mutex<HashMap<SubKey, SubHandle>>,
     sub_handles: Mutex<Vec<JoinHandle<()>>>,
+    calls: Mutex<HashMap<SubKey, Arc<AtomicBool>>>,
+    tasks: Mutex<HashMap<String, TaskEntry>>,
+    task_listeners: Mutex<HashMap<SubKey, TaskListener>>,
 }
 
 impl Ctx {
@@ -703,6 +827,23 @@ impl Ctx {
             reg_cv: Condvar::new(),
             subs: Mutex::new(HashMap::new()),
             sub_handles: Mutex::new(Vec::new()),
+            calls: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            task_listeners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn emit_task_update(&self, entry: &TaskEntry) {
+        let listeners: Vec<(Value, net::Writer)> = self
+            .task_listeners
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|l| l.task_ids.iter().any(|tid| tid == &entry.task_id))
+            .map(|l| (l.id.clone(), l.out.clone()))
+            .collect();
+        for (sub_id, w) in listeners {
+            let _ = send_event_notif(&w, "notifications/tasks", entry.to_notif_pairs(), &sub_id);
         }
     }
 
@@ -773,7 +914,17 @@ fn check_optional_session(ctx: &Ctx, args: &Value, tool: &str) -> Result<(), Str
     }
 }
 
+#[cfg(test)]
 fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
+    let never = AtomicBool::new(false);
+    call_tool_cancellable(ctx, params, &never)
+}
+
+fn call_tool_cancellable(
+    ctx: &Ctx,
+    params: &Value,
+    cancelled: &AtomicBool,
+) -> Result<Value, String> {
     let name = match params.get("name") {
         Some(Value::Str(n)) => n.as_str(),
         other => return Err(wrong("tools/call", "name", "a string", other)),
@@ -977,7 +1128,12 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             let peek = opt_bool(name, args, "peek")?;
             let (mail, consumed) = ctx
                 .inbox
-                .read(limit as usize, Duration::from_secs(wait as u64), peek)
+                .read_cancellable(
+                    limit as usize,
+                    Duration::from_secs(wait as u64),
+                    peek,
+                    cancelled,
+                )
                 .map_err(io)?;
             Ok(obj(vec![
                 ("mail", Value::Arr(mail)),
@@ -996,7 +1152,7 @@ fn call_tool(ctx: &Ctx, params: &Value) -> Result<Value, String> {
             // no-poll: bounds the wait for the confirmation; its arrival ends the wait.
             let deadline = Instant::now() + Duration::from_secs(wait as u64);
             let mut held = ctx.confirmed.lock().unwrap();
-            while !held.0 && held.1.is_none() {
+            while !held.0 && held.1.is_none() && !cancelled.load(Ordering::SeqCst) {
                 // no-poll: the same bound; elapsed time is read only to end the wait.
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -1146,7 +1302,7 @@ fn present(row: &Value, now: i64, window_ms: i64) -> bool {
     }
 }
 
-fn tool_result(text: &str, is_error: bool, modern: bool) -> Value {
+fn tool_result(text: &str, structured: Option<Value>, is_error: bool, modern: bool) -> Value {
     let mut pairs = vec![(
         "content",
         Value::Arr(vec![obj(vec![("type", s("text")), ("text", s(text))])]),
@@ -1155,6 +1311,9 @@ fn tool_result(text: &str, is_error: bool, modern: bool) -> Value {
         pairs.push(("isError", Value::Bool(true)));
     }
     if modern {
+        if let Some(sc) = structured {
+            pairs.push(("structuredContent", sc));
+        }
         pairs.push(("resultType", s("complete")));
         pairs.push(("_meta", server_info_meta()));
     }
@@ -1172,7 +1331,12 @@ fn now_ms() -> i64 {
 
 pub use roger_wire::wire::format_iso8601_utc;
 
+#[cfg(test)]
 fn events_list_result() -> Value {
+    events_list_paged(&Value::Obj(Vec::new())).expect("unpaged events_list succeeds")
+}
+
+fn events_list_paged(params: &Value) -> Result<Value, RpcErr> {
     let mail_event = obj(vec![
         ("name", s("roger.mail")),
         (
@@ -1242,16 +1406,39 @@ fn events_list_result() -> Value {
             .unwrap(),
         ),
     ]);
-    obj(vec![
+    let all_events = vec![mail_event, board_event, reg_event];
+    let (events, next_cursor) = paginate_values(all_events, params, 100)?;
+    let mut pairs = vec![
         ("resultType", s("complete")),
-        (
-            "events",
-            Value::Arr(vec![mail_event, board_event, reg_event]),
-        ),
-        ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
-        ("cacheScope", s("public")),
-        ("_meta", server_info_meta()),
-    ])
+        ("events", Value::Arr(events)),
+    ];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
+    pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+    pairs.push(("cacheScope", s("public")));
+    pairs.push(("_meta", server_info_meta()));
+    Ok(obj(pairs))
+}
+
+fn events_webhook_unsupported(params: &Value) -> RpcErr {
+    let name = match params.get("name") {
+        Some(Value::Str(n)) if !n.is_empty() => n.as_str(),
+        other => {
+            return RpcErr::invalid_params(format!(
+                "expected name to be a non-empty string, saw {}",
+                type_name(other)
+            ))
+        }
+    };
+    if !matches!(name, "roger.mail" | "roger.board" | "roger.registration") {
+        return RpcErr::not_found("event", format!("unknown event {name}"));
+    }
+    RpcErr::unsupported(
+        "deliveryMode",
+        "webhook",
+        format!("event {name} does not support webhook delivery"),
+    )
 }
 
 #[derive(Clone, Default)]
@@ -1653,6 +1840,16 @@ fn register_sub(ctx: &Ctx, id: &Value) -> Result<(SubKey, SubHandle), RpcErr> {
 
 fn unregister_sub(ctx: &Ctx, key: &SubKey) {
     ctx.subs.lock().unwrap().remove(key);
+    ctx.task_listeners.lock().unwrap().remove(key);
+}
+
+fn client_declares_ext(params: &Value, ext_id: &str) -> bool {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|c| c.get("extensions"))
+        .and_then(|e| e.get(ext_id))
+        .is_some_and(|v| matches!(v, Value::Obj(_)))
 }
 
 fn start_subscriptions_listen(
@@ -1661,8 +1858,31 @@ fn start_subscriptions_listen(
     id: Value,
     params: &Value,
 ) -> Result<(), RpcErr> {
+    let mut granted_task_ids: Vec<String> = Vec::new();
     match params.get("notifications") {
-        None | Some(Value::Obj(_)) => {}
+        None => {}
+        Some(notif @ Value::Obj(_)) => {
+            if let Some(raw_tids) = notif.get("taskIds") {
+                let Value::Arr(items) = raw_tids else {
+                    return Err(RpcErr::invalid_params(
+                        "expected notifications.taskIds to be an array",
+                    ));
+                };
+                if !client_declares_ext(params, "io.modelcontextprotocol/tasks") {
+                    return Err(RpcErr::missing_capability("io.modelcontextprotocol/tasks"));
+                }
+                for item in items {
+                    let Value::Str(tid) = item else {
+                        return Err(RpcErr::invalid_params(
+                            "expected taskIds entries to be strings",
+                        ));
+                    };
+                    if !tid.is_empty() && !granted_task_ids.contains(tid) {
+                        granted_task_ids.push(tid.clone());
+                    }
+                }
+            }
+        }
         Some(other) => {
             return Err(RpcErr::invalid_params(format!(
                 "expected notifications to be an object, saw {}",
@@ -1671,10 +1891,25 @@ fn start_subscriptions_listen(
         }
     }
     let (key, ctrl) = register_sub(ctx, &id)?;
+    let mut ack_notif = Vec::new();
+    if !granted_task_ids.is_empty() {
+        ack_notif.push((
+            "taskIds",
+            Value::Arr(granted_task_ids.iter().map(|t| s(t)).collect()),
+        ));
+        ctx.task_listeners.lock().unwrap().insert(
+            key.clone(),
+            TaskListener {
+                id: id.clone(),
+                out: out.clone(),
+                task_ids: granted_task_ids,
+            },
+        );
+    }
     let _ = send_event_notif(
         out,
         "notifications/subscriptions/acknowledged",
-        vec![("notifications", obj(vec![]))],
+        vec![("notifications", obj(ack_notif))],
         &id,
     );
     let ctx_c = Arc::clone(ctx);
@@ -2166,6 +2401,12 @@ fn cancel_sub(ctx: &Ctx, request_id: &Value) {
         ctx.board_cv.notify_all();
         ctx.reg_cv.notify_all();
     }
+    let call_flag = ctx.calls.lock().unwrap().remove(&key);
+    if let Some(flag) = call_flag {
+        flag.store(true, Ordering::SeqCst);
+        ctx.inbox.notify();
+        ctx.confirmed_cv.notify_all();
+    }
 }
 
 fn close_all_subs(ctx: &Ctx, terminated_reason: Option<&str>) {
@@ -2186,6 +2427,345 @@ fn close_all_subs(ctx: &Ctx, terminated_reason: Option<&str>) {
     for h in handles {
         let _ = h.join();
     }
+}
+
+// ---- SEP-2640 skills + resources & SEP-2663 tasks ----
+
+fn skill_entry_value() -> Value {
+    use roger_wire::wire::{
+        roger_skill_digests, ROGER_SKILL_DESCRIPTION, ROGER_SKILL_MD, ROGER_SKILL_NAME,
+        ROGER_SKILL_REF_MD, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let (md_sha, ref_sha) = roger_skill_digests();
+    let md_size = ROGER_SKILL_MD.len() as i64;
+    let ref_size = ROGER_SKILL_REF_MD.len() as i64;
+    obj(vec![
+        ("uri", s(ROGER_SKILL_URI)),
+        ("name", s(ROGER_SKILL_NAME)),
+        ("description", s(ROGER_SKILL_DESCRIPTION)),
+        (
+            "frontmatter",
+            obj(vec![
+                ("name", s(ROGER_SKILL_NAME)),
+                ("description", s(ROGER_SKILL_DESCRIPTION)),
+                ("license", s("Apache-2.0")),
+            ]),
+        ),
+        (
+            "resources",
+            Value::Arr(vec![
+                obj(vec![
+                    ("uri", s(ROGER_SKILL_URI)),
+                    ("digest", s(&format!("sha256:{md_sha}"))),
+                    ("size", Value::Int(md_size)),
+                ]),
+                obj(vec![
+                    ("uri", s(ROGER_SKILL_REF_URI)),
+                    ("digest", s(&format!("sha256:{ref_sha}"))),
+                    ("size", Value::Int(ref_size)),
+                ]),
+            ]),
+        ),
+        (
+            "files",
+            Value::Arr(vec![
+                obj(vec![
+                    ("uri", s(ROGER_SKILL_URI)),
+                    ("sha256", s(&md_sha)),
+                    ("size", Value::Int(md_size)),
+                    ("mimeType", s("text/markdown")),
+                ]),
+                obj(vec![
+                    ("uri", s(ROGER_SKILL_REF_URI)),
+                    ("sha256", s(&ref_sha)),
+                    ("size", Value::Int(ref_size)),
+                    ("mimeType", s("text/markdown")),
+                ]),
+            ]),
+        ),
+    ])
+}
+
+fn skills_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    let (skills, next_cursor) = paginate_values(vec![skill_entry_value()], params, 100)?;
+    let mut pairs = vec![
+        ("resultType", s("complete")),
+        ("skills", Value::Arr(skills)),
+    ];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
+    pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+    pairs.push(("cacheScope", s("public")));
+    pairs.push(("_meta", server_info_meta()));
+    Ok(obj(pairs))
+}
+
+fn skills_get_result(params: &Value) -> Result<Value, RpcErr> {
+    let Some(Value::Str(uri)) = params.get("uri") else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    if uri != roger_wire::wire::ROGER_SKILL_URI {
+        return Err(RpcErr::invalid_params(format!("unknown skill: {uri}")));
+    }
+    Ok(obj(vec![
+        ("resultType", s("complete")),
+        ("skill", skill_entry_value()),
+        ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+        ("cacheScope", s("public")),
+        ("_meta", server_info_meta()),
+    ]))
+}
+
+fn resources_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_DESCRIPTION, ROGER_SKILL_NAME, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let all = vec![
+        obj(vec![
+            ("uri", s(ROGER_SKILL_URI)),
+            ("name", s(ROGER_SKILL_NAME)),
+            ("description", s(ROGER_SKILL_DESCRIPTION)),
+            ("mimeType", s("text/markdown")),
+        ]),
+        obj(vec![
+            ("uri", s(ROGER_SKILL_REF_URI)),
+            ("name", s("protocol.md")),
+            ("mimeType", s("text/markdown")),
+        ]),
+    ];
+    let (resources, next_cursor) = paginate_values(all, params, 100)?;
+    let mut pairs = vec![
+        ("resultType", s("complete")),
+        ("resources", Value::Arr(resources)),
+    ];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
+    pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+    pairs.push(("cacheScope", s("public")));
+    pairs.push(("_meta", server_info_meta()));
+    Ok(obj(pairs))
+}
+
+fn resource_templates_list_paged(params: &Value) -> Result<Value, RpcErr> {
+    let (templates, next_cursor) = paginate_values(Vec::new(), params, 100)?;
+    let mut pairs = vec![
+        ("resultType", s("complete")),
+        ("resourceTemplates", Value::Arr(templates)),
+    ];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
+    pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+    pairs.push(("cacheScope", s("public")));
+    pairs.push(("_meta", server_info_meta()));
+    Ok(obj(pairs))
+}
+
+fn resources_read_result(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_MD, ROGER_SKILL_REF_MD, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let Some(Value::Str(uri)) = params.get("uri") else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    let text = match uri.as_str() {
+        ROGER_SKILL_URI => ROGER_SKILL_MD,
+        ROGER_SKILL_REF_URI => ROGER_SKILL_REF_MD,
+        _ => return Err(RpcErr::invalid_params(format!("resource not found: {uri}"))),
+    };
+    Ok(obj(vec![
+        ("resultType", s("complete")),
+        (
+            "contents",
+            Value::Arr(vec![obj(vec![
+                ("uri", s(uri)),
+                ("mimeType", s("text/markdown")),
+                ("text", s(text)),
+            ])]),
+        ),
+        ("ttlMs", Value::Int(DISCOVER_TTL_MS)),
+        ("cacheScope", s("public")),
+        ("_meta", server_info_meta()),
+    ]))
+}
+
+fn resources_directory_read(params: &Value) -> Result<Value, RpcErr> {
+    use roger_wire::wire::{
+        ROGER_SKILL_DESCRIPTION, ROGER_SKILL_NAME, ROGER_SKILL_REF_URI, ROGER_SKILL_URI,
+    };
+    let Some(Value::Str(raw_uri)) = params.get("uri") else {
+        return Err(RpcErr::invalid_params("expected params.uri to be a string"));
+    };
+    let dir = raw_uri.trim_end_matches('/');
+    let children = match dir {
+        "skill://roger-wilco" => vec![
+            obj(vec![
+                ("uri", s(ROGER_SKILL_URI)),
+                ("name", s(ROGER_SKILL_NAME)),
+                ("description", s(ROGER_SKILL_DESCRIPTION)),
+                ("mimeType", s("text/markdown")),
+            ]),
+            obj(vec![
+                ("uri", s("skill://roger-wilco/references")),
+                ("name", s("references")),
+                ("mimeType", s("inode/directory")),
+            ]),
+        ],
+        "skill://roger-wilco/references" => vec![obj(vec![
+            ("uri", s(ROGER_SKILL_REF_URI)),
+            ("name", s("protocol.md")),
+            ("mimeType", s("text/markdown")),
+        ])],
+        _ => {
+            return Err(RpcErr::invalid_params(format!(
+                "directory not found: {raw_uri}"
+            )))
+        }
+    };
+    let uris: Vec<Value> = children
+        .iter()
+        .filter_map(|c| c.get("uri").cloned())
+        .collect();
+    let (paged, next_cursor) = paginate_values(children, params, 100)?;
+    let mut pairs = vec![
+        ("resultType", s("complete")),
+        ("resources", Value::Arr(paged)),
+        ("uris", Value::Arr(uris)),
+    ];
+    if let Some(nc) = next_cursor {
+        pairs.push(("nextCursor", s(&nc)));
+    }
+    pairs.push(("ttlMs", Value::Int(DISCOVER_TTL_MS)));
+    pairs.push(("cacheScope", s("public")));
+    pairs.push(("_meta", server_info_meta()));
+    Ok(obj(pairs))
+}
+
+fn start_tool_task(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcErr> {
+    if !client_declares_ext(params, "io.modelcontextprotocol/tasks") {
+        return Err(RpcErr::missing_capability("io.modelcontextprotocol/tasks"));
+    }
+    let task_id = session::gen_uuid().map_err(|e| RpcErr {
+        code: -32603,
+        message: e.to_string(),
+        data: None,
+    })?;
+    let ts = format_iso8601_utc(now_ms());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let seed = TaskEntry {
+        task_id: task_id.clone(),
+        status: "working".into(),
+        created_at: ts.clone(),
+        last_updated_at: ts,
+        result: None,
+        cancelled: Arc::clone(&cancelled),
+    };
+    let created_response = seed.to_value("task");
+    ctx.tasks.lock().unwrap().insert(task_id.clone(), seed);
+
+    let ctx_c = Arc::clone(ctx);
+    let params_c = params.clone();
+    std::thread::spawn(move || {
+        let tool_out = match call_tool_cancellable(&ctx_c, &params_c, &cancelled) {
+            Ok(v) => {
+                let text = json::stringify(&v);
+                tool_result(&text, Some(v), false, true)
+            }
+            Err(reason) => tool_result(&reason, None, true, true),
+        };
+        let mut guard = ctx_c.tasks.lock().unwrap();
+        if let Some(entry) = guard.get_mut(&task_id) {
+            if entry.status == "working" {
+                if cancelled.load(Ordering::SeqCst) {
+                    entry.status = "cancelled".into();
+                } else {
+                    entry.status = "completed".into();
+                    entry.result = Some(tool_out);
+                }
+                entry.last_updated_at = format_iso8601_utc(now_ms());
+                let snap = TaskEntry {
+                    task_id: entry.task_id.clone(),
+                    status: entry.status.clone(),
+                    created_at: entry.created_at.clone(),
+                    last_updated_at: entry.last_updated_at.clone(),
+                    result: entry.result.clone(),
+                    cancelled: Arc::clone(&entry.cancelled),
+                };
+                drop(guard);
+                ctx_c.emit_task_update(&snap);
+            }
+        }
+    });
+
+    Ok(created_response)
+}
+
+fn require_task_id(params: &Value) -> Result<&str, RpcErr> {
+    match params.get("taskId") {
+        Some(Value::Str(tid)) if !tid.is_empty() => Ok(tid.as_str()),
+        _ => Err(RpcErr::invalid_params(
+            "expected params.taskId to be a non-empty string",
+        )),
+    }
+}
+
+fn tasks_get_result(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_task_id(params)?;
+    let guard = ctx.tasks.lock().unwrap();
+    let Some(entry) = guard.get(tid) else {
+        return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+    };
+    Ok(entry.to_value("complete"))
+}
+
+fn tasks_cancel_result(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_task_id(params)?;
+    let snap = {
+        let mut guard = ctx.tasks.lock().unwrap();
+        let Some(entry) = guard.get_mut(tid) else {
+            return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+        };
+        let changed = entry.status == "working" || entry.status == "input_required";
+        if changed {
+            entry.cancelled.store(true, Ordering::SeqCst);
+            entry.status = "cancelled".into();
+            entry.last_updated_at = format_iso8601_utc(now_ms());
+        }
+        let cloned = TaskEntry {
+            task_id: entry.task_id.clone(),
+            status: entry.status.clone(),
+            created_at: entry.created_at.clone(),
+            last_updated_at: entry.last_updated_at.clone(),
+            result: entry.result.clone(),
+            cancelled: Arc::clone(&entry.cancelled),
+        };
+        (changed, cloned)
+    };
+    if snap.0 {
+        ctx.inbox.notify();
+        ctx.confirmed_cv.notify_all();
+        ctx.emit_task_update(&snap.1);
+    }
+    Ok(snap.1.to_value("complete"))
+}
+
+fn tasks_update_result(ctx: &Ctx, params: &Value) -> Result<Value, RpcErr> {
+    let tid = require_task_id(params)?;
+    if !matches!(params.get("inputResponses"), Some(Value::Obj(_))) {
+        return Err(RpcErr::invalid_params(
+            "expected params.inputResponses to be an object",
+        ));
+    }
+    let guard = ctx.tasks.lock().unwrap();
+    let Some(entry) = guard.get(tid) else {
+        return Err(RpcErr::invalid_params(format!("unknown task: {tid}")));
+    };
+    if entry.status != "input_required" {
+        return Err(RpcErr::invalid_params("task is not awaiting input"));
+    }
+    Ok(entry.to_value("complete"))
 }
 
 // ---- the inbox ----
@@ -2300,19 +2880,35 @@ impl Inbox {
         Ok(cache.entries.is_empty())
     }
 
-    /// Up to `limit` entries after the read position. With none and `wait` above
-    /// zero, waits up to `wait` for the next Store write. Unless `peek`, the
-    /// read position moves past what is returned and is durable before this returns.
+    #[cfg(test)]
     fn read(
         &self,
         limit: usize,
         wait: Duration,
         peek: bool,
     ) -> io::Result<(Vec<Value>, Option<String>)> {
+        let never = AtomicBool::new(false);
+        self.read_cancellable(limit, wait, peek, &never)
+    }
+
+    /// Up to `limit` entries after the read position. With none and `wait` above
+    /// zero, waits up to `wait` for the next Store write or cancellation. Unless
+    /// `peek`, the read position moves past what is returned and is durable before
+    /// this returns.
+    fn read_cancellable(
+        &self,
+        limit: usize,
+        wait: Duration,
+        peek: bool,
+        cancelled: &AtomicBool,
+    ) -> io::Result<(Vec<Value>, Option<String>)> {
         // no-poll: bounds how long a reader waits for a write; the write ends the wait.
         let deadline = Instant::now() + wait;
         let mut consumed = self.consumed.lock().unwrap();
         loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return Ok((Vec::new(), None));
+            }
             let page = {
                 let mut cache = self.cache.lock().unwrap();
                 cache.refresh()?;
@@ -2324,6 +2920,9 @@ impl Inbox {
                 )
             };
             if !page.is_empty() {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Ok((Vec::new(), None));
+                }
                 let last = page
                     .last()
                     .and_then(|e| e.get("record"))
@@ -2556,6 +3155,9 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
                 || method == "server/discover"
                 || method == "subscriptions/listen"
                 || method.starts_with("events/")
+                || method.starts_with("skills/")
+                || method.starts_with("tasks/")
+                || method.starts_with("resources/")
                 || has_modern_meta(&params);
             if modern {
                 if let Err(err) = validate_meta(&params) {
@@ -2568,18 +3170,51 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
                     let _ = net::send(out, &reply_ok(&id, discover_result()));
                 }
                 "tools/list" => {
-                    let _ = net::send(out, &reply_ok(&id, tools_list(ctx.groups, modern)));
+                    let res = match tools_list_paged(ctx.groups, modern, &params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
                 }
                 // Each call runs on its own thread, so a waiting inbox read never
-                // holds up another call.
+                // holds up another call and notifications/cancelled aborts it cleanly.
                 "tools/call" => {
+                    let wants_task = modern
+                        && params
+                            .get("_meta")
+                            .and_then(|m| m.get("io.modelcontextprotocol/task"))
+                            == Some(&Value::Bool(true));
+                    if wants_task {
+                        let res = match start_tool_task(ctx, &params) {
+                            Ok(v) => reply_ok(&id, v),
+                            Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                        };
+                        let _ = net::send(out, &res);
+                        return;
+                    }
+                    let call_key = SubKey::from_id(&id);
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    if let Some(ref k) = call_key {
+                        ctx.calls
+                            .lock()
+                            .unwrap()
+                            .insert(k.clone(), Arc::clone(&cancelled));
+                    }
                     let (ctx, out) = (Arc::clone(ctx), out.clone());
                     std::thread::spawn(move || {
-                        let result = match call_tool(&ctx, &params) {
-                            Ok(v) => tool_result(&json::stringify(&v), false, modern),
-                            Err(reason) => tool_result(&reason, true, modern),
+                        let result = match call_tool_cancellable(&ctx, &params, &cancelled) {
+                            Ok(v) => {
+                                let text = json::stringify(&v);
+                                tool_result(&text, Some(v), false, modern)
+                            }
+                            Err(reason) => tool_result(&reason, None, true, modern),
                         };
-                        let _ = net::send(&out, &reply_ok(&id, result));
+                        if let Some(ref k) = call_key {
+                            ctx.calls.lock().unwrap().remove(k);
+                        }
+                        if !cancelled.load(Ordering::SeqCst) {
+                            let _ = net::send(&out, &reply_ok(&id, result));
+                        }
                     });
                 }
                 "subscriptions/listen" => {
@@ -2589,7 +3224,11 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
                     }
                 }
                 "events/list" => {
-                    let _ = net::send(out, &reply_ok(&id, events_list_result()));
+                    let res = match events_list_paged(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
                 }
                 "events/poll" => {
                     let res = match events_poll(ctx, &params) {
@@ -2598,11 +3237,78 @@ fn handle_line(ctx: &Arc<Ctx>, out: &net::Writer, line: &str) {
                     };
                     let _ = net::send(out, &res);
                 }
+                "events/subscribe" | "events/unsubscribe" => {
+                    let err = events_webhook_unsupported(&params);
+                    let _ = net::send(out, &reply_err_data(&id, err.code, &err.message, err.data));
+                }
                 "events/stream" => {
                     if let Err(err) = start_events_stream(ctx, out, id.clone(), &params) {
                         let _ =
                             net::send(out, &reply_err_data(&id, err.code, &err.message, err.data));
                     }
+                }
+                "skills/list" => {
+                    let res = match skills_list_paged(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "skills/get" => {
+                    let res = match skills_get_result(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "resources/list" => {
+                    let res = match resources_list_paged(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "resources/templates/list" => {
+                    let res = match resource_templates_list_paged(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "resources/read" => {
+                    let res = match resources_read_result(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "resources/directory/read" => {
+                    let res = match resources_directory_read(&params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "tasks/get" => {
+                    let res = match tasks_get_result(ctx, &params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "tasks/cancel" => {
+                    let res = match tasks_cancel_result(ctx, &params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
+                }
+                "tasks/update" => {
+                    let res = match tasks_update_result(ctx, &params) {
+                        Ok(v) => reply_ok(&id, v),
+                        Err(err) => reply_err_data(&id, err.code, &err.message, err.data),
+                    };
+                    let _ = net::send(out, &res);
                 }
                 other => {
                     let _ = net::send(
@@ -3810,5 +4516,80 @@ mod tests {
         drop(ctx);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_inbox_wait_releases_mutex_immediately_and_suppresses_reply() {
+        let dir = std::env::temp_dir().join(format!("roger-mcp-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("cancel.store");
+
+        let ctx = Arc::new(Ctx::new(
+            PathBuf::from("tcp://127.0.0.1:1"),
+            "me-cancel".into(),
+            Inbox::open(&store).unwrap(),
+            false,
+        ));
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        struct VecWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for VecWriter {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = net::writer(Box::new(VecWriter(Arc::clone(&buf))));
+
+        handle_line(
+            &ctx,
+            &out,
+            r#"{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"roger_inbox","arguments":{"wait_seconds":60},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        );
+        // Wait until request 77 is registered in ctx.calls.
+        for _ in 0..100 {
+            if ctx.calls.lock().unwrap().contains_key(&SubKey::Int(77)) {
+                break;
+            }
+            // no-poll: test wait until worker registers request 77 in ctx.calls.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // no-poll: test wall-clock assertion that cancellation ends the 60s wait immediately.
+        let started = Instant::now();
+        handle_line(
+            &ctx,
+            &out,
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":77}}"#,
+        );
+        // Subsequent immediate read acquires Inbox.consumed without waiting 60s.
+        let (page, _) = ctx.inbox.read(10, Duration::ZERO, true).unwrap();
+        assert!(page.is_empty());
+        // no-poll: test wall-clock assertion that cancellation ends the 60s wait immediately.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // no-poll: test grace window to verify cancelled worker writes zero bytes.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "cancelled call must emit no reply"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pagination_and_webhook_unsupported_follow_2026_07_28_and_sep_3415() {
+        assert!(
+            tools_list_paged(false, true, &json::parse(r#"{"cursor":"bogus"}"#).unwrap()).is_err()
+        );
+        assert!(events_list_paged(&json::parse(r#"{"cursor":"999"}"#).unwrap()).is_err());
+        let ok_events = events_list_paged(&json::parse(r#"{"cursor":"0"}"#).unwrap()).unwrap();
+        assert_eq!(ok_events.get("resultType"), Some(&s("complete")));
+
+        let wh = events_webhook_unsupported(&json::parse(r#"{"name":"roger.mail"}"#).unwrap());
+        assert_eq!(wh.code, -32026);
+        let nf = events_webhook_unsupported(&json::parse(r#"{"name":"roger.unknown"}"#).unwrap());
+        assert_eq!(nf.code, -32023);
     }
 }

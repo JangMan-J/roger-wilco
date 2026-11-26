@@ -5,4 +5,5 @@ pub mod daemon;
 pub mod durlog;
 pub mod http;
 pub mod mcp;
+pub mod mrtr;
 pub mod session;

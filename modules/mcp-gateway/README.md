@@ -1,6 +1,21 @@
 # `roger-mcp-gateway`
 
-`roger-mcp-gateway` is an optional multi-session Model Context Protocol (MCP `2026-07-28`) Streamable HTTP and SEP-3415 (`io.modelcontextprotocol/events`) push/poll gateway for Roger-Wilco. It serves HTTP/1.1 and prior-knowledge HTTP/2 (`h2c`) from a single TCP listener so containerized MCP clients across local or remote network namespaces can manage explicit durable Roger session handles (`roger_register` / `roger_unregister`), consume real-time push or cursor-resumable poll event streams backed directly by `DurLog` + `Notify`, and invoke all Roger MCP tools with exact wire and semantic parity to `roger mcp`.
+`roger-mcp-gateway` is an optional multi-session Model Context Protocol (MCP `2026-07-28`) Streamable HTTP gateway for Roger-Wilco. It serves HTTP/1.1 and prior-knowledge HTTP/2 (`h2c`) from a single TCP listener so containerized or remote MCP clients can manage explicit durable Roger session handles (`roger_register` / `roger_unregister`), consume real-time push or cursor-resumable poll event streams backed directly by `DurLog` + `Notify`, and invoke all Roger MCP tools with exact wire and semantic parity to `roger mcp`.
+
+## Protocol Boundary
+
+`roger-mcp-gateway` implements a strict, explicit subset of MCP `2026-07-28` and finalized SEPs:
+
+- **Core `2026-07-28` (SEP-2567, SEP-2575, SEP-2243, SEP-2549)**: Sessionless Streamable HTTP (`POST <endpoint>`), per-request `_meta` (`protocolVersion`, `clientCapabilities`, `clientInfo`), `_meta["io.modelcontextprotocol/serverInfo"]` on responses, `server/discover`, `subscriptions/listen`, `resultType`, `ttlMs`/`cacheScope`, and HTTP header-body mirroring (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`).
+- **Events (SEP-3415, `io.modelcontextprotocol/events`)**: `events/list` (with pagination), `events/poll`, and `events/stream` (`active`, `event`, `heartbeat`, `terminated`); webhook RPCs (`events/subscribe`, `events/unsubscribe`) return `-32026` (`deliveryMode: "webhook"`).
+- **Ops**: Deterministic `tools/list` with cursor pagination, `annotations` (`readOnlyHint`, `idempotentHint`, `destructiveHint`, `openWorldHint`), `structuredContent` alongside text JSON content, `resources/list` / `resources/templates/list` / `resources/read` (`Mcp-Name: <uri>`), and `x-mcp-header` (`Mcp-Param-*`) validation.
+- **Tasks (SEP-2663, `io.modelcontextprotocol/tasks`)**: Async task creation (`resultType: "task"`) on `tools/call` when `_meta["io.modelcontextprotocol/task"]: true` is requested by a `tasks`-capable client, `tasks/get`, `tasks/cancel`, `tasks/update` (enforcing `Mcp-Name: <taskId>`), and `notifications/tasks` push over `subscriptions/listen` (`notifications.taskIds`, `-32021` capability gating).
+- **Skills (SEP-2640, `io.modelcontextprotocol/skills`)**: `skills/list`, `skills/get`, `resources/read`, and `resources/directory/read` (`directoryRead: true`) serving the SHA-256-verified `skill://roger-wilco/SKILL.md` guide and `skill://roger-wilco/references/protocol.md` reference.
+- **MRTR (SEP-2322)**: HMAC-SHA256 `requestState` and `inputResponses` validation on `tools/call`, permitting only `elicitation/create` when `clientCapabilities.elicitation` is declared.
+- **Server Cards (SEP-2127)**: Public, ETag-cached pre-connection discovery at `GET <endpoint>/server-card` (`application/mcp-server-card+json`) and `GET /.well-known/ai-catalog.json` (`application/ai-catalog+json`), strictly omitting primitives and negotiated capabilities.
+- **Auth (RFC 9728 / OAuth 2.1 Resource Server + Bearer)**: Constant-time Bearer token enforcement (`--token-env`), optional RFC 9728 Protected Resource Metadata at `GET /.well-known/oauth-protected-resource<endpoint>` and `GET /.well-known/oauth-protected-resource` (`--auth-server`, `--scope`, `--public-url`), and `WWW-Authenticate: Bearer resource_metadata="...", scope="..."` challenges on `401 Unauthorized`.
+- **Excluded Deprecated Features (SEP-2577, SEP-2596)**: Roots, Sampling (`sampling/createMessage`, `includeContext`), Logging (`logging/setLevel`, `notifications/message`, `_meta["io.modelcontextprotocol/logLevel"]`), Dynamic Client Registration, and legacy `2024-11-05` HTTP+SSE are intentionally absent.
+- **Pre-`2026-07-28` Compatibility Scope**: Limited strictly to version-negotiation diagnostics and transport tolerance (`GET`/`DELETE` -> `405 Allow: POST`, `Mcp-Session-Id`/`Last-Event-ID` ignored, unheadered legacy `initialize` -> `400` + `-32022` naming `"2026-07-28"`, modern-header `initialize` -> `404` + `-32601` naming `"2026-07-28"`). Stdio `roger mcp` additionally retains dual-era `initialize` handshake negotiation for pre-`2026-07-28` stdio clients.
 
 ## Build
 
@@ -12,7 +27,8 @@ cargo build --release --manifest-path modules/mcp-gateway/Cargo.toml
 
 ```text
 Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port> --store-dir <dir>
-                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>] [--groups]
+                         [--port-file <path>] [--endpoint <path>] [--token-env <NAME>]
+                         [--public-url <url>] [--auth-server <issuer-url>] [--scope <scope>] [--groups]
 ```
 
 - `--bind <address:port>`: TCP listener serving both HTTP/1.1 and HTTP/2 (`h2c`).
@@ -20,16 +36,11 @@ Usage: roger-mcp-gateway --bind <address:port> --socket <path|tcp://address:port
 - `--store-dir <dir>`: directory holding per-Address append-only Store files (`<hex_sha256_of_address>.store`) and atomic read cursors (`<hex_sha256_of_address>.store.cursor`).
 - `--port-file <path>`: optional path atomically populated (`<path>.tmp` -> `fsync` -> `rename`) with the bound TCP port immediately after `bind`.
 - `--endpoint <path>`: MCP HTTP endpoint path (default `"/mcp"`). `GET /healthz` is always served (`200 OK` `{"ok":true}`).
-- `--token-env <NAME>`: optional environment variable holding the required Bearer secret. When set, every request to `<endpoint>` must carry `Authorization: Bearer <token>` (checked in constant time) or receives `401 Unauthorized` with `WWW-Authenticate: Bearer`.
+- `--token-env <NAME>`: optional environment variable holding the required Bearer secret. When set, every request to `<endpoint>` must carry `Authorization: Bearer <token>` (checked in constant time) or receives `401 Unauthorized`.
+- `--public-url <url>`: optional canonical public URL of the MCP endpoint advertised in the Server Card and RFC 9728 Protected Resource Metadata.
+- `--auth-server <issuer-url>`: optional OAuth 2.1 Authorization Server issuer URL (repeatable). Enables RFC 9728 Protected Resource Metadata endpoints and `resource_metadata` parameters on `401 WWW-Authenticate` challenges.
+- `--scope <scope>`: optional required scope token (repeatable) advertised in Protected Resource Metadata and `401 WWW-Authenticate` challenges.
 - `--groups`: enable Named Group tools (`roger_subscribe`, `roger_unsubscribe`, `roger_groups`, `roger_articles`, `roger_group_policy`) and `group` sends on `roger_send` statically across this gateway deployment.
-
-## MCP `2026-07-28` Streamable HTTP
-
-- **Sessionless HTTP**: `POST <endpoint>` handles all JSON-RPC requests and notifications. `GET <endpoint>` and `DELETE <endpoint>` return `405 Method Not Allowed` (`Allow: POST`). Any legacy `Mcp-Session-Id` or `Last-Event-ID` headers are ignored.
-- **Required Headers**: Every JSON-RPC request POST must carry `MCP-Protocol-Version` (matching `_meta["io.modelcontextprotocol/protocolVersion"]`), `Mcp-Method` (matching `method`), and `Mcp-Name` (for `tools/call`, `events/poll`, `events/stream`, `events/subscribe`, `events/unsubscribe`, supporting `=?base64?<b64>?=` sentinel decoding) — mismatches return `400 Bad Request` + JSON-RPC `-32020` (`HeaderMismatch`).
-- **Per-Request `_meta`**: Every request carries `_meta["io.modelcontextprotocol/protocolVersion"]` (`"2026-07-28"`, else `400` + `-32022`) and `_meta["io.modelcontextprotocol/clientCapabilities"]` (object, else `400` + `-32602`).
-- **`Origin` & `Accept`**: Non-loopback or invalid `Origin` headers on local bindings return `403 Forbidden`; incompatible `Accept` headers return `406 Not Acceptable`.
-- **Discovery & Listen**: `server/discover` returns `supportedVersions: ["2026-07-28"]`, `tools`, `io.modelcontextprotocol/events`, `ttlMs`, and `cacheScope: "public"`. `subscriptions/listen` returns an SSE stream with `notifications/subscriptions/acknowledged`, keepalive comments, and graceful closure on server shutdown.
 
 ## Explicit Session Handles (`roger_register` / `roger_unregister`)
 
