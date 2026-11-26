@@ -568,7 +568,8 @@ mod tests {
         let err = parse("watch", &["--unknown"]).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         #[cfg(feature = "test-hooks")]
-        let expected = "expected one of --socket, --hold-before-ack, --link-pace-ms for watch, saw --unknown";
+        let expected =
+            "expected one of --socket, --hold-before-ack, --link-pace-ms for watch, saw --unknown";
         #[cfg(not(feature = "test-hooks"))]
         let expected = "expected one of --socket for watch, saw --unknown";
         assert_eq!(err.to_string(), expected);
